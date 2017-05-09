@@ -1,0 +1,3 @@
+[submodule "vendor/rdma-core"]
+	path = vendor/rdma-core
+	url = https://github.com/linux-rdma/rdma-core.git

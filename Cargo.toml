@@ -1,0 +1,11 @@
+[package]
+name = "ibverbs"
+version = "0.1.0"
+authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
+build = "build.rs"
+links = "ibverbs"
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.25"
