@@ -4,7 +4,10 @@ version = "0.1.0"
 
 description = "Bindings for RDMA ibverbs through rdma-core"
 #readme = "README.md"
-authors = ["Jon Gjengset <jon@thesquareplanet.com>"]
+authors = [
+    "Jon Gjengset <jon@thesquareplanet.com>",
+    "Jonathan Behrens <fintelia@gmail.com>"
+]
 build = "build.rs"
 links = "ibverbs"
 

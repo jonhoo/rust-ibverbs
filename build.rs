@@ -24,6 +24,7 @@ fn main() {
         // https://github.com/servo/rust-bindgen/issues/550
         .hide_type("max_align_t")
         .whitelisted_function("ibv_.*")
+        .whitelisted_type("ibv_.*")
         .generate()
         .expect("Unable to generate bindings");
 
