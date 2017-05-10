@@ -5,8 +5,9 @@ use std::marker::PhantomData;
 use std::ptr;
 use std::mem;
 use std::os::raw::{c_void, c_int};
+use std::error::Error;
 
-const PORT_NUM: u8 = 0;
+const PORT_NUM: u8 = 1;
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
@@ -109,8 +110,11 @@ impl Context {
         assert!(!ctx.is_null());
 
         let mut port_attr = ffi::ibv_port_attr::default();
-        let ok = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, mem::transmute(&mut port_attr)) };
-        assert_eq!(ok, 0);
+        let errno = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, mem::transmute(&mut port_attr)) };
+        if errno != 0 {
+            let e = std::io::Error::from_raw_os_error(errno);
+            panic!("{}", e.description());
+        }
 
         let mut gid = ffi::ibv_gid::default();
         let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, mem::transmute(&mut gid)) };
@@ -385,12 +389,18 @@ impl<'a> PreparedQueuePair<'a> {
         attr.qp_state = ffi::ibv_qp_state::IBV_QPS_RTS;
         attr.timeout = self.timeout;
         attr.retry_cnt = self.retry_count;
+        attr.sq_psn = 0;
         attr.rnr_retry = self.rnr_retry;
         attr.max_rd_atomic = 1;
         let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_TIMEOUT | ffi::IBV_QP_RETRY_CNT |
-                   ffi::IBV_QP_SQ_PSN | ffi::IBV_QP_MAX_QP_RD_ATOMIC;
-        let ok = unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
-        assert_eq!(ok, 0);
+                   ffi::IBV_QP_SQ_PSN | ffi::IBV_QP_RNR_RETRY |
+                   ffi::IBV_QP_MAX_QP_RD_ATOMIC;
+        let errno =
+            unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
+        if errno != 0 {
+            let e = std::io::Error::from_raw_os_error(errno);
+            panic!("{}", e.description());
+        }
 
         QueuePair {
             _phantom: PhantomData,
@@ -444,8 +454,11 @@ impl<'a> ProtectionDomain<'a> {
 
 impl<'a> Drop for ProtectionDomain<'a> {
     fn drop(&mut self) {
-        let ok = unsafe { ffi::ibv_dealloc_pd(self.pd) };
-        assert_eq!(ok, 0);
+        let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
+        if errno != 0 {
+            let e = std::io::Error::from_raw_os_error(errno);
+            panic!("{}", e.description());
+        }
     }
 }
 
@@ -511,7 +524,7 @@ impl<'a> QueuePair<'a> {
             sg_list: mem::transmute(&mut sge),
             num_sge: 1,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: 0,
+            send_flags: ffi::IBV_SEND_SIGNALED.0 as i32,
             imm_data: 0,
             wr: Default::default(),
             qp_type: Default::default(),

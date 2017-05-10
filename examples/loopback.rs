@@ -16,12 +16,11 @@ fn main() {
     let endpoint = qp_builder.endpoint();
     let mut qp = qp_builder.handshake(endpoint);
 
-    let mut mr = pd.allocate::<u8>(16);
-    mr[8] = 0x42;
-    mr[15] = 0x41;
+    let mut mr = pd.allocate::<u64>(2);
+    mr[1] = 0x42;
 
-    unsafe { qp.post_receive(&mut mr, 8.., 2) };
-    unsafe { qp.post_send(&mut mr, ..8, 1) };
+    unsafe { qp.post_receive(&mut mr, ..1, 2) };
+    unsafe { qp.post_send(&mut mr, 1.., 1) };
 
     let mut sent = false;
     let mut received = false;
@@ -38,12 +37,13 @@ fn main() {
                 1 => {
                     assert!(!sent);
                     sent = true;
+                    println!("sent");
                 }
                 2 => {
                     assert!(!received);
                     received = true;
                     assert_eq!(mr[0], 0x42);
-                    assert_eq!(mr[7], 0x41);
+                    println!("received");
                 }
                 _ => unreachable!(),
             }

@@ -28,6 +28,7 @@ fn main() {
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_wc_flags")
+        .bitfield_enum("ibv_send_flags")
         .prepend_enum_name(false)
         .hide_type("ibv_wc")
         .generate()
