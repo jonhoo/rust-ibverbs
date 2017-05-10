@@ -9,8 +9,7 @@ authors = [
     "Jonathan Behrens <fintelia@gmail.com>"
 ]
 build = "build.rs"
-links = "ibverbs"
-
+#links = "ibverbs"
 
 homepage = "https://github.com/jonhoo/rust-ibverbs"
 repository = "https://github.com/jonhoo/rust-ibverbs.git"

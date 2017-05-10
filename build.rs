@@ -25,6 +25,11 @@ fn main() {
         .hide_type("max_align_t")
         .whitelisted_function("ibv_.*")
         .whitelisted_type("ibv_.*")
+        .bitfield_enum("ibv_access_flags")
+        .bitfield_enum("ibv_qp_attr_mask")
+        .bitfield_enum("ibv_wc_flags")
+        .prepend_enum_name(false)
+        .hide_type("ibv_wc")
         .generate()
         .expect("Unable to generate bindings");
 

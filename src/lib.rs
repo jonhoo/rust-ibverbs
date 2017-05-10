@@ -4,25 +4,36 @@
 use std::marker::PhantomData;
 use std::ptr;
 use std::mem;
-use std::os::raw::c_void;
+use std::os::raw::{c_void, c_int};
 
 const PORT_NUM: u8 = 0;
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
-mod ffi;
+pub mod ffi;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_wc_status;
 pub use ffi::ibv_wc_opcode;
-pub use ffi::ibv_wc__bindgen_ty_1;
+
+pub use ffi::ibv_access_flags;
+pub use ffi::IBV_ACCESS_LOCAL_WRITE;
+pub use ffi::IBV_ACCESS_MW_BIND;
+pub use ffi::IBV_ACCESS_ON_DEMAND;
+pub use ffi::IBV_ACCESS_REMOTE_ATOMIC;
+pub use ffi::IBV_ACCESS_REMOTE_READ;
+pub use ffi::IBV_ACCESS_REMOTE_WRITE;
+pub use ffi::IBV_ACCESS_ZERO_BASED;
 
 pub fn devices() -> DeviceList {
     let mut n = 0i32;
     let devices = unsafe { ffi::ibv_get_device_list(mem::transmute(&mut n)) };
     assert!(n >= 0);
-    assert!(!devices.is_null());
+
+    if devices.is_null() {
+        return DeviceList(&mut []);
+    }
 
     let devices = unsafe {
         use std::slice;
@@ -41,6 +52,14 @@ impl Drop for DeviceList {
 
 impl DeviceList {
     pub fn iter(&self) -> DeviceListIter {
+        DeviceListIter { list: self, i: 0 }
+    }
+}
+
+impl<'a> IntoIterator for &'a DeviceList {
+    type Item = <DeviceListIter<'a> as Iterator>::Item;
+    type IntoIter = DeviceListIter<'a>;
+    fn into_iter(self) -> Self::IntoIter {
         DeviceListIter { list: self, i: 0 }
     }
 }
@@ -106,13 +125,13 @@ impl Context {
 
     /// Create a completion queue.
     ///
-    /// `cqe` is the minimum number of entries required for CQ.
-    /// `cqctx` is an opaque identifier returned by `CompletionQueue::poll`.
-    pub fn create_cq(&self, cqe: i32, cqctx: isize) -> CompletionQueue {
+    /// `min_cq_entries` is the minimum number of entries required for CQ.
+    /// `id` is an opaque identifier returned by `CompletionQueue::poll`.
+    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> CompletionQueue {
         let cq = unsafe {
             ffi::ibv_create_cq(self.ctx,
-                               cqe,
-                               ptr::null::<c_void>().offset(cqctx) as *mut _,
+                               min_cq_entries,
+                               ptr::null::<c_void>().offset(id) as *mut _,
                                ptr::null::<c_void>() as *mut _,
                                0)
         };
@@ -151,7 +170,7 @@ impl<'a> CompletionQueue<'a> {
     /// If the return value is non-negative and strictly less
     /// than num_entries, then the CQ was emptied.
     #[inline]
-    pub fn poll(&self, completions: &mut [ffi::ibv_wc]) -> usize {
+    pub fn poll(&self, completions: &mut [ffi::ibv_wc]) -> isize {
         let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
         let ops = &mut unsafe { &mut *ctx }.ops;
         let n = unsafe {
@@ -160,7 +179,7 @@ impl<'a> CompletionQueue<'a> {
                                           completions.as_mut_ptr())
         };
         assert!(n >= 0);
-        n as usize
+        n as isize
     }
 }
 
@@ -187,7 +206,7 @@ pub struct QueuePairBuilder<'a> {
     qp_type: ffi::ibv_qp_type,
 
     // carried along to handshake phase
-    access: i32,
+    access: ffi::ibv_access_flags,
     timeout: u8,
     retry_count: u8,
     rnr_retry: u8,
@@ -221,7 +240,7 @@ impl<'qp> QueuePairBuilder<'qp> {
 
             qp_type,
 
-            access: ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE as i32,
+            access: ffi::IBV_ACCESS_LOCAL_WRITE,
             min_rnr_timer: 16,
             retry_count: 6,
             rnr_retry: 6,
@@ -229,40 +248,39 @@ impl<'qp> QueuePairBuilder<'qp> {
         }
     }
 
-    pub fn set_access(mut self, access: i32) -> Self {
+    pub fn set_access(mut self, access: ffi::ibv_access_flags) -> Self {
         self.access = access;
         self
     }
 
     pub fn allow_remote_rw(mut self) -> Self {
-        self.access |= ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE as i32 |
-                       ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ as i32;
+        self.access = self.access | ffi::IBV_ACCESS_REMOTE_WRITE | ffi::IBV_ACCESS_REMOTE_READ;
         self
     }
 
-    pub fn min_rnr_timer(mut self, timer: u8) -> Self {
+    pub fn set_min_rnr_timer(mut self, timer: u8) -> Self {
         self.min_rnr_timer = timer;
         self
     }
 
-    pub fn timeout(mut self, timeout: u8) -> Self {
+    pub fn set_timeout(mut self, timeout: u8) -> Self {
         self.timeout = timeout;
         self
     }
 
-    pub fn retry_count(mut self, count: u8) -> Self {
+    pub fn set_retry_count(mut self, count: u8) -> Self {
         assert!(count <= 7);
         self.retry_count = count;
         self
     }
 
-    pub fn rnr_retry(mut self, n: u8) -> Self {
+    pub fn set_rnr_retry(mut self, n: u8) -> Self {
         assert!(n <= 7);
         self.rnr_retry = n;
         self
     }
 
-    pub fn context(mut self, ctx: isize) -> Self {
+    pub fn set_context(mut self, ctx: isize) -> Self {
         self.ctx = ctx;
         self
     }
@@ -305,7 +323,7 @@ pub struct PreparedQueuePair<'a> {
     qp: *mut ffi::ibv_qp,
 
     // carried from builder
-    access: i32,
+    access: ffi::ibv_access_flags,
     min_rnr_timer: u8,
     timeout: u8,
     retry_count: u8,
@@ -330,17 +348,15 @@ impl<'a> PreparedQueuePair<'a> {
     }
 
     pub fn handshake(self, remote: QueuePairEndpoint) -> QueuePair<'a> {
-        use ffi::ibv_qp_attr_mask::*;
-
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr::default();
         attr.qp_state = ffi::ibv_qp_state::IBV_QPS_INIT;
-        attr.qp_access_flags = self.access;
+        attr.qp_access_flags = self.access.0 as c_int;
         attr.pkey_index = 0;
         attr.port_num = PORT_NUM;
-        let mask = IBV_QP_STATE as i32 | IBV_QP_PKEY_INDEX as i32 | IBV_QP_PORT as i32 |
-                   IBV_QP_ACCESS_FLAGS as i32;
-        let ok = unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask) };
+        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_PKEY_INDEX | ffi::IBV_QP_PORT |
+                   ffi::IBV_QP_ACCESS_FLAGS;
+        let ok = unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
         assert_eq!(ok, 0);
 
         // set ready to receive
@@ -358,11 +374,10 @@ impl<'a> PreparedQueuePair<'a> {
         attr.ah_attr.port_num = PORT_NUM;
         attr.ah_attr.grh.dgid = remote.gid;
         attr.ah_attr.grh.hop_limit = 0xff;
-        let mask = IBV_QP_STATE as i32 | IBV_QP_AV as i32 | IBV_QP_PATH_MTU as i32 |
-                   IBV_QP_DEST_QPN as i32 | IBV_QP_RQ_PSN as i32 |
-                   IBV_QP_MAX_DEST_RD_ATOMIC as i32 |
-                   IBV_QP_MIN_RNR_TIMER as i32;
-        let ok = unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask) };
+        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_AV | ffi::IBV_QP_PATH_MTU |
+                   ffi::IBV_QP_DEST_QPN | ffi::IBV_QP_RQ_PSN |
+                   ffi::IBV_QP_MAX_DEST_RD_ATOMIC | ffi::IBV_QP_MIN_RNR_TIMER;
+        let ok = unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
         assert_eq!(ok, 0);
 
         // set ready to send
@@ -372,9 +387,9 @@ impl<'a> PreparedQueuePair<'a> {
         attr.retry_cnt = self.retry_count;
         attr.rnr_retry = self.rnr_retry;
         attr.max_rd_atomic = 1;
-        let mask = IBV_QP_STATE as i32 | IBV_QP_TIMEOUT as i32 | IBV_QP_RETRY_CNT as i32 |
-                   IBV_QP_SQ_PSN as i32 | IBV_QP_MAX_QP_RD_ATOMIC as i32;
-        let ok = unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask) };
+        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_TIMEOUT | ffi::IBV_QP_RETRY_CNT |
+                   ffi::IBV_QP_SQ_PSN | ffi::IBV_QP_MAX_QP_RD_ATOMIC;
+        let ok = unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
         assert_eq!(ok, 0);
 
         QueuePair {
@@ -395,16 +410,14 @@ unsafe impl<'a> Send for ProtectionDomain<'a> {}
 impl<'a> ProtectionDomain<'a> {
     pub fn create_qp<'pd, 'scq, 'rcq, 'qp>(&'pd self,
                                            send: &'scq CompletionQueue,
-                                           max_send_wr: u32,
                                            recv: &'rcq CompletionQueue,
-                                           max_recv_wr: u32,
                                            qp_type: ffi::ibv_qp_type)
                                            -> QueuePairBuilder<'qp>
         where 'scq: 'qp,
               'rcq: 'qp,
               'pd: 'qp
     {
-        QueuePairBuilder::new(self, send, max_send_wr, recv, max_recv_wr, qp_type)
+        QueuePairBuilder::new(self, send, 1, recv, 1, qp_type)
     }
 
     pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> MemoryRegion<T> {
@@ -414,15 +427,14 @@ impl<'a> ProtectionDomain<'a> {
         let mut data = Vec::with_capacity(n);
         data.resize(n, T::default());
 
-        use ffi::ibv_access_flags::*;
-        let access = IBV_ACCESS_LOCAL_WRITE as i32 | IBV_ACCESS_REMOTE_WRITE as i32 |
-                     IBV_ACCESS_REMOTE_READ as i32 |
-                     IBV_ACCESS_REMOTE_ATOMIC as i32;
+        let access = ffi::IBV_ACCESS_LOCAL_WRITE | ffi::IBV_ACCESS_REMOTE_WRITE |
+                     ffi::IBV_ACCESS_REMOTE_READ |
+                     ffi::IBV_ACCESS_REMOTE_ATOMIC;
         let mr = unsafe {
             ffi::ibv_reg_mr(self.pd,
                             data.as_mut_ptr() as *mut _,
                             n * mem::size_of::<T>(),
-                            access)
+                            access.0 as i32)
         };
         assert!(!mr.is_null());
 
@@ -479,22 +491,24 @@ pub struct QueuePair<'a> {
 impl<'a> QueuePair<'a> {
     /// Post a list of work requests to a send queue.
     ///
-    /// If `IBV_SEND_INLINE` flag is set, the data buffers can be reused
-    /// immediately after the call returns.
+    /// # Safety
+    ///
+    /// The memory region must remain allocated until the associated send completes (i.e., until
+    /// `CompletionQueue::poll` returns a completion for this send).
     #[inline]
-    pub fn post_send<T, R>(&mut self, mr: &mut MemoryRegion<T>, range: R, wr_id: u64)
+    pub unsafe fn post_send<T, R>(&mut self, mr: &mut MemoryRegion<T>, range: R, wr_id: u64)
         where R: std::slice::SliceIndex<[T], Output = [T]>
     {
         let range = &mr[range];
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: (mem::size_of::<T>() * range.len()) as u32,
-            lkey: unsafe { &*mr.mr }.lkey,
+            lkey: (&*mr.mr).lkey,
         };
         let mut wr = ffi::ibv_send_wr {
             wr_id: wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: unsafe { mem::transmute(&mut sge) },
+            sg_list: mem::transmute(&mut sge),
             num_sge: 1,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
             send_flags: 0,
@@ -505,44 +519,43 @@ impl<'a> QueuePair<'a> {
         };
         let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
 
-        let ctx = unsafe { &*self.qp }.context;
-        let ops = &mut unsafe { &mut *ctx }.ops;
-        let n = unsafe {
-            ops.post_send.as_mut().unwrap()(self.qp,
-                                            mem::transmute(&mut wr),
-                                            mem::transmute(&mut bad_wr))
-        };
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let n = ops.post_send.as_mut().unwrap()(self.qp,
+                                                mem::transmute(&mut wr),
+                                                mem::transmute(&mut bad_wr));
         assert!(n >= 0);
     }
 
-    ///
     /// Post a list of work requests to a receive queue.
     ///
+    /// # Safety
+    ///
+    /// The memory region must remain allocated until the associated send completes (i.e., until
+    /// `CompletionQueue::poll` returns a completion for this receive).
     #[inline]
-    pub fn post_receive<T, R>(&mut self, mr: &mut MemoryRegion<T>, range: R, wr_id: u64)
+    pub unsafe fn post_receive<T, R>(&mut self, mr: &mut MemoryRegion<T>, range: R, wr_id: u64)
         where R: std::slice::SliceIndex<[T], Output = [T]>
     {
         let range = &mr[range];
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: (mem::size_of::<T>() * range.len()) as u32,
-            lkey: unsafe { &*mr.mr }.lkey,
+            lkey: (&*mr.mr).lkey,
         };
         let mut wr = ffi::ibv_recv_wr {
             wr_id: wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: unsafe { mem::transmute(&mut sge) },
+            sg_list: mem::transmute(&mut sge),
             num_sge: 1,
         };
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null::<ffi::ibv_recv_wr>() as *mut _;
 
-        let ctx = unsafe { &*self.qp }.context;
-        let ops = &mut unsafe { &mut *ctx }.ops;
-        let n = unsafe {
-            ops.post_recv.as_mut().unwrap()(self.qp,
-                                            mem::transmute(&mut wr),
-                                            mem::transmute(&mut bad_wr))
-        };
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let n = ops.post_recv.as_mut().unwrap()(self.qp,
+                                                mem::transmute(&mut wr),
+                                                mem::transmute(&mut bad_wr));
         assert!(n >= 0);
     }
 }

@@ -1,5 +1,138 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct ibv_wc {
+    wr_id: u64,
+    status: ibv_wc_status,
+    opcode: ibv_wc_opcode,
+    vendor_err: u32,
+    byte_len: u32,
+    imm_data: u32,
+    qp_num: u32,
+    src_qp: u32,
+    wc_flags: ibv_wc_flags,
+    pkey_index: u16,
+    slid: u16,
+    sl: u8,
+    dlid_path_bits: u8,
+}
+
+impl ibv_wc {
+    pub fn wr_id(&self) -> u64 {
+        self.wr_id
+    }
+
+    pub fn len(&self) -> usize {
+        self.byte_len as usize
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.status == ibv_wc_status::IBV_WC_SUCCESS
+    }
+
+    pub fn error(&self) -> Option<(ibv_wc_status, u32)> {
+        match self.status {
+            ibv_wc_status::IBV_WC_SUCCESS => None,
+            status => Some((status, self.vendor_err)),
+        }
+    }
+
+    pub fn opcode(&self) -> ibv_wc_opcode {
+        self.opcode
+    }
+
+    pub fn imm_data(&self) -> Option<u32> {
+        if self.is_valid() && (self.wc_flags.0 & IBV_WC_WITH_IMM.0 != 0) {
+            Some(self.imm_data)
+        } else {
+            None
+        }
+    }
+}
+
+#[test]
+fn bindgen_test_layout_ibv_wc() {
+    assert_eq!(::std::mem::size_of::<ibv_wc>(),
+               48usize,
+               concat!("Size of: ", stringify!(ibv_wc)));
+    assert_eq!(::std::mem::align_of::<ibv_wc>(),
+               8usize,
+               concat!("Alignment of ", stringify!(ibv_wc)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).wr_id as *const _ as usize },
+               0usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(wr_id)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).status as *const _ as usize },
+               8usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(status)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).opcode as *const _ as usize },
+               12usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(opcode)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).vendor_err as *const _ as usize },
+               16usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(vendor_err)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).byte_len as *const _ as usize },
+               20usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(byte_len)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).qp_num as *const _ as usize },
+               28usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(qp_num)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).src_qp as *const _ as usize },
+               32usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(src_qp)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).wc_flags as *const _ as usize },
+               36usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(wc_flags)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).pkey_index as *const _ as usize },
+               40usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(pkey_index)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).slid as *const _ as usize },
+               42usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(slid)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).sl as *const _ as usize },
+               44usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(sl)));
+    assert_eq!(unsafe { &(*(0 as *const ibv_wc)).dlid_path_bits as *const _ as usize },
+               45usize,
+               concat!("Alignment of field: ",
+                       stringify!(ibv_wc),
+                       "::",
+                       stringify!(dlid_path_bits)));
+}
+
 impl Default for ibv_qp_cap {
     fn default() -> Self {
         ibv_qp_cap {
@@ -142,18 +275,14 @@ impl Default for ibv_wc {
     fn default() -> Self {
         ibv_wc {
             wr_id: 0,
-            status: ibv_wc_status::IBV_WC_SUCCESS,
+            status: ibv_wc_status::IBV_WC_GENERAL_ERR,
             opcode: ibv_wc_opcode::IBV_WC_LOCAL_INV,
             vendor_err: 0,
             byte_len: 0,
-            __bindgen_anon_1: ibv_wc__bindgen_ty_1 {
-                imm_data: Default::default(),
-                invalidated_rkey: Default::default(),
-                bindgen_union_field: 0,
-            },
+            imm_data: 0,
             qp_num: 0,
             src_qp: 0,
-            wc_flags: 0,
+            wc_flags: ibv_wc_flags(0),
             pkey_index: 0,
             slid: 0,
             sl: 0,
