@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs"
-version = "0.2.1"
+version = "0.2.2"
 
 description = "Bindings for RDMA ibverbs through rdma-core"
 readme = "README.md"
@@ -13,7 +13,7 @@ links = "ibverbs"
 
 homepage = "https://github.com/jonhoo/rust-ibverbs"
 repository = "https://github.com/jonhoo/rust-ibverbs.git"
-documentation = "https://jon.tsp.io/crates/ibverbs/"
+documentation = "https://docs.rs/ibverbs/"
 
 keywords = ["rdma", "ibverbs", "networking", "ffi"]
 categories = ["network-programming", "api-bindings"]
