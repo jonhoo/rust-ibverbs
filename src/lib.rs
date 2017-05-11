@@ -53,6 +53,7 @@ use std::io;
 
 const PORT_NUM: u8 = 1;
 
+/// Direct access to low-level libverbs FFI.
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
@@ -64,14 +65,16 @@ pub use ffi::ibv_qp_type;
 pub use ffi::ibv_wc_status;
 pub use ffi::ibv_wc_opcode;
 
+/// Access flags for use with `QueuePair` and `MemoryRegion`.
 pub use ffi::ibv_access_flags;
+/// Enable Local Write Access.
 pub use ffi::IBV_ACCESS_LOCAL_WRITE;
-pub use ffi::IBV_ACCESS_MW_BIND;
-pub use ffi::IBV_ACCESS_ON_DEMAND;
-pub use ffi::IBV_ACCESS_REMOTE_ATOMIC;
-pub use ffi::IBV_ACCESS_REMOTE_READ;
+/// Enable Remote Write Access.
 pub use ffi::IBV_ACCESS_REMOTE_WRITE;
-pub use ffi::IBV_ACCESS_ZERO_BASED;
+/// Enable Remote Read Access.
+pub use ffi::IBV_ACCESS_REMOTE_READ;
+/// Enable Remote Atomic Operation Access (if supported).
+pub use ffi::IBV_ACCESS_REMOTE_ATOMIC;
 
 /// Get list of available RDMA devices.
 pub fn devices() -> io::Result<DeviceList> {

@@ -1,5 +1,6 @@
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+/// An ibverb work completion.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct ibv_wc {
@@ -8,29 +9,44 @@ pub struct ibv_wc {
     opcode: ibv_wc_opcode,
     vendor_err: u32,
     byte_len: u32,
-    imm_data: u32,
-    qp_num: u32,
-    src_qp: u32,
-    wc_flags: ibv_wc_flags,
-    pkey_index: u16,
-    slid: u16,
-    sl: u8,
-    dlid_path_bits: u8,
+
+    /// Immediate data OR the local RKey that was invalidated depending on `wc_flags`.
+    /// See `man ibv_poll_cq` for details.
+    pub imm_data: u32,
+    /// Local QP number of completed WR
+    pub qp_num: u32,
+    /// Source QP number (remote QP number) of completed WR (valid only for UD QPs)
+    pub src_qp: u32,
+    /// Flags of the completed WR
+    pub wc_flags: ibv_wc_flags,
+    /// P_Key index (valid only for GSI QPs)
+    pub pkey_index: u16,
+    /// Source LID
+    pub slid: u16,
+    /// Service Level
+    pub sl: u8,
+    /// DLID path bits (not applicable for multicast messages)
+    pub dlid_path_bits: u8,
 }
 
 impl ibv_wc {
+    /// Returns the ID of the completed work request.
     pub fn wr_id(&self) -> u64 {
         self.wr_id
     }
 
+    /// Returns the number of bytes transferred for this work request.
     pub fn len(&self) -> usize {
         self.byte_len as usize
     }
 
+    /// Check if this work requested completed successfully.
     pub fn is_valid(&self) -> bool {
         self.status == ibv_wc_status::IBV_WC_SUCCESS
     }
 
+    /// Returns the work completion status and vendor error syndrome (`vendor_err`) if the work
+    /// request did not completed successfully.
     pub fn error(&self) -> Option<(ibv_wc_status, u32)> {
         match self.status {
             ibv_wc_status::IBV_WC_SUCCESS => None,
@@ -38,10 +54,16 @@ impl ibv_wc {
         }
     }
 
+    /// Returns the operation type specified in the completed WR.
     pub fn opcode(&self) -> ibv_wc_opcode {
         self.opcode
     }
 
+    /// Returns the immediate data of this work completion if provided.
+    ///
+    /// Note that IMM is only returned if `IBV_WC_WITH_IMM` is set in `wc_flags`. If this is not
+    /// the case, no immediate value was provided, and `imm_data` should be interpreted
+    /// differently. See `man ibv_poll_cq` for details.
     pub fn imm_data(&self) -> Option<u32> {
         if self.is_valid() && (self.wc_flags.0 & IBV_WC_WITH_IMM.0 != 0) {
             Some(self.imm_data)
