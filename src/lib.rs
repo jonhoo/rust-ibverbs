@@ -191,7 +191,7 @@ impl Context {
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, mem::transmute(&mut port_attr)) };
         if errno != 0 {
-            return Err(std::io::Error::from_raw_os_error(errno));
+            return Err(io::Error::from_raw_os_error(errno));
         }
 
         let mut gid = ffi::ibv_gid::default();
@@ -214,7 +214,7 @@ impl Context {
     /// `CompletionQueue::poll`.
     ///
     /// Note that the device may choose to allocate more CQ entries than the provided minimum.
-    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> Result<CompletionQueue, ()> {
+    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
         let cq = unsafe {
             ffi::ibv_create_cq(self.ctx,
                                min_cq_entries,
@@ -224,7 +224,7 @@ impl Context {
         };
 
         if cq.is_null() {
-            Err(())
+            Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
                    _phantom: PhantomData,
@@ -293,7 +293,7 @@ impl<'a> Drop for CompletionQueue<'a> {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if errno != 0 {
-            let e = std::io::Error::from_raw_os_error(errno);
+            let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
         }
     }
@@ -419,7 +419,7 @@ impl<'qp> QueuePairBuilder<'qp> {
     ///
     /// This method will fail if asked to create QP of a type other than `IBV_QPT_RC` or
     /// `IBV_QPT_UD` associated with an SRQ.
-    pub fn build(&self) -> Result<PreparedQueuePair<'qp>, ()> {
+    pub fn build(&self) -> io::Result<PreparedQueuePair<'qp>> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
             send_cq: unsafe { mem::transmute(self.send) },
@@ -438,7 +438,7 @@ impl<'qp> QueuePairBuilder<'qp> {
 
         let qp = unsafe { ffi::ibv_create_qp(self.pd.pd, mem::transmute(&mut attr)) };
         if qp.is_null() {
-            Err(())
+            Err(io::Error::last_os_error())
         } else {
             Ok(PreparedQueuePair {
                    ctx: self.pd.ctx,
@@ -546,7 +546,7 @@ impl<'a> PreparedQueuePair<'a> {
         let errno =
             unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
         if errno != 0 {
-            return Err(std::io::Error::from_raw_os_error(errno));
+            return Err(io::Error::from_raw_os_error(errno));
         }
 
         // set ready to receive
@@ -570,7 +570,7 @@ impl<'a> PreparedQueuePair<'a> {
         let errno =
             unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
         if errno != 0 {
-            return Err(std::io::Error::from_raw_os_error(errno));
+            return Err(io::Error::from_raw_os_error(errno));
         }
 
         // set ready to send
@@ -587,7 +587,7 @@ impl<'a> PreparedQueuePair<'a> {
         let errno =
             unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
         if errno != 0 {
-            return Err(std::io::Error::from_raw_os_error(errno));
+            return Err(io::Error::from_raw_os_error(errno));
         }
 
         Ok(QueuePair {
@@ -634,7 +634,7 @@ impl<T> Drop for MemoryRegion<T> {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if errno != 0 {
-            let e = std::io::Error::from_raw_os_error(errno);
+            let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
         }
     }
@@ -681,7 +681,7 @@ impl<'a> ProtectionDomain<'a> {
     /// Panics if the size of the memory region zero bytes, which can occur either if `n` is 0, or
     /// if `mem::size_of::<T>()` is 0.
     ///
-    pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> Result<MemoryRegion<T>, ()> {
+    pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> io::Result<MemoryRegion<T>> {
         assert!(n > 0);
         assert!(mem::size_of::<T>() > 0);
 
@@ -707,7 +707,7 @@ impl<'a> ProtectionDomain<'a> {
         // function.
 
         if !mr.is_null() {
-            Err(())
+            Err(io::Error::last_os_error())
         } else {
             Ok(MemoryRegion { mr, data })
         }
@@ -718,7 +718,7 @@ impl<'a> Drop for ProtectionDomain<'a> {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if errno != 0 {
-            let e = std::io::Error::from_raw_os_error(errno);
+            let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
         }
     }
@@ -793,7 +793,7 @@ impl<'a> QueuePair<'a> {
                                                     mem::transmute(&mut wr),
                                                     mem::transmute(&mut bad_wr));
         if errno != 0 {
-            Err(std::io::Error::from_raw_os_error(errno))
+            Err(io::Error::from_raw_os_error(errno))
         } else {
             Ok(())
         }
@@ -848,7 +848,7 @@ impl<'a> QueuePair<'a> {
                                                     mem::transmute(&mut wr),
                                                     mem::transmute(&mut bad_wr));
         if errno != 0 {
-            Err(std::io::Error::from_raw_os_error(errno))
+            Err(io::Error::from_raw_os_error(errno))
         } else {
             Ok(())
         }
@@ -860,7 +860,7 @@ impl<'a> Drop for QueuePair<'a> {
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
         let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
         if errno != 0 {
-            let e = std::io::Error::from_raw_os_error(errno);
+            let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
         }
     }
