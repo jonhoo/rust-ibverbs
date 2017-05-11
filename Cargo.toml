@@ -19,10 +19,9 @@ keywords = ["rdma", "ibverbs", "networking", "ffi"]
 categories = ["network-programming", "api-bindings"]
 
 license = "MIT/Apache-2.0"
+
 [badges]
 travis-ci = { repository = "jonhoo/rust-ibverbs" }
-
-[dependencies]
 
 [build-dependencies]
 bindgen = "0.25"
