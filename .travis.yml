@@ -19,6 +19,8 @@ env:
 before_install: . vendor/bindgen/ci/before_install.sh
 rust:
   - nightly
+  - beta
+  - stable
 cache: cargo
 matrix:
   allow_failures:

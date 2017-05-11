@@ -61,7 +61,6 @@
 //! [1]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 
 #![deny(missing_docs)]
-#![feature(slice_get_slice)]
 
 use std::marker::PhantomData;
 use std::ptr;
@@ -95,6 +94,10 @@ pub use ffi::IBV_ACCESS_REMOTE_WRITE;
 pub use ffi::IBV_ACCESS_REMOTE_READ;
 /// Enable Remote Atomic Operation Access (if supported).
 pub use ffi::IBV_ACCESS_REMOTE_ATOMIC;
+
+/// Because `std::slice::SliceIndex` is still unstable, we follow @alexcrichton's suggestion in
+/// https://github.com/rust-lang/rust/issues/35729 and implement it ourselves.
+mod sliceindex;
 
 /// Get list of available RDMA devices.
 ///
@@ -1082,9 +1085,9 @@ impl<'res> QueuePair<'res> {
                                   range: R,
                                   wr_id: u64)
                                   -> io::Result<()>
-        where R: std::slice::SliceIndex<[T], Output = [T]>
+        where R: sliceindex::SliceIndex<[T], Output = [T]>
     {
-        let range = &mr[range];
+        let range = range.index(&mr);
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: (mem::size_of::<T>() * range.len()) as u32,
@@ -1165,9 +1168,9 @@ impl<'res> QueuePair<'res> {
                                      range: R,
                                      wr_id: u64)
                                      -> io::Result<()>
-        where R: std::slice::SliceIndex<[T], Output = [T]>
+        where R: sliceindex::SliceIndex<[T], Output = [T]>
     {
-        let range = &mr[range];
+        let range = range.index(&mr);
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: (mem::size_of::<T>() * range.len()) as u32,
