@@ -706,7 +706,7 @@ impl<'a> ProtectionDomain<'a> {
         // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
         // function.
 
-        if !mr.is_null() {
+        if mr.is_null() {
             Err(io::Error::last_os_error())
         } else {
             Ok(MemoryRegion { mr, data })
