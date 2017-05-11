@@ -10,7 +10,7 @@ fn main() {
     println!("cargo:rustc-link-lib=ibverbs");
 
     // build vendor/rdma-core
-    Command::new("sh")
+    Command::new("bash")
         .current_dir("vendor/rdma-core/")
         .args(&["build.sh"])
         .status()
