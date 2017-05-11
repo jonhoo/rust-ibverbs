@@ -3,6 +3,7 @@ addons:
   apt:
     packages:
     - libibverbs1
+    - ninja-build
 rust:
   - nightly
 cache: cargo
