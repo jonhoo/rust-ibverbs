@@ -1,11 +1,29 @@
 //! Rust API wrapping the `ibverbs` RDMA library.
 //!
 //! `libibverbs` is a library that allows userspace processes to use RDMA "verbs" to perform
-//! high-throughput, low-latency network operations.
+//! high-throughput, low-latency network operations for both Infiniband (according to the
+//! Infiniband specifications) and iWarp (iWARP verbs specifications). It handles the control path
+//! of creating, modifying, querying and destroying resources such as Protection Domains,
+//! Completion Queues, Queue-Pairs, Shared Receive Queues, Address Handles, and Memory Regions. It
+//! also handles sending and receiving data posted to QPs and SRQs, and getting completions from
+//! CQs using polling and completions events.
 //!
 //! A good place to start is to look at the programs in [`examples/`](examples/), and the upstream
 //! [C examples]. You can test RDMA programs on modern Linux kernels even without specialized RDMA
 //! hardware by using [SoftRoCE][soft].
+//!
+//! # For the detail-oriented
+//!
+//! The control path is implemented through system calls to the `uverbs` kernel module, which
+//! further calls the low-level HW driver. The data path is implemented through calls made to
+//! low-level HW library which, in most cases, interacts directly with the HW provides kernel and
+//! network stack bypass (saving context/mode switches) along with zero copy and an asynchronous
+//! I/O model.
+//!
+//! iWARP ethernet NICs support RDMA over hardware-offloaded TCP/IP, while InfiniBand is a general
+//! high-throughput, low-latency networking technology. InfiniBand host channel adapters (HCAs) and
+//! iWARP NICs commonly support direct hardware access from userspace (kernel bypass), and
+//! `libibverbs` supports this when available.
 //!
 //! For more information on RDMA verbs, see the [InfiniBand Architecture Specification][infini]
 //! vol. 1, especially chapter 11, and the RDMA Consortium's [RDMA Protocol Verbs
@@ -20,16 +38,15 @@
 //! system-wide installation is not available, those library files can be used instead by copying
 //! them to `/usr/lib`, or by adding that path to the dynamic linking search path.
 //!
-//! # Hardware support
-//!
-//! iWARP ethernet NICs support RDMA over hardware-offloaded TCP/IP, while InfiniBand is a general
-//! high-throughput, low-latency networking technology. InfiniBand host channel adapters (HCAs) and
-//! iWARP NICs commonly support direct hardware access from userspace (kernel bypass), and
-//! libibverbs supports this when available.
-//!
 //! # Thread safety
 //!
 //! All interfaces are `Sync` and `Send` since the underlying ibverbs API [is thread safe][safe].
+//!
+//! # Documentation
+//!
+//! Much of the documentation of this crate borrows heavily from the excellent posts over at
+//! [RDMAmojo]. If you are going to be working a lot with ibverbs, chances are you will want to
+//! head over there. In particular, [this overview post][1] may be a good place to start.
 //!
 //! [`rdma-core`]: https://github.com/linux-rdma/rdma-core
 //! [`libibverbs/verbs.h`]: https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h
@@ -40,6 +57,8 @@
 //! [RFC5040]: https://tools.ietf.org/html/rfc5040
 //! [safe]: http://www.rdmamojo.com/2013/07/26/libibverbs-thread-safe-level/
 //! [soft]: https://github.com/SoftRoCE/rxe-dev/wiki/rxe-dev:-Home
+//! [RDMAmojo]: http://www.rdmamojo.com/
+//! [1]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 
 #![deny(missing_docs)]
 #![feature(slice_get_slice)]
@@ -50,6 +69,7 @@ use std::mem;
 use std::os::raw::{c_void, c_int};
 use std::error::Error;
 use std::io;
+use std::ffi::CStr;
 
 const PORT_NUM: u8 = 1;
 
@@ -77,6 +97,12 @@ pub use ffi::IBV_ACCESS_REMOTE_READ;
 pub use ffi::IBV_ACCESS_REMOTE_ATOMIC;
 
 /// Get list of available RDMA devices.
+///
+/// # Errors
+///
+///  - `EPERM`: Permission denied.
+///  - `ENOMEM`: Insufficient memory to complete the operation.
+///  - `ENOSYS`: No kernel support for RDMA.
 pub fn devices() -> io::Result<DeviceList> {
     let mut n = 0i32;
     let devices = unsafe { ffi::ibv_get_device_list(mem::transmute(&mut n)) };
@@ -164,8 +190,73 @@ impl<'a> From<&'a *mut ffi::ibv_device> for Device<'a> {
 
 impl<'a> Device<'a> {
     /// Opens an RMDA device and creates a context for further use.
+    ///
+    /// This context will later be used to query its resources or for creating resources.
+    ///
+    /// Unlike what the verb name suggests, it doesn't actually open the device. This device was
+    /// opened by the kernel low-level driver and may be used by other user/kernel level code. This
+    /// verb only opens a context to allow user level applications to use it.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: `PORT_NUM` is invalid (from `ibv_query_port_attr`).
+    ///  - `ENOMEM`: Out of memory (from `ibv_query_port_attr`).
+    ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
+    ///  - Other: the device is not in `ACTIVE` or `ARMED` state.
     pub fn open(&self) -> io::Result<Context> {
         Context::with_device(*self.0)
+    }
+
+    /// Returns a string of the name, which is associated with this RDMA device.
+    ///
+    /// This name is unique within a specific machine (the same name cannot be assigned to more
+    /// than one device). However, this name isn't unique across an InfiniBand fabric (this name
+    /// can be found in different machines).
+    ///
+    /// When there are more than one RDMA devices in a computer, changing the device location in
+    /// the computer (i.e. in the PCI bus) may result a change in the names associated with the
+    /// devices. In order to distinguish between the device, it is recommended using the device
+    /// GUID, returned by `Device::guid`.
+    ///
+    /// The name is composed from:
+    ///
+    ///  - a *prefix* which describes the RDMA device vendor and model
+    ///    - `cxgb3` - Chelsio Communications, T3 RDMA family
+    ///    - `cxgb4` - Chelsio Communications, T4 RDMA family
+    ///    - `ehca` - IBM, eHCA family
+    ///    - `ipathverbs` - QLogic
+    ///    - `mlx4` - Mellanox Technologies, ConnectX family
+    ///    - `mthca` - Mellanox Technologies, InfiniHost family
+    ///    - `nes` - Intel, Intel-NE family
+    ///  - an *index* that helps to differentiate between several devices from the same vendor and
+    ///    family in the same computer
+    pub fn name(&self) -> Option<&'a CStr> {
+        let name_ptr = unsafe { ffi::ibv_get_device_name(*self.0) };
+        if name_ptr.is_null() {
+            None
+        } else {
+            Some(unsafe { CStr::from_ptr(name_ptr) })
+        }
+    }
+
+    /// Returns the Global Unique IDentifier (GUID) of this RDMA device.
+    ///
+    /// This GUID, that was assigned to this device by its vendor during the manufacturing, is
+    /// unique and can be used as an identifier to an RDMA device.
+    ///
+    /// From the prefix of the RDMA device GUID, one can know who is the vendor of that device
+    /// using the [IEEE OUI](http://standards.ieee.org/develop/regauth/oui/oui.txt).
+    ///
+    /// # Errors
+    ///
+    ///  - `EMFILE`: Too many files are opened by this process.
+    pub fn guid(&self) -> io::Result<u64> {
+        let guid = unsafe { ffi::ibv_get_device_guid(*self.0) };
+        if guid == 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(guid)
+        }
     }
 }
 
@@ -180,6 +271,7 @@ unsafe impl Sync for Context {}
 unsafe impl Send for Context {}
 
 impl Context {
+    /// Opens a context for the given device, and queries its port and gid.
     fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
         assert!(!dev.is_null());
 
@@ -188,16 +280,38 @@ impl Context {
             return Err(io::Error::new(io::ErrorKind::Other, format!("failed to open device")));
         }
 
+        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
+        //
+        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
+        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
+        //   recommended avoiding saving the result of this query, or to flush them when a new SM
+        //   (re)configures the subnet.
+        //
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, mem::transmute(&mut port_attr)) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
+        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
+        //
+        //   The content of the GID table is valid only when the port_attr.state is either
+        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
+        //   table is indeterminate.
+        //
+        match port_attr.state {
+            ffi::ibv_port_state::IBV_PORT_ACTIVE |
+            ffi::ibv_port_state::IBV_PORT_ARMED => {}
+            _ => {
+                return Err(io::Error::new(io::ErrorKind::Other,
+                                          format!("port is not ACTIVE or ARMED")));
+            }
+        }
+
         let mut gid = ffi::ibv_gid::default();
         let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, mem::transmute(&mut gid)) };
         if ok != 0 {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("failed to query gid")));
+            return Err(io::Error::last_os_error());
         }
 
         Ok(Context {
@@ -209,11 +323,23 @@ impl Context {
 
     /// Create a completion queue (CQ).
     ///
-    /// `create_cq` creates a completion queue with at least `min_cq_entries` entries for the RDMA
-    /// device context context. `id` is an opaque identifier that is echoed by
+    /// When an outstanding Work Request, within a Send or Receive Queue, is completed, a Work
+    /// Completion is being added to the CQ of that Work Queue. This Work Completion indicates that
+    /// the outstanding Work Request has been completed (and no longer considered outstanding) and
+    /// provides details on it (status, direction, opcode, etc.).
+    ///
+    /// A single CQ can be shared for sending, receiving, and sharing across multiple QPs. The Work
+    /// Completion holds the information to specify the QP number and the Queue (Send or Receive)
+    /// that it came from.
+    ///
+    /// `min_cq_entries` defines the minimum size of the CQ. The actual created size can be equal
+    /// or higher than this value. `id` is an opaque identifier that is echoed by
     /// `CompletionQueue::poll`.
     ///
-    /// Note that the device may choose to allocate more CQ entries than the provided minimum.
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
     pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
         let cq = unsafe {
             ffi::ibv_create_cq(self.ctx,
@@ -234,6 +360,12 @@ impl Context {
     }
 
     /// Allocate a protection domain (PDs) for the device's context.
+    ///
+    /// The created PD will be used primarily to create `QueuePair`s and `MemoryRegion`s.
+    ///
+    /// A protection domain is a means of protection, and helps you create a group of object that
+    /// can work together. If several objects were created using PD1, and others were created using
+    /// PD2, working with objects from group1 together with objects from group2 will not work.
     pub fn alloc_pd(&self) -> Result<ProtectionDomain, ()> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.ctx) };
         if pd.is_null() {
@@ -261,18 +393,37 @@ unsafe impl<'a> Send for CompletionQueue<'a> {}
 unsafe impl<'a> Sync for CompletionQueue<'a> {}
 
 impl<'a> CompletionQueue<'a> {
-    /// Poll a CQ for (possibly multiple) work completions.
+    /// Poll for (possibly multiple) work completions.
     ///
-    /// Returns the subset of `completions` that successfully completed. If the returned slice has
-    /// fewer elements than the provided `completions` slice, the CQ was emptied.
+    /// A Work Completion indicates that a Work Request in a Work Queue, and all of the outstanding
+    /// unsignaled Work Requests that posted to that Work Queue, associated with this CQ have
+    /// completed. Any Receive Requests, signaled Send Requests and Send Requests that ended with
+    /// an error will generate Work Completions.
+    ///
+    /// When a Work Request ends, a Work Completion is added to the tail of the CQ that this Work
+    /// Queue is associated with. `poll` checks if Work Completions are present in a CQ, and pop
+    /// them from the head of the CQ in the order they entered it (FIFO) into `completions`. After
+    /// a Work Completion was popped from a CQ, it cannot be returned to it. `poll` returns the
+    /// subset of `completions` that successfully completed. If the returned slice has fewer
+    /// elements than the provided `completions` slice, the CQ was emptied.
     ///
     /// Not all attributes of the completed `ibv_wc`'s are always valid. If the completion status
     /// is not `IBV_WC_SUCCESS`, only the following attributes are valid: `wr_id`, `status`,
     /// `qp_num`, and `vendor_err`.
+    ///
+    /// Note that `poll` does not block or cause a context switch. This is why RDMA technologies
+    /// can achieve very low latency (below 1 µs).
     #[inline]
     pub fn poll<'c>(&self,
                     completions: &'c mut [ffi::ibv_wc])
                     -> Result<&'c mut [ffi::ibv_wc], ()> {
+
+        // TODO: from http://www.rdmamojo.com/2013/02/15/ibv_poll_cq/
+        //
+        //   One should consume Work Completions at a rate that prevents the CQ from being overrun
+        //   (hold more Work Completions than the CQ size). In case of an CQ overrun, the async
+        //   event `IBV_EVENT_CQ_ERR` will be triggered, and the CQ cannot be used anymore.
+        //
         let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
         let ops = &mut unsafe { &mut *ctx }.ops;
         let n = unsafe {
@@ -302,7 +453,8 @@ impl<'a> Drop for CompletionQueue<'a> {
 /// An unconfigured `QueuePair`.
 ///
 /// A `QueuePairBuilder` is used to configure a `QueuePair` before it is allocated and initialized.
-/// To construct one, use `ProtectionDomain::create_qp`.
+/// To construct one, use `ProtectionDomain::create_qp`. See also
+/// http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/ for many more details.
 pub struct QueuePairBuilder<'a> {
     ctx: isize,
     pd: &'a ProtectionDomain<'a>,
@@ -327,6 +479,18 @@ pub struct QueuePairBuilder<'a> {
 }
 
 impl<'qp> QueuePairBuilder<'qp> {
+    /// Prepare a new `QueuePair` builder.
+    ///
+    /// `max_send_wr` is the maximum number of outstanding Work Requests that can be posted to the
+    /// Send Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`. There may be RDMA
+    /// devices that for specific transport types may support less outstanding Work Requests than
+    /// the maximum reported value.
+    ///
+    /// Similarly, `max_recv_wr` is the maximum number of outstanding Work Requests that can be
+    /// posted to the Receive Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`.
+    /// There may be RDMA devices that for specific transport types may support less outstanding
+    /// Work Requests than the maximum reported value. This value is ignored if the Queue Pair is
+    /// associated with an SRQ
     fn new<'scq, 'rcq, 'pd>(pd: &'pd ProtectionDomain,
                             send: &'scq CompletionQueue,
                             max_send_wr: u32,
@@ -362,6 +526,8 @@ impl<'qp> QueuePairBuilder<'qp> {
     }
 
     /// Set the access flags for the new `QueuePair`.
+    ///
+    /// Defaults to `IBV_ACCESS_LOCAL_WRITE`.
     pub fn set_access(&mut self, access: ffi::ibv_access_flags) -> &mut Self {
         self.access = access;
         self
@@ -373,19 +539,106 @@ impl<'qp> QueuePairBuilder<'qp> {
         self
     }
 
-    /// Set the minimum RNR timer value for the new `QueuePair`.
+    /// Sets the minimum RNR NAK Timer Field Value for the new `QueuePair`.
+    ///
+    /// Defaults to 16 (2.56 ms delay).
+    /// Relevant only for RC QPs.
+    ///
+    /// When an incoming message to this QP should consume a Work Request from the Receive Queue,
+    /// but no Work Request is outstanding on that Queue, the QP will send an RNR NAK packet to
+    /// the initiator. It does not affect RNR NAKs sent for other reasons. The value must be one of
+    /// the following values:
+    ///
+    ///  - 0 - 655.36 ms delay
+    ///  - 1 - 0.01 ms delay
+    ///  - 2 - 0.02 ms delay
+    ///  - 3 - 0.03 ms delay
+    ///  - 4 - 0.04 ms delay
+    ///  - 5 - 0.06 ms delay
+    ///  - 6 - 0.08 ms delay
+    ///  - 7 - 0.12 ms delay
+    ///  - 8 - 0.16 ms delay
+    ///  - 9 - 0.24 ms delay
+    ///  - 10 - 0.32 ms delay
+    ///  - 11 - 0.48 ms delay
+    ///  - 12 - 0.64 ms delay
+    ///  - 13 - 0.96 ms delay
+    ///  - 14 - 1.28 ms delay
+    ///  - 15 - 1.92 ms delay
+    ///  - 16 - 2.56 ms delay
+    ///  - 17 - 3.84 ms delay
+    ///  - 18 - 5.12 ms delay
+    ///  - 19 - 7.68 ms delay
+    ///  - 20 - 10.24 ms delay
+    ///  - 21 - 15.36 ms delay
+    ///  - 22 - 20.48 ms delay
+    ///  - 23 - 30.72 ms delay
+    ///  - 24 - 40.96 ms delay
+    ///  - 25 - 61.44 ms delay
+    ///  - 26 - 81.92 ms delay
+    ///  - 27 - 122.88 ms delay
+    ///  - 28 - 163.84 ms delay
+    ///  - 29 - 245.76 ms delay
+    ///  - 30 - 327.68 ms delay
+    ///  - 31 - 491.52 ms delay
     pub fn set_min_rnr_timer(&mut self, timer: u8) -> &mut Self {
         self.min_rnr_timer = timer;
         self
     }
 
-    /// Set the timeout for the new `QueuePair`.
+    /// Sets the minimum timeout that the new `QueuePair` waits for ACK/NACK from remote QP before
+    /// retransmitting the packet.
+    ///
+    /// Defaults to 4 (65.536µs).
+    /// Relevant only to RC QPs.
+    ///
+    /// The value zero is special value that waits an infinite time for the ACK/NACK (useful
+    /// for debugging). This means that if any packet in a message is being lost and no ACK or NACK
+    /// is being sent, no retry will ever occur and the QP will just stop sending data.
+    ///
+    /// For any other value of timeout, the time calculation is `4.096*2^timeout`µs, giving:
+    ///
+    ///  - 0 - infinite
+    ///  - 1 - 8.192 µs
+    ///  - 2 - 16.384 µs
+    ///  - 3 - 32.768 µs
+    ///  - 4 - 65.536 µs
+    ///  - 5 - 131.072 µs
+    ///  - 6 - 262.144 µs
+    ///  - 7 - 524.288 µs
+    ///  - 8 - 1.048 ms
+    ///  - 9 - 2.097 ms
+    ///  - 10 - 4.194 ms
+    ///  - 11 - 8.388 ms
+    ///  - 12 - 16.777 ms
+    ///  - 13 - 33.554 ms
+    ///  - 14 - 67.108 ms
+    ///  - 15 - 134.217 ms
+    ///  - 16 - 268.435 ms
+    ///  - 17 - 536.870 ms
+    ///  - 18 - 1.07 s
+    ///  - 19 - 2.14 s
+    ///  - 20 - 4.29 s
+    ///  - 21 - 8.58 s
+    ///  - 22 - 17.1 s
+    ///  - 23 - 34.3 s
+    ///  - 24 - 68.7 s
+    ///  - 25 - 137 s
+    ///  - 26 - 275 s
+    ///  - 27 - 550 s
+    ///  - 28 - 1100 s
+    ///  - 29 - 2200 s
+    ///  - 30 - 4400 s
+    ///  - 31 - 8800 s
     pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
         self.timeout = timeout;
         self
     }
 
-    /// Set the retry count for the new `QueuePair`.
+    /// Sets the total number of times that the new `QueuePair` will try to resend the packets
+    /// before reporting an error because the remote side doesn't answer in the primary path.
+    ///
+    /// This 3 bit value defaults to 6.
     ///
     /// # Panics
     ///
@@ -396,7 +649,11 @@ impl<'qp> QueuePairBuilder<'qp> {
         self
     }
 
-    /// Set the RNR retry limit for the new `QueuePair`.
+    /// Sets the total number of times that the new `QueuePair` will try to resend the packets when
+    /// an RNR NACK was sent by the remote QP before reporting an error.
+    ///
+    /// This 3 bit value defaults to 6. The value 7 is special and specify to retry sending the
+    /// message indefinitely when a RNR Nack is being sent by remote side.
     ///
     /// # Panics
     ///
@@ -408,6 +665,8 @@ impl<'qp> QueuePairBuilder<'qp> {
     }
 
     /// Set the opaque context value for the new `QueuePair`.
+    ///
+    /// Defaults to 0.
     pub fn set_context(&mut self, ctx: isize) -> &mut Self {
         self.ctx = ctx;
         self
@@ -419,6 +678,14 @@ impl<'qp> QueuePairBuilder<'qp> {
     ///
     /// This method will fail if asked to create QP of a type other than `IBV_QPT_RC` or
     /// `IBV_QPT_UD` associated with an SRQ.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid `ProtectionDomain`, sending or receiving `Context`, or invalid value
+    ///    provided in `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
+    ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
     pub fn build(&self) -> io::Result<PreparedQueuePair<'qp>> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
@@ -518,7 +785,11 @@ impl<'a> PreparedQueuePair<'a> {
     ///
     /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
     /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`).
-    /// It also sets the following parameters, which are currently not configurable:
+    /// Further discussion of the protocol can be found on [RDMAmojo].
+    ///
+    /// The handshake also sets the following parameters, which are currently not configurable:
+    ///
+    /// # Examples
     ///
     /// ```text,ignore
     /// port_num = PORT_NUM;
@@ -534,6 +805,13 @@ impl<'a> PreparedQueuePair<'a> {
     /// ah_attr.src_path_bits = 0;
     /// ah_attr.grh.hop_limit = 0xff;
     /// ```
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in `attr` or in `attr_mask`.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///
+    /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
     pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair<'a>> {
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr::default();
@@ -651,6 +929,15 @@ unsafe impl<'a> Send for ProtectionDomain<'a> {}
 
 impl<'a> ProtectionDomain<'a> {
     /// Creates a queue pair builder associated with this protection domain.
+    ///
+    /// `send` and `recv` are the device `Context` to associate with the send and receive queues
+    /// respectively. `send` and `recv` may refer to the same `Context`.
+    ///
+    /// `qp_type` indicates the requested Transport Service Type of this QP:
+    ///
+    ///  - `IBV_QPT_RC`: Reliable Connection
+    ///  - `IBV_QPT_UC`: Unreliable Connection
+    ///  - `IBV_QPT_UD`: Unreliable Datagram
     pub fn create_qp<'pd, 'scq, 'rcq, 'qp>(&'pd self,
                                            send: &'scq CompletionQueue,
                                            recv: &'rcq CompletionQueue,
@@ -663,9 +950,20 @@ impl<'a> ProtectionDomain<'a> {
         QueuePairBuilder::new(self, send, 1, recv, 1, qp_type)
     }
 
-    /// Register a memory region (MR) associated with this protection domain.
+    /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
     ///
-    /// Only registered memory can be sent from and received to by `QueuePair`s.
+    /// This process allows the RDMA device to read and write data to the allocated memory. Only
+    /// registered memory can be sent from and received to by `QueuePair`s. Performing this
+    /// registration takes some time, so performing memory registration isn't recommended in the
+    /// data path, when fast response is required.
+    ///
+    /// Every successful registration will result with a MR which has unique (within a specific
+    /// RDMA device) `lkey` and `rkey` values. These keys must be communicated to the other end's
+    /// `QueuePair` for direct memory access.
+    ///
+    /// The maximum size of the block that can be registered is limited to
+    /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
+    /// that can be registered for a specific device.
     ///
     /// `allocate` currently sets the following permissions for each new `MemoryRegion`:
     ///
@@ -681,6 +979,11 @@ impl<'a> ProtectionDomain<'a> {
     /// Panics if the size of the memory region zero bytes, which can occur either if `n` is 0, or
     /// if `mem::size_of::<T>()` is 0.
     ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid access value.
+    ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
+    ///    complete this operation.
     pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> io::Result<MemoryRegion<T>> {
         assert!(n > 0);
         assert!(mem::size_of::<T>() > 0);
@@ -725,6 +1028,12 @@ impl<'a> Drop for ProtectionDomain<'a> {
 }
 
 /// A fully initialized and ready `QueuePair`.
+///
+/// A queue pair is the actual object that sends and receives data in the RDMA architecture
+/// (something like a socket). It's not exactly like a socket, however. A socket is an abstraction,
+/// which is maintained by the network stack and doesn't have a physical resource behind it. A QP
+/// is a resource of an RDMA device and a QP number can be used by one process at the same time
+/// (similar to a socket that is associated with a specific TCP or UDP port number)
 pub struct QueuePair<'a> {
     _phantom: PhantomData<&'a ()>,
     qp: *mut ffi::ibv_qp,
@@ -734,17 +1043,36 @@ unsafe impl<'a> Send for QueuePair<'a> {}
 unsafe impl<'a> Sync for QueuePair<'a> {}
 
 impl<'a> QueuePair<'a> {
-    /// Post a list of work requests to a send queue.
+    /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
     ///
-    /// Specifically, the memory at `mr[range]` will be sent as a single `ibv_send_wr` using
+    /// Generates a HW-specific Send Request for the memory at `mr[range]`, and adds it to the tail
+    /// of the Queue Pair's Send Queue without performing any context switch. The RDMA device will
+    /// handle it (later) in asynchronous way. If there is a failure in one of the WRs because the
+    /// Send Queue is full or one of the attributes in the WR is bad, it stops immediately and
+    /// return the pointer to that WR.
+    ///
+    /// `wr_id` is a 64 bits value associated with this WR. If a Work Completion will be generated
+    /// when this Work Request ends, it will contain this value.
+    ///
+    /// Internally, the memory at `mr[range]` will be sent as a single `ibv_send_wr` using
     /// `IBV_WR_SEND`. The send has `IBV_SEND_SIGNALED` set, so a work completion will also be
     /// triggered as a result of this send.
+    ///
+    /// See also [RDMAmojo's `ibv_post_send` documentation][1].
     ///
     /// # Safety
     ///
     /// The memory region can only be safely reused or dropped after the request is fully executed
     /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
     /// until `CompletionQueue::poll` returns a completion for this send).
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in the Work Request.
+    ///  - `ENOMEM`: Send Queue is full or not enough resources to complete this operation.
+    ///  - `EFAULT`: Invalid value provided in `QueuePair`.
+    ///
+    /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
     pub unsafe fn post_send<T, R>(&mut self,
                                   mr: &mut MemoryRegion<T>,
@@ -799,15 +1127,35 @@ impl<'a> QueuePair<'a> {
         }
     }
 
-    /// Post a list of work requests to a receive queue.
+    /// Posts a linked list of Work Requests (WRs) to the Receive Queue of this Queue Pair.
     ///
-    /// Specifically, the memory at `mr[range]` will be received into as a single `ibv_recv_wr`.
+    /// Generates a HW-specific Receive Request out of it and add it to the tail of the Queue
+    /// Pair's Receive Queue without performing any context switch. The RDMA device will take one
+    /// of those Work Requests as soon as an incoming opcode to that QP will consume a Receive
+    /// Request (RR). If there is a failure in one of the WRs because the Receive Queue is full or
+    /// one of the attributes in the WR is bad, it stops immediately and return the pointer to that
+    /// WR.
+    ///
+    /// `wr_id` is a 64 bits value associated with this WR. When a Work Completion is generated
+    /// when this Work Request ends, it will contain this value.
+    ///
+    /// Internally, the memory at `mr[range]` will be received into as a single `ibv_recv_wr`.
+    ///
+    /// See also [DDMAmojo's `ibv_post_recv` documentation][1].
     ///
     /// # Safety
     ///
     /// The memory region can only be safely reused or dropped after the request is fully executed
     /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
     /// until `CompletionQueue::poll` returns a completion for this receive).
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in the Work Request.
+    ///  - `ENOMEM`: Receive Queue is full or not enough resources to complete this operation.
+    ///  - `EFAULT`: Invalid value provided in `QueuePair`.
+    ///
+    /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
     pub unsafe fn post_receive<T, R>(&mut self,
                                      mr: &mut MemoryRegion<T>,
