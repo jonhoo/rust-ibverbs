@@ -13,6 +13,7 @@ links = "ibverbs"
 
 homepage = "https://github.com/jonhoo/rust-ibverbs"
 repository = "https://github.com/jonhoo/rust-ibverbs.git"
+documentation = "https://jon.tsp.io/crates/ibverbs/"
 
 keywords = ["rdma", "ibverbs", "networking", "ffi"]
 categories = ["network-programming", "api-bindings"]
