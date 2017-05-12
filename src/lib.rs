@@ -62,6 +62,9 @@
 
 #![deny(missing_docs)]
 
+// avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
+#![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
+
 use std::marker::PhantomData;
 use std::ptr;
 use std::mem;
@@ -108,7 +111,7 @@ mod sliceindex;
 ///  - `ENOSYS`: No kernel support for RDMA.
 pub fn devices() -> io::Result<DeviceList> {
     let mut n = 0i32;
-    let devices = unsafe { ffi::ibv_get_device_list(mem::transmute(&mut n)) };
+    let devices = unsafe { ffi::ibv_get_device_list(&mut n as *mut _) };
 
     if devices.is_null() {
         return Err(io::Error::last_os_error());
@@ -280,7 +283,7 @@ impl Context {
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
         if ctx.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, format!("failed to open device")));
+            return Err(io::Error::new(io::ErrorKind::Other, "failed to open device".to_string()));
         }
 
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
@@ -291,7 +294,7 @@ impl Context {
         //   (re)configures the subnet.
         //
         let mut port_attr = ffi::ibv_port_attr::default();
-        let errno = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, mem::transmute(&mut port_attr)) };
+        let errno = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, &mut port_attr as *mut _) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -307,12 +310,12 @@ impl Context {
             ffi::ibv_port_state::IBV_PORT_ARMED => {}
             _ => {
                 return Err(io::Error::new(io::ErrorKind::Other,
-                                          format!("port is not ACTIVE or ARMED")));
+                                          "port is not ACTIVE or ARMED".to_string()));
             }
         }
 
         let mut gid = ffi::ibv_gid::default();
-        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, mem::transmute(&mut gid)) };
+        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, &mut gid as *mut _) };
         if ok != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -456,8 +459,9 @@ impl<'a> Drop for CompletionQueue<'a> {
 /// An unconfigured `QueuePair`.
 ///
 /// A `QueuePairBuilder` is used to configure a `QueuePair` before it is allocated and initialized.
-/// To construct one, use `ProtectionDomain::create_qp`. See also
-/// http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/ for many more details.
+/// To construct one, use `ProtectionDomain::create_qp`. See also [RDMAmojo] for many more details.
+///
+/// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 pub struct QueuePairBuilder<'res> {
     ctx: isize,
     pd: &'res ProtectionDomain<'res>,
@@ -692,8 +696,8 @@ impl<'res> QueuePairBuilder<'res> {
     pub fn build(&self) -> io::Result<PreparedQueuePair<'res>> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
-            send_cq: unsafe { mem::transmute(self.send) },
-            recv_cq: unsafe { mem::transmute(self.recv) },
+            send_cq: self.send as *const _ as *mut _,
+            recv_cq: self.recv as *const _ as *mut _,
             srq: ptr::null::<ffi::ibv_srq>() as *mut _,
             cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
@@ -706,7 +710,7 @@ impl<'res> QueuePairBuilder<'res> {
             sq_sig_all: 0,
         };
 
-        let qp = unsafe { ffi::ibv_create_qp(self.pd.pd, mem::transmute(&mut attr)) };
+        let qp = unsafe { ffi::ibv_create_qp(self.pd.pd, &mut attr as *mut _) };
         if qp.is_null() {
             Err(io::Error::last_os_error())
         } else {
@@ -824,8 +828,7 @@ impl<'res> PreparedQueuePair<'res> {
         attr.port_num = PORT_NUM;
         let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_PKEY_INDEX | ffi::IBV_QP_PORT |
                    ffi::IBV_QP_ACCESS_FLAGS;
-        let errno =
-            unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -848,8 +851,7 @@ impl<'res> PreparedQueuePair<'res> {
         let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_AV | ffi::IBV_QP_PATH_MTU |
                    ffi::IBV_QP_DEST_QPN | ffi::IBV_QP_RQ_PSN |
                    ffi::IBV_QP_MAX_DEST_RD_ATOMIC | ffi::IBV_QP_MIN_RNR_TIMER;
-        let errno =
-            unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -865,8 +867,7 @@ impl<'res> PreparedQueuePair<'res> {
         let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_TIMEOUT | ffi::IBV_QP_RETRY_CNT |
                    ffi::IBV_QP_SQ_PSN | ffi::IBV_QP_RNR_RETRY |
                    ffi::IBV_QP_MAX_QP_RD_ATOMIC;
-        let errno =
-            unsafe { ffi::ibv_modify_qp(self.qp, mem::transmute(&mut attr), mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -1087,7 +1088,7 @@ impl<'res> QueuePair<'res> {
                                   -> io::Result<()>
         where R: sliceindex::SliceIndex<[T], Output = [T]>
     {
-        let range = range.index(&mr);
+        let range = range.index(mr);
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: (mem::size_of::<T>() * range.len()) as u32,
@@ -1096,7 +1097,7 @@ impl<'res> QueuePair<'res> {
         let mut wr = ffi::ibv_send_wr {
             wr_id: wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: mem::transmute(&mut sge),
+            sg_list: &mut sge as *mut _,
             num_sge: 1,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
             send_flags: ffi::IBV_SEND_SIGNALED.0 as i32,
@@ -1123,9 +1124,8 @@ impl<'res> QueuePair<'res> {
 
         let ctx = (&*self.qp).context;
         let ops = &mut (&mut *ctx).ops;
-        let errno = ops.post_send.as_mut().unwrap()(self.qp,
-                                                    mem::transmute(&mut wr),
-                                                    mem::transmute(&mut bad_wr));
+        let errno =
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
@@ -1170,7 +1170,7 @@ impl<'res> QueuePair<'res> {
                                      -> io::Result<()>
         where R: sliceindex::SliceIndex<[T], Output = [T]>
     {
-        let range = range.index(&mr);
+        let range = range.index(mr);
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
             length: (mem::size_of::<T>() * range.len()) as u32,
@@ -1179,7 +1179,7 @@ impl<'res> QueuePair<'res> {
         let mut wr = ffi::ibv_recv_wr {
             wr_id: wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: mem::transmute(&mut sge),
+            sg_list: &mut sge as *mut _,
             num_sge: 1,
         };
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null::<ffi::ibv_recv_wr>() as *mut _;
@@ -1198,9 +1198,8 @@ impl<'res> QueuePair<'res> {
 
         let ctx = (&*self.qp).context;
         let ops = &mut (&mut *ctx).ops;
-        let errno = ops.post_recv.as_mut().unwrap()(self.qp,
-                                                    mem::transmute(&mut wr),
-                                                    mem::transmute(&mut bad_wr));
+        let errno =
+            ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {

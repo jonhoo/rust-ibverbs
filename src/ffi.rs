@@ -1,3 +1,4 @@
+#![cfg_attr(feature = "cargo-clippy", allow(expl_impl_clone_on_copy))]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 /// An ibverb work completion.
@@ -47,6 +48,7 @@ pub struct ibv_wc {
     pub dlid_path_bits: u8,
 }
 
+#[cfg_attr(feature = "cargo-clippy", allow(len_without_is_empty))]
 impl ibv_wc {
     /// Returns the 64 bit value that was associated with the corresponding Work Request.
     pub fn wr_id(&self) -> u64 {
