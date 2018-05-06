@@ -61,17 +61,16 @@
 //! [1]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 
 #![deny(missing_docs)]
-
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 #![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
 
-use std::marker::PhantomData;
-use std::ptr;
-use std::mem;
-use std::os::raw::{c_void, c_int};
 use std::error::Error;
-use std::io;
 use std::ffi::CStr;
+use std::io;
+use std::marker::PhantomData;
+use std::mem;
+use std::os::raw::{c_int, c_void};
+use std::ptr;
 
 const PORT_NUM: u8 = 1;
 
@@ -82,21 +81,21 @@ const PORT_NUM: u8 = 1;
 #[allow(missing_docs)]
 pub mod ffi;
 
-pub use ffi::ibv_wc;
 pub use ffi::ibv_qp_type;
-pub use ffi::ibv_wc_status;
+pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
+pub use ffi::ibv_wc_status;
 
 /// Access flags for use with `QueuePair` and `MemoryRegion`.
 pub use ffi::ibv_access_flags;
 /// Enable Local Write Access.
 pub use ffi::IBV_ACCESS_LOCAL_WRITE;
-/// Enable Remote Write Access.
-pub use ffi::IBV_ACCESS_REMOTE_WRITE;
-/// Enable Remote Read Access.
-pub use ffi::IBV_ACCESS_REMOTE_READ;
 /// Enable Remote Atomic Operation Access (if supported).
 pub use ffi::IBV_ACCESS_REMOTE_ATOMIC;
+/// Enable Remote Read Access.
+pub use ffi::IBV_ACCESS_REMOTE_READ;
+/// Enable Remote Write Access.
+pub use ffi::IBV_ACCESS_REMOTE_WRITE;
 
 /// Because `std::slice::SliceIndex` is still unstable, we follow @alexcrichton's suggestion in
 /// https://github.com/rust-lang/rust/issues/35729 and implement it ourselves.
@@ -283,7 +282,10 @@ impl Context {
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
         if ctx.is_null() {
-            return Err(io::Error::new(io::ErrorKind::Other, "failed to open device".to_string()));
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "failed to open device".to_string(),
+            ));
         }
 
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
@@ -306,11 +308,12 @@ impl Context {
         //   table is indeterminate.
         //
         match port_attr.state {
-            ffi::ibv_port_state::IBV_PORT_ACTIVE |
-            ffi::ibv_port_state::IBV_PORT_ARMED => {}
+            ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
             _ => {
-                return Err(io::Error::new(io::ErrorKind::Other,
-                                          "port is not ACTIVE or ARMED".to_string()));
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "port is not ACTIVE or ARMED".to_string(),
+                ));
             }
         }
 
@@ -321,10 +324,10 @@ impl Context {
         }
 
         Ok(Context {
-               ctx,
-               port_attr,
-               gid,
-           })
+            ctx,
+            port_attr,
+            gid,
+        })
     }
 
     /// Create a completion queue (CQ).
@@ -348,20 +351,22 @@ impl Context {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
         let cq = unsafe {
-            ffi::ibv_create_cq(self.ctx,
-                               min_cq_entries,
-                               ptr::null::<c_void>().offset(id) as *mut _,
-                               ptr::null::<c_void>() as *mut _,
-                               0)
+            ffi::ibv_create_cq(
+                self.ctx,
+                min_cq_entries,
+                ptr::null::<c_void>().offset(id) as *mut _,
+                ptr::null::<c_void>() as *mut _,
+                0,
+            )
         };
 
         if cq.is_null() {
             Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
-                   _phantom: PhantomData,
-                   cq: cq,
-               })
+                _phantom: PhantomData,
+                cq: cq,
+            })
         }
     }
 
@@ -420,10 +425,10 @@ impl<'ctx> CompletionQueue<'ctx> {
     /// Note that `poll` does not block or cause a context switch. This is why RDMA technologies
     /// can achieve very low latency (below 1 µs).
     #[inline]
-    pub fn poll<'c>(&self,
-                    completions: &'c mut [ffi::ibv_wc])
-                    -> Result<&'c mut [ffi::ibv_wc], ()> {
-
+    pub fn poll<'c>(
+        &self,
+        completions: &'c mut [ffi::ibv_wc],
+    ) -> Result<&'c mut [ffi::ibv_wc], ()> {
         // TODO: from http://www.rdmamojo.com/2013/02/15/ibv_poll_cq/
         //
         //   One should consume Work Completions at a rate that prevents the CQ from being overrun
@@ -433,9 +438,11 @@ impl<'ctx> CompletionQueue<'ctx> {
         let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
         let ops = &mut unsafe { &mut *ctx }.ops;
         let n = unsafe {
-            ops.poll_cq.as_mut().unwrap()(self.cq,
-                                          completions.len() as i32,
-                                          completions.as_mut_ptr())
+            ops.poll_cq.as_mut().unwrap()(
+                self.cq,
+                completions.len() as i32,
+                completions.as_mut_ptr(),
+            )
         };
 
         if n < 0 {
@@ -498,16 +505,18 @@ impl<'res> QueuePairBuilder<'res> {
     /// There may be RDMA devices that for specific transport types may support less outstanding
     /// Work Requests than the maximum reported value. This value is ignored if the Queue Pair is
     /// associated with an SRQ
-    fn new<'scq, 'rcq, 'pd>(pd: &'pd ProtectionDomain,
-                            send: &'scq CompletionQueue,
-                            max_send_wr: u32,
-                            recv: &'rcq CompletionQueue,
-                            max_recv_wr: u32,
-                            qp_type: ffi::ibv_qp_type)
-                            -> QueuePairBuilder<'res>
-        where 'scq: 'res,
-              'rcq: 'res,
-              'pd: 'res
+    fn new<'scq, 'rcq, 'pd>(
+        pd: &'pd ProtectionDomain,
+        send: &'scq CompletionQueue,
+        max_send_wr: u32,
+        recv: &'rcq CompletionQueue,
+        max_recv_wr: u32,
+        qp_type: ffi::ibv_qp_type,
+    ) -> QueuePairBuilder<'res>
+    where
+        'scq: 'res,
+        'rcq: 'res,
+        'pd: 'res,
     {
         QueuePairBuilder {
             ctx: 0,
@@ -715,15 +724,15 @@ impl<'res> QueuePairBuilder<'res> {
             Err(io::Error::last_os_error())
         } else {
             Ok(PreparedQueuePair {
-                   ctx: self.pd.ctx,
-                   qp: qp,
+                ctx: self.pd.ctx,
+                qp: qp,
 
-                   access: self.access,
-                   timeout: self.timeout,
-                   retry_count: self.retry_count,
-                   rnr_retry: self.rnr_retry,
-                   min_rnr_timer: self.min_rnr_timer,
-               })
+                access: self.access,
+                timeout: self.timeout,
+                retry_count: self.retry_count,
+                rnr_retry: self.rnr_retry,
+                min_rnr_timer: self.min_rnr_timer,
+            })
         }
     }
 }
@@ -826,8 +835,8 @@ impl<'res> PreparedQueuePair<'res> {
         attr.qp_access_flags = self.access.0 as c_int;
         attr.pkey_index = 0;
         attr.port_num = PORT_NUM;
-        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_PKEY_INDEX | ffi::IBV_QP_PORT |
-                   ffi::IBV_QP_ACCESS_FLAGS;
+        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_PKEY_INDEX | ffi::IBV_QP_PORT
+            | ffi::IBV_QP_ACCESS_FLAGS;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
@@ -848,9 +857,9 @@ impl<'res> PreparedQueuePair<'res> {
         attr.ah_attr.port_num = PORT_NUM;
         attr.ah_attr.grh.dgid = remote.gid;
         attr.ah_attr.grh.hop_limit = 0xff;
-        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_AV | ffi::IBV_QP_PATH_MTU |
-                   ffi::IBV_QP_DEST_QPN | ffi::IBV_QP_RQ_PSN |
-                   ffi::IBV_QP_MAX_DEST_RD_ATOMIC | ffi::IBV_QP_MIN_RNR_TIMER;
+        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_AV | ffi::IBV_QP_PATH_MTU | ffi::IBV_QP_DEST_QPN
+            | ffi::IBV_QP_RQ_PSN | ffi::IBV_QP_MAX_DEST_RD_ATOMIC
+            | ffi::IBV_QP_MIN_RNR_TIMER;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
@@ -864,18 +873,18 @@ impl<'res> PreparedQueuePair<'res> {
         attr.sq_psn = 0;
         attr.rnr_retry = self.rnr_retry;
         attr.max_rd_atomic = 1;
-        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_TIMEOUT | ffi::IBV_QP_RETRY_CNT |
-                   ffi::IBV_QP_SQ_PSN | ffi::IBV_QP_RNR_RETRY |
-                   ffi::IBV_QP_MAX_QP_RD_ATOMIC;
+        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_TIMEOUT | ffi::IBV_QP_RETRY_CNT
+            | ffi::IBV_QP_SQ_PSN | ffi::IBV_QP_RNR_RETRY
+            | ffi::IBV_QP_MAX_QP_RD_ATOMIC;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
         Ok(QueuePair {
-               _phantom: PhantomData,
-               qp: self.qp,
-           })
+            _phantom: PhantomData,
+            qp: self.qp,
+        })
     }
 }
 
@@ -945,14 +954,16 @@ impl<'ctx> ProtectionDomain<'ctx> {
     ///
     /// Note that both this protection domain, *and* both provided completion queues, must outlive
     /// the resulting `QueuePair`.
-    pub fn create_qp<'pd, 'scq, 'rcq, 'res>(&'pd self,
-                                            send: &'scq CompletionQueue,
-                                            recv: &'rcq CompletionQueue,
-                                            qp_type: ffi::ibv_qp_type)
-                                            -> QueuePairBuilder<'res>
-        where 'scq: 'res,
-              'rcq: 'res,
-              'pd: 'res
+    pub fn create_qp<'pd, 'scq, 'rcq, 'res>(
+        &'pd self,
+        send: &'scq CompletionQueue,
+        recv: &'rcq CompletionQueue,
+        qp_type: ffi::ibv_qp_type,
+    ) -> QueuePairBuilder<'res>
+    where
+        'scq: 'res,
+        'rcq: 'res,
+        'pd: 'res,
     {
         QueuePairBuilder::new(self, send, 1, recv, 1, qp_type)
     }
@@ -998,14 +1009,15 @@ impl<'ctx> ProtectionDomain<'ctx> {
         let mut data = Vec::with_capacity(n);
         data.resize(n, T::default());
 
-        let access = ffi::IBV_ACCESS_LOCAL_WRITE | ffi::IBV_ACCESS_REMOTE_WRITE |
-                     ffi::IBV_ACCESS_REMOTE_READ |
-                     ffi::IBV_ACCESS_REMOTE_ATOMIC;
+        let access = ffi::IBV_ACCESS_LOCAL_WRITE | ffi::IBV_ACCESS_REMOTE_WRITE
+            | ffi::IBV_ACCESS_REMOTE_READ | ffi::IBV_ACCESS_REMOTE_ATOMIC;
         let mr = unsafe {
-            ffi::ibv_reg_mr(self.pd,
-                            data.as_mut_ptr() as *mut _,
-                            n * mem::size_of::<T>(),
-                            access.0 as i32)
+            ffi::ibv_reg_mr(
+                self.pd,
+                data.as_mut_ptr() as *mut _,
+                n * mem::size_of::<T>(),
+                access.0 as i32,
+            )
         };
 
         // TODO
@@ -1081,12 +1093,14 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub unsafe fn post_send<T, R>(&mut self,
-                                  mr: &mut MemoryRegion<T>,
-                                  range: R,
-                                  wr_id: u64)
-                                  -> io::Result<()>
-        where R: sliceindex::SliceIndex<[T], Output = [T]>
+    pub unsafe fn post_send<T, R>(
+        &mut self,
+        mr: &mut MemoryRegion<T>,
+        range: R,
+        wr_id: u64,
+    ) -> io::Result<()>
+    where
+        R: sliceindex::SliceIndex<[T], Output = [T]>,
     {
         let range = range.index(mr);
         let mut sge = ffi::ibv_sge {
@@ -1163,12 +1177,14 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub unsafe fn post_receive<T, R>(&mut self,
-                                     mr: &mut MemoryRegion<T>,
-                                     range: R,
-                                     wr_id: u64)
-                                     -> io::Result<()>
-        where R: sliceindex::SliceIndex<[T], Output = [T]>
+    pub unsafe fn post_receive<T, R>(
+        &mut self,
+        mr: &mut MemoryRegion<T>,
+        range: R,
+        wr_id: u64,
+    ) -> io::Result<()>
+    where
+        R: sliceindex::SliceIndex<[T], Output = [T]>,
     {
         let range = range.index(mr);
         let mut sge = ffi::ibv_sge {

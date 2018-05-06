@@ -1,8 +1,8 @@
 extern crate bindgen;
 
 use std::env;
-use std::process::Command;
 use std::path::PathBuf;
+use std::process::Command;
 
 fn main() {
     println!("cargo:include=vendor/rdma-core/build/include");
