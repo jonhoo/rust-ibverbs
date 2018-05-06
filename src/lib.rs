@@ -69,7 +69,7 @@ use std::ffi::CStr;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
-use std::os::raw::{c_int, c_void};
+use std::os::raw::c_void;
 use std::ptr;
 
 const PORT_NUM: u8 = 1;
@@ -88,14 +88,6 @@ pub use ffi::ibv_wc_status;
 
 /// Access flags for use with `QueuePair` and `MemoryRegion`.
 pub use ffi::ibv_access_flags;
-/// Enable Local Write Access.
-pub use ffi::IBV_ACCESS_LOCAL_WRITE;
-/// Enable Remote Atomic Operation Access (if supported).
-pub use ffi::IBV_ACCESS_REMOTE_ATOMIC;
-/// Enable Remote Read Access.
-pub use ffi::IBV_ACCESS_REMOTE_READ;
-/// Enable Remote Write Access.
-pub use ffi::IBV_ACCESS_REMOTE_WRITE;
 
 /// Because `std::slice::SliceIndex` is still unstable, we follow @alexcrichton's suggestion in
 /// https://github.com/rust-lang/rust/issues/35729 and implement it ourselves.
@@ -482,7 +474,7 @@ pub struct QueuePairBuilder<'res> {
     max_recv_sge: u32,
     max_inline_data: u32,
 
-    qp_type: ffi::ibv_qp_type,
+    qp_type: ffi::ibv_qp_type::Type,
 
     // carried along to handshake phase
     access: ffi::ibv_access_flags,
@@ -511,7 +503,7 @@ impl<'res> QueuePairBuilder<'res> {
         max_send_wr: u32,
         recv: &'rcq CompletionQueue,
         max_recv_wr: u32,
-        qp_type: ffi::ibv_qp_type,
+        qp_type: ffi::ibv_qp_type::Type,
     ) -> QueuePairBuilder<'res>
     where
         'scq: 'res,
@@ -533,7 +525,7 @@ impl<'res> QueuePairBuilder<'res> {
 
             qp_type,
 
-            access: ffi::IBV_ACCESS_LOCAL_WRITE,
+            access: ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE,
             min_rnr_timer: 16,
             retry_count: 6,
             rnr_retry: 6,
@@ -551,7 +543,8 @@ impl<'res> QueuePairBuilder<'res> {
 
     /// Set the access flags of the new `QueuePair` such that it allows remote reads and writes.
     pub fn allow_remote_rw(&mut self) -> &mut Self {
-        self.access = self.access | ffi::IBV_ACCESS_REMOTE_WRITE | ffi::IBV_ACCESS_REMOTE_READ;
+        self.access = self.access | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ;
         self
     }
 
@@ -832,11 +825,12 @@ impl<'res> PreparedQueuePair<'res> {
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr::default();
         attr.qp_state = ffi::ibv_qp_state::IBV_QPS_INIT;
-        attr.qp_access_flags = self.access.0 as c_int;
+        attr.qp_access_flags = self.access.0;
         attr.pkey_index = 0;
         attr.port_num = PORT_NUM;
-        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_PKEY_INDEX | ffi::IBV_QP_PORT
-            | ffi::IBV_QP_ACCESS_FLAGS;
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
+            | ffi::ibv_qp_attr_mask::IBV_QP_PORT
+            | ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
@@ -857,9 +851,12 @@ impl<'res> PreparedQueuePair<'res> {
         attr.ah_attr.port_num = PORT_NUM;
         attr.ah_attr.grh.dgid = remote.gid;
         attr.ah_attr.grh.hop_limit = 0xff;
-        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_AV | ffi::IBV_QP_PATH_MTU | ffi::IBV_QP_DEST_QPN
-            | ffi::IBV_QP_RQ_PSN | ffi::IBV_QP_MAX_DEST_RD_ATOMIC
-            | ffi::IBV_QP_MIN_RNR_TIMER;
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_AV
+            | ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU
+            | ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN
+            | ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN
+            | ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC
+            | ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
@@ -873,9 +870,11 @@ impl<'res> PreparedQueuePair<'res> {
         attr.sq_psn = 0;
         attr.rnr_retry = self.rnr_retry;
         attr.max_rd_atomic = 1;
-        let mask = ffi::IBV_QP_STATE | ffi::IBV_QP_TIMEOUT | ffi::IBV_QP_RETRY_CNT
-            | ffi::IBV_QP_SQ_PSN | ffi::IBV_QP_RNR_RETRY
-            | ffi::IBV_QP_MAX_QP_RD_ATOMIC;
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT
+            | ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT
+            | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN
+            | ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY
+            | ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
@@ -958,7 +957,7 @@ impl<'ctx> ProtectionDomain<'ctx> {
         &'pd self,
         send: &'scq CompletionQueue,
         recv: &'rcq CompletionQueue,
-        qp_type: ffi::ibv_qp_type,
+        qp_type: ffi::ibv_qp_type::Type,
     ) -> QueuePairBuilder<'res>
     where
         'scq: 'res,
@@ -1009,8 +1008,10 @@ impl<'ctx> ProtectionDomain<'ctx> {
         let mut data = Vec::with_capacity(n);
         data.resize(n, T::default());
 
-        let access = ffi::IBV_ACCESS_LOCAL_WRITE | ffi::IBV_ACCESS_REMOTE_WRITE
-            | ffi::IBV_ACCESS_REMOTE_READ | ffi::IBV_ACCESS_REMOTE_ATOMIC;
+        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 self.pd,
@@ -1114,11 +1115,11 @@ impl<'res> QueuePair<'res> {
             sg_list: &mut sge as *mut _,
             num_sge: 1,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: ffi::IBV_SEND_SIGNALED.0 as i32,
-            imm_data: 0,
+            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: Default::default(),
             qp_type: Default::default(),
             __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
         };
         let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
 

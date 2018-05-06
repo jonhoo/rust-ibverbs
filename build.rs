@@ -18,7 +18,7 @@ fn main() {
 
     // generate the bindings
     let bindings = bindgen::Builder::default()
-        .header("wrapper.h")
+        .header("vendor/rdma-core/libibverbs/verbs.h")
         .clang_arg("-Ivendor/rdma-core/build/include/")
         // https://github.com/servo/rust-bindgen/issues/550
         .blacklist_type("max_align_t")
@@ -28,6 +28,19 @@ fn main() {
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_wc_flags")
         .bitfield_enum("ibv_send_flags")
+        .bitfield_enum("ibv_port_cap_flags")
+        .constified_enum_module("ibv_qp_type")
+        .constified_enum_module("ibv_qp_state")
+        .constified_enum_module("ibv_port_state")
+        .constified_enum_module("ibv_wc_opcode")
+        .constified_enum_module("ibv_wr_opcode")
+        .constified_enum_module("ibv_wc_status")
+        //.constified_enum_module("IBV_WC_.*")
+        //.constified_enum_module("IBV_WR_.*")
+        //.constified_enum_module("IBV_QPS_.*")
+        //.constified_enum_module("IBV_PORT_.*")
+        .derive_default(true)
+        .derive_debug(true)
         .prepend_enum_name(false)
         .blacklist_type("ibv_wc")
         .generate()

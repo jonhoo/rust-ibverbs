@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs"
-version = "0.3.0"
+version = "0.4.0"
 
 description = "Bindings for RDMA ibverbs through rdma-core"
 readme = "README.md"
