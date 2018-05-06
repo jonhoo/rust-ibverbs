@@ -18,19 +18,18 @@ fn main() {
 
     // generate the bindings
     let bindings = bindgen::Builder::default()
-        .no_unstable_rust()
         .header("wrapper.h")
         .clang_arg("-Ivendor/rdma-core/build/include/")
         // https://github.com/servo/rust-bindgen/issues/550
-        .hide_type("max_align_t")
-        .whitelisted_function("ibv_.*")
-        .whitelisted_type("ibv_.*")
+        .blacklist_type("max_align_t")
+        .whitelist_function("ibv_.*")
+        .whitelist_type("ibv_.*")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_wc_flags")
         .bitfield_enum("ibv_send_flags")
         .prepend_enum_name(false)
-        .hide_type("ibv_wc")
+        .blacklist_type("ibv_wc")
         .generate()
         .expect("Unable to generate bindings");
 
