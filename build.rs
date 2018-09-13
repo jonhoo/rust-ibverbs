@@ -31,10 +31,8 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header("vendor/rdma-core/libibverbs/verbs.h")
         .clang_arg("-Ivendor/rdma-core/build/include/")
-        // https://github.com/servo/rust-bindgen/issues/550
-        .blacklist_type("max_align_t")
-        .whitelist_function("ibv_.*")
-        .whitelist_type("ibv_.*")
+        .allowlist_function("ibv_.*")
+        .allowlist_type("ibv_.*")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_wc_flags")
@@ -53,7 +51,8 @@ fn main() {
         .derive_default(true)
         .derive_debug(true)
         .prepend_enum_name(false)
-        .blacklist_type("ibv_wc")
+        .blocklist_type("ibv_wc")
+        .size_t_is_usize(true)
         .generate()
         .expect("Unable to generate bindings");
 

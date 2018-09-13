@@ -33,7 +33,7 @@ optional = true
 features = ["derive"]
 
 [build-dependencies]
-bindgen = "0.36"
+bindgen = "0.58"
 
 [features]
 default = ["serde"]
