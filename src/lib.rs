@@ -89,6 +89,10 @@ pub use ffi::ibv_wc_status;
 /// Access flags for use with `QueuePair` and `MemoryRegion`.
 pub use ffi::ibv_access_flags;
 
+#[macro_use]
+extern crate serde_derive;
+extern crate serde;
+
 /// Because `std::slice::SliceIndex` is still unstable, we follow @alexcrichton's suggestion in
 /// https://github.com/rust-lang/rust/issues/35729 and implement it ourselves.
 mod sliceindex;
@@ -774,6 +778,54 @@ pub struct QueuePairEndpoint {
     num: u32,
     lid: u16,
     gid: ffi::ibv_gid,
+}
+
+/// Make QueuePairEndpoint portable, along with private members
+#[derive(Copy, Clone, Serialize, Deserialize)]
+pub struct PortableQPEndpoint {
+    num: u32,
+    lid: u16,
+    gid_subnet_prefix: u64,
+    gid_interface_id: u64,
+}
+
+impl PortableQPEndpoint {
+
+    /// Make it serializable.
+    pub fn new(qpe: &QueuePairEndpoint) -> PortableQPEndpoint {
+        PortableQPEndpoint {
+            num: qpe.num,
+            lid: qpe.lid,
+            // TODO: they're actually be64 and fixit
+            gid_subnet_prefix: unsafe {qpe.gid.global.subnet_prefix},
+            gid_interface_id: unsafe {qpe.gid.global.interface_id },
+        }
+    }
+
+    /// build QueuePairEndpoint from decoded PortableQPEndpoint
+    pub fn to_qpe(&self) -> QueuePairEndpoint {
+        let mut gid = ffi::ibv_gid::default();
+        unsafe {
+            gid.global.subnet_prefix = self.gid_subnet_prefix;
+            gid.global.interface_id = self.gid_interface_id;
+        }
+        QueuePairEndpoint {
+            num: self.num,
+            lid: self.lid,
+            gid: gid,
+        }
+    }
+}
+
+/// Test serializable endpoint
+#[test]
+pub fn test_endpoint_serialize() {
+    let qpe = QueuePairEndpoint{ num: 234, lid: 324, gid: Default::default()};
+    let pqpe = PortableQPEndpoint::new(&qpe);
+    assert_eq!(234, qpe.num);
+    assert_eq!(234, pqpe.num);
+    assert_eq!(324, qpe.lid);
+    assert_eq!(324, pqpe.lid);
 }
 
 impl<'res> PreparedQueuePair<'res> {
