@@ -698,8 +698,8 @@ impl<'res> QueuePairBuilder<'res> {
     pub fn build(&self) -> io::Result<PreparedQueuePair<'res>> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
-            send_cq: self.send as *const _ as *mut _,
-            recv_cq: self.recv as *const _ as *mut _,
+            send_cq: self.send.cq as *const _ as *mut _,
+            recv_cq: self.recv.cq as *const _ as *mut _,
             srq: ptr::null::<ffi::ibv_srq>() as *mut _,
             cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
