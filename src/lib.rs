@@ -455,6 +455,32 @@ impl<'a> Drop for CompletionQueue<'a> {
     }
 }
 
+/// SharedReceiveQueue, so-called srq.
+pub struct SharedReceiveQueue<'pd> {
+    _phantom: PhantomData<&'pd ()>,
+    srq: *mut ffi::ibv_srq,
+}
+
+impl<'a> Default for SharedReceiveQueue<'a> {
+    fn default() -> SharedReceiveQueue<'a> {
+        SharedReceiveQueue{
+            _phantom: PhantomData,
+            srq: ptr::null::<c_void>() as *mut _,
+        }
+    }
+}
+
+impl<'a> Drop for SharedReceiveQueue<'a> {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_destroy_srq(self.srq) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e.description());
+        }
+    }
+}
+
+
 /// An unconfigured `QueuePair`.
 ///
 /// A `QueuePairBuilder` is used to configure a `QueuePair` before it is allocated and initialized.
@@ -469,6 +495,7 @@ pub struct QueuePairBuilder<'res> {
     max_send_wr: u32,
     recv: &'res CompletionQueue<'res>,
     max_recv_wr: u32,
+    srq: Option<&'res SharedReceiveQueue<'res>>,
 
     max_send_sge: u32,
     max_recv_sge: u32,
@@ -518,6 +545,7 @@ impl<'res> QueuePairBuilder<'res> {
             max_send_wr,
             recv,
             max_recv_wr,
+            srq: std::option::Option::None,
 
             max_send_sge: 1,
             max_recv_sge: 1,
@@ -681,6 +709,11 @@ impl<'res> QueuePairBuilder<'res> {
         self
     }
 
+    /// Update the srq, othrewise the default NULL is used.
+    pub fn set_srq(&mut self, srq: &'res SharedReceiveQueue<'res>) -> &mut Self {
+        self.srq = Option::Some(srq);
+        self
+    }
     /// Create a new `QueuePair` from this builder template.
     ///
     /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
@@ -696,11 +729,16 @@ impl<'res> QueuePairBuilder<'res> {
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
     pub fn build(&self) -> io::Result<PreparedQueuePair<'res>> {
+        let srq_ptr = match self.srq {
+            Some(ref s) => s.srq as *const _ as *mut _,
+            None => ptr::null::<ffi::ibv_srq>() as *mut _,
+        };
+
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
             send_cq: self.send.cq as *const _ as *mut _,
             recv_cq: self.recv.cq as *const _ as *mut _,
-            srq: ptr::null::<ffi::ibv_srq>() as *mut _,
+            srq: srq_ptr,
             cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
@@ -940,6 +978,29 @@ unsafe impl<'a> Sync for ProtectionDomain<'a> {}
 unsafe impl<'a> Send for ProtectionDomain<'a> {}
 
 impl<'ctx> ProtectionDomain<'ctx> {
+    /// Creates a shared receive queue
+    pub fn create_srq<'pd>(&'pd self, max_wr: u32, max_sge: u32) -> io::Result<SharedReceiveQueue<'ctx>>
+    where 'pd: 'ctx
+    {
+        let mut attr = ffi::ibv_srq_init_attr {
+            srq_context: ptr::null::<c_void>() as *mut _,
+            attr: ffi::ibv_srq_attr {
+                max_wr: max_wr,
+                max_sge: max_sge,
+                srq_limit: 0
+            }
+        };
+        let srq = unsafe { ffi::ibv_create_srq(self.pd, &mut attr as *mut _) };
+        if srq.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(SharedReceiveQueue{
+                _phantom: PhantomData,
+                srq: srq
+            })
+        }
+    }
+
     /// Creates a queue pair builder associated with this protection domain.
     ///
     /// `send` and `recv` are the device `Context` to associate with the send and receive queues
@@ -1223,6 +1284,47 @@ impl<'res> QueuePair<'res> {
             Ok(())
         }
     }
+
+    /// Receive any message into shared receive queue
+    #[inline]
+    pub unsafe fn post_srq_receive<T, R>(
+        &mut self,
+        mr: &mut MemoryRegion<T>,
+        range: R,
+        wr_id: u64,
+    ) -> io::Result<()>
+    where
+        R: sliceindex::SliceIndex<[T], Output = [T]>,
+    {
+        let range = range.index(mr);
+        let mut sge = ffi::ibv_sge {
+            addr: range.as_ptr() as u64,
+            length: (mem::size_of::<T>() * range.len()) as u32,
+            lkey: (&*mr.mr).lkey,
+        };
+        let mut wr = ffi::ibv_recv_wr {
+            wr_id: wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+        };
+        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null::<ffi::ibv_recv_wr>() as *mut _;
+
+        // If the QP qp is associated with a shared receive queue, you must use the function
+        // ibv_post_srq_recv(), and not ibv_post_recv(), since the QP's own receive queue will not
+        // be used.
+
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let errno =
+            ops.post_srq_recv.as_mut().unwrap()((*self.qp).srq as *mut _, &mut wr as *mut _, &mut bad_wr as *mut _);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+
 }
 
 impl<'a> Drop for QueuePair<'a> {
