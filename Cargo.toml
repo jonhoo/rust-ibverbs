@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs"
-version = "0.4.1"
+version = "0.4.2"
 
 description = "Bindings for RDMA ibverbs through rdma-core"
 readme = "README.md"
@@ -22,6 +22,7 @@ license = "MIT/Apache-2.0"
 
 [badges]
 travis-ci = { repository = "jonhoo/rust-ibverbs" }
+maintenance = { status = "looking-for-maintainer" }
 
 [build-dependencies]
 bindgen = "0.36"
