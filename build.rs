@@ -9,6 +9,12 @@ fn main() {
     println!("cargo:rustc-link-search=native=vendor/rdma-core/build/lib");
     println!("cargo:rustc-link-lib=ibverbs");
 
+    // initialize and update submodules
+    Command::new("git")
+        .args(&["submodule", "update", "--init"])
+        .status()
+        .expect("Failed to update submodules.");
+
     // build vendor/rdma-core
     Command::new("bash")
         .current_dir("vendor/rdma-core/")
