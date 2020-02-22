@@ -791,6 +791,8 @@ pub struct QueuePairEndpoint {
     num: u32,
     lid: u16,
     gid: ffi::ibv_gid,
+    rkey: u32,
+    raddr: u64,
 }
 
 impl<'res> PreparedQueuePair<'res> {
@@ -804,6 +806,8 @@ impl<'res> PreparedQueuePair<'res> {
             num,
             lid: self.ctx.port_attr.lid,
             gid: self.ctx.gid,
+            rkey: 0,
+            raddr: 0,
         }
     }
 
@@ -1077,6 +1081,15 @@ impl<'a> Drop for ProtectionDomain<'a> {
 pub struct QueuePair<'res> {
     _phantom: PhantomData<&'res ()>,
     qp: *mut ffi::ibv_qp,
+}
+
+impl<'a> Default for QueuePair<'a> {
+    fn default() -> Self {
+        QueuePair{
+            _phantom: Default::default(),
+            qp: std::ptr::null_mut(),
+        }
+    }
 }
 
 unsafe impl<'a> Send for QueuePair<'a> {}
