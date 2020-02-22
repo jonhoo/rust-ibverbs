@@ -64,6 +64,8 @@
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 #![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
 
+extern crate serde;
+
 use std::error::Error;
 use std::ffi::CStr;
 use std::io;
@@ -786,13 +788,53 @@ pub struct PreparedQueuePair<'res> {
 /// An identifier for the network endpoint of a `QueuePair`.
 ///
 /// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
-#[derive(Copy, Clone)]
 pub struct QueuePairEndpoint {
     num: u32,
     lid: u16,
     gid: ffi::ibv_gid,
-    rkey: u32,
-    raddr: u64,
+}
+
+use serde::{Serialize, Deserialize};
+
+/// A wrapper around `QueuePairEndpoint` with addintional `rkey` and `raddr` field. Intended to be sent to the peer.
+// TODO: write more thoughout documentation for fields.
+#[derive(Serialize, Deserialize)]
+pub struct EndpointMsg {
+    /// num
+    pub num: u32,
+    /// lid
+    pub lid: u16,
+    /// gid
+    pub gid: [u8; 16usize],
+    /// rkey
+    pub rkey: RemoteKey,
+    /// raddr
+    pub raddr: RemoteAddr,
+}
+
+impl From<QueuePairEndpoint> for EndpointMsg {
+    fn from(q: QueuePairEndpoint) -> EndpointMsg {
+        let gid = unsafe{q.gid.raw};
+        EndpointMsg{
+            num: q.num,
+            lid: q.lid,
+            gid: gid,
+            rkey: RemoteKey(0),
+            raddr: RemoteAddr(0),
+        }
+    }
+}
+
+impl Into<QueuePairEndpoint> for EndpointMsg {
+    fn into(self) -> QueuePairEndpoint {
+        let gid = ffi::ibv_gid{ raw: self.gid};
+
+        QueuePairEndpoint{
+            num: self.num,
+            lid: self.lid,
+            gid: gid,
+        }
+    }
 }
 
 impl<'res> PreparedQueuePair<'res> {
@@ -806,8 +848,6 @@ impl<'res> PreparedQueuePair<'res> {
             num,
             lid: self.ctx.port_attr.lid,
             gid: self.ctx.gid,
-            rkey: 0,
-            raddr: 0,
         }
     }
 
@@ -942,7 +982,12 @@ impl<T> MemoryRegion<T> {
 }
 
 /// A key that authorizes direct memory access to a memory region.
+#[derive(Copy, Clone, Deserialize, Serialize)]
 pub struct RemoteKey(u32);
+
+/// A remote address to perform RDMA operations on.
+#[derive(Copy, Clone, Deserialize, Serialize)]
+pub struct RemoteAddr(u64);
 
 impl<T> Drop for MemoryRegion<T> {
     fn drop(&mut self) {
@@ -1085,7 +1130,7 @@ pub struct QueuePair<'res> {
 
 impl<'a> Default for QueuePair<'a> {
     fn default() -> Self {
-        QueuePair{
+        QueuePair {
             _phantom: Default::default(),
             qp: std::ptr::null_mut(),
         }
