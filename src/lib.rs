@@ -66,7 +66,7 @@ extern crate serde;
 use std::error::Error;
 use std::ffi::CStr;
 use std::io;
-use std::marker::PhantomData;
+// use std::marker::PhantomData;
 use std::mem;
 use std::os::raw::c_void;
 use std::ptr;
@@ -200,7 +200,7 @@ impl<'devlist> Device<'devlist> {
     ///  - `ENOMEM`: Out of memory (from `ibv_query_port_attr`).
     ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
     ///  - Other: the device is not in `ACTIVE` or `ARMED` state.
-    pub fn open(&self) -> io::Result<Context> {
+    pub fn open(&self) -> io::Result<Arc<Context>> {
         Context::with_device(*self.0)
     }
 
@@ -272,7 +272,7 @@ unsafe impl Send for Context {}
 
 impl Context {
     /// Opens a context for the given device, and queries its port and gid.
-    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
+    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Arc<Context>> {
         assert!(!dev.is_null());
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
@@ -318,11 +318,11 @@ impl Context {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Context {
+        Ok(Arc::new(Context {
             ctx,
             port_attr,
             gid,
-        })
+        }))
     }
 
     /// Create a completion queue (CQ).
@@ -359,7 +359,7 @@ impl Context {
             Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
-                _phantom: PhantomData,
+                // _phantom: PhantomData,
                 cq: cq,
             })
         }
@@ -403,15 +403,15 @@ impl Drop for Context {
 }
 
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
-pub struct CompletionQueue<'ctx> {
-    _phantom: PhantomData<&'ctx ()>,
+pub struct CompletionQueue {
+    // _phantom: PhantomData<&'ctx ()>,
     cq: *mut ffi::ibv_cq,
 }
 
-unsafe impl<'a> Send for CompletionQueue<'a> {}
-unsafe impl<'a> Sync for CompletionQueue<'a> {}
+unsafe impl Send for CompletionQueue {}
+unsafe impl Sync for CompletionQueue {}
 
-impl<'ctx> CompletionQueue<'ctx> {
+impl<'ctx> CompletionQueue {
     /// Poll for (possibly multiple) work completions.
     ///
     /// A Work Completion indicates that a Work Request in a Work Queue, and all of the outstanding
@@ -461,7 +461,7 @@ impl<'ctx> CompletionQueue<'ctx> {
     }
 }
 
-impl<'a> Drop for CompletionQueue<'a> {
+impl Drop for CompletionQueue {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if errno != 0 {
@@ -481,9 +481,9 @@ pub struct QueuePairBuilder<'res> {
     ctx: isize,
     pd: &'res ProtectionDomain,
 
-    send: &'res CompletionQueue<'res>,
+    send: &'res CompletionQueue,
     max_send_wr: u32,
-    recv: &'res CompletionQueue<'res>,
+    recv: &'res CompletionQueue,
     max_recv_wr: u32,
 
     max_send_sge: u32,
