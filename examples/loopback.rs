@@ -1,16 +1,17 @@
 extern crate ibverbs;
+use std::sync::Arc;
 
 fn main() {
-    let ctx = ibverbs::devices()
+    let ctx = Arc::new(ibverbs::devices()
         .unwrap()
         .iter()
         .next()
         .expect("no rdma device available")
         .open()
-        .unwrap();
+        .unwrap());
 
     let cq = ctx.create_cq(16, 0).unwrap();
-    let pd = ctx.alloc_pd().unwrap();
+    let pd = ctx.clone().alloc_pd().unwrap();
 
     let qp_builder = pd.create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
         .build()

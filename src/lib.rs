@@ -60,10 +60,7 @@
 //! [RDMAmojo]: http://www.rdmamojo.com/
 //! [1]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 
-#![deny(missing_docs)]
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
-#![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
-
 extern crate serde;
 
 use std::error::Error;
@@ -73,6 +70,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::Arc;
 
 const PORT_NUM: u8 = 1;
 
@@ -281,7 +279,7 @@ impl Context {
         if ctx.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "failed to open device".to_string(),
+                "failed to open device",
             ));
         }
 
@@ -374,12 +372,12 @@ impl Context {
     /// A protection domain is a means of protection, and helps you create a group of object that
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
-    pub fn alloc_pd(&self) -> Result<ProtectionDomain, ()> {
+    pub fn alloc_pd(self: Arc<Self>) -> Result<ProtectionDomain, ()> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.ctx) };
         if pd.is_null() {
             Err(())
         } else {
-            Ok(ProtectionDomain { ctx: self, pd })
+            Ok(ProtectionDomain { ctx: self.clone(), pd })
         }
     }
 
@@ -481,7 +479,7 @@ impl<'a> Drop for CompletionQueue<'a> {
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 pub struct QueuePairBuilder<'res> {
     ctx: isize,
-    pd: &'res ProtectionDomain<'res>,
+    pd: &'res ProtectionDomain,
 
     send: &'res CompletionQueue<'res>,
     max_send_wr: u32,
@@ -714,7 +712,7 @@ impl<'res> QueuePairBuilder<'res> {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
-    pub fn build(&self) -> io::Result<PreparedQueuePair<'res>> {
+    pub fn build(&self) -> io::Result<PreparedQueuePair> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
             send_cq: self.send.cq as *const _ as *mut _,
@@ -736,7 +734,7 @@ impl<'res> QueuePairBuilder<'res> {
             Err(io::Error::last_os_error())
         } else {
             Ok(PreparedQueuePair {
-                ctx: self.pd.ctx,
+                ctx: self.pd.ctx.clone(),
                 qp: qp,
 
                 access: self.access,
@@ -773,8 +771,9 @@ impl<'res> QueuePairBuilder<'res> {
 /// let host1end = host1.recv();
 /// let qp = pqp.handshake(host1end);
 /// ```
-pub struct PreparedQueuePair<'res> {
-    ctx: &'res Context,
+#[derive(Clone)]
+pub struct PreparedQueuePair {
+    ctx: Arc<Context>,
     qp: *mut ffi::ibv_qp,
 
     // carried from builder
@@ -788,17 +787,18 @@ pub struct PreparedQueuePair<'res> {
 /// An identifier for the network endpoint of a `QueuePair`.
 ///
 /// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
+#[derive(Clone)]
 pub struct QueuePairEndpoint {
     num: u32,
     lid: u16,
     gid: ffi::ibv_gid,
 }
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// A wrapper around `QueuePairEndpoint` with addintional `rkey` and `raddr` field. Intended to be sent to the peer.
 // TODO: write more thoughout documentation for fields.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct EndpointMsg {
     /// num
     pub num: u32,
@@ -814,8 +814,8 @@ pub struct EndpointMsg {
 
 impl From<QueuePairEndpoint> for EndpointMsg {
     fn from(q: QueuePairEndpoint) -> EndpointMsg {
-        let gid = unsafe{q.gid.raw};
-        EndpointMsg{
+        let gid = unsafe { q.gid.raw };
+        EndpointMsg {
             num: q.num,
             lid: q.lid,
             gid: gid,
@@ -827,9 +827,9 @@ impl From<QueuePairEndpoint> for EndpointMsg {
 
 impl Into<QueuePairEndpoint> for EndpointMsg {
     fn into(self) -> QueuePairEndpoint {
-        let gid = ffi::ibv_gid{ raw: self.gid};
+        let gid = ffi::ibv_gid { raw: self.gid };
 
-        QueuePairEndpoint{
+        QueuePairEndpoint {
             num: self.num,
             lid: self.lid,
             gid: gid,
@@ -837,7 +837,7 @@ impl Into<QueuePairEndpoint> for EndpointMsg {
     }
 }
 
-impl<'res> PreparedQueuePair<'res> {
+impl PreparedQueuePair {
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
@@ -882,7 +882,7 @@ impl<'res> PreparedQueuePair<'res> {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
-    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair<'res>> {
+    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr::default();
         attr.qp_state = ffi::ibv_qp_state::IBV_QPS_INIT;
@@ -945,7 +945,7 @@ impl<'res> PreparedQueuePair<'res> {
         }
 
         Ok(QueuePair {
-            _phantom: PhantomData,
+            // _phantom: PhantomData,
             qp: self.qp,
         })
     }
@@ -1000,15 +1000,15 @@ impl<T> Drop for MemoryRegion<T> {
 }
 
 /// A protection domain for a device's context.
-pub struct ProtectionDomain<'ctx> {
-    ctx: &'ctx Context,
+pub struct ProtectionDomain {
+    ctx: Arc<Context>,
     pd: *mut ffi::ibv_pd,
 }
 
-unsafe impl<'a> Sync for ProtectionDomain<'a> {}
-unsafe impl<'a> Send for ProtectionDomain<'a> {}
+unsafe impl Sync for ProtectionDomain {}
+unsafe impl Send for ProtectionDomain {}
 
-impl<'ctx> ProtectionDomain<'ctx> {
+impl ProtectionDomain {
     /// Creates a queue pair builder associated with this protection domain.
     ///
     /// `send` and `recv` are the device `Context` to associate with the send and receive queues
@@ -1106,7 +1106,7 @@ impl<'ctx> ProtectionDomain<'ctx> {
     }
 }
 
-impl<'a> Drop for ProtectionDomain<'a> {
+impl Drop for ProtectionDomain {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if errno != 0 {
@@ -1123,24 +1123,24 @@ impl<'a> Drop for ProtectionDomain<'a> {
 /// which is maintained by the network stack and doesn't have a physical resource behind it. A QP
 /// is a resource of an RDMA device and a QP number can be used by one process at the same time
 /// (similar to a socket that is associated with a specific TCP or UDP port number)
-pub struct QueuePair<'res> {
-    _phantom: PhantomData<&'res ()>,
+pub struct QueuePair{
+    // _phantom: PhantomData<&'res ()>,
     qp: *mut ffi::ibv_qp,
 }
 
-impl<'a> Default for QueuePair<'a> {
+impl Default for QueuePair {
     fn default() -> Self {
         QueuePair {
-            _phantom: Default::default(),
+            // _phantom: Default::default(),
             qp: std::ptr::null_mut(),
         }
     }
 }
 
-unsafe impl<'a> Send for QueuePair<'a> {}
-unsafe impl<'a> Sync for QueuePair<'a> {}
+unsafe impl Send for QueuePair {}
+unsafe impl Sync for QueuePair {}
 
-impl<'res> QueuePair<'res> {
+impl QueuePair {
     /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
     ///
     /// Generates a HW-specific Send Request for the memory at `mr[range]`, and adds it to the tail
@@ -1303,7 +1303,7 @@ impl<'res> QueuePair<'res> {
     }
 }
 
-impl<'a> Drop for QueuePair<'a> {
+impl Drop for QueuePair {
     fn drop(&mut self) {
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
         let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
