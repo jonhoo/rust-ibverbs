@@ -983,11 +983,11 @@ impl<T> MemoryRegion<T> {
 
 /// A key that authorizes direct memory access to a memory region.
 #[derive(Copy, Clone, Deserialize, Serialize)]
-pub struct RemoteKey(u32);
+pub struct RemoteKey(pub u32);
 
 /// A remote address to perform RDMA operations on.
 #[derive(Copy, Clone, Deserialize, Serialize)]
-pub struct RemoteAddr(u64);
+pub struct RemoteAddr(pub u64);
 
 impl<T> Drop for MemoryRegion<T> {
     fn drop(&mut self) {
