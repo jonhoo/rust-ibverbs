@@ -1,5 +1,4 @@
 extern crate ibverbs;
-use std::sync::Arc;
 
 fn main() {
     let ctx = ibverbs::devices()

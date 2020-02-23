@@ -344,7 +344,7 @@ impl Context {
     ///
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
     ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
+    pub fn create_cq(self: Arc<Self>, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx,
@@ -382,7 +382,7 @@ impl Context {
     }
 
     /// Query corresponding device
-    pub fn query_device(&self) -> io::Result<DeviceAttr> {
+    pub fn query_device(self: Arc<Self>) -> io::Result<DeviceAttr> {
         let mut dev_attrs = Default::default();
 
         let ret = unsafe { ffi::ibv_query_device(self.ctx, &mut dev_attrs) };
