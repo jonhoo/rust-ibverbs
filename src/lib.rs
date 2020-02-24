@@ -966,6 +966,21 @@ impl PreparedQueuePair {
     }
 }
 
+impl Drop for PreparedQueuePair {
+    fn drop(&mut self) {
+        // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
+        let errno = if !self.qp.is_null() {
+            unsafe { ffi::ibv_destroy_qp(self.qp) }
+        } else {
+            0
+        };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e.description());
+        }
+    }
+}
+
 /// A memory region that has been registered for use with RDMA.
 pub struct MemoryRegion<T> {
     mr: *mut ffi::ibv_mr,
