@@ -344,11 +344,7 @@ impl Context {
     ///
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
     ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn create_cq(
-        &self,
-        min_cq_entries: i32,
-        id: isize,
-    ) -> io::Result<CompletionQueue> {
+    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx,
@@ -751,6 +747,7 @@ impl<'res> QueuePairBuilder<'res> {
             Ok(PreparedQueuePair {
                 ctx: self.pd.ctx.clone(),
                 qp: qp,
+                connected: false,
 
                 access: self.access,
                 timeout: self.timeout,
@@ -790,6 +787,7 @@ impl<'res> QueuePairBuilder<'res> {
 pub struct PreparedQueuePair {
     ctx: Arc<Context>,
     qp: *mut ffi::ibv_qp,
+    connected: bool,
 
     // carried from builder
     access: ffi::ibv_access_flags,
@@ -968,12 +966,38 @@ impl PreparedQueuePair {
 
 impl Drop for PreparedQueuePair {
     fn drop(&mut self) {
+        if self.qp.is_null() {
+            return;
+        }
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
-        let errno = if !self.qp.is_null() {
-            unsafe { ffi::ibv_destroy_qp(self.qp) }
-        } else {
-            0
+        let mut qp_attr = ffi::ibv_qp_attr::default();
+        let mut qp_init_attr = ffi::ibv_qp_init_attr::default();
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
+
+        let errno = unsafe {
+            ffi::ibv_query_qp(
+                self.qp,
+                &mut qp_attr as *mut _,
+                mask.0 as i32,
+                &mut qp_init_attr as *mut _,
+            )
         };
+
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("PANIC: cannot query QP while dropping: {}", e.description());
+        }
+
+        // QP is initialized and not will be controlled by QueuePair struct, thus it
+        // should not be deallocated here;
+        if qp_attr.qp_state == ffi::ibv_qp_state::IBV_QPS_RTS
+            || qp_attr.qp_state == ffi::ibv_qp_state::IBV_QPS_RTR
+        {
+            return;
+        }
+
+        let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
+
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
