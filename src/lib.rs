@@ -344,7 +344,11 @@ impl Context {
     ///
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
     ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn create_cq(self: Arc<Self>, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
+    pub fn create_cq(
+        self: Arc<Self>,
+        min_cq_entries: i32,
+        id: isize,
+    ) -> io::Result<CompletionQueue> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx,
@@ -377,7 +381,10 @@ impl Context {
         if pd.is_null() {
             Err(())
         } else {
-            Ok(ProtectionDomain { ctx: self.clone(), pd })
+            Ok(ProtectionDomain {
+                ctx: self.clone(),
+                pd,
+            })
         }
     }
 
@@ -397,7 +404,11 @@ impl Context {
 
 impl Drop for Context {
     fn drop(&mut self) {
-        let ok = unsafe { ffi::ibv_close_device(self.ctx) };
+        let ok = if !self.ctx.is_null() {
+            unsafe { ffi::ibv_close_device(self.ctx) }
+        } else {
+            0
+        };
         assert_eq!(ok, 0);
     }
 }
@@ -463,7 +474,11 @@ impl<'ctx> CompletionQueue {
 
 impl Drop for CompletionQueue {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        let errno = if !self.cq.is_null() {
+            unsafe { ffi::ibv_destroy_cq(self.cq) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
@@ -991,7 +1006,11 @@ pub struct RemoteAddr(pub u64);
 
 impl<T> Drop for MemoryRegion<T> {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
+        let errno = if !self.mr.is_null() {
+            unsafe { ffi::ibv_dereg_mr(self.mr) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
@@ -1108,7 +1127,11 @@ impl ProtectionDomain {
 
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
+        let errno = if !self.pd.is_null() {
+            unsafe { ffi::ibv_dealloc_pd(self.pd) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
@@ -1123,7 +1146,7 @@ impl Drop for ProtectionDomain {
 /// which is maintained by the network stack and doesn't have a physical resource behind it. A QP
 /// is a resource of an RDMA device and a QP number can be used by one process at the same time
 /// (similar to a socket that is associated with a specific TCP or UDP port number)
-pub struct QueuePair{
+pub struct QueuePair {
     // _phantom: PhantomData<&'res ()>,
     qp: *mut ffi::ibv_qp,
 }
@@ -1306,7 +1329,11 @@ impl QueuePair {
 impl Drop for QueuePair {
     fn drop(&mut self) {
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
-        let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
+        let errno = if !self.qp.is_null() {
+            unsafe { ffi::ibv_destroy_qp(self.qp) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e.description());
