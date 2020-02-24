@@ -477,7 +477,7 @@ impl Drop for CompletionQueue {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("Could not destroy Completion Queue: errno={} err=\"{}\"", errno, e.description());
         }
     }
 }
@@ -1000,7 +1000,7 @@ impl Drop for PreparedQueuePair {
 
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("Could not destroy Prepared Queue Pair: errno={} err=\"{}\"", errno, e.description());
         }
     }
 }
@@ -1052,7 +1052,7 @@ impl<T> Drop for MemoryRegion<T> {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("Could not deregister Memory Region: errno={} err=\"{}\"", errno, e.description());
         }
     }
 }
@@ -1173,7 +1173,7 @@ impl Drop for ProtectionDomain {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("Could not deallocate Protection Domain: errno={} err=\"{}\"", errno, e.description());
         }
     }
 }
@@ -1375,7 +1375,7 @@ impl Drop for QueuePair {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("Could not destroy Queue Pair: errno={} err=\"{}\"", errno, e.description());
         }
     }
 }
