@@ -1363,6 +1363,111 @@ impl QueuePair {
             Ok(())
         }
     }
+
+
+    /// Write a single value from the top of the memory region
+    #[inline]
+    pub unsafe fn post_write_single<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()>
+    {
+        let mut sge = ffi::ibv_sge {
+            addr: mr.as_ptr() as u64,
+            length: mem::size_of::<T>() as u32,
+            lkey: (&*mr.mr).lkey,
+        };
+        let flg = if sig {
+            ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
+        }else{
+            0
+        };
+
+        let mut wr = ffi::ibv_send_wr {
+            wr_id: wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            send_flags: flg,
+            wr: ffi::ibv_send_wr__bindgen_ty_2{
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1{
+                    remote_addr: addr,
+                    rkey: key,
+                }
+            },
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let errno =
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Write a single value from the top of the memory region
+    #[inline]
+    pub unsafe fn post_read_single<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()>
+    {
+        let mut sge = ffi::ibv_sge {
+            addr: mr.as_ptr() as u64,
+            length: mem::size_of::<T>() as u32,
+            lkey: (&*mr.mr).lkey,
+        };
+        let flg = if sig {
+            ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
+        }else{
+            0
+        };
+
+        let mut wr = ffi::ibv_send_wr {
+            wr_id: wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_READ,
+            send_flags: flg,
+            wr: ffi::ibv_send_wr__bindgen_ty_2{
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1{
+                    remote_addr: addr,
+                    rkey: key,
+                }
+            },
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let errno =
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Drop for QueuePair {
