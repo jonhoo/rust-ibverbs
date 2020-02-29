@@ -1016,6 +1016,7 @@ impl Drop for PreparedQueuePair {
 /// A memory region that has been registered for use with RDMA.
 pub struct MemoryRegion<T> {
     mr: *mut ffi::ibv_mr,
+    size: usize,
     data: Vec<T>,
 }
 
@@ -1040,6 +1041,10 @@ impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
         RemoteKey(unsafe { &*self.mr }.rkey)
+    }
+
+    pub fn size(&self) -> usize {
+        self.size()
     }
 }
 
@@ -1171,7 +1176,7 @@ impl ProtectionDomain {
         if mr.is_null() {
             Err(io::Error::last_os_error())
         } else {
-            Ok(MemoryRegion { mr, data })
+            Ok(MemoryRegion { mr, size: n, data })
         }
     }
 }
@@ -1380,19 +1385,27 @@ impl QueuePair {
         }
     }
 
-    /// Write a single value from the top of the memory region
+    /// Write N values from the specified MR to the remote memory.
     #[inline]
-    pub unsafe fn post_write_single<T>(
+    pub unsafe fn post_write_buf<T>(
         &self,
         mr: &MemoryRegion<T>,
+        n: usize,
         addr: u64,
         key: u32,
         wr_id: u64,
         sig: bool,
     ) -> io::Result<()> {
+        assert!(
+            mr.size >= n,
+            "ERROR: cannot write {} values from a MR of size {}, MR is too small",
+            n,
+            mr.size
+        );
+
         let mut sge = ffi::ibv_sge {
             addr: mr.as_ptr() as u64,
-            length: mem::size_of::<T>() as u32,
+            length: (mem::size_of::<T>() * n) as u32,
             lkey: (&*mr.mr).lkey,
         };
         let flg = if sig {
@@ -1436,17 +1449,25 @@ impl QueuePair {
 
     /// Write a single value from the top of the memory region
     #[inline]
-    pub unsafe fn post_read_single<T>(
+    pub unsafe fn post_read_buf<T>(
         &self,
         mr: &MemoryRegion<T>,
+        n: usize,
         addr: u64,
         key: u32,
         wr_id: u64,
         sig: bool,
     ) -> io::Result<()> {
+        assert!(
+            mr.size >= n,
+            "ERROR: cannot read {} values to a MR of size {}, MR is too small",
+            n,
+            mr.size
+        );
+
         let mut sge = ffi::ibv_sge {
             addr: mr.as_ptr() as u64,
-            length: mem::size_of::<T>() as u32,
+            length: (mem::size_of::<T>() * n) as u32,
             lkey: (&*mr.mr).lkey,
         };
         let flg = if sig {
@@ -1486,6 +1507,32 @@ impl QueuePair {
         } else {
             Ok(())
         }
+    }
+
+    /// Write a single value from the top of the memory region
+    #[inline]
+    pub unsafe fn post_write_single<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()> {
+        self.post_write_buf(mr, 1, addr, key, wr_id, sig)
+    }
+
+    /// Write a single value from the top of the memory region
+    #[inline]
+    pub unsafe fn post_read_single<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()> {
+        self.post_read_buf(mr, 1, addr, key, wr_id, sig)
     }
 }
 
