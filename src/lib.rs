@@ -477,7 +477,11 @@ impl Drop for CompletionQueue {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("Could not destroy Completion Queue: errno={} err=\"{}\"", errno, e.description());
+            panic!(
+                "Could not destroy Completion Queue: errno={} err=\"{}\"",
+                errno,
+                e.description()
+            );
         }
     }
 }
@@ -1000,7 +1004,11 @@ impl Drop for PreparedQueuePair {
 
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("Could not destroy Prepared Queue Pair: errno={} err=\"{}\"", errno, e.description());
+            panic!(
+                "Could not destroy Prepared Queue Pair: errno={} err=\"{}\"",
+                errno,
+                e.description()
+            );
         }
     }
 }
@@ -1052,7 +1060,11 @@ impl<T> Drop for MemoryRegion<T> {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("Could not deregister Memory Region: errno={} err=\"{}\"", errno, e.description());
+            panic!(
+                "Could not deregister Memory Region: errno={} err=\"{}\"",
+                errno,
+                e.description()
+            );
         }
     }
 }
@@ -1173,7 +1185,11 @@ impl Drop for ProtectionDomain {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("Could not deallocate Protection Domain: errno={} err=\"{}\"", errno, e.description());
+            panic!(
+                "Could not deallocate Protection Domain: errno={} err=\"{}\"",
+                errno,
+                e.description()
+            );
         }
     }
 }
@@ -1364,7 +1380,6 @@ impl QueuePair {
         }
     }
 
-
     /// Write a single value from the top of the memory region
     #[inline]
     pub unsafe fn post_write_single<T>(
@@ -1374,8 +1389,7 @@ impl QueuePair {
         key: u32,
         wr_id: u64,
         sig: bool,
-    ) -> io::Result<()>
-    {
+    ) -> io::Result<()> {
         let mut sge = ffi::ibv_sge {
             addr: mr.as_ptr() as u64,
             length: mem::size_of::<T>() as u32,
@@ -1383,7 +1397,7 @@ impl QueuePair {
         };
         let flg = if sig {
             ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
-        }else{
+        } else {
             0
         };
 
@@ -1394,11 +1408,11 @@ impl QueuePair {
             num_sge: 1,
             opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
             send_flags: flg,
-            wr: ffi::ibv_send_wr__bindgen_ty_2{
-                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1{
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
                     remote_addr: addr,
                     rkey: key,
-                }
+                },
             },
             qp_type: Default::default(),
             __bindgen_anon_1: Default::default(),
@@ -1411,7 +1425,10 @@ impl QueuePair {
         let errno =
             ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
         if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("ERROR: Faile to write. errno={}", errno),
+            ))
         } else {
             Ok(())
         }
@@ -1426,8 +1443,7 @@ impl QueuePair {
         key: u32,
         wr_id: u64,
         sig: bool,
-    ) -> io::Result<()>
-    {
+    ) -> io::Result<()> {
         let mut sge = ffi::ibv_sge {
             addr: mr.as_ptr() as u64,
             length: mem::size_of::<T>() as u32,
@@ -1435,7 +1451,7 @@ impl QueuePair {
         };
         let flg = if sig {
             ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
-        }else{
+        } else {
             0
         };
 
@@ -1446,11 +1462,11 @@ impl QueuePair {
             num_sge: 1,
             opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_READ,
             send_flags: flg,
-            wr: ffi::ibv_send_wr__bindgen_ty_2{
-                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1{
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
                     remote_addr: addr,
                     rkey: key,
-                }
+                },
             },
             qp_type: Default::default(),
             __bindgen_anon_1: Default::default(),
@@ -1463,7 +1479,10 @@ impl QueuePair {
         let errno =
             ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
         if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("ERROR: Faile to read. errno={}", errno),
+            ))
         } else {
             Ok(())
         }
@@ -1480,7 +1499,11 @@ impl Drop for QueuePair {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("Could not destroy Queue Pair: errno={} err=\"{}\"", errno, e.description());
+            panic!(
+                "Could not destroy Queue Pair: errno={} err=\"{}\"",
+                errno,
+                e.description()
+            );
         }
     }
 }
