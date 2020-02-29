@@ -1044,7 +1044,7 @@ impl<T> MemoryRegion<T> {
     }
 
     pub fn size(&self) -> usize {
-        self.size()
+        self.size
     }
 }
 
