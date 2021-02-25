@@ -542,7 +542,8 @@ impl<'res> QueuePairBuilder<'res> {
 
     /// Set the access flags of the new `QueuePair` such that it allows remote reads and writes.
     pub fn allow_remote_rw(&mut self) -> &mut Self {
-        self.access = self.access | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+        self.access = self.access
+            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ;
         self
     }
@@ -827,7 +828,8 @@ impl<'res> PreparedQueuePair<'res> {
         attr.qp_access_flags = self.access.0;
         attr.pkey_index = 0;
         attr.port_num = PORT_NUM;
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
+            | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_PORT
             | ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
@@ -850,7 +852,8 @@ impl<'res> PreparedQueuePair<'res> {
         attr.ah_attr.port_num = PORT_NUM;
         attr.ah_attr.grh.dgid = remote.gid;
         attr.ah_attr.grh.hop_limit = 0xff;
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_AV
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
+            | ffi::ibv_qp_attr_mask::IBV_QP_AV
             | ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU
             | ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN
             | ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN
@@ -869,7 +872,8 @@ impl<'res> PreparedQueuePair<'res> {
         attr.sq_psn = 0;
         attr.rnr_retry = self.rnr_retry;
         attr.max_rd_atomic = 1;
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
+            | ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT
             | ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT
             | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN
             | ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY
