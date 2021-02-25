@@ -64,7 +64,6 @@
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 #![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
 
-use std::error::Error;
 use std::ffi::CStr;
 use std::io;
 use std::marker::PhantomData;
@@ -450,7 +449,7 @@ impl<'a> Drop for CompletionQueue<'a> {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("{}", e);
         }
     }
 }
@@ -925,7 +924,7 @@ impl<T> Drop for MemoryRegion<T> {
         let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("{}", e);
         }
     }
 }
@@ -1042,7 +1041,7 @@ impl<'a> Drop for ProtectionDomain<'a> {
         let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("{}", e);
         }
     }
 }
@@ -1231,7 +1230,7 @@ impl<'a> Drop for QueuePair<'a> {
         let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e.description());
+            panic!("{}", e);
         }
     }
 }
