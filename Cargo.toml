@@ -20,6 +20,8 @@ categories = ["network-programming", "api-bindings"]
 
 license = "MIT/Apache-2.0"
 
+exclude = ["vendor/rdma-core/build/"]
+
 [badges]
 travis-ci = { repository = "jonhoo/rust-ibverbs" }
 maintenance = { status = "looking-for-maintainer" }
