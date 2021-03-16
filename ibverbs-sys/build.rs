@@ -30,6 +30,7 @@ fn main() {
         .blacklist_type("max_align_t")
         .whitelist_function("ibv_.*")
         .whitelist_type("ibv_.*")
+        .whitelist_function("verbs_get_ctx_op")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_wc_flags")
