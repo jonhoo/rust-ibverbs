@@ -74,13 +74,6 @@ use std::sync::Arc;
 
 const PORT_NUM: u8 = 1;
 
-/// Direct access to low-level libverbs FFI.
-#[allow(non_upper_case_globals)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(missing_docs)]
-pub mod ffi;
-
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;

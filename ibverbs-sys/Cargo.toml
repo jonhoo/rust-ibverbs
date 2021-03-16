@@ -1,0 +1,19 @@
+[package]
+name = "ibverbs-sys"
+version = "0.4.2"
+description = "Direct bindgen bindings for RDMA ibverbs through rdma-core used by the ibverbs crate"
+authors = [
+    "Ricardo Delfin <me@rdelfin.com>",
+]
+edition = "2018"
+build = "build.rs"
+links = "ibverbs"
+
+keywords = ["rdma", "ibverbs", "networking", "ffi"]
+categories = ["network-programming", "api-bindings"]
+
+license = "MIT/Apache-2.0"
+
+[build-dependencies]
+bindgen = "0.36"
+serde = {version = "1.0.104", features = ["derive"] }

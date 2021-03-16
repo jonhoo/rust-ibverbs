@@ -1,32 +1,5 @@
-[package]
-name = "ibverbs"
-version = "0.4.2"
-
-description = "Bindings for RDMA ibverbs through rdma-core"
-readme = "README.md"
-authors = [
-    "Jon Gjengset <jon@thesquareplanet.com>",
-    "Jonathan Behrens <fintelia@gmail.com>"
+[workspace]
+members = [
+    "ibverbs",
+    "ibverbs-sys",
 ]
-build = "build.rs"
-links = "ibverbs"
-
-homepage = "https://github.com/jonhoo/rust-ibverbs"
-repository = "https://github.com/jonhoo/rust-ibverbs.git"
-documentation = "https://docs.rs/ibverbs/"
-
-keywords = ["rdma", "ibverbs", "networking", "ffi"]
-categories = ["network-programming", "api-bindings"]
-
-license = "MIT/Apache-2.0"
-
-[badges]
-travis-ci = { repository = "jonhoo/rust-ibverbs" }
-maintenance = { status = "looking-for-maintainer" }
-
-[dependencies]
-serde = {version = "1.0.104", features = ["derive"] }
-
-[build-dependencies]
-bindgen = "0.36"
-serde = {version = "1.0.104", features = ["derive"] }

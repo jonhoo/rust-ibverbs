@@ -1,6 +1,6 @@
 [submodule "vendor/rdma-core"]
-	path = vendor/rdma-core
+	path = ibverbs-sys/vendor/rdma-core
 	url = https://github.com/linux-rdma/rdma-core.git
 [submodule "vendor/bindgen"]
-	path = vendor/bindgen
+	path = ibverbs-sys/vendor/bindgen
 	url = https://github.com/servo/rust-bindgen.git
