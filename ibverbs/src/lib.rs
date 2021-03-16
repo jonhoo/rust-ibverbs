@@ -63,7 +63,6 @@
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 extern crate serde;
 
-use std::error::Error;
 use std::ffi::CStr;
 use std::io;
 // use std::marker::PhantomData;
@@ -473,7 +472,7 @@ impl Drop for CompletionQueue {
             panic!(
                 "Could not destroy Completion Queue: errno={} err=\"{}\"",
                 errno,
-                e.description()
+                e.to_string()
             );
         }
     }
@@ -982,7 +981,7 @@ impl Drop for PreparedQueuePair {
 
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("PANIC: cannot query QP while dropping: {}", e.description());
+            panic!("PANIC: cannot query QP while dropping: {}", e.to_string());
         }
 
         // QP is initialized and not will be controlled by QueuePair struct, thus it
@@ -1000,7 +999,7 @@ impl Drop for PreparedQueuePair {
             panic!(
                 "Could not destroy Prepared Queue Pair: errno={} err=\"{}\"",
                 errno,
-                e.description()
+                e.to_string()
             );
         }
     }
@@ -1061,7 +1060,7 @@ impl<T> Drop for MemoryRegion<T> {
             panic!(
                 "Could not deregister Memory Region: errno={} err=\"{}\"",
                 errno,
-                e.description()
+                e.to_string()
             );
         }
     }
@@ -1186,7 +1185,7 @@ impl Drop for ProtectionDomain {
             panic!(
                 "Could not deallocate Protection Domain: errno={} err=\"{}\"",
                 errno,
-                e.description()
+                e.to_string()
             );
         }
     }
@@ -1542,7 +1541,7 @@ impl Drop for QueuePair {
             panic!(
                 "Could not destroy Queue Pair: errno={} err=\"{}\"",
                 errno,
-                e.description()
+                e.to_string()
             );
         }
     }
