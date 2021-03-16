@@ -284,7 +284,11 @@ impl Context {
         //
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe {
-            ffi::ibv_query_port(ctx, PORT_NUM, &mut port_attr as *mut ffi::ibv_port_attr)
+            ffi::ibv_query_port(
+                ctx,
+                PORT_NUM,
+                &mut port_attr as *mut ffi::_compat_ibv_port_attr,
+            )
         };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
