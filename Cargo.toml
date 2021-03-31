@@ -26,5 +26,16 @@ exclude = ["vendor/rdma-core/build/"]
 travis-ci = { repository = "jonhoo/rust-ibverbs" }
 maintenance = { status = "looking-for-maintainer" }
 
+[dependencies.serde]
+version = "1.0"
+optional = true
+features = ["derive"]
+
 [build-dependencies]
 bindgen = "0.36"
+
+[features]
+default = ["serde"]
+
+[dev-dependencies]
+bincode = "1.3"

@@ -766,14 +766,104 @@ pub struct PreparedQueuePair<'res> {
     rnr_retry: u8,
 }
 
+#[cfg(feature = "serde")]
+extern crate serde;
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
+
+// We go through this rigeramol because serde does now know how to derive unions.
+
+/// A (serde) serializable representation of a `QueuePairEndpoint`.
+#[derive(Copy, Clone, Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct PortableQPEndpoint {
+    num: u32,
+    lid: u16,
+    gid_subnet_prefix: u64,
+    gid_interface_id: u64,
+}
+
+impl From<QueuePairEndpoint> for PortableQPEndpoint {
+    fn from(qpe: QueuePairEndpoint) -> PortableQPEndpoint {
+        PortableQPEndpoint {
+            num: qpe.num,
+            lid: qpe.lid,
+            // TODO: they're actually be64 and fixit
+            gid_subnet_prefix: unsafe { qpe.gid.global.subnet_prefix },
+            gid_interface_id: unsafe { qpe.gid.global.interface_id },
+        }
+    }
+}
+
+impl From<PortableQPEndpoint> for QueuePairEndpoint {
+    fn from(pqpe: PortableQPEndpoint) -> QueuePairEndpoint {
+        let mut gid = ffi::ibv_gid::default();
+        gid.global.subnet_prefix = pqpe.gid_subnet_prefix;
+        gid.global.interface_id = pqpe.gid_interface_id;
+        QueuePairEndpoint {
+            num: pqpe.num,
+            lid: pqpe.lid,
+            gid: gid,
+        }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod test_serde {
+    use super::*;
+    extern crate bincode;
+    #[test]
+    fn encode_decode() {
+        let qpe_default = QueuePairEndpoint {
+            num: 72,
+            lid: 9,
+            gid: Default::default(),
+        };
+
+        let mut qpe = qpe_default;
+        qpe.gid.global.subnet_prefix = 87;
+        qpe.gid.global.interface_id = 192;
+        let encoded = bincode::serialize(&qpe).unwrap();
+
+        let decoded: QueuePairEndpoint = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(qpe, decoded);
+        assert_ne!(qpe, qpe_default);
+    }
+}
+
 /// An identifier for the network endpoint of a `QueuePair`.
 ///
 /// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
 #[derive(Copy, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "PortableQPEndpoint"))]
+#[cfg_attr(feature = "serde", serde(into = "PortableQPEndpoint"))]
 pub struct QueuePairEndpoint {
     num: u32,
     lid: u16,
     gid: ffi::ibv_gid,
+}
+
+impl PartialEq<QueuePairEndpoint> for QueuePairEndpoint {
+    fn eq(&self, rhs: &QueuePairEndpoint) -> bool {
+        self.num == rhs.num
+            && self.lid == rhs.lid
+            && unsafe {
+                self.gid.global.subnet_prefix == rhs.gid.global.subnet_prefix
+                    && self.gid.global.interface_id == rhs.gid.global.interface_id
+            }
+    }
+}
+
+impl std::fmt::Debug for QueuePairEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f,"QueuePairEndpoint {{ num: {:?}, lid: {:?}, gid_subnet_prefix: {:?}, gid_interface_id: {:?} }}",
+        self.num,
+        self.lid,
+        unsafe{self.gid.global.subnet_prefix},
+        unsafe{self.gid.global.interface_id},
+        )
+    }
 }
 
 impl<'res> PreparedQueuePair<'res> {
