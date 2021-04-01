@@ -776,11 +776,11 @@ use serde::{Deserialize, Serialize};
 /// A (serde) serializable representation of a `QueuePairEndpoint`.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[doc(hidden)]
 pub struct PortableQPEndpoint {
     num: u32,
     lid: u16,
-    gid_subnet_prefix: u64,
-    gid_interface_id: u64,
+    gid_raw: [u8; 16],
 }
 
 impl From<QueuePairEndpoint> for PortableQPEndpoint {
@@ -788,9 +788,7 @@ impl From<QueuePairEndpoint> for PortableQPEndpoint {
         PortableQPEndpoint {
             num: qpe.num,
             lid: qpe.lid,
-            // TODO: they're actually be64 and fixit
-            gid_subnet_prefix: unsafe { qpe.gid.global.subnet_prefix },
-            gid_interface_id: unsafe { qpe.gid.global.interface_id },
+            gid_raw: unsafe { qpe.gid.raw },
         }
     }
 }
@@ -798,12 +796,11 @@ impl From<QueuePairEndpoint> for PortableQPEndpoint {
 impl From<PortableQPEndpoint> for QueuePairEndpoint {
     fn from(pqpe: PortableQPEndpoint) -> QueuePairEndpoint {
         let mut gid = ffi::ibv_gid::default();
-        gid.global.subnet_prefix = pqpe.gid_subnet_prefix;
-        gid.global.interface_id = pqpe.gid_interface_id;
+        gid.raw = pqpe.gid_raw;
         QueuePairEndpoint {
             num: pqpe.num,
             lid: pqpe.lid,
-            gid: gid,
+            gid,
         }
     }
 }
@@ -846,22 +843,16 @@ pub struct QueuePairEndpoint {
 
 impl PartialEq<QueuePairEndpoint> for QueuePairEndpoint {
     fn eq(&self, rhs: &QueuePairEndpoint) -> bool {
-        self.num == rhs.num
-            && self.lid == rhs.lid
-            && unsafe {
-                self.gid.global.subnet_prefix == rhs.gid.global.subnet_prefix
-                    && self.gid.global.interface_id == rhs.gid.global.interface_id
-            }
+        self.num == rhs.num && self.lid == rhs.lid && unsafe { self.gid.raw == rhs.gid.raw }
     }
 }
 
 impl std::fmt::Debug for QueuePairEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f,"QueuePairEndpoint {{ num: {:?}, lid: {:?}, gid_subnet_prefix: {:?}, gid_interface_id: {:?} }}",
-        self.num,
-        self.lid,
-        unsafe{self.gid.global.subnet_prefix},
-        unsafe{self.gid.global.interface_id},
+        write!(
+            f,
+            "QueuePairEndpoint {{ num: {:?}, lid: {:?}, gid: union not shown }}",
+            self.num, self.lid,
         )
     }
 }
