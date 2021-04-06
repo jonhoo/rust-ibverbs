@@ -64,6 +64,7 @@
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 #![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
 
+use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
 use std::marker::PhantomData;
@@ -84,6 +85,9 @@ pub use ffi::ibv_qp_type;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
 pub use ffi::ibv_wc_status;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Access flags for use with `QueuePair` and `MemoryRegion`.
 pub use ffi::ibv_access_flags;
@@ -260,7 +264,7 @@ impl<'devlist> Device<'devlist> {
 pub struct Context {
     ctx: *mut ffi::ibv_context,
     port_attr: ffi::ibv_port_attr,
-    gid: ffi::ibv_gid,
+    gid: Gid,
 }
 
 unsafe impl Sync for Context {}
@@ -308,8 +312,9 @@ impl Context {
             }
         }
 
-        let mut gid = ffi::ibv_gid::default();
-        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, &mut gid as *mut _) };
+        // let mut gid = ffi::ibv_gid::default();
+        let mut gid = Gid::default();
+        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.ffi()) };
         if ok != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -766,95 +771,78 @@ pub struct PreparedQueuePair<'res> {
     rnr_retry: u8,
 }
 
-#[cfg(feature = "serde")]
-extern crate serde;
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
-// We go through this rigeramol because serde does now know how to derive unions.
-
-/// A (serde) serializable representation of a `QueuePairEndpoint`.
-#[derive(Copy, Clone, Debug)]
+/// A Global identifier for ibv.
+///
+/// This struct acts as a rust wrapper for `ffi::ibv_gid`. We use it instead of
+/// `ffi::ibv_giv` because `ffi::ibv_gid` is actually an untagged union.
+///
+/// ```c
+/// union ibv_gid {
+///     uint8_t   raw[16];
+///     struct {
+/// 	    __be64	subnet_prefix;
+/// 	    __be64	interface_id;
+///     } global;
+/// };
+/// ```
+///
+/// It appears that `global` exists for convenience, but can be safely ignored.
+/// For continuity, the methods `subnet_prefix` and `interface_id` are provided.
+/// These methods read the array as big endian, regardless of native cpu
+/// endianness.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[doc(hidden)]
-pub struct PortableQPEndpoint {
-    num: u32,
-    lid: u16,
-    gid_raw: [u8; 16],
+#[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
+struct Gid {
+    raw: [u8; 16],
 }
 
-impl From<QueuePairEndpoint> for PortableQPEndpoint {
-    fn from(qpe: QueuePairEndpoint) -> PortableQPEndpoint {
-        PortableQPEndpoint {
-            num: qpe.num,
-            lid: qpe.lid,
-            gid_raw: unsafe { qpe.gid.raw },
+impl Gid {
+    /// Expose a pointer to the underlying `ffi::ibv_gid` object for use in ffi
+    /// calls.
+    fn ffi(&mut self) -> *mut ffi::ibv_gid {
+        self.raw.as_mut_ptr() as _
+    }
+
+    /// Expose the subnet_prefix component of the `Gid` as a u64. This is
+    /// equivalent to accessing the `global.subnet_prefix` component of the
+    /// `ffi::ibv_gid` union.
+    #[allow(dead_code)]
+    fn subnet_prefix(&self) -> u64 {
+        u64::from_be_bytes(self.raw[..8].try_into().unwrap())
+    }
+
+    /// Expose the interface_id component of the `Gid` as a u64. This is
+    /// equivalent to accessing the `global.interface_id` component of the
+    /// `ffi::ibv_gid` union.
+    #[allow(dead_code)]
+    fn interface_id(&self) -> u64 {
+        u64::from_be_bytes(self.raw[8..].try_into().unwrap())
+    }
+}
+
+impl From<ffi::ibv_gid> for Gid {
+    fn from(gid: ffi::ibv_gid) -> Self {
+        Self {
+            raw: unsafe { gid.raw },
         }
     }
 }
 
-impl From<PortableQPEndpoint> for QueuePairEndpoint {
-    fn from(pqpe: PortableQPEndpoint) -> QueuePairEndpoint {
-        let mut gid = ffi::ibv_gid::default();
-        gid.raw = pqpe.gid_raw;
-        QueuePairEndpoint {
-            num: pqpe.num,
-            lid: pqpe.lid,
-            gid,
-        }
-    }
-}
-
-#[cfg(all(test, feature = "serde"))]
-mod test_serde {
-    use super::*;
-    extern crate bincode;
-    #[test]
-    fn encode_decode() {
-        let qpe_default = QueuePairEndpoint {
-            num: 72,
-            lid: 9,
-            gid: Default::default(),
-        };
-
-        let mut qpe = qpe_default;
-        qpe.gid.global.subnet_prefix = 87;
-        qpe.gid.global.interface_id = 192;
-        let encoded = bincode::serialize(&qpe).unwrap();
-
-        let decoded: QueuePairEndpoint = bincode::deserialize(&encoded).unwrap();
-        assert_eq!(qpe, decoded);
-        assert_ne!(qpe, qpe_default);
+impl From<Gid> for ffi::ibv_gid {
+    fn from(mut gid: Gid) -> Self {
+        unsafe { *gid.ffi() }
     }
 }
 
 /// An identifier for the network endpoint of a `QueuePair`.
 ///
 /// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[cfg_attr(feature = "serde", serde(from = "PortableQPEndpoint"))]
-#[cfg_attr(feature = "serde", serde(into = "PortableQPEndpoint"))]
 pub struct QueuePairEndpoint {
     num: u32,
     lid: u16,
-    gid: ffi::ibv_gid,
-}
-
-impl PartialEq<QueuePairEndpoint> for QueuePairEndpoint {
-    fn eq(&self, rhs: &QueuePairEndpoint) -> bool {
-        self.num == rhs.num && self.lid == rhs.lid && unsafe { self.gid.raw == rhs.gid.raw }
-    }
-}
-
-impl std::fmt::Debug for QueuePairEndpoint {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "QueuePairEndpoint {{ num: {:?}, lid: {:?}, gid: union not shown }}",
-            self.num, self.lid,
-        )
-    }
+    gid: Gid,
 }
 
 impl<'res> PreparedQueuePair<'res> {
@@ -931,7 +919,7 @@ impl<'res> PreparedQueuePair<'res> {
         attr.ah_attr.sl = 0;
         attr.ah_attr.src_path_bits = 0;
         attr.ah_attr.port_num = PORT_NUM;
-        attr.ah_attr.grh.dgid = remote.gid;
+        attr.ah_attr.grh.dgid = remote.gid.into();
         attr.ah_attr.grh.hop_limit = 0xff;
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_AV
@@ -1317,5 +1305,29 @@ impl<'a> Drop for QueuePair<'a> {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e);
         }
+    }
+}
+
+#[cfg(all(test, feature = "serde"))]
+mod test_serde {
+    use super::*;
+    extern crate bincode;
+    #[test]
+    fn encode_decode() {
+        let qpe_default = QueuePairEndpoint {
+            num: 72,
+            lid: 9,
+            gid: Default::default(),
+        };
+
+        let mut qpe = qpe_default;
+        qpe.gid.raw = unsafe { std::mem::transmute([87_u64.to_be(), 192_u64.to_be()]) };
+        let encoded = bincode::serialize(&qpe).unwrap();
+
+        let decoded: QueuePairEndpoint = bincode::deserialize(&encoded).unwrap();
+        assert_eq!(decoded.gid.subnet_prefix(), 87);
+        assert_eq!(decoded.gid.interface_id(), 192);
+        assert_eq!(qpe, decoded);
+        assert_ne!(qpe, qpe_default);
     }
 }
