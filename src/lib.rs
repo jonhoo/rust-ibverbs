@@ -314,7 +314,7 @@ impl Context {
 
         // let mut gid = ffi::ibv_gid::default();
         let mut gid = Gid::default();
-        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.ffi()) };
+        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.as_mut() as _) };
         if ok != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -791,18 +791,13 @@ pub struct PreparedQueuePair<'res> {
 /// These methods read the array as big endian, regardless of native cpu
 /// endianness.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Default, Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
 struct Gid {
     raw: [u8; 16],
 }
 
 impl Gid {
-    /// Expose a pointer to the underlying `ffi::ibv_gid` object for use in ffi
-    /// calls.
-    fn ffi(&mut self) -> *mut ffi::ibv_gid {
-        self.raw.as_mut_ptr() as _
-    }
-
     /// Expose the subnet_prefix component of the `Gid` as a u64. This is
     /// equivalent to accessing the `global.subnet_prefix` component of the
     /// `ffi::ibv_gid` union.
@@ -830,7 +825,25 @@ impl From<ffi::ibv_gid> for Gid {
 
 impl From<Gid> for ffi::ibv_gid {
     fn from(mut gid: Gid) -> Self {
-        unsafe { *gid.ffi() }
+        *gid.as_mut()
+    }
+}
+
+impl AsRef<ffi::ibv_gid> for Gid {
+    fn as_ref(&self) -> &ffi::ibv_gid {
+        unsafe { self.raw.as_ptr().cast::<ffi::ibv_gid>().as_ref().unwrap() }
+    }
+}
+
+impl AsMut<ffi::ibv_gid> for Gid {
+    fn as_mut(&mut self) -> &mut ffi::ibv_gid {
+        unsafe {
+            self.raw
+                .as_mut_ptr()
+                .cast::<ffi::ibv_gid>()
+                .as_mut()
+                .unwrap()
+        }
     }
 }
 
