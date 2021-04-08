@@ -314,7 +314,7 @@ impl Context {
 
         // let mut gid = ffi::ibv_gid::default();
         let mut gid = Gid::default();
-        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.as_mut() as _) };
+        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.as_mut()) };
         if ok != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -831,19 +831,13 @@ impl From<Gid> for ffi::ibv_gid {
 
 impl AsRef<ffi::ibv_gid> for Gid {
     fn as_ref(&self) -> &ffi::ibv_gid {
-        unsafe { self.raw.as_ptr().cast::<ffi::ibv_gid>().as_ref().unwrap() }
+        unsafe { &*self.raw.as_ptr().cast::<ffi::ibv_gid>() }
     }
 }
 
 impl AsMut<ffi::ibv_gid> for Gid {
     fn as_mut(&mut self) -> &mut ffi::ibv_gid {
-        unsafe {
-            self.raw
-                .as_mut_ptr()
-                .cast::<ffi::ibv_gid>()
-                .as_mut()
-                .unwrap()
-        }
+        unsafe { &mut *self.raw.as_mut_ptr().cast::<ffi::ibv_gid>() }
     }
 }
 
