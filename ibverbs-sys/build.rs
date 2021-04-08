@@ -1,5 +1,6 @@
 extern crate bindgen;
 
+use cmake;
 use std::env;
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,16 +17,17 @@ fn main() {
         .expect("Failed to update submodules.");
 
     // build vendor/rdma-core
-    Command::new("bash")
-        .current_dir("vendor/rdma-core/")
-        .args(&["build.sh"])
-        .status()
-        .expect("Failed to build vendor/rdma-core using build.sh");
+    let dst = cmake::Config::new("vendor/rdma-core")
+        .define("NO_MAN_PAGES", "1")
+        .build();
 
     // generate the bindings
     let bindings = bindgen::Builder::default()
-        .header("vendor/rdma-core/libibverbs/verbs.h")
-        .clang_arg("-Ivendor/rdma-core/build/include/")
+        .header(format!(
+            "{}/build/include/infiniband/verbs.h",
+            dst.to_str().unwrap()
+        ))
+        .clang_arg(format!("-I{}/build/include/", dst.to_str().unwrap()))
         // https://github.com/servo/rust-bindgen/issues/550
         .blacklist_type("max_align_t")
         .whitelist_function("ibv_.*")
