@@ -5,7 +5,6 @@ description = "Direct bindgen bindings for RDMA ibverbs through rdma-core used b
 authors = [
     "Jon Gjengset <jon@thesquareplanet.com>",
     "Jonathan Behrens <fintelia@gmail.com>"
-    "Ricardo Delfin <me@rdelfin.com>",
 ]
 edition = "2018"
 build = "build.rs"
