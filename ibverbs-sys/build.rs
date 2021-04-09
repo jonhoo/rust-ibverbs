@@ -11,14 +11,14 @@ fn main() {
     println!("cargo:rustc-link-lib=ibverbs");
 
     // initialize and update submodules
-    if Path::new(".git").is_dir() {
+    if Path::new("../.git").is_dir() {
         Command::new("git")
             .args(&["submodule", "update", "--init"])
             .status()
             .expect("Failed to update submodules.");
     } else {
         assert!(
-            Path::new("vendor/rdma-core").is_dir(),
+            Path::new("ibverbs-sys/vendor/rdma-core").is_dir(),
             "vendor source not included"
         );
     }
