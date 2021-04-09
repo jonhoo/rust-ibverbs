@@ -60,25 +60,18 @@
 //! [RDMAmojo]: http://www.rdmamojo.com/
 //! [1]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 
-#![deny(missing_docs)]
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
-#![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
+extern crate serde;
 
 use std::ffi::CStr;
 use std::io;
-use std::marker::PhantomData;
+// use std::marker::PhantomData;
 use std::mem;
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::Arc;
 
 const PORT_NUM: u8 = 1;
-
-/// Direct access to low-level libverbs FFI.
-#[allow(non_upper_case_globals)]
-#[allow(non_camel_case_types)]
-#[allow(non_snake_case)]
-#[allow(missing_docs)]
-pub mod ffi;
 
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_wc;
@@ -199,7 +192,7 @@ impl<'devlist> Device<'devlist> {
     ///  - `ENOMEM`: Out of memory (from `ibv_query_port_attr`).
     ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
     ///  - Other: the device is not in `ACTIVE` or `ARMED` state.
-    pub fn open(&self) -> io::Result<Context> {
+    pub fn open(&self) -> io::Result<Arc<Context>> {
         Context::with_device(*self.0)
     }
 
@@ -256,6 +249,9 @@ impl<'devlist> Device<'devlist> {
     }
 }
 
+/// RDMA device attributes
+pub type DeviceAttr = ffi::ibv_device_attr;
+
 /// An RDMA context bound to a device.
 pub struct Context {
     ctx: *mut ffi::ibv_context,
@@ -268,14 +264,14 @@ unsafe impl Send for Context {}
 
 impl Context {
     /// Opens a context for the given device, and queries its port and gid.
-    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
+    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Arc<Context>> {
         assert!(!dev.is_null());
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
         if ctx.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                "failed to open device".to_string(),
+                "failed to open device",
             ));
         }
 
@@ -287,7 +283,15 @@ impl Context {
         //   (re)configures the subnet.
         //
         let mut port_attr = ffi::ibv_port_attr::default();
-        let errno = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, &mut port_attr as *mut _) };
+        let errno = unsafe {
+            ffi::ibv_query_port(
+                ctx,
+                PORT_NUM,
+                // ibv_port_attr can safely be cast to a _compat_ibv_port_attr as the former is a
+                // superset of the latter
+                &mut port_attr as *mut ffi::ibv_port_attr as *mut ffi::_compat_ibv_port_attr,
+            )
+        };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -314,11 +318,11 @@ impl Context {
             return Err(io::Error::last_os_error());
         }
 
-        Ok(Context {
+        Ok(Arc::new(Context {
             ctx,
             port_attr,
             gid,
-        })
+        }))
     }
 
     /// Create a completion queue (CQ).
@@ -355,7 +359,7 @@ impl Context {
             Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
-                _phantom: PhantomData,
+                // _phantom: PhantomData,
                 cq: cq,
             })
         }
@@ -368,33 +372,53 @@ impl Context {
     /// A protection domain is a means of protection, and helps you create a group of object that
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
-    pub fn alloc_pd(&self) -> Result<ProtectionDomain, ()> {
+    pub fn alloc_pd(self: Arc<Self>) -> Result<ProtectionDomain, ()> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.ctx) };
         if pd.is_null() {
             Err(())
         } else {
-            Ok(ProtectionDomain { ctx: self, pd })
+            Ok(ProtectionDomain {
+                ctx: self.clone(),
+                pd,
+            })
         }
+    }
+
+    /// Query corresponding device
+    pub fn query_device(&self) -> io::Result<DeviceAttr> {
+        let mut dev_attrs = Default::default();
+
+        let ret = unsafe { ffi::ibv_query_device(self.ctx, &mut dev_attrs) };
+
+        if ret != 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(dev_attrs)
     }
 }
 
 impl Drop for Context {
     fn drop(&mut self) {
-        let ok = unsafe { ffi::ibv_close_device(self.ctx) };
+        let ok = if !self.ctx.is_null() {
+            unsafe { ffi::ibv_close_device(self.ctx) }
+        } else {
+            0
+        };
         assert_eq!(ok, 0);
     }
 }
 
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
-pub struct CompletionQueue<'ctx> {
-    _phantom: PhantomData<&'ctx ()>,
+pub struct CompletionQueue {
+    // _phantom: PhantomData<&'ctx ()>,
     cq: *mut ffi::ibv_cq,
 }
 
-unsafe impl<'a> Send for CompletionQueue<'a> {}
-unsafe impl<'a> Sync for CompletionQueue<'a> {}
+unsafe impl Send for CompletionQueue {}
+unsafe impl Sync for CompletionQueue {}
 
-impl<'ctx> CompletionQueue<'ctx> {
+impl<'ctx> CompletionQueue {
     /// Poll for (possibly multiple) work completions.
     ///
     /// A Work Completion indicates that a Work Request in a Work Queue, and all of the outstanding
@@ -444,12 +468,20 @@ impl<'ctx> CompletionQueue<'ctx> {
     }
 }
 
-impl<'a> Drop for CompletionQueue<'a> {
+impl Drop for CompletionQueue {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        let errno = if !self.cq.is_null() {
+            unsafe { ffi::ibv_destroy_cq(self.cq) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!(
+                "Could not destroy Completion Queue: errno={} err=\"{}\"",
+                errno,
+                e.to_string()
+            );
         }
     }
 }
@@ -462,11 +494,11 @@ impl<'a> Drop for CompletionQueue<'a> {
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 pub struct QueuePairBuilder<'res> {
     ctx: isize,
-    pd: &'res ProtectionDomain<'res>,
+    pd: &'res ProtectionDomain,
 
-    send: &'res CompletionQueue<'res>,
+    send: &'res CompletionQueue,
     max_send_wr: u32,
-    recv: &'res CompletionQueue<'res>,
+    recv: &'res CompletionQueue,
     max_recv_wr: u32,
 
     max_send_sge: u32,
@@ -695,7 +727,7 @@ impl<'res> QueuePairBuilder<'res> {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
-    pub fn build(&self) -> io::Result<PreparedQueuePair<'res>> {
+    pub fn build(&self) -> io::Result<PreparedQueuePair> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
             send_cq: self.send.cq as *const _ as *mut _,
@@ -717,8 +749,9 @@ impl<'res> QueuePairBuilder<'res> {
             Err(io::Error::last_os_error())
         } else {
             Ok(PreparedQueuePair {
-                ctx: self.pd.ctx,
+                ctx: self.pd.ctx.clone(),
                 qp: qp,
+                connected: false,
 
                 access: self.access,
                 timeout: self.timeout,
@@ -754,9 +787,11 @@ impl<'res> QueuePairBuilder<'res> {
 /// let host1end = host1.recv();
 /// let qp = pqp.handshake(host1end);
 /// ```
-pub struct PreparedQueuePair<'res> {
-    ctx: &'res Context,
+#[derive(Clone)]
+pub struct PreparedQueuePair {
+    ctx: Arc<Context>,
     qp: *mut ffi::ibv_qp,
+    connected: bool,
 
     // carried from builder
     access: ffi::ibv_access_flags,
@@ -769,14 +804,57 @@ pub struct PreparedQueuePair<'res> {
 /// An identifier for the network endpoint of a `QueuePair`.
 ///
 /// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
-#[derive(Copy, Clone)]
+#[derive(Clone)]
 pub struct QueuePairEndpoint {
     num: u32,
     lid: u16,
     gid: ffi::ibv_gid,
 }
 
-impl<'res> PreparedQueuePair<'res> {
+use serde::{Deserialize, Serialize};
+
+/// A wrapper around `QueuePairEndpoint` with addintional `rkey` and `raddr` field. Intended to be sent to the peer.
+// TODO: write more thoughout documentation for fields.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct EndpointMsg {
+    /// num
+    pub num: u32,
+    /// lid
+    pub lid: u16,
+    /// gid
+    pub gid: [u8; 16usize],
+    /// rkey
+    pub rkey: RemoteKey,
+    /// raddr
+    pub raddr: RemoteAddr,
+}
+
+impl From<QueuePairEndpoint> for EndpointMsg {
+    fn from(q: QueuePairEndpoint) -> EndpointMsg {
+        let gid = unsafe { q.gid.raw };
+        EndpointMsg {
+            num: q.num,
+            lid: q.lid,
+            gid: gid,
+            rkey: RemoteKey(0),
+            raddr: RemoteAddr(0),
+        }
+    }
+}
+
+impl Into<QueuePairEndpoint> for EndpointMsg {
+    fn into(self) -> QueuePairEndpoint {
+        let gid = ffi::ibv_gid { raw: self.gid };
+
+        QueuePairEndpoint {
+            num: self.num,
+            lid: self.lid,
+            gid: gid,
+        }
+    }
+}
+
+impl PreparedQueuePair {
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
@@ -821,7 +899,7 @@ impl<'res> PreparedQueuePair<'res> {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
-    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair<'res>> {
+    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr::default();
         attr.qp_state = ffi::ibv_qp_state::IBV_QPS_INIT;
@@ -884,15 +962,61 @@ impl<'res> PreparedQueuePair<'res> {
         }
 
         Ok(QueuePair {
-            _phantom: PhantomData,
+            // _phantom: PhantomData,
             qp: self.qp,
         })
+    }
+}
+
+impl Drop for PreparedQueuePair {
+    fn drop(&mut self) {
+        if self.qp.is_null() {
+            return;
+        }
+        // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
+        let mut qp_attr = ffi::ibv_qp_attr::default();
+        let mut qp_init_attr = ffi::ibv_qp_init_attr::default();
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
+
+        let errno = unsafe {
+            ffi::ibv_query_qp(
+                self.qp,
+                &mut qp_attr as *mut _,
+                mask.0 as i32,
+                &mut qp_init_attr as *mut _,
+            )
+        };
+
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("PANIC: cannot query QP while dropping: {}", e.to_string());
+        }
+
+        // QP is initialized and not will be controlled by QueuePair struct, thus it
+        // should not be deallocated here;
+        if qp_attr.qp_state == ffi::ibv_qp_state::IBV_QPS_RTS
+            || qp_attr.qp_state == ffi::ibv_qp_state::IBV_QPS_RTR
+        {
+            return;
+        }
+
+        let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
+
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!(
+                "Could not destroy Prepared Queue Pair: errno={} err=\"{}\"",
+                errno,
+                e.to_string()
+            );
+        }
     }
 }
 
 /// A memory region that has been registered for use with RDMA.
 pub struct MemoryRegion<T> {
     mr: *mut ffi::ibv_mr,
+    size: usize,
     data: Vec<T>,
 }
 
@@ -918,31 +1042,48 @@ impl<T> MemoryRegion<T> {
     pub fn rkey(&self) -> RemoteKey {
         RemoteKey(unsafe { &*self.mr }.rkey)
     }
+
+    pub fn size(&self) -> usize {
+        self.size
+    }
 }
 
 /// A key that authorizes direct memory access to a memory region.
-pub struct RemoteKey(u32);
+#[derive(Copy, Clone, Deserialize, Serialize)]
+pub struct RemoteKey(pub u32);
+
+/// A remote address to perform RDMA operations on.
+#[derive(Copy, Clone, Deserialize, Serialize)]
+pub struct RemoteAddr(pub u64);
 
 impl<T> Drop for MemoryRegion<T> {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
+        let errno = if !self.mr.is_null() {
+            unsafe { ffi::ibv_dereg_mr(self.mr) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!(
+                "Could not deregister Memory Region: errno={} err=\"{}\"",
+                errno,
+                e.to_string()
+            );
         }
     }
 }
 
 /// A protection domain for a device's context.
-pub struct ProtectionDomain<'ctx> {
-    ctx: &'ctx Context,
+pub struct ProtectionDomain {
+    ctx: Arc<Context>,
     pd: *mut ffi::ibv_pd,
 }
 
-unsafe impl<'a> Sync for ProtectionDomain<'a> {}
-unsafe impl<'a> Send for ProtectionDomain<'a> {}
+unsafe impl Sync for ProtectionDomain {}
+unsafe impl Send for ProtectionDomain {}
 
-impl<'ctx> ProtectionDomain<'ctx> {
+impl ProtectionDomain {
     /// Creates a queue pair builder associated with this protection domain.
     ///
     /// `send` and `recv` are the device `Context` to associate with the send and receive queues
@@ -1019,7 +1160,7 @@ impl<'ctx> ProtectionDomain<'ctx> {
             ffi::ibv_reg_mr(
                 self.pd,
                 data.as_mut_ptr() as *mut _,
-                n * mem::size_of::<T>(),
+                (n * mem::size_of::<T>()) as u64,
                 access.0 as i32,
             )
         };
@@ -1035,17 +1176,25 @@ impl<'ctx> ProtectionDomain<'ctx> {
         if mr.is_null() {
             Err(io::Error::last_os_error())
         } else {
-            Ok(MemoryRegion { mr, data })
+            Ok(MemoryRegion { mr, size: n, data })
         }
     }
 }
 
-impl<'a> Drop for ProtectionDomain<'a> {
+impl Drop for ProtectionDomain {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
+        let errno = if !self.pd.is_null() {
+            unsafe { ffi::ibv_dealloc_pd(self.pd) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!(
+                "Could not deallocate Protection Domain: errno={} err=\"{}\"",
+                errno,
+                e.to_string()
+            );
         }
     }
 }
@@ -1057,15 +1206,24 @@ impl<'a> Drop for ProtectionDomain<'a> {
 /// which is maintained by the network stack and doesn't have a physical resource behind it. A QP
 /// is a resource of an RDMA device and a QP number can be used by one process at the same time
 /// (similar to a socket that is associated with a specific TCP or UDP port number)
-pub struct QueuePair<'res> {
-    _phantom: PhantomData<&'res ()>,
+pub struct QueuePair {
+    // _phantom: PhantomData<&'res ()>,
     qp: *mut ffi::ibv_qp,
 }
 
-unsafe impl<'a> Send for QueuePair<'a> {}
-unsafe impl<'a> Sync for QueuePair<'a> {}
+impl Default for QueuePair {
+    fn default() -> Self {
+        QueuePair {
+            // _phantom: Default::default(),
+            qp: std::ptr::null_mut(),
+        }
+    }
+}
 
-impl<'res> QueuePair<'res> {
+unsafe impl Send for QueuePair {}
+unsafe impl Sync for QueuePair {}
+
+impl QueuePair {
     /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
     ///
     /// Generates a HW-specific Send Request for the memory at `mr[range]`, and adds it to the tail
@@ -1226,15 +1384,173 @@ impl<'res> QueuePair<'res> {
             Ok(())
         }
     }
+
+    /// Write N values from the specified MR to the remote memory.
+    #[inline]
+    pub unsafe fn post_write_buf<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        n: usize,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()> {
+        assert!(
+            mr.size >= n,
+            "ERROR: cannot write {} values from a MR of size {}, MR is too small",
+            n,
+            mr.size
+        );
+
+        let mut sge = ffi::ibv_sge {
+            addr: mr.as_ptr() as u64,
+            length: (mem::size_of::<T>() * n) as u32,
+            lkey: (&*mr.mr).lkey,
+        };
+        let flg = if sig {
+            ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
+        } else {
+            0
+        };
+
+        let mut wr = ffi::ibv_send_wr {
+            wr_id: wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            send_flags: flg,
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: addr,
+                    rkey: key,
+                },
+            },
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let errno =
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        if errno != 0 {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("ERROR: Faile to write. errno={}", errno),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Write a single value from the top of the memory region
+    #[inline]
+    pub unsafe fn post_read_buf<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        n: usize,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()> {
+        assert!(
+            mr.size >= n,
+            "ERROR: cannot read {} values to a MR of size {}, MR is too small",
+            n,
+            mr.size
+        );
+
+        let mut sge = ffi::ibv_sge {
+            addr: mr.as_ptr() as u64,
+            length: (mem::size_of::<T>() * n) as u32,
+            lkey: (&*mr.mr).lkey,
+        };
+        let flg = if sig {
+            ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
+        } else {
+            0
+        };
+
+        let mut wr = ffi::ibv_send_wr {
+            wr_id: wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: &mut sge as *mut _,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_READ,
+            send_flags: flg,
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: addr,
+                    rkey: key,
+                },
+            },
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        let ctx = (&*self.qp).context;
+        let ops = &mut (&mut *ctx).ops;
+        let errno =
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        if errno != 0 {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("ERROR: Faile to read. errno={}", errno),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Write a single value from the top of the memory region
+    #[inline]
+    pub unsafe fn post_write_single<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()> {
+        self.post_write_buf(mr, 1, addr, key, wr_id, sig)
+    }
+
+    /// Write a single value from the top of the memory region
+    #[inline]
+    pub unsafe fn post_read_single<T>(
+        &self,
+        mr: &MemoryRegion<T>,
+        addr: u64,
+        key: u32,
+        wr_id: u64,
+        sig: bool,
+    ) -> io::Result<()> {
+        self.post_read_buf(mr, 1, addr, key, wr_id, sig)
+    }
 }
 
-impl<'a> Drop for QueuePair<'a> {
+impl Drop for QueuePair {
     fn drop(&mut self) {
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
-        let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
+        let errno = if !self.qp.is_null() {
+            unsafe { ffi::ibv_destroy_qp(self.qp) }
+        } else {
+            0
+        };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!(
+                "Could not destroy Queue Pair: errno={} err=\"{}\"",
+                errno,
+                e.to_string()
+            );
         }
     }
 }

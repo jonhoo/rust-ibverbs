@@ -1,5 +1,6 @@
 extern crate bindgen;
 
+use cmake;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -10,33 +11,47 @@ fn main() {
     println!("cargo:rustc-link-lib=ibverbs");
 
     // initialize and update submodules
-    if Path::new(".git").is_dir() {
+    if Path::new("../.git").is_dir() {
         Command::new("git")
             .args(&["submodule", "update", "--init"])
             .status()
             .expect("Failed to update submodules.");
     } else {
         assert!(
-            Path::new("vendor/rdma-core").is_dir(),
+            Path::new("ibverbs-sys/vendor/rdma-core").is_dir(),
             "vendor source not included"
         );
     }
 
     // build vendor/rdma-core
-    Command::new("bash")
-        .current_dir("vendor/rdma-core/")
-        .args(&["build.sh"])
-        .status()
-        .expect("Failed to build vendor/rdma-core using build.sh");
+    let dst = cmake::Config::new("vendor/rdma-core")
+        .define("NO_MAN_PAGES", "1")
+        .build();
+
+    let mut lib_dst = dst.clone();
+    lib_dst.push("lib");
+
+    let mut include_dst = dst.clone();
+    include_dst.push("include");
+
+    let mut verbs_header = dst.clone();
+    verbs_header.push("include");
+    verbs_header.push("infiniband");
+    verbs_header.push("verbs.h");
+
+    println!("cargo:include=native={}", include_dst.display());
+    println!("cargo:rustc-link-search=native={}", lib_dst.display());
+    println!("cargo:rustc-link-lib=ibverbs");
 
     // generate the bindings
     let bindings = bindgen::Builder::default()
-        .header("vendor/rdma-core/libibverbs/verbs.h")
-        .clang_arg("-Ivendor/rdma-core/build/include/")
+        .header(format!("{}", verbs_header.display()))
+        .clang_arg(format!("-I{}", include_dst.display()))
         // https://github.com/servo/rust-bindgen/issues/550
         .blacklist_type("max_align_t")
         .whitelist_function("ibv_.*")
         .whitelist_type("ibv_.*")
+        .whitelist_function("verbs_get_ctx_op")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_wc_flags")
