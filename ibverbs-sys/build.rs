@@ -28,13 +28,25 @@ fn main() {
         .define("NO_MAN_PAGES", "1")
         .build();
 
+    let mut lib_dst = dst.clone();
+    lib_dst.push("lib");
+
+    let mut include_dst = dst.clone();
+    include_dst.push("include");
+
+    let mut verbs_header = dst.clone();
+    verbs_header.push("include");
+    verbs_header.push("infiniband");
+    verbs_header.push("verbs.h");
+
+    println!("cargo:include=native={}/lib", lib_dst.display());
+    println!("cargo:rustc-link-search=native={}", include_dst.display());
+    println!("cargo:rustc-link-lib=ibverbs");
+
     // generate the bindings
     let bindings = bindgen::Builder::default()
-        .header(format!(
-            "{}/build/include/infiniband/verbs.h",
-            dst.to_str().unwrap()
-        ))
-        .clang_arg(format!("-I{}/build/include/", dst.to_str().unwrap()))
+        .header(format!("{}", verbs_header.display()))
+        .clang_arg(format!("-I{}", include_dst.display()))
         // https://github.com/servo/rust-bindgen/issues/550
         .blacklist_type("max_align_t")
         .whitelist_function("ibv_.*")
