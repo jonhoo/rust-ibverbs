@@ -39,8 +39,8 @@ fn main() {
     verbs_header.push("infiniband");
     verbs_header.push("verbs.h");
 
-    println!("cargo:include=native={}/lib", lib_dst.display());
-    println!("cargo:rustc-link-search=native={}", include_dst.display());
+    println!("cargo:include=native={}", include_dst.display());
+    println!("cargo:rustc-link-search=native={}", lib_dst.display());
     println!("cargo:rustc-link-lib=ibverbs");
 
     // generate the bindings
