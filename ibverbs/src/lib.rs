@@ -1065,11 +1065,15 @@ impl<T> Drop for MemoryRegion<T> {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
+<<<<<<< HEAD:ibverbs/src/lib.rs
             panic!(
                 "Could not deregister Memory Region: errno={} err=\"{}\"",
                 errno,
                 e.to_string()
             );
+=======
+            panic!("{}", e);
+>>>>>>> jonhoo-master:src/lib.rs
         }
     }
 }
@@ -1190,11 +1194,15 @@ impl Drop for ProtectionDomain {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
+<<<<<<< HEAD:ibverbs/src/lib.rs
             panic!(
                 "Could not deallocate Protection Domain: errno={} err=\"{}\"",
                 errno,
                 e.to_string()
             );
+=======
+            panic!("{}", e);
+>>>>>>> jonhoo-master:src/lib.rs
         }
     }
 }
@@ -1546,11 +1554,15 @@ impl Drop for QueuePair {
         };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
+<<<<<<< HEAD:ibverbs/src/lib.rs
             panic!(
                 "Could not destroy Queue Pair: errno={} err=\"{}\"",
                 errno,
                 e.to_string()
             );
+=======
+            panic!("{}", e);
+>>>>>>> jonhoo-master:src/lib.rs
         }
     }
 }

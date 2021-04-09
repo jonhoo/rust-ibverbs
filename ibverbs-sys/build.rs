@@ -2,7 +2,7 @@ extern crate bindgen;
 
 use cmake;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
@@ -11,10 +11,17 @@ fn main() {
     println!("cargo:rustc-link-lib=ibverbs");
 
     // initialize and update submodules
-    Command::new("git")
-        .args(&["submodule", "update", "--init"])
-        .status()
-        .expect("Failed to update submodules.");
+    if Path::new(".git").is_dir() {
+        Command::new("git")
+            .args(&["submodule", "update", "--init"])
+            .status()
+            .expect("Failed to update submodules.");
+    } else {
+        assert!(
+            Path::new("vendor/rdma-core").is_dir(),
+            "vendor source not included"
+        );
+    }
 
     // build vendor/rdma-core
     let dst = cmake::Config::new("vendor/rdma-core")

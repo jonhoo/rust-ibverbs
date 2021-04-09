@@ -3,6 +3,8 @@ name = "ibverbs-sys"
 version = "0.4.2"
 description = "Direct bindgen bindings for RDMA ibverbs through rdma-core used by the ibverbs crate"
 authors = [
+    "Jon Gjengset <jon@thesquareplanet.com>",
+    "Jonathan Behrens <fintelia@gmail.com>"
     "Ricardo Delfin <me@rdelfin.com>",
 ]
 edition = "2018"
