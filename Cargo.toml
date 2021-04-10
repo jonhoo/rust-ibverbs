@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs"
-version = "0.4.5"
+version = "0.5.0"
 edition = "2018"
 
 description = "Bindings for RDMA ibverbs through rdma-core"
