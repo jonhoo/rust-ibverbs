@@ -61,6 +61,7 @@
 //! [1]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 
 #![deny(missing_docs)]
+#![warn(rust_2018_idioms)]
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 #![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
 
@@ -132,7 +133,7 @@ impl Drop for DeviceList {
 
 impl DeviceList {
     /// Returns an iterator over all found devices.
-    pub fn iter(&self) -> DeviceListIter {
+    pub fn iter(&self) -> DeviceListIter<'_> {
         DeviceListIter { list: self, i: 0 }
     }
 
@@ -147,7 +148,7 @@ impl DeviceList {
     }
 
     /// Returns the device at the given `index`, or `None` if out of bounds.
-    pub fn get(&self, index: usize) -> Option<Device> {
+    pub fn get(&self, index: usize) -> Option<Device<'_>> {
         self.0.get(index).map(|d| d.into())
     }
 }
@@ -345,7 +346,7 @@ impl Context {
     ///
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
     ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
+    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue<'_>> {
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx,
@@ -361,7 +362,7 @@ impl Context {
         } else {
             Ok(CompletionQueue {
                 _phantom: PhantomData,
-                cq: cq,
+                cq,
             })
         }
     }
@@ -373,7 +374,7 @@ impl Context {
     /// A protection domain is a means of protection, and helps you create a group of object that
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
-    pub fn alloc_pd(&self) -> Result<ProtectionDomain, ()> {
+    pub fn alloc_pd(&self) -> Result<ProtectionDomain<'_>, ()> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.ctx) };
         if pd.is_null() {
             Err(())
@@ -502,10 +503,10 @@ impl<'res> QueuePairBuilder<'res> {
     /// Work Requests than the maximum reported value. This value is ignored if the Queue Pair is
     /// associated with an SRQ
     fn new<'scq, 'rcq, 'pd>(
-        pd: &'pd ProtectionDomain,
-        send: &'scq CompletionQueue,
+        pd: &'pd ProtectionDomain<'_>,
+        send: &'scq CompletionQueue<'_>,
         max_send_wr: u32,
-        recv: &'rcq CompletionQueue,
+        recv: &'rcq CompletionQueue<'_>,
         max_recv_wr: u32,
         qp_type: ffi::ibv_qp_type::Type,
     ) -> QueuePairBuilder<'res>
@@ -516,7 +517,7 @@ impl<'res> QueuePairBuilder<'res> {
     {
         QueuePairBuilder {
             ctx: 0,
-            pd: pd,
+            pd,
 
             send,
             max_send_wr,
@@ -723,7 +724,7 @@ impl<'res> QueuePairBuilder<'res> {
         } else {
             Ok(PreparedQueuePair {
                 ctx: self.pd.ctx,
-                qp: qp,
+                qp,
 
                 access: self.access,
                 timeout: self.timeout,
@@ -1034,8 +1035,8 @@ impl<'ctx> ProtectionDomain<'ctx> {
     /// the resulting `QueuePair`.
     pub fn create_qp<'pd, 'scq, 'rcq, 'res>(
         &'pd self,
-        send: &'scq CompletionQueue,
-        recv: &'rcq CompletionQueue,
+        send: &'scq CompletionQueue<'_>,
+        recv: &'rcq CompletionQueue<'_>,
         qp_type: ffi::ibv_qp_type::Type,
     ) -> QueuePairBuilder<'res>
     where
@@ -1318,7 +1319,6 @@ impl<'a> Drop for QueuePair<'a> {
 #[cfg(all(test, feature = "serde"))]
 mod test_serde {
     use super::*;
-    extern crate bincode;
     #[test]
     fn encode_decode() {
         let qpe_default = QueuePairEndpoint {

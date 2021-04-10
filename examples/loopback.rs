@@ -1,5 +1,3 @@
-extern crate ibverbs;
-
 fn main() {
     let ctx = ibverbs::devices()
         .unwrap()
@@ -12,7 +10,8 @@ fn main() {
     let cq = ctx.create_cq(16, 0).unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
-    let qp_builder = pd.create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
+    let qp_builder = pd
+        .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
         .build()
         .unwrap();
 
