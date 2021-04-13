@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/ibverbs/badge.svg)](https://docs.rs/ibverbs/)
 [![Build Status](https://travis-ci.org/jonhoo/rust-ibverbs.svg?branch=master)](https://travis-ci.org/jonhoo/rust-ibverbs)
 
-Rust API wrapping the `ibverbs` RDMA library.
+Rust API wrapping the `ibverbs` Remote Direct Memory Access (RDMA) library.
 
 `libibverbs` is a library that allows userspace processes to use RDMA "verbs" to perform
 high-throughput, low-latency network operations for both Infiniband (according to the
