@@ -292,7 +292,9 @@ impl Context {
         //   (re)configures the subnet.
         //
         let mut port_attr = ffi::ibv_port_attr::default();
-        let errno = unsafe { ffi::ibv_query_port(ctx, PORT_NUM, &mut port_attr as *mut _) };
+        let errno = unsafe {
+            ffi::ibv_query_port(ctx, PORT_NUM, &mut port_attr as *mut ffi::ibv_port_attr as *mut _)
+        };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
