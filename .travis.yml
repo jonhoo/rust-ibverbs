@@ -5,7 +5,7 @@ group: edge
 script:
   - ./scripts/ci.sh
   - cargo build --verbose
-  - cargo test --verbose
+  - cargo test --verbose -- --test-threads=1
 addons:
   apt:
     packages:
