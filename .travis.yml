@@ -4,9 +4,12 @@ sudo: true
 group: edge
 script:
   - sudo apt-get install --yes linux-modules-extra-"$(uname --kernel-release)"
+  - cargo install cargo-valgrind
   - ./scripts/ci.sh
   - cargo build --verbose
-  - cargo test --verbose -- --test-threads=1
+  - for t in ./target/debug/deps/integration-*; do sudo valgrind --tool=memcheck --leak-check=full --show-leak-kinds=all --track-origins=yes "${t}" can_send_rdma_loopback_traffic_on_test_device; done
+#  - cargo test --verbose -- --test-threads=1 || true
+#  - cargo valgrind test --verbose --test integration -- --test-threads=1 || true
 addons:
   apt:
     packages:
