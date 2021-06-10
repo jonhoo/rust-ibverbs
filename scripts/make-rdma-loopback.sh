@@ -4,7 +4,9 @@
 set -euxETo pipefail
 
 # Configuration
-declare -r RXE_INTERFACE_NAME="${1}"
+
+# Define the name of the SoftRoCE device we would like to create for integration testing.
+declare -r RXE_INTERFACE_NAME="rust_ibverbs"
 
 # Print an error message
 log() {
