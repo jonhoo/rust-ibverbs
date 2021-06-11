@@ -1,0 +1,6 @@
+[Match]
+# Match any device with the virtio_net driver and attempt DHCP on it.
+Driver=virtio_net
+
+[Network]
+DHCP=yes
