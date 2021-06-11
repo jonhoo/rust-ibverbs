@@ -188,13 +188,6 @@ RUN printf "%s\n" "root:rust_ibverbs" | chpasswd
 RUN systemctl enable cloud-init \
  && systemctl enable systemd-networkd
 
-# Clean up for the final image
-RUN rm --force --recursive /tmp/debs \
- && apt-get clean \
- && rm --force --recursive /var/lib/apt/lists/* \
- && rm --force --recursive /var/log/* \
- && rm --force --recursive /var/cache/ldconfig/aux-cache
-
 COPY assets/provision/root/ /
 
 ENV KERNEL_VERSION="5.12.9"
@@ -222,6 +215,15 @@ RUN mkdir --parent /boot/EFI/BOOT/ \
   --add-section .initrd="/boot/initrd.img-${KERNEL_VERSION}" --change-section-vma .initrd=0x4000000 \
   /usr/lib/systemd/boot/efi/linuxx64.efi.stub /boot/EFI/BOOT/BOOTX64.EFI
 
-# This mostly serves to squash the final image into one major layer
+# Clean up for the final image
+RUN rm --force --recursive /tmp/debs \
+ && apt-get clean \
+ && rm --force --recursive /var/lib/apt/lists/* \
+ && rm --force --recursive /var/log/* \
+ && rm --force --recursive /var/cache/ldconfig/aux-cache \
+ && rm --force /etc/machine-id \
+ && rm --force /var/lib/dbus/machine-id
+
+# This serves to squash the final image into one major layer
 FROM scratch as image
 COPY --from=provision / /
