@@ -183,6 +183,54 @@ impl<'d> From<&'d *mut ffi::ibv_device> for Device<'d> {
     }
 }
 
+/// A Global unique identifier for ibv.
+///
+/// This struct acts as a rust wrapper for GUID value represented as `__be64` in
+/// libibverbs. We introduce this struct, because u64 is stored in host
+/// endianness, whereas ibverbs stores GUID in network order (big endian).
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[repr(transparent)]
+pub struct Guid {
+    raw: [u8; 8],
+}
+
+impl Guid {
+    /// Upper 24 bits of the GUID are OUI (Organizationally Unique Identifier,
+    /// http://standards-oui.ieee.org/oui/oui.txt). The function returns OUI as
+    /// a 24-bit number inside a u64 number.
+    pub fn oui(&self) -> u32 {
+        let padded = [0, self.raw[0], self.raw[1], self.raw[2]];
+        u32::from_be_bytes(padded)
+    }
+
+    /// A GUID equal to zero is considered to be reserved. Return if the GUID is
+    /// reserved.
+    pub fn is_reserved(&self) -> bool {
+        self.raw == [0; 8]
+    }
+}
+
+impl From<u64> for Guid {
+    fn from(guid: u64) -> Self {
+        Self {
+            raw: guid.to_be_bytes(),
+        }
+    }
+}
+
+impl From<Guid> for u64 {
+    fn from(guid: Guid) -> Self {
+        u64::from_be_bytes(guid.raw)
+    }
+}
+
+impl AsRef<ffi::__be64> for Guid {
+    fn as_ref(&self) -> &ffi::__be64 {
+        unsafe { &*self.raw.as_ptr().cast::<ffi::__be64>() }
+    }
+}
+
 impl<'devlist> Device<'devlist> {
     /// Opens an RMDA device and creates a context for further use.
     ///
@@ -245,9 +293,10 @@ impl<'devlist> Device<'devlist> {
     /// # Errors
     ///
     ///  - `EMFILE`: Too many files are opened by this process.
-    pub fn guid(&self) -> io::Result<u64> {
-        let guid = unsafe { ffi::ibv_get_device_guid(*self.0) };
-        if guid == 0 {
+    pub fn guid(&self) -> io::Result<Guid> {
+        let guid_int = unsafe { ffi::ibv_get_device_guid(*self.0) };
+        let guid: Guid = guid_int.into();
+        if guid.is_reserved() {
             Err(io::Error::last_os_error())
         } else {
             Ok(guid)
@@ -1351,5 +1400,17 @@ mod test_serde {
         assert_eq!(decoded.gid.interface_id(), 192);
         assert_eq!(qpe, decoded);
         assert_ne!(qpe, qpe_default);
+    }
+
+    #[test]
+    fn encode_decode_guid() {
+        let guid_u64 = 0x12_34_56_78_9a_bc_de_f0_u64;
+        let _be: ffi::__be64 = guid_u64.to_be();
+        let guid: Guid = guid_u64.into();
+
+        assert_eq!(guid.is_reserved(), false);
+        assert_eq!(guid.raw, [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
+        println!("{:#08x}", guid.oui());
+        assert_eq!(guid.oui(), 0x123456);
     }
 }
