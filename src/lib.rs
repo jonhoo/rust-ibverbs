@@ -259,6 +259,19 @@ impl<'devlist> Device<'devlist> {
             Ok(guid)
         }
     }
+
+    /// Returns stable IB device index as it is assigned by the kernel
+    /// # Errors
+    ///
+    ///  - `ENOTSUP`: Stable index is not supported
+    pub fn index(&self) -> io::Result<i32> {
+        let idx = unsafe { ffi::ibv_get_device_index(*self.0) };
+        if idx == -1 {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "device index not known"))
+        } else {
+            Ok(idx)
+        }
+    }
 }
 
 /// An RDMA context bound to a device.
