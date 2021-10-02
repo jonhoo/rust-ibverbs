@@ -1,4 +1,4 @@
-# Target 1: (build) constructs necessary deb files
+# This target constructs necessary deb files
 FROM debian:bullseye as package_build
 
 # Add deb-src dependencies to sources.list
@@ -21,9 +21,9 @@ RUN apt-get update \
   ca-certificates      `#needed for kernel fetch` \
   dwarves \
   flex \
-  libelf-dev:native \
+  libelf-dev \
   libncurses-dev       `#needed for "make menuconfig"` \
-  libssl-dev:native \
+  libssl-dev \
   lsb-release          `#needed for "make" command` \
   pkg-config \
   wget                 `#needed for kernel source fetch` \
@@ -40,11 +40,12 @@ RUN mkdir --parent /tmp/debs
 # Also, I ran make-oldconfig on this to bring all the kernel build parameters up to date.
 # If we bump the kernel version in the future we will need to run make-oldconfig again to make sure we have a valid
 # kernel config.
-ENV KERNEL_VERSION="5.12.9"
+ENV KERNEL_VERSION="5.14.9"
 RUN mkdir --parent /tmp/linux-kernel-build \
  && wget --quiet --output-document=- "https://cdn.kernel.org/pub/linux/kernel/v5.x/linux-${KERNEL_VERSION}.tar.xz" \
   | tar --extract --xz --directory=/tmp/linux-kernel-build/
 COPY ./assets/kernel.config /tmp/linux-kernel-build/linux-"${KERNEL_VERSION}"/.config
+RUN false
 RUN cd /tmp/linux-kernel-build/linux-"${KERNEL_VERSION}" \
  && make ARCH=x86_64 --jobs="$(( $(nproc) + 1 ))" deb-pkg
 
@@ -203,7 +204,7 @@ RUN dracut \
   "/boot/initrd.img-${KERNEL_VERSION}"
 
 # Generate the unified kernel's command line
-RUN printf "root=LABEL=ROOT rw console=tty0 earlyprintk=tty0 console=ttyS0,115200n8 earlyprintk=ttyS0,115200n8\n" > /kernel.cmdline
+RUN printf "root=LABEL=ROOT rw console=tty0 earlyprintk=tty0 console=ttyS0,115200n8 earlyprintk=ttyS0,115200n8 intel_iommu=on iommu=pt\n" > /kernel.cmdline
 
 # Produce a unified linux kernel + initramfs + command line (this should make it trivial to boot on a properly
 # configured VM, most physical gear, and in AWS assuming the AMI is configured with EFI over legacy BIOS)

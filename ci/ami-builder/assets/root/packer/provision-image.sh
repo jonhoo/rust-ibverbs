@@ -30,7 +30,7 @@ mkdir -p /etc/default/grub.d
 cat <<EOF > /etc/default/grub.d/50-aws-settings.cfg
 GRUB_RECORDFAIL_TIMEOUT=0
 GRUB_TIMEOUT=0
-GRUB_CMDLINE_LINUX_DEFAULT="root=LABEL=ROOT rw console=tty0 earlyprintk=tty0 console=ttyS0,115200 earlyprintk=ttyS0,115200 scsi_mod.use_blk_mq=Y"
+GRUB_CMDLINE_LINUX_DEFAULT="root=LABEL=ROOT rw console=tty0 earlyprintk=tty0 console=ttyS0,115200 earlyprintk=ttyS0,115200 scsi_mod.use_blk_mq=Y intel_iommu=on iommu=pt"
 GRUB_TERMINAL=console
 EOF
 
