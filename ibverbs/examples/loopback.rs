@@ -2,6 +2,21 @@ fn main() {
     let ctx = ibverbs::devices()
         .unwrap()
         .iter()
+        .filter(|device| match device.name() {
+            None => false,
+            Some(name) => {
+                match name.to_str() {
+                    Ok(name) => {
+                        // name == "rocep2s0f0v0"
+                        name == "rust_ibverbs"
+                    }
+                    Err(err) => {
+                        eprintln!("no name: {}", err);
+                        false
+                    }
+                }
+            },
+        })
         .next()
         .expect("no rdma device available")
         .open()
@@ -34,6 +49,14 @@ fn main() {
         }
         assert!(completed.len() <= 2);
         for wr in completed {
+            if ! wr.is_valid() {
+                match wr.error() {
+                    None => {}
+                    Some(err) => {
+                        panic!("ibverbs error of type: {} with vendor error: {}", err.0, err.1);
+                    }
+                }
+            }
             match wr.wr_id() {
                 1 => {
                     assert!(!sent);

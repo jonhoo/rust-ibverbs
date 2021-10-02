@@ -124,7 +124,7 @@ mod helper {
             if let Some(device_name_cstr) = rdma_device.name() {
                 match device_name_cstr.to_str() {
                     Ok(device_name) => {
-                        if device_name == "rust_ibverbs1" {
+                        if device_name == "rust_ibverbs" {
                             Some(rdma_device)
                         } else {
                             None

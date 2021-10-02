@@ -20,16 +20,6 @@ get_rdma_netns_state() {
   rdma system show | grep netns | awk '{print $NF}'
 }
 
-# Check that our rdma devices are available across network namespaces
-confirm_rdma_netns_shared() {
-  declare access
-  access="$(get_rdma_netns_state)"
-  declare -r access
-  if [[ "${access}" != "shared" ]]; then
-    log "rdma netns state is not shared: current state ${access}"
-    return 1
-  fi
-}
 
 # Set up a SoftRoCE loopback device.  To do this we create a dummy device and then hang a macvlan in bridge mode off of
 # that dummy device.  This strategy allows all ordinary network traffic transmitted to the macvlan to be sent back to
@@ -66,7 +56,6 @@ wait_for_rdma_device_to_be_ready() {
 }
 
 main() {
-  confirm_rdma_netns_shared
   set_up_soft_roce_loopback_device "${RXE_INTERFACE_NAME}"
   wait_for_rdma_device_to_be_ready "${RXE_INTERFACE_NAME}"
 }
