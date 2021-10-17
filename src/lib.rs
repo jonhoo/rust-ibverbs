@@ -739,8 +739,10 @@ impl<'res> QueuePairBuilder<'res> {
         } else {
             Ok(PreparedQueuePair {
                 ctx: self.pd.ctx,
-                qp,
-
+                qp: QueuePair {
+                    _phantom: PhantomData,
+                    qp,
+                },
                 access: self.access,
                 timeout: self.timeout,
                 retry_count: self.retry_count,
@@ -777,7 +779,7 @@ impl<'res> QueuePairBuilder<'res> {
 /// ```
 pub struct PreparedQueuePair<'res> {
     ctx: &'res Context,
-    qp: *mut ffi::ibv_qp,
+    qp: QueuePair<'res>,
 
     // carried from builder
     access: ffi::ibv_access_flags,
@@ -873,7 +875,7 @@ impl<'res> PreparedQueuePair<'res> {
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
     pub fn endpoint(&self) -> QueuePairEndpoint {
-        let num = unsafe { &*self.qp }.qp_num;
+        let num = unsafe { &*self.qp.qp }.qp_num;
 
         QueuePairEndpoint {
             num,
@@ -924,7 +926,7 @@ impl<'res> PreparedQueuePair<'res> {
             | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_PORT
             | ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -951,7 +953,7 @@ impl<'res> PreparedQueuePair<'res> {
             | ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN
             | ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC
             | ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -970,15 +972,12 @@ impl<'res> PreparedQueuePair<'res> {
             | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN
             | ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY
             | ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut attr as *mut _, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
-        Ok(QueuePair {
-            _phantom: PhantomData,
-            qp: self.qp,
-        })
+        Ok(self.qp)
     }
 }
 
