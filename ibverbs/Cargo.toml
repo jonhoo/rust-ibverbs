@@ -31,9 +31,6 @@ version = "1.0"
 optional = true
 features = ["derive"]
 
-[build-dependencies]
-bindgen = "0.58"
-
 [features]
 default = ["serde"]
 
