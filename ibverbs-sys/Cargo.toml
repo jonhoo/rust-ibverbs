@@ -28,4 +28,4 @@ travis-ci = { repository = "jonhoo/rust-ibverbs" }
 maintenance = { status = "looking-for-maintainer" }
 
 [build-dependencies]
-bindgen = "0.58"
+bindgen = "0.59"
