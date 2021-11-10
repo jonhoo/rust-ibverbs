@@ -204,8 +204,7 @@ impl Guid {
         u32::from_be_bytes(padded)
     }
 
-    /// A GUID equal to zero is considered to be reserved. Return if the GUID is
-    /// reserved.
+    /// Returns `true` if this GUID is all zeroes, which is considered reserved.
     pub fn is_reserved(&self) -> bool {
         self.raw == [0; 8]
     }
