@@ -198,7 +198,7 @@ pub struct Guid {
 impl Guid {
     /// Upper 24 bits of the GUID are OUI (Organizationally Unique Identifier,
     /// http://standards-oui.ieee.org/oui/oui.txt). The function returns OUI as
-    /// a 24-bit number inside a u64 number.
+    /// a 24-bit number inside a u32.
     pub fn oui(&self) -> u32 {
         let padded = [0, self.raw[0], self.raw[1], self.raw[2]];
         u32::from_be_bytes(padded)
