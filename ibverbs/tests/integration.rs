@@ -77,11 +77,11 @@ fn can_send_rdma_loopback_traffic_on_test_device() {
 
                 unsafe {
                     queue_pair
-                        .post_send(&mut memory_region, 1.., SEND_REQUEST_ID)
-                        .expect("failed to post send request on queue pair");
-                    queue_pair
                         .post_receive(&mut memory_region, ..1, RECEIVE_REQUEST_ID)
                         .expect("failed to post receive request on queue pair");
+                    queue_pair
+                        .post_send(&mut memory_region, 1.., SEND_REQUEST_ID)
+                        .expect("failed to post send request on queue pair");
                 }
 
                 let mut sent = false;
