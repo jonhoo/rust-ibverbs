@@ -1,23 +1,30 @@
+version: ~> 1.0
 language: rust
-dist: trusty
-sudo: false
+dist: focal
+sudo: true
+group: edge
+script:
+  - sudo apt-get install --yes linux-modules-extra-"$(uname --kernel-release)"
+  - ./scripts/ci.sh
+  - cargo build --verbose
+  - cargo test --verbose -- --test-threads=1
 addons:
   apt:
     packages:
-    - libibverbs1
-    - ninja-build
+    - cmake
+    - cmake-data
+    - gcc-10
+    - ibverbs-providers
+    - iproute2
+    - jq
+    - libibverbs-dev
     - libnl-3-dev
     - libnl-genl-3-dev
     - libnl-route-3-dev
     - libudev-dev
-    - cmake
-    - cmake-data
-    - gcc-5
-    sources:
-    - ubuntu-toolchain-r-test
-    - george-edison55-precise-backports # cmake 3.2.3
+    - ninja-build
 env:
-  - LLVM_VERSION=3.9.0
+  - RUST_BACKTRACE=1
 rust:
   - nightly
   - beta

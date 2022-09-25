@@ -1,7 +1,7 @@
 [package]
 name = "ibverbs-sys"
-version = "0.1.0"
-edition = "2018"
+version = "0.2.0"
+edition = "2021"
 
 description = "Raw, FFI bindings for RDMA ibverbs through rdma-core"
 readme = "../README.md"
@@ -28,4 +28,4 @@ travis-ci = { repository = "jonhoo/rust-ibverbs" }
 maintenance = { status = "looking-for-maintainer" }
 
 [build-dependencies]
-bindgen = "0.59"
+bindgen = "0.60"

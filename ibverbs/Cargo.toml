@@ -1,7 +1,7 @@
 [package]
 name = "ibverbs"
-version = "0.7.0"
-edition = "2018"
+version = "0.8.0"
+edition = "2021"
 
 description = "Bindings for RDMA ibverbs through rdma-core"
 readme = "../README.md"
@@ -24,7 +24,7 @@ travis-ci = { repository = "jonhoo/rust-ibverbs" }
 maintenance = { status = "looking-for-maintainer" }
 
 [dependencies]
-ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.1.0" }
+ffi = { path = "../ibverbs-sys", package = "ibverbs-sys" }
 
 [dependencies.serde]
 version = "1.0"

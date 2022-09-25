@@ -323,7 +323,6 @@ impl<'devlist> Device<'devlist> {
 pub struct Context {
     ctx: *mut ffi::ibv_context,
     port_attr: ffi::ibv_port_attr,
-    gid: Gid,
 }
 
 unsafe impl Sync for Context {}
@@ -379,7 +378,7 @@ impl Context {
 
         // let mut gid = ffi::ibv_gid::default();
         let mut gid = Gid::default();
-        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.as_mut()) };
+        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 1 /* TODO: this is not correct */, gid.as_mut()) };
         if ok != 0 {
             return Err(io::Error::last_os_error());
         }
@@ -387,8 +386,51 @@ impl Context {
         Ok(Context {
             ctx,
             port_attr,
-            gid,
         })
+    }
+
+    fn gid_from_index(&self, gid_index: i32) -> io::Result<Gid> {
+        let mut gid = Gid::default();
+        let result = unsafe {
+            ffi::ibv_query_gid(self.ctx, PORT_NUM, gid_index, gid.as_mut())
+        };
+        if result == 0 {
+            Ok(gid)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    #[allow(unused)]
+    fn gid_from_ip(&self, ip: std::net::IpAddr) -> io::Result<Vec<(i32, Gid)>> {
+        let ipv6 = match ip {
+            IpAddr::V4(ipv4) => {
+                ipv4.to_ipv6_mapped()
+            }
+            IpAddr::V6(ipv6) => {
+                ipv6
+            }
+        };
+        let mut device_attr = ffi::ibv_device_attr::default();
+        let result = unsafe {
+            ffi::ibv_query_device(self.ctx, &mut device_attr)
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let device_attr = device_attr;
+        let mut ret = vec![];
+        for index in 0..device_attr.max_ah {
+            match self.gid_from_index(index) {
+                Ok(gid) => {
+                    if gid.raw == ipv6.octets() {
+                        ret.push((index, gid))
+                    }
+                }
+                Err(_err) => continue,
+            }
+        }
+        return Ok(ret)
     }
 
     /// Create a completion queue (CQ).
@@ -929,7 +971,7 @@ impl<'res> PreparedQueuePair<'res> {
         QueuePairEndpoint {
             num,
             lid: self.ctx.port_attr.lid,
-            gid: self.ctx.gid,
+            gid: self.ctx.gid_from_index(1 /* todo: this is not correct */).unwrap(),
         }
     }
 
@@ -993,6 +1035,7 @@ impl<'res> PreparedQueuePair<'res> {
         attr.ah_attr.sl = 0;
         attr.ah_attr.src_path_bits = 0;
         attr.ah_attr.port_num = PORT_NUM;
+        attr.ah_attr.grh.sgid_index = 1;
         attr.ah_attr.grh.dgid = remote.gid.into();
         attr.ah_attr.grh.hop_limit = 0xff;
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
@@ -1040,6 +1083,8 @@ unsafe impl<T> Send for MemoryRegion<T> {}
 unsafe impl<T> Sync for MemoryRegion<T> {}
 
 use std::ops::{Deref, DerefMut};
+use std::net::IpAddr;
+
 impl<T> Deref for MemoryRegion<T> {
     type Target = [T];
     fn deref(&self) -> &Self::Target {
