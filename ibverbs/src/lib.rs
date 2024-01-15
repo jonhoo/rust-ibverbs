@@ -919,7 +919,7 @@ pub struct QueuePairEndpoint {
     /// the context's `lid`
     pub lid: u16,
     /// the context's `gid`, used for global routing
-    pub gid: Gid,
+    pub gid: Option<Gid>,
 }
 
 impl<'res> PreparedQueuePair<'res> {
@@ -932,7 +932,7 @@ impl<'res> PreparedQueuePair<'res> {
         QueuePairEndpoint {
             num,
             lid: self.ctx.port_attr.lid,
-            gid: self.ctx.gid,
+            gid: Some(self.ctx.gid),
         }
     }
 
@@ -941,6 +941,12 @@ impl<'res> PreparedQueuePair<'res> {
     /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
     /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`).
     /// Further discussion of the protocol can be found on [RDMAmojo].
+    ///
+    /// If the endpoint contains a Gid, the routing will be global. This means:
+    /// ```text,ignore
+    /// ah_attr.is_global = 1;
+    /// ah_attr.grh.hop_limit = 0xff;
+    /// ```
     ///
     /// The handshake also sets the following parameters, which are currently not configurable:
     ///
@@ -956,9 +962,7 @@ impl<'res> PreparedQueuePair<'res> {
     /// max_rd_atomic = 1;
     ///
     /// ah_attr.sl = 0;
-    /// ah_attr.is_global = 1;
     /// ah_attr.src_path_bits = 0;
-    /// ah_attr.grh.hop_limit = 0xff;
     /// ```
     ///
     /// # Errors
@@ -994,20 +998,20 @@ impl<'res> PreparedQueuePair<'res> {
             max_dest_rd_atomic: 1,
             min_rnr_timer: self.min_rnr_timer,
             ah_attr: ffi::ibv_ah_attr {
-                is_global: 1,
                 dlid: remote.lid,
                 sl: 0,
                 src_path_bits: 0,
                 port_num: PORT_NUM,
-                grh: ffi::ibv_global_route {
-                    dgid: remote.gid.into(),
-                    hop_limit: 0xff,
-                    ..Default::default()
-                },
+                grh: Default::default(),
                 ..Default::default()
             },
             ..Default::default()
         };
+        if let Some(gid) = remote.gid {
+            attr.ah_attr.is_global = 1;
+            attr.ah_attr.grh.dgid = gid.into();
+            attr.ah_attr.grh.hop_limit = 0xff;
+        }
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_AV
             | ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU
@@ -1402,16 +1406,17 @@ mod test_serde {
         let qpe_default = QueuePairEndpoint {
             num: 72,
             lid: 9,
-            gid: Default::default(),
+            gid: Some(Default::default()),
         };
 
         let mut qpe = qpe_default;
-        qpe.gid.raw = unsafe { std::mem::transmute([87_u64.to_be(), 192_u64.to_be()]) };
+        qpe.gid.as_mut().unwrap().raw =
+            unsafe { std::mem::transmute([87_u64.to_be(), 192_u64.to_be()]) };
         let encoded = bincode::serialize(&qpe).unwrap();
 
         let decoded: QueuePairEndpoint = bincode::deserialize(&encoded).unwrap();
-        assert_eq!(decoded.gid.subnet_prefix(), 87);
-        assert_eq!(decoded.gid.interface_id(), 192);
+        assert_eq!(decoded.gid.unwrap().subnet_prefix(), 87);
+        assert_eq!(decoded.gid.unwrap().interface_id(), 192);
         assert_eq!(qpe, decoded);
         assert_ne!(qpe, qpe_default);
     }
