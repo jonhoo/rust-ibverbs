@@ -860,7 +860,7 @@ pub struct PreparedQueuePair<'res> {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Hash)]
 #[repr(transparent)]
-struct Gid {
+pub struct Gid {
     raw: [u8; 16],
 }
 
@@ -914,9 +914,12 @@ impl AsMut<ffi::ibv_gid> for Gid {
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct QueuePairEndpoint {
-    num: u32,
-    lid: u16,
-    gid: Gid,
+    /// the `QueuePair`'s `qp_num`
+    pub num: u32,
+    /// the context's `lid`
+    pub lid: u16,
+    /// the context's `gid`, used for global routing
+    pub gid: Gid,
 }
 
 impl<'res> PreparedQueuePair<'res> {
