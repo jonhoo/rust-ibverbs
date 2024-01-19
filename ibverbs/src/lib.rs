@@ -63,7 +63,7 @@
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms)]
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
-#![cfg_attr(feature = "cargo-clippy", allow(doc_markdown))]
+#![allow(clippy::doc_markdown)]
 
 use std::convert::TryInto;
 use std::ffi::CStr;
@@ -847,8 +847,8 @@ pub struct PreparedQueuePair<'res> {
 /// union ibv_gid {
 ///     uint8_t   raw[16];
 ///     struct {
-/// 	    __be64	subnet_prefix;
-/// 	    __be64	interface_id;
+///         __be64 subnet_prefix;
+///         __be64 interface_id;
 ///     } global;
 /// };
 /// ```
@@ -966,11 +966,13 @@ impl<'res> PreparedQueuePair<'res> {
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
     pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair<'res>> {
         // init and associate with port
-        let mut attr = ffi::ibv_qp_attr::default();
-        attr.qp_state = ffi::ibv_qp_state::IBV_QPS_INIT;
-        attr.qp_access_flags = self.access.0;
-        attr.pkey_index = 0;
-        attr.port_num = PORT_NUM;
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
+            qp_access_flags: self.access.0,
+            pkey_index: 0,
+            port_num: PORT_NUM,
+            ..Default::default()
+        };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_PORT
@@ -981,20 +983,28 @@ impl<'res> PreparedQueuePair<'res> {
         }
 
         // set ready to receive
-        let mut attr = ffi::ibv_qp_attr::default();
-        attr.qp_state = ffi::ibv_qp_state::IBV_QPS_RTR;
-        attr.path_mtu = self.ctx.port_attr.active_mtu;
-        attr.dest_qp_num = remote.num;
-        attr.rq_psn = 0;
-        attr.max_dest_rd_atomic = 1;
-        attr.min_rnr_timer = self.min_rnr_timer;
-        attr.ah_attr.is_global = 1;
-        attr.ah_attr.dlid = remote.lid;
-        attr.ah_attr.sl = 0;
-        attr.ah_attr.src_path_bits = 0;
-        attr.ah_attr.port_num = PORT_NUM;
-        attr.ah_attr.grh.dgid = remote.gid.into();
-        attr.ah_attr.grh.hop_limit = 0xff;
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
+            path_mtu: self.ctx.port_attr.active_mtu,
+            dest_qp_num: remote.num,
+            rq_psn: 0,
+            max_dest_rd_atomic: 1,
+            min_rnr_timer: self.min_rnr_timer,
+            ah_attr: ffi::ibv_ah_attr {
+                is_global: 1,
+                dlid: remote.lid,
+                sl: 0,
+                src_path_bits: 0,
+                port_num: PORT_NUM,
+                grh: ffi::ibv_global_route {
+                    dgid: remote.gid.into(),
+                    hop_limit: 0xff,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_AV
             | ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU
@@ -1008,13 +1018,15 @@ impl<'res> PreparedQueuePair<'res> {
         }
 
         // set ready to send
-        let mut attr = ffi::ibv_qp_attr::default();
-        attr.qp_state = ffi::ibv_qp_state::IBV_QPS_RTS;
-        attr.timeout = self.timeout;
-        attr.retry_cnt = self.retry_count;
-        attr.sq_psn = 0;
-        attr.rnr_retry = self.rnr_retry;
-        attr.max_rd_atomic = 1;
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
+            timeout: self.timeout,
+            retry_cnt: self.retry_count,
+            sq_psn: 0,
+            rnr_retry: self.rnr_retry,
+            max_rd_atomic: 1,
+            ..Default::default()
+        };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT
             | ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT
@@ -1249,11 +1261,11 @@ impl<'res> QueuePair<'res> {
         let range = range.index(mr);
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
-            length: (mem::size_of::<T>() * range.len()) as u32,
-            lkey: (&*mr.mr).lkey,
+            length: mem::size_of_val(range) as u32,
+            lkey: (*mr.mr).lkey,
         };
         let mut wr = ffi::ibv_send_wr {
-            wr_id: wr_id,
+            wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
             sg_list: &mut sge as *mut _,
             num_sge: 1,
@@ -1280,8 +1292,8 @@ impl<'res> QueuePair<'res> {
         // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
         // immediately after the call returns.
 
-        let ctx = (&*self.qp).context;
-        let ops = &mut (&mut *ctx).ops;
+        let ctx = (*self.qp).context;
+        let ops = &mut (*ctx).ops;
         let errno =
             ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
         if errno != 0 {
@@ -1333,11 +1345,11 @@ impl<'res> QueuePair<'res> {
         let range = range.index(mr);
         let mut sge = ffi::ibv_sge {
             addr: range.as_ptr() as u64,
-            length: (mem::size_of::<T>() * range.len()) as u32,
-            lkey: (&*mr.mr).lkey,
+            length: mem::size_of_val(range) as u32,
+            lkey: (*mr.mr).lkey,
         };
         let mut wr = ffi::ibv_recv_wr {
-            wr_id: wr_id,
+            wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
             sg_list: &mut sge as *mut _,
             num_sge: 1,
@@ -1356,8 +1368,8 @@ impl<'res> QueuePair<'res> {
         // means that in all cases, the actual data of the incoming message will start at an offset
         // of 40 bytes into the buffer(s) in the scatter list.
 
-        let ctx = (&*self.qp).context;
-        let ops = &mut (&mut *ctx).ops;
+        let ctx = (*self.qp).context;
+        let ops = &mut (*ctx).ops;
         let errno =
             ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
         if errno != 0 {

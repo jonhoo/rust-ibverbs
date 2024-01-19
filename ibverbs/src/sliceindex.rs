@@ -18,7 +18,7 @@ impl<T> SliceIndex<[T]> for usize {
 
     #[inline]
     unsafe fn get_unchecked(self, slice: &[T]) -> &T {
-        &*slice.as_ptr().offset(self as isize)
+        &*slice.as_ptr().add(self)
     }
 
     #[inline]
@@ -46,10 +46,7 @@ impl<T> SliceIndex<[T]> for ops::Range<usize> {
     #[inline]
     unsafe fn get_unchecked(self, slice: &[T]) -> &[T] {
         use std::slice::from_raw_parts;
-        from_raw_parts(
-            slice.as_ptr().offset(self.start as isize),
-            self.end - self.start,
-        )
+        from_raw_parts(slice.as_ptr().add(self.start), self.end - self.start)
     }
 
     #[inline]

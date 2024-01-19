@@ -10,7 +10,7 @@ fn main() {
     // initialize and update submodules
     if Path::new(".git").is_dir() {
         Command::new("git")
-            .args(&["submodule", "update", "--init"])
+            .args(["submodule", "update", "--init"])
             .status()
             .expect("Failed to update submodules.");
     } else {
@@ -23,7 +23,7 @@ fn main() {
     // build vendor/rdma-core
     Command::new("bash")
         .current_dir("vendor/rdma-core/")
-        .args(&["build.sh"])
+        .args(["build.sh"])
         .status()
         .expect("Failed to build vendor/rdma-core using build.sh");
 
