@@ -2,6 +2,8 @@
 
 [![Crates.io](https://img.shields.io/crates/v/ibverbs.svg)](https://crates.io/crates/ibverbs)
 [![Documentation](https://docs.rs/ibverbs/badge.svg)](https://docs.rs/ibverbs/)
+[![codecov](https://codecov.io/gh/jonhoo/rust-ibverbs/graph/badge.svg?token=3nylKSTA6R)](https://codecov.io/gh/jonhoo/rust-ibverbs)
+[![Dependency status](https://deps.rs/repo/github/jonhoo/rust-ibverbs/status.svg)](https://deps.rs/repo/github/jonhoo/rust-ibverbs)
 
 Rust API wrapping the `ibverbs` Remote Direct Memory Access (RDMA) library.
 
