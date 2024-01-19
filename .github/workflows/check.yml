@@ -52,7 +52,7 @@ jobs:
       - name: Install libibverbs dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install libibverbs1 libnl-3-dev libnl-genl-3-dev libnl-route-3-dev
+          sudo apt-get install libibverbs1 libibverbs-dev
       - name: Install ${{ matrix.toolchain }}
         uses: dtolnay/rust-toolchain@master
         with:
@@ -75,7 +75,7 @@ jobs:
       - name: Install libibverbs dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install libibverbs1 libnl-3-dev libnl-genl-3-dev libnl-route-3-dev
+          sudo apt-get install libibverbs1 libibverbs-dev
       - name: Install nightly
         uses: dtolnay/rust-toolchain@nightly
       - name: cargo doc
@@ -94,7 +94,7 @@ jobs:
       - name: Install libibverbs dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install libibverbs1 libnl-3-dev libnl-genl-3-dev libnl-route-3-dev
+          sudo apt-get install libibverbs1 libibverbs-dev
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
       - name: cargo install cargo-hack
@@ -119,7 +119,7 @@ jobs:
       - name: Install libibverbs dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install libibverbs1 libnl-3-dev libnl-genl-3-dev libnl-route-3-dev
+          sudo apt-get install libibverbs1 libibverbs-dev
       - name: Install ${{ matrix.msrv }}
         uses: dtolnay/rust-toolchain@master
         with:
