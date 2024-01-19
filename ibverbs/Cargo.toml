@@ -12,22 +12,17 @@ authors = [
 
 homepage = "https://github.com/jonhoo/rust-ibverbs"
 repository = "https://github.com/jonhoo/rust-ibverbs.git"
-documentation = "https://docs.rs/ibverbs/"
 
 keywords = ["rdma", "ibverbs", "networking"]
 categories = ["network-programming", "api-bindings"]
 
-license = "MIT/Apache-2.0"
-
-[badges]
-travis-ci = { repository = "jonhoo/rust-ibverbs" }
-maintenance = { status = "looking-for-maintainer" }
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.1.0" }
 
 [dependencies.serde]
-version = "1.0"
+version = "1.0.100"
 optional = true
 features = ["derive"]
 
