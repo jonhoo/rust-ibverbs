@@ -24,3 +24,7 @@ exclude = ["vendor/rdma-core/build/"]
 
 [build-dependencies]
 bindgen = "0.69.2"
+
+# to make -Zminimal-versions work
+[target.'cfg(any())'.dependencies]
+regex = "1.6"
