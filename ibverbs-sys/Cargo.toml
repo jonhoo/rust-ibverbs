@@ -14,18 +14,13 @@ links = "ibverbs"
 
 homepage = "https://github.com/jonhoo/rust-ibverbs"
 repository = "https://github.com/jonhoo/rust-ibverbs.git"
-documentation = "https://docs.rs/ibverbs/"
 
 keywords = ["rdma", "ibverbs", "networking", "ffi"]
 categories = ["network-programming", "api-bindings"]
 
-license = "MIT/Apache-2.0"
+license = "MIT OR Apache-2.0"
 
 exclude = ["vendor/rdma-core/build/"]
-
-[badges]
-travis-ci = { repository = "jonhoo/rust-ibverbs" }
-maintenance = { status = "looking-for-maintainer" }
 
 [build-dependencies]
 bindgen = "0.69.2"
