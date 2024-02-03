@@ -554,6 +554,7 @@ pub struct QueuePairBuilder<'res> {
     retry_count: u8,
     rnr_retry: u8,
     min_rnr_timer: u8,
+    max_rd_atomic: u8,
     max_dest_rd_atomic: u8,
 }
 
@@ -603,6 +604,7 @@ impl<'res> QueuePairBuilder<'res> {
             retry_count: 6,
             rnr_retry: 6,
             timeout: 4,
+            max_rd_atomic: 1,
             max_dest_rd_atomic: 1,
         }
     }
@@ -748,6 +750,14 @@ impl<'res> QueuePairBuilder<'res> {
         self
     }
 
+    /// Set the number of outstanding RDMA reads & atomic operations on the destination Queue Pair.
+    ///
+    /// This defaults to 1.
+    pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
+        self.max_rd_atomic = max_rd_atomic;
+        self
+    }
+
     /// Set the number of responder resources for handling incoming RDMA reads & atomic operations.
     ///
     /// This defaults to 1.
@@ -810,6 +820,7 @@ impl<'res> QueuePairBuilder<'res> {
                 retry_count: self.retry_count,
                 rnr_retry: self.rnr_retry,
                 min_rnr_timer: self.min_rnr_timer,
+                max_rd_atomic: self.max_rd_atomic,
                 max_dest_rd_atomic: self.max_dest_rd_atomic,
             })
         }
@@ -850,6 +861,7 @@ pub struct PreparedQueuePair<'res> {
     timeout: u8,
     retry_count: u8,
     rnr_retry: u8,
+    max_rd_atomic: u8,
     max_dest_rd_atomic: u8,
 }
 
@@ -973,8 +985,6 @@ impl<'res> PreparedQueuePair<'res> {
     /// rq_psn = 0;
     /// sq_psn = 0;
     ///
-    /// max_rd_atomic = 1;
-    ///
     /// ah_attr.sl = 0;
     /// ah_attr.src_path_bits = 0;
     /// ```
@@ -1045,7 +1055,7 @@ impl<'res> PreparedQueuePair<'res> {
             retry_cnt: self.retry_count,
             sq_psn: 0,
             rnr_retry: self.rnr_retry,
-            max_rd_atomic: 1,
+            max_rd_atomic: self.max_rd_atomic,
             ..Default::default()
         };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
