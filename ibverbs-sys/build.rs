@@ -3,8 +3,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    println!("cargo:include=vendor/rdma-core/build/include");
-    println!("cargo:rustc-link-search=native=vendor/rdma-core/build/lib");
+    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("failed to get current directory");
+    println!("cargo:include={manifest_dir}/vendor/rdma-core/build/include");
+    println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
     println!("cargo:rustc-link-lib=ibverbs");
 
     // initialize and update submodules
