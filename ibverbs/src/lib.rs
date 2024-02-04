@@ -556,6 +556,7 @@ pub struct QueuePairBuilder<'res> {
     min_rnr_timer: u8,
     max_rd_atomic: u8,
     max_dest_rd_atomic: u8,
+    path_mtu: u32,
 }
 
 impl<'res> QueuePairBuilder<'res> {
@@ -606,6 +607,7 @@ impl<'res> QueuePairBuilder<'res> {
             timeout: 4,
             max_rd_atomic: 1,
             max_dest_rd_atomic: 1,
+            path_mtu: pd.ctx.port_attr.active_mtu,
         }
     }
 
@@ -766,6 +768,21 @@ impl<'res> QueuePairBuilder<'res> {
         self
     }
 
+    /// Set the path MTU.
+    ///
+    /// Defaults to the port's active_mtu.
+    /// The possible values are:
+    ///  - 1: 256
+    ///  - 2: 512
+    ///  - 3: 1024
+    ///  - 4: 2048
+    ///  - 5: 4096
+    pub fn set_path_mtu(&mut self, path_mtu: u32) -> &mut Self {
+        assert!((1..=5).contains(&path_mtu));
+        self.path_mtu = path_mtu;
+        self
+    }
+
     /// Set the opaque context value for the new `QueuePair`.
     ///
     /// Defaults to 0.
@@ -822,6 +839,7 @@ impl<'res> QueuePairBuilder<'res> {
                 min_rnr_timer: self.min_rnr_timer,
                 max_rd_atomic: self.max_rd_atomic,
                 max_dest_rd_atomic: self.max_dest_rd_atomic,
+                path_mtu: self.path_mtu,
             })
         }
     }
@@ -863,6 +881,7 @@ pub struct PreparedQueuePair<'res> {
     rnr_retry: u8,
     max_rd_atomic: u8,
     max_dest_rd_atomic: u8,
+    path_mtu: u32,
 }
 
 /// A Global identifier for ibv.
@@ -1016,7 +1035,7 @@ impl<'res> PreparedQueuePair<'res> {
         // set ready to receive
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-            path_mtu: self.ctx.port_attr.active_mtu,
+            path_mtu: self.path_mtu,
             dest_qp_num: remote.num,
             rq_psn: 0,
             max_dest_rd_atomic: self.max_dest_rd_atomic,
