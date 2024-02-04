@@ -557,6 +557,7 @@ pub struct QueuePairBuilder<'res> {
     max_rd_atomic: u8,
     max_dest_rd_atomic: u8,
     path_mtu: u32,
+    rq_psn: u32,
 }
 
 impl<'res> QueuePairBuilder<'res> {
@@ -608,6 +609,7 @@ impl<'res> QueuePairBuilder<'res> {
             max_rd_atomic: 1,
             max_dest_rd_atomic: 1,
             path_mtu: pd.ctx.port_attr.active_mtu,
+            rq_psn: 0,
         }
     }
 
@@ -783,6 +785,14 @@ impl<'res> QueuePairBuilder<'res> {
         self
     }
 
+    /// Set the PSN for the receive queue.
+    ///
+    /// Defaults to 0.
+    pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
+        self.rq_psn = rq_psn;
+        self
+    }
+
     /// Set the opaque context value for the new `QueuePair`.
     ///
     /// Defaults to 0.
@@ -840,6 +850,7 @@ impl<'res> QueuePairBuilder<'res> {
                 max_rd_atomic: self.max_rd_atomic,
                 max_dest_rd_atomic: self.max_dest_rd_atomic,
                 path_mtu: self.path_mtu,
+                rq_psn: self.rq_psn,
             })
         }
     }
@@ -882,6 +893,7 @@ pub struct PreparedQueuePair<'res> {
     max_rd_atomic: u8,
     max_dest_rd_atomic: u8,
     path_mtu: u32,
+    rq_psn: u32,
 }
 
 /// A Global identifier for ibv.
@@ -1001,7 +1013,6 @@ impl<'res> PreparedQueuePair<'res> {
     /// ```text,ignore
     /// port_num = PORT_NUM;
     /// pkey_index = 0;
-    /// rq_psn = 0;
     /// sq_psn = 0;
     ///
     /// ah_attr.sl = 0;
@@ -1037,7 +1048,7 @@ impl<'res> PreparedQueuePair<'res> {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
             path_mtu: self.path_mtu,
             dest_qp_num: remote.num,
-            rq_psn: 0,
+            rq_psn: self.rq_psn,
             max_dest_rd_atomic: self.max_dest_rd_atomic,
             min_rnr_timer: self.min_rnr_timer,
             ah_attr: ffi::ibv_ah_attr {
