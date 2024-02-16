@@ -634,12 +634,11 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Defaults to `IBV_ACCESS_LOCAL_WRITE`.
     pub fn set_access(&mut self, access: ffi::ibv_access_flags) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC
-            && self.qp_type != ffi::ibv_qp_type::IBV_QPT_UC
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
+            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
-            panic!("Setting the access flags is only possible on RC and UC Queue Pairs.");
+            self.access = Some(access);
         }
-        self.access = Some(access);
         self
     }
 
@@ -647,16 +646,15 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Valid only for RC and UC QPs.
     pub fn allow_remote_rw(&mut self) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC
-            && self.qp_type != ffi::ibv_qp_type::IBV_QPT_UC
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
+            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
-            panic!("Setting the access flags is only possible on RC and UC Queue Pairs.");
+            self.access = Some(
+                self.access.unwrap()
+                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+            );
         }
-        self.access = Some(
-            self.access.unwrap()
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ,
-        );
         self
     }
 
@@ -703,10 +701,9 @@ impl<'res> QueuePairBuilder<'res> {
     ///  - 30 - 327.68 ms delay
     ///  - 31 - 491.52 ms delay
     pub fn set_min_rnr_timer(&mut self, timer: u8) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC {
-            panic!("Setting the RNR timer value is only possible on RC Queue Pairs.");
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            self.min_rnr_timer = Some(timer);
         }
-        self.min_rnr_timer = Some(timer);
         self
     }
 
@@ -755,10 +752,9 @@ impl<'res> QueuePairBuilder<'res> {
     ///  - 30 - 4400 s
     ///  - 31 - 8800 s
     pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC {
-            panic!("Setting the timeout is only possible on RC Queue Pairs.");
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            self.timeout = Some(timeout);
         }
-        self.timeout = Some(timeout);
         self
     }
 
@@ -772,11 +768,10 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Panics if a count higher than 7 is given.
     pub fn set_retry_count(&mut self, count: u8) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC {
-            panic!("Setting the retry count is only possible on RC Queue Pairs.");
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            assert!(count <= 7);
+            self.retry_count = Some(count);
         }
-        assert!(count <= 7);
-        self.retry_count = Some(count);
         self
     }
 
@@ -791,11 +786,10 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Panics if a limit higher than 7 is given.
     pub fn set_rnr_retry(&mut self, n: u8) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC {
-            panic!("Setting the RNR retry count is only possible on RC Queue Pairs.");
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            assert!(n <= 7);
+            self.rnr_retry = Some(n);
         }
-        assert!(n <= 7);
-        self.rnr_retry = Some(n);
         self
     }
 
@@ -804,10 +798,9 @@ impl<'res> QueuePairBuilder<'res> {
     /// This defaults to 1.
     /// Valid only for RC QPs.
     pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC {
-            panic!("Setting the number of outstanding RDMA reads & atomic operations is only possible on RC Queue Pairs.");
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            self.max_rd_atomic = Some(max_rd_atomic);
         }
-        self.max_rd_atomic = Some(max_rd_atomic);
         self
     }
 
@@ -815,10 +808,9 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// This defaults to 1.
     pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC {
-            panic!("Setting the responder resources for handling incoming RDMA reads & atomic operations is only possible on RC Queue Pairs.");
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
         }
-        self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
         self
     }
 
@@ -832,13 +824,12 @@ impl<'res> QueuePairBuilder<'res> {
     ///  - 4: 2048
     ///  - 5: 4096
     pub fn set_path_mtu(&mut self, path_mtu: u32) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC
-            && self.qp_type != ffi::ibv_qp_type::IBV_QPT_UC
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
+            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
-            panic!("Setting the path MTU is only possible on RC and UC Queue Pairs.");
+            assert!((1..=5).contains(&path_mtu));
+            self.path_mtu = Some(path_mtu);
         }
-        assert!((1..=5).contains(&path_mtu));
-        self.path_mtu = Some(path_mtu);
         self
     }
 
@@ -846,12 +837,11 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Defaults to 0.
     pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
-        if self.qp_type != ffi::ibv_qp_type::IBV_QPT_RC
-            && self.qp_type != ffi::ibv_qp_type::IBV_QPT_UC
+        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
+            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
-            panic!("Setting the receive queue's PSN is only possible on RC and UC Queue Pairs.");
+            self.rq_psn = Some(rq_psn);
         }
-        self.rq_psn = Some(rq_psn);
         self
     }
 
