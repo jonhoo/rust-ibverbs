@@ -18,7 +18,7 @@ fn main() {
     let endpoint = qp_builder.endpoint();
     let mut qp = qp_builder.handshake(endpoint).unwrap();
 
-    let mut mr = pd.allocate::<u64>(2).unwrap();
+    let mut mr = pd.allocate::<u64>(2, None).unwrap();
     mr[1] = 0x42;
 
     unsafe { qp.post_receive(&mut mr, ..1, 2) }.unwrap();

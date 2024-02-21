@@ -1144,7 +1144,7 @@ impl<'ctx> ProtectionDomain<'ctx> {
     /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
     /// that can be registered for a specific device.
     ///
-    /// `allocate` currently sets the following permissions for each new `MemoryRegion`:
+    /// `allocate` accepts an optional set of permission flags. The default is:
     ///
     ///  - `IBV_ACCESS_LOCAL_WRITE`: Enables Local Write Access
     ///  - `IBV_ACCESS_REMOTE_WRITE`: Enables Remote Write Access
@@ -1163,17 +1163,26 @@ impl<'ctx> ProtectionDomain<'ctx> {
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
-    pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> io::Result<MemoryRegion<T>> {
+    pub fn allocate<T: Sized + Copy + Default>(
+        &self,
+        n: usize,
+        access_flags: Option<ffi::ibv_access_flags>,
+    ) -> io::Result<MemoryRegion<T>> {
         assert!(n > 0);
         assert!(mem::size_of::<T>() > 0);
 
         let mut data = Vec::with_capacity(n);
         data.resize(n, T::default());
 
-        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
+        let access = match access_flags {
+            Some(access) => access,
+            None => {
+                ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
+                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC
+            }
+        };
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 self.pd,
