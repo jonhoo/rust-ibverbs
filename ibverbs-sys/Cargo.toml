@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs-sys"
-version = "0.1.2"
+version = "0.2.0+52.0"
 edition = "2021"
 
 description = "Raw, FFI bindings for RDMA ibverbs through rdma-core"

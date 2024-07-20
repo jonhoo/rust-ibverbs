@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "ibverbs"
-version = "0.7.1"
+version = "0.8.0"
 dependencies = [
  "bincode",
  "ibverbs-sys",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "ibverbs-sys"
-version = "0.1.2"
+version = "0.2.0+52.0"
 dependencies = [
  "bindgen",
  "regex",
