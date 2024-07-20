@@ -30,7 +30,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: configure-ci.sh
+        run: ./configure-ci.sh
       - name: Install ${{ matrix.toolchain }}
         uses: dtolnay/rust-toolchain@master
         with:
@@ -75,7 +75,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: configure-ci.sh
+        run: ./configure-ci.sh
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
       - name: Install nightly for -Zminimal-versions
@@ -115,7 +115,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: configure-ci.sh
+        run: ./configure-ci.sh
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
         with:
