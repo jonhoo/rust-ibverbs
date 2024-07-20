@@ -13,7 +13,8 @@ echo "Move Cargo target dir to avoid super long paths"
 mkdir /tmp/cargo
 
 echo "Tell Cargo to use clang and target dir"
-cat >.cargo <<EOF
+mkdir .cargo
+cat >.cargo/config.toml <<EOF
 [build]
 target-dir = "/tmp/cargo"
 
