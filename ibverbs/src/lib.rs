@@ -1075,12 +1075,19 @@ impl<T> DerefMut for MemoryRegion<T> {
 impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
-        RemoteKey(unsafe { &*self.mr }.rkey)
+        RemoteKey {
+            key: unsafe { &*self.mr }.rkey,
+        }
     }
 }
 
 /// A key that authorizes direct memory access to a memory region.
-pub struct RemoteKey(u32);
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RemoteKey {
+    /// The actual key value.
+    pub key: u32,
+}
 
 impl<T> Drop for MemoryRegion<T> {
     fn drop(&mut self) {
