@@ -441,7 +441,10 @@ impl Context {
     pub fn alloc_pd(&self) -> io::Result<ProtectionDomain<'_>> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.ctx) };
         if pd.is_null() {
-            Err(io::Error::other("obv_alloc_pd returned null"))
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "obv_alloc_pd returned null",
+            ))
         } else {
             Ok(ProtectionDomain { ctx: self, pd })
         }
@@ -507,7 +510,7 @@ impl<'ctx> CompletionQueue<'ctx> {
         };
 
         if n < 0 {
-            Err(io::Error::other("ibv_poll_cq failed"))
+            Err(io::Error::new(io::ErrorKind::Other, "ibv_poll_cq failed"))
         } else {
             Ok(&mut completions[0..n as usize])
         }
