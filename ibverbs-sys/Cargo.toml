@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs-sys"
-version = "0.2.0+52.0"
+version = "0.2.1+52.0"
 edition = "2021"
 
 description = "Raw, FFI bindings for RDMA ibverbs through rdma-core"
@@ -24,6 +24,7 @@ exclude = ["vendor/rdma-core/build/"]
 
 [build-dependencies]
 bindgen = "0.69.2"
+cmake = "0.1.50"
 
 # to make -Zminimal-versions work
 [target.'cfg(any())'.dependencies]

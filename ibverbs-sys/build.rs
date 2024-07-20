@@ -8,8 +8,10 @@ fn main() {
     println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
     println!("cargo:rustc-link-lib=ibverbs");
 
-    // initialize and update submodules
-    if Path::new(".git").is_dir() {
+    if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
+        // don't touch source dir if not necessary
+    } else if Path::new(".git").is_dir() {
+        // initialize and update submodules
         Command::new("git")
             .args(["submodule", "update", "--init"])
             .status()
@@ -22,16 +24,21 @@ fn main() {
     }
 
     // build vendor/rdma-core
-    Command::new("bash")
-        .current_dir("vendor/rdma-core/")
-        .args(["build.sh"])
-        .status()
-        .expect("Failed to build vendor/rdma-core using build.sh");
+    eprintln!("run cmake");
+    let built_in = cmake::Config::new("vendor/rdma-core")
+        .define("IN_PLACE", "1")
+        .define("NO_MAN_PAGES", "1")
+        .no_build_target(true)
+        .build();
+    let built_in = built_in
+        .to_str()
+        .expect("build directory path is not valid UTF-8");
 
     // generate the bindings
+    eprintln!("run bindgen");
     let bindings = bindgen::Builder::default()
         .header("vendor/rdma-core/libibverbs/verbs.h")
-        .clang_arg("-Ivendor/rdma-core/build/include/")
+        .clang_arg(format!("-I{built_in}/include/"))
         .allowlist_function("ibv_.*")
         .allowlist_type("ibv_.*")
         .bitfield_enum("ibv_access_flags")
