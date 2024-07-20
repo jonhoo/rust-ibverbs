@@ -47,9 +47,15 @@ jobs:
       # https://twitter.com/jonhoo/status/1571290371124260865
       - name: cargo test --locked
         run: cargo test --locked --all-features --all-targets
+        env:
+          CC: clang
+          CXX: clang
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
         run: cargo test --locked --all-features --doc
+        env:
+          CC: clang
+          CXX: clang
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
     # that this crate is compatible with the minimal version that this crate and its dependencies
@@ -96,6 +102,9 @@ jobs:
         run: cargo +nightly update -Zminimal-versions
       - name: cargo test
         run: cargo test --locked --all-features --all-targets
+        env:
+          CC: clang
+          CXX: clang
   coverage:
     # use llvm-cov to build and collect coverage and outputs in a format that
     # is compatible with codecov.io
@@ -142,6 +151,9 @@ jobs:
         run: cargo generate-lockfile
       - name: cargo llvm-cov
         run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
+        env:
+          CC: clang
+          CXX: clang
       - name: Record Rust version
         run: echo "RUST=$(rustc --version)" >> "$GITHUB_ENV"
       - name: Upload to codecov.io
