@@ -53,6 +53,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libibverbs1 libibverbs-dev
+      - name: Install clang for rdma-core to be happy
+        run: |
+          sudo apt-get install clang
       - name: Install ${{ matrix.toolchain }}
         uses: dtolnay/rust-toolchain@master
         with:
@@ -77,6 +80,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libibverbs1 libibverbs-dev
+      - name: Install clang for rdma-core to be happy
+        run: |
+          sudo apt-get install clang
       - name: Install nightly
         uses: dtolnay/rust-toolchain@nightly
       - name: cargo doc
@@ -96,6 +102,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libibverbs1 libibverbs-dev
+      - name: Install clang for rdma-core to be happy
+        run: |
+          sudo apt-get install clang
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
       - name: cargo install cargo-hack
@@ -121,6 +130,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install libibverbs1 libibverbs-dev
+      - name: Install clang for rdma-core to be happy
+        run: |
+          sudo apt-get install clang
       - name: Install ${{ matrix.msrv }}
         uses: dtolnay/rust-toolchain@master
         with:
