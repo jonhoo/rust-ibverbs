@@ -438,10 +438,13 @@ impl Context {
     /// A protection domain is a means of protection, and helps you create a group of object that
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
-    pub fn alloc_pd(&self) -> Result<ProtectionDomain<'_>, ()> {
+    pub fn alloc_pd(&self) -> io::Result<ProtectionDomain<'_>> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.ctx) };
         if pd.is_null() {
-            Err(())
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "obv_alloc_pd returned null",
+            ))
         } else {
             Ok(ProtectionDomain { ctx: self, pd })
         }
@@ -489,7 +492,7 @@ impl<'ctx> CompletionQueue<'ctx> {
     pub fn poll<'c>(
         &self,
         completions: &'c mut [ffi::ibv_wc],
-    ) -> Result<&'c mut [ffi::ibv_wc], ()> {
+    ) -> io::Result<&'c mut [ffi::ibv_wc]> {
         // TODO: from http://www.rdmamojo.com/2013/02/15/ibv_poll_cq/
         //
         //   One should consume Work Completions at a rate that prevents the CQ from being overrun
@@ -507,7 +510,7 @@ impl<'ctx> CompletionQueue<'ctx> {
         };
 
         if n < 0 {
-            Err(())
+            Err(io::Error::new(io::ErrorKind::Other, "ibv_poll_cq failed"))
         } else {
             Ok(&mut completions[0..n as usize])
         }
@@ -1075,12 +1078,19 @@ impl<T> DerefMut for MemoryRegion<T> {
 impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
-        RemoteKey(unsafe { &*self.mr }.rkey)
+        RemoteKey {
+            key: unsafe { &*self.mr }.rkey,
+        }
     }
 }
 
 /// A key that authorizes direct memory access to a memory region.
-pub struct RemoteKey(u32);
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub struct RemoteKey {
+    /// The actual key value.
+    pub key: u32,
+}
 
 impl<T> Drop for MemoryRegion<T> {
     fn drop(&mut self) {
