@@ -650,7 +650,7 @@ impl<'res> QueuePairBuilder<'res> {
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
             self.access = Some(
-                self.access.unwrap()
+                self.access.expect("always set to Some in new")
                     | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
                     | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ,
             );
@@ -807,6 +807,7 @@ impl<'res> QueuePairBuilder<'res> {
     /// Set the number of responder resources for handling incoming RDMA reads & atomic operations.
     ///
     /// This defaults to 1.
+    /// Valid only for RC QPs.
     pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
             self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
@@ -817,6 +818,7 @@ impl<'res> QueuePairBuilder<'res> {
     /// Set the path MTU.
     ///
     /// Defaults to the port's active_mtu.
+    /// Valid only for RC and UC QPs.
     /// The possible values are:
     ///  - 1: 256
     ///  - 2: 512
@@ -836,6 +838,7 @@ impl<'res> QueuePairBuilder<'res> {
     /// Set the PSN for the receive queue.
     ///
     /// Defaults to 0.
+    /// Valid only for RC and UC QPs.
     pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
