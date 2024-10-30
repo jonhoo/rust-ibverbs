@@ -856,6 +856,22 @@ impl<'res> QueuePairBuilder<'res> {
         self
     }
 
+    /// Set the maximum number of send requests in the work queue
+    ///
+    /// Defaults to 1.
+    pub fn set_max_send_wr(&mut self, max_send_wr: u32) -> &mut Self {
+        self.max_send_wr = max_send_wr;
+        self
+    }
+
+    /// Set the maximum number of receive requests in the work queue
+    ///
+    /// Defaults to 1.
+    pub fn set_max_recv_wr(&mut self, max_recv_wr: u32) -> &mut Self {
+        self.max_recv_wr = max_recv_wr;
+        self
+    }
+
     /// Create a new `QueuePair` from this builder template.
     ///
     /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
