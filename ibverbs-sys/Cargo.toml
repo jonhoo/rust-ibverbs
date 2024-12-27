@@ -29,4 +29,5 @@ cmake = "0.1.50"
 
 # to make -Zminimal-versions work
 [target.'cfg(any())'.dependencies]
+# https://github.com/rust-lang/rust-bindgen/pull/3048
 proc-macro2 = { version = "1.0.80", optional = true }
