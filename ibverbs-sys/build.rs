@@ -24,9 +24,9 @@ fn main() {
     }
 
     // build vendor/rdma-core
+    // note that we only build it to generate the bindings!
     eprintln!("run cmake");
     let built_in = cmake::Config::new("vendor/rdma-core")
-        .define("IN_PLACE", "1")
         .define("NO_MAN_PAGES", "1")
         .no_build_target(true)
         .build();
