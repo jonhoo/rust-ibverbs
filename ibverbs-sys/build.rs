@@ -28,6 +28,18 @@ fn main() {
     eprintln!("run cmake");
     let built_in = cmake::Config::new("vendor/rdma-core")
         .define("NO_MAN_PAGES", "1")
+        // cmake crate defaults CMAKE_INSTALL_PREFIX to the output directory
+        //
+        //   https://github.com/rust-lang/cmake-rs/blob/94da9de2ea79ab6cad572e908864a160cf4847a9/src/lib.rs#L699-L703
+        //
+        // this results in overly long runtime paths on docs.rs, which then fail the build. it also
+        // causes sadness for users trying to build since the bindings may fail to build for the
+        // same reason (see https://github.com/jonhoo/rust-ibverbs/pull/41 for what was an
+        // incomplete fix).
+        //
+        // since we never actually _install_ anything when building here, we should be able to
+        // safely set this to any short path. simply by convention we set it to `/usr`.
+        .define("CMAKE_INSTALL_PREFIX", "/usr")
         .no_build_target(true)
         .build();
     let built_in = built_in
