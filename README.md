@@ -15,7 +15,7 @@ Completion Queues, Queue-Pairs, Shared Receive Queues, Address Handles, and Memo
 also handles sending and receiving data posted to QPs and SRQs, and getting completions from
 CQs using polling and completions events.
 
-A good place to start is to look at the programs in [`examples/`](examples/), and the upstream
+A good place to start is to look at the programs in [`examples/`](ibverbs/examples/), and the upstream
 [C examples]. You can test RDMA programs on modern Linux kernels even without specialized RDMA
 hardware by using [SoftRoCE][soft].
 
