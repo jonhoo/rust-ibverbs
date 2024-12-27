@@ -105,7 +105,7 @@ jobs:
     # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
     strategy:
       matrix:
-        msrv: ["1.70.0"] # bindgen 1.69
+        msrv: ["1.82.0"] # bindgen 1.71
     name: ubuntu / ${{ matrix.msrv }}
     steps:
       - uses: actions/checkout@v4

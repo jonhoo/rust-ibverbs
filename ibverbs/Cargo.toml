@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 
 description = "Bindings for RDMA ibverbs through rdma-core"
@@ -19,7 +19,7 @@ categories = ["network-programming", "api-bindings"]
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.2.0" }
+ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.3.0" }
 
 [dependencies.serde]
 version = "1.0.100"
