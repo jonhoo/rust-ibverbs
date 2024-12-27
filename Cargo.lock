@@ -117,6 +117,7 @@ version = "0.3.0+55.0"
 dependencies = [
  "bindgen",
  "cmake",
+ "proc-macro2",
  "regex",
 ]
 
