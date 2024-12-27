@@ -118,7 +118,6 @@ dependencies = [
  "bindgen",
  "cmake",
  "proc-macro2",
- "regex",
 ]
 
 [[package]]
