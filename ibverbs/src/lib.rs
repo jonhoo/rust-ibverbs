@@ -379,7 +379,7 @@ impl Context {
 
         // let mut gid = ffi::ibv_gid::default();
         let mut gid = Gid::default();
-        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 0, gid.as_mut()) };
+        let ok = unsafe { ffi::ibv_query_gid(ctx, PORT_NUM, 3, gid.as_mut()) };
         if ok != 0 {
             return Err(io::Error::last_os_error());
         }
