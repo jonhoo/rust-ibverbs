@@ -377,18 +377,18 @@ impl Context {
             }
         }
 
-        let mut gid_table = vec![ffi::ibv_gid_entry::default(); port_attr.gid_tbl_len as usize];
+        let mut raw_gid_tbl = vec![ffi::ibv_gid_entry::default(); port_attr.gid_tbl_len as usize];
         let num_entries = unsafe {
             ffi::_ibv_query_gid_table(
                 ctx,
-                gid_table.as_mut_ptr(),
-                gid_table.len(),
+                raw_gid_tbl.as_mut_ptr(),
+                raw_gid_tbl.len(),
                 0,
                 size_of::<ffi::ibv_gid_entry>(),
             )
         };
-        assert_eq!(num_entries as usize, gid_table.len());
-        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
+        assert_eq!(num_entries as usize, raw_gid_tbl.len());
+        let gid_table = raw_gid_tbl.into_iter().map(GidEntry::from).collect();
 
         Ok(Context {
             ctx,
