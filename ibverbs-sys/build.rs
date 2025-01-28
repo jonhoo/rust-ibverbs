@@ -73,6 +73,7 @@ fn main() {
         .derive_debug(true)
         .prepend_enum_name(false)
         .blocklist_type("ibv_wc")
+        .wrap_static_fns(true)
         .size_t_is_usize(true)
         .generate()
         .expect("Unable to generate bindings");
