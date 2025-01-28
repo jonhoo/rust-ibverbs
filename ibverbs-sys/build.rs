@@ -51,6 +51,7 @@ fn main() {
     let bindings = bindgen::Builder::default()
         .header("vendor/rdma-core/libibverbs/verbs.h")
         .clang_arg(format!("-I{built_in}/include/"))
+        .allowlist_function("_ibv_.*")
         .allowlist_function("ibv_.*")
         .allowlist_type("ibv_.*")
         .allowlist_var("IBV_LINK_LAYER_.*")
@@ -73,7 +74,6 @@ fn main() {
         .derive_debug(true)
         .prepend_enum_name(false)
         .blocklist_type("ibv_wc")
-        .wrap_static_fns(true)
         .size_t_is_usize(true)
         .generate()
         .expect("Unable to generate bindings");
