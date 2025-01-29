@@ -378,9 +378,16 @@ impl Context {
         }
 
         let mut gid_table = vec![ffi::ibv_gid_entry::default(); port_attr.gid_tbl_len as usize];
-        let num_entries =
-            unsafe { ffi::ibv_query_gid_table(ctx, gid_table.as_mut_ptr(), gid_table.len(), 0) };
-        assert_eq!(num_entries as usize, gid_table.len());
+        let num_entries = unsafe {
+            ffi::_ibv_query_gid_table(
+                ctx,
+                gid_table.as_mut_ptr(),
+                gid_table.len(),
+                0,
+                size_of::<ffi::ibv_gid_entry>(),
+            )
+        };
+        gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
 
         Ok(Context {
