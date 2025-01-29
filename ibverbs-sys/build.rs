@@ -5,6 +5,7 @@ use std::process::Command;
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("failed to get current directory");
     println!("cargo:include={manifest_dir}/vendor/rdma-core/build/include");
+    println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
     println!("cargo:rustc-link-lib=ibverbs");
 
     if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
