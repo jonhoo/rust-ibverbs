@@ -1201,8 +1201,6 @@ impl<'res> PreparedQueuePair<'res> {
             attr.ah_attr.grh.dgid = gid.into();
             attr.ah_attr.grh.hop_limit = 0xff;
             attr.ah_attr.grh.sgid_index = self.gid_index as u8;
-        } else {
-            panic!();
         }
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_AV
