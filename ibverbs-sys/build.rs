@@ -4,12 +4,7 @@ use std::process::Command;
 
 fn main() {
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("failed to get current directory");
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     println!("cargo:include={manifest_dir}/vendor/rdma-core/build/include");
-    println!(
-        "cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib;{}",
-        out_path.to_str().unwrap()
-    );
     println!("cargo:rustc-link-lib=ibverbs");
 
     if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
@@ -83,6 +78,7 @@ fn main() {
         .expect("Unable to generate bindings");
 
     // write the bindings to the $OUT_DIR/bindings.rs file.
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Could not write bindings");
