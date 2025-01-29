@@ -677,6 +677,7 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Defaults to 0.
     pub fn set_gid_index(&mut self, gid_index: usize) -> &mut Self {
+        assert!(gid_index < self.pd.ctx.gid_table.len());
         self.gid_index = gid_index;
         self
     }
