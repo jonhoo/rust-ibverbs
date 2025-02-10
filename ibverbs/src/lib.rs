@@ -1086,6 +1086,7 @@ pub struct GidEntry {
     /// enum ibv_gid_type, can be one of IBV_GID_TYPE_IB, IBV_GID_TYPE_ROCE_V1 or IBV_GID_TYPE_ROCE_V2.
     pub gid_type: ffi::ibv_gid_type,
     /// The interface index of the net device associated with this GID.
+    ///
     /// It is 0 if there is no net device associated with it.
     pub ndev_ifindex: u32,
 }
