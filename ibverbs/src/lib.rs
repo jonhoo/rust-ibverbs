@@ -387,6 +387,12 @@ impl Context {
                 size_of::<ffi::ibv_gid_entry>(),
             )
         };
+        if num_entries < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to query gid table, error={}", -num_entries),
+            ));
+        }
         gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
 
