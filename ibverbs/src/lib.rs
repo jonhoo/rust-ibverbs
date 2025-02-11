@@ -76,6 +76,7 @@ use std::ptr;
 const PORT_NUM: u8 = 1;
 
 /// Direct access to low-level libverbs FFI.
+pub use ffi::ibv_gid_type;
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
@@ -559,7 +560,7 @@ pub struct QueuePairBuilder<'res> {
     recv: &'res CompletionQueue<'res>,
     max_recv_wr: u32,
 
-    gid_index: usize,
+    gid_index: Option<u32>,
     max_send_sge: u32,
     max_recv_sge: u32,
     max_inline_data: u32,
@@ -617,7 +618,7 @@ impl<'res> QueuePairBuilder<'res> {
             ctx: 0,
             pd,
 
-            gid_index: 0,
+            gid_index: None,
             send,
             max_send_wr,
             recv,
@@ -681,10 +682,10 @@ impl<'res> QueuePairBuilder<'res> {
     /// The entry corresponds to the index in `Context::gid_table()`. This is only used if the
     /// `QueuePairEndpoint` that is passed to `QueuePair::handshake()` has a `gid`.
     ///
-    /// Defaults to 0.
-    pub fn set_gid_index(&mut self, gid_index: usize) -> &mut Self {
-        assert!(gid_index < self.pd.ctx.gid_table.len());
-        self.gid_index = gid_index;
+    /// Defaults to unset.
+    pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
+        assert!(gid_index < self.pd.ctx.gid_table.len() as u32);
+        self.gid_index = Some(gid_index);
         self
     }
 
@@ -987,7 +988,7 @@ pub struct PreparedQueuePair<'res> {
     qp: QueuePair<'res>,
 
     // carried from builder
-    gid_index: usize,
+    gid_index: Option<u32>,
     /// only valid for RC and UC
     access: Option<ffi::ibv_access_flags>,
     /// only valid for RC
@@ -1128,11 +1129,16 @@ impl<'res> PreparedQueuePair<'res> {
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
     pub fn endpoint(&self) -> QueuePairEndpoint {
         let num = unsafe { &*self.qp.qp }.qp_num;
-
+        let gid = self.gid_index.map(|gid_index| {
+            // NOTE: bounds check happened in `set_gid_index`.
+            let gid_entry = &self.ctx.gid_table[gid_index as usize];
+            assert_eq!(gid_entry.gid_index, gid_index);
+            gid_entry.gid
+        });
         QueuePairEndpoint {
             num,
             lid: self.ctx.port_attr.lid,
-            gid: Some(self.ctx.gid_table[self.gid_index].gid),
+            gid,
         }
     }
 
@@ -1207,7 +1213,10 @@ impl<'res> PreparedQueuePair<'res> {
             attr.ah_attr.is_global = 1;
             attr.ah_attr.grh.dgid = gid.into();
             attr.ah_attr.grh.hop_limit = 0xff;
-            attr.ah_attr.grh.sgid_index = self.gid_index as u8;
+            attr.ah_attr.grh.sgid_index = self
+                .gid_index
+                .ok_or_else(|| io::Error::other("gid was set for remote but not local"))?
+                as u8;
         }
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_AV
