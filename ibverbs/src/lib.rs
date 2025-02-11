@@ -1082,6 +1082,7 @@ impl AsMut<ffi::ibv_gid> for Gid {
 ///
 /// This struct acts as a rust wrapper for `ffi::ibv_gid_entry`. We use it instead of
 /// `ffi::ibv_gid_entry` because `ffi::ibv_gid` is wrapped by `Gid`.
+#[derive(Debug, Clone)]
 pub struct GidEntry {
     /// The GID entry.
     pub gid: Gid,
