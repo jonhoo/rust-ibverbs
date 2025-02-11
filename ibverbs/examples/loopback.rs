@@ -12,6 +12,7 @@ fn main() {
 
     let qp_builder = pd
         .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
+        .set_gid_index(1)
         .build()
         .unwrap();
 

@@ -52,6 +52,7 @@ fn main() {
         .header("vendor/rdma-core/libibverbs/verbs.h")
         .clang_arg(format!("-I{built_in}/include/"))
         .allowlist_function("ibv_.*")
+        .allowlist_function("_ibv_.*")
         .allowlist_type("ibv_.*")
         .allowlist_var("IBV_LINK_LAYER_.*")
         .bitfield_enum("ibv_access_flags")
