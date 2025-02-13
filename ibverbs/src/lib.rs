@@ -551,9 +551,9 @@ impl<'ctx> CompletionQueue<'ctx> {
         let c = completions as *mut [ffi::ibv_wc];
 
         loop {
-            let acompletions = self.poll(unsafe { &mut *c })?;
-            if !acompletions.is_empty() {
-                return Ok(acompletions);
+            let completions = self.poll(unsafe { &mut *c })?;
+            if !completions.is_empty() {
+                return Ok(completions);
             }
 
             let ctx: *mut ffi::ibv_context = unsafe { &*self.cq }.context;
@@ -564,11 +564,12 @@ impl<'ctx> CompletionQueue<'ctx> {
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
-            let asdf = self.poll(unsafe { &mut *c })?;
-            if !asdf.is_empty() {
-                return Ok(asdf);
+            let completions = self.poll(unsafe { &mut *c })?;
+            if !completions.is_empty() {
+                return Ok(completions);
             }
 
+            println!("POLL4");
             let mut out_cq = std::ptr::null_mut();
             let mut out_cq_context = std::ptr::null_mut();
             let errno = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
@@ -576,6 +577,7 @@ impl<'ctx> CompletionQueue<'ctx> {
                 return Err(io::Error::from_raw_os_error(errno));
             }
 
+            println!("POLL5");
             assert_eq!(self.cq, out_cq);
             unsafe {
                 ffi::ibv_ack_cq_events(self.cq, 1);
