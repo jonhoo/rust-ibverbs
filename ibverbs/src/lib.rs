@@ -548,8 +548,10 @@ impl<'ctx> CompletionQueue<'ctx> {
         &self,
         completions: &'c mut [ffi::ibv_wc],
     ) -> io::Result<&'c mut [ffi::ibv_wc]> {
+        let c = completions as *mut [ffi::ibv_wc];
+
         loop {
-            let acompletions = self.poll(completions)?;
+            let acompletions = self.poll(unsafe { &mut *c })?;
             if !acompletions.is_empty() {
                 return Ok(acompletions);
             }
@@ -562,8 +564,7 @@ impl<'ctx> CompletionQueue<'ctx> {
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
-
-            let asdf = self.poll(completions)?;
+            let asdf = self.poll(unsafe { &mut *c })?;
             if !asdf.is_empty() {
                 return Ok(asdf);
             }
