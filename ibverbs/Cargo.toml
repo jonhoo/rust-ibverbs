@@ -20,6 +20,7 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.3.0" }
+libc = "0.2"
 
 [dependencies.serde]
 version = "1.0.100"

@@ -72,6 +72,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::os::raw::c_void;
 use std::ptr;
+use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
@@ -424,12 +425,28 @@ impl Context {
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue<'_>> {
+        let cc = unsafe { ffi::ibv_create_comp_channel(self.ctx) };
+        if cc.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let cc_fd = unsafe { *cc }.fd;
+        let flags = unsafe { libc::fcntl(cc_fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let rc = unsafe { libc::fcntl(cc_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx,
                 min_cq_entries,
                 ptr::null::<c_void>().offset(id) as *mut _,
-                ptr::null::<c_void>() as *mut _,
+                cc,
                 0,
             )
         };
@@ -439,6 +456,7 @@ impl Context {
         } else {
             Ok(CompletionQueue {
                 _phantom: PhantomData,
+                cc,
                 cq,
             })
         }
@@ -479,6 +497,7 @@ impl Drop for Context {
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
 pub struct CompletionQueue<'ctx> {
     _phantom: PhantomData<&'ctx ()>,
+    cc: *mut ffi::ibv_comp_channel,
     cq: *mut ffi::ibv_cq,
 }
 
@@ -533,11 +552,105 @@ impl<'ctx> CompletionQueue<'ctx> {
             Ok(&mut completions[0..n as usize])
         }
     }
+
+    /// Waits for one or more work completions in a Completion Queue (CQ).
+    ///
+    /// Unlike `poll`, this method blocks until at least one work completion is available or the
+    /// optional timeout expires. It is designed to wait efficiently for completions when polling
+    /// alone is insufficient, such as in low-traffic scenarios.
+    ///
+    /// The returned slice reflects completed work requests (e.g., sends, receives) from the
+    /// associated Work Queue. Not all fields in `ibv_wc` are valid unless the status is
+    /// `IBV_WC_SUCCESS`.
+    ///
+    /// # Errors
+    /// - `TimedOut`: If the timeout expires before any completions are available.
+    /// - System errors: From underlying calls like `req_notify_cq`, `poll`, or `ibv_get_cq_event`.
+    ///
+    /// # Notes
+    /// - This method blocks, unlike `poll`, but avoids busy-waiting by leveraging CQ events and
+    ///   system polling.
+    /// - Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
+    ///   `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable.
+    pub fn wait<'c>(
+        &self,
+        completions: &'c mut [ffi::ibv_wc],
+        timeout: Option<Duration>,
+    ) -> io::Result<&'c mut [ffi::ibv_wc]> {
+        let c = completions as *mut [ffi::ibv_wc];
+
+        loop {
+            let completions = self.poll(unsafe { &mut *c })?;
+            if !completions.is_empty() {
+                return Ok(completions);
+            }
+
+            let ctx: *mut ffi::ibv_context = unsafe { *self.cq }.context;
+            let errno = unsafe {
+                let ops = &mut { &mut *ctx }.ops;
+                ops.req_notify_cq.as_mut().unwrap()(self.cq, 0)
+            };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+
+            let completions = self.poll(unsafe { &mut *c })?;
+            if !completions.is_empty() {
+                return Ok(completions);
+            }
+
+            let mut pollfd = libc::pollfd {
+                fd: unsafe { *self.cc }.fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe {
+                libc::poll(
+                    &mut pollfd,
+                    1,
+                    timeout.map_or(-1, |x| x.as_millis() as libc::c_int),
+                )
+            };
+            match rc {
+                -1 => return Err(io::Error::last_os_error()),
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Timed out during completion queue wait",
+                    ))
+                }
+                1 => {}
+                _ => unreachable!(),
+            }
+
+            let mut out_cq = std::ptr::null_mut();
+            let mut out_cq_context = std::ptr::null_mut();
+            let rc = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
+            if rc < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(e);
+            }
+
+            assert_eq!(self.cq, out_cq);
+            unsafe {
+                ffi::ibv_ack_cq_events(self.cq, 1);
+            };
+        }
+    }
 }
 
 impl<'a> Drop for CompletionQueue<'a> {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e);
+        }
+
+        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e);
