@@ -202,7 +202,7 @@ fn bindgen_test_layout_ibv_wc() {
         concat!("Alignment of ", stringify!(ibv_wc))
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).wr_id as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, wr_id),
         0usize,
         concat!(
             "Alignment of field: ",
@@ -212,7 +212,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).status as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, status),
         8usize,
         concat!(
             "Alignment of field: ",
@@ -222,7 +222,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).opcode as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, opcode),
         12usize,
         concat!(
             "Alignment of field: ",
@@ -232,7 +232,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).vendor_err as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, vendor_err),
         16usize,
         concat!(
             "Alignment of field: ",
@@ -242,7 +242,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).byte_len as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, byte_len),
         20usize,
         concat!(
             "Alignment of field: ",
@@ -252,7 +252,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).qp_num as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, qp_num),
         28usize,
         concat!(
             "Alignment of field: ",
@@ -262,7 +262,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).src_qp as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, src_qp),
         32usize,
         concat!(
             "Alignment of field: ",
@@ -272,7 +272,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).wc_flags as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, wc_flags),
         36usize,
         concat!(
             "Alignment of field: ",
@@ -282,7 +282,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).pkey_index as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, pkey_index),
         40usize,
         concat!(
             "Alignment of field: ",
@@ -292,7 +292,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).slid as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, slid),
         42usize,
         concat!(
             "Alignment of field: ",
@@ -302,7 +302,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).sl as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, sl),
         44usize,
         concat!(
             "Alignment of field: ",
@@ -312,7 +312,7 @@ fn bindgen_test_layout_ibv_wc() {
         )
     );
     assert_eq!(
-        unsafe { &(*(0 as *const ibv_wc)).dlid_path_bits as *const _ as usize },
+        std::mem::offset_of!(ibv_wc, dlid_path_bits),
         45usize,
         concat!(
             "Alignment of field: ",
