@@ -104,7 +104,7 @@ checksum = "d2fabcfbdc87f4758337ca535fb41a6d701b65693ce38287d856d1674551ec9b"
 
 [[package]]
 name = "ibverbs"
-version = "0.9.1"
+version = "0.9.2"
 dependencies = [
  "bincode",
  "ibverbs-sys",
@@ -113,7 +113,7 @@ dependencies = [
 
 [[package]]
 name = "ibverbs-sys"
-version = "0.3.1+55.0"
+version = "0.3.2+55.0"
 dependencies = [
  "bindgen",
  "cmake",
