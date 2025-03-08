@@ -22,8 +22,8 @@ fn main() {
     let mut mr = pd.allocate::<u64>(2).unwrap();
     mr[1] = 0x42;
 
-    unsafe { qp.post_receive(&mut mr, ..1, 2) }.unwrap();
-    unsafe { qp.post_send(&mut mr, 1.., 1) }.unwrap();
+    unsafe { qp.post_receive(&[mr.slice(..1)], 2) }.unwrap();
+    unsafe { qp.post_send(&[mr.slice(1..)], 1) }.unwrap();
 
     let mut sent = false;
     let mut received = false;
