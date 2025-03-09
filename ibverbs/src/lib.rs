@@ -1303,7 +1303,7 @@ impl<T> MemoryRegion<T> {
     }
 
     /// Make a subslice of this memory region.
-    pub fn slice(&mut self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
+    pub unsafe fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
         let (addr, length) = calc_addr_len::<T>(
             bounds,
             unsafe { *self.mr }.addr as u64,
@@ -1334,6 +1334,7 @@ fn calc_addr_len<T>(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize
         std::ops::Bound::Excluded(i) => i.checked_mul(size_of::<T>()).unwrap(),
         std::ops::Bound::Unbounded => bytes_len,
     };
+    assert!(start < end);
     assert!(start <= bytes_len);
     assert!(end <= bytes_len);
     let addr = addr + start as u64;
@@ -1343,6 +1344,7 @@ fn calc_addr_len<T>(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize
 
 /// Local memory slice.
 #[derive(Debug, Default, Copy, Clone)]
+#[repr(transparent)]
 pub struct LocalMemorySlice<'a> {
     _sge: ffi::ibv_sge,
     phantom: PhantomData<&'a ()>,
@@ -1530,9 +1532,9 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub unsafe fn post_send<'a>(
+    pub unsafe fn post_send(
         &mut self,
-        local: &[LocalMemorySlice<'a>],
+        local: &[LocalMemorySlice<'_>],
         wr_id: u64,
     ) -> io::Result<()> {
         let mut wr = ffi::ibv_send_wr {
@@ -1604,9 +1606,9 @@ impl<'res> QueuePair<'res> {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub unsafe fn post_receive<'a>(
+    pub unsafe fn post_receive(
         &mut self,
-        local: &[LocalMemorySlice<'a>],
+        local: &[LocalMemorySlice<'_>],
         wr_id: u64,
     ) -> io::Result<()> {
         let mut wr = ffi::ibv_recv_wr {
@@ -1692,6 +1694,10 @@ mod test_serde {
         assert_eq!(
             std::mem::size_of::<LocalMemorySlice<'static>>(),
             std::mem::size_of::<ffi::ibv_sge>()
+        );
+        assert_eq!(
+            std::mem::align_of::<LocalMemorySlice<'static>>(),
+            std::mem::align_of::<ffi::ibv_sge>()
         );
     }
 }
