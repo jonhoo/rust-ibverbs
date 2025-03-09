@@ -74,7 +74,6 @@ use std::os::raw::c_void;
 use std::ptr;
 
 const PORT_NUM: u8 = 1;
-const MAX_GID_TBL_LEN: usize = 32;
 
 /// Direct access to low-level libverbs FFI.
 pub use ffi::ibv_gid_type;
@@ -381,6 +380,7 @@ impl Context {
         }
 
         let ctx = Context { ctx };
+        // checks that the port is active/armed.
         ctx.query_port()?;
         Ok(ctx)
     }
@@ -446,16 +446,23 @@ impl Context {
 
     /// Returns the valid GID table entries of this RDMA device context.
     pub fn gid_table(&self) -> io::Result<Vec<GidEntry>> {
-        let mut gid_table = vec![ffi::ibv_gid_entry::default(); MAX_GID_TBL_LEN];
+        let max_entries = self.query_port()?.gid_tbl_len as usize;
+        let mut gid_table = vec![ffi::ibv_gid_entry::default(); max_entries];
         let num_entries = unsafe {
             ffi::_ibv_query_gid_table(
                 self.ctx,
                 gid_table.as_mut_ptr(),
-                gid_table.len(),
+                max_entries,
                 0,
                 size_of::<ffi::ibv_gid_entry>(),
             )
         };
+        if num_entries < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to query gid table, error={}", -num_entries),
+            ));
+        }
         gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
         Ok(gid_table)
