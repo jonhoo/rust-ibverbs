@@ -1376,6 +1376,68 @@ impl<'ctx> ProtectionDomain<'ctx> {
     /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
     /// that can be registered for a specific device.
     ///
+    /// `allocate` accepts a set of permission flags.
+    /// Local read access is always enabled for the MR.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size of the memory region zero bytes, which can occur either if `n` is 0, or
+    /// if `mem::size_of::<T>()` is 0.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid access value.
+    ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
+    ///    complete this operation.
+    pub fn allocate_with_permissions<T: Sized + Copy + Default>(
+        &self,
+        n: usize,
+        access_flags: ffi::ibv_access_flags,
+    ) -> io::Result<MemoryRegion<T>> {
+        assert!(n > 0);
+        assert!(mem::size_of::<T>() > 0);
+        let mut data = Vec::with_capacity(n);
+        data.resize(n, T::default());
+
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.pd,
+                data.as_mut_ptr() as *mut _,
+                n * mem::size_of::<T>(),
+                access_flags.0 as i32,
+            )
+        };
+
+        // TODO
+        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
+        // The local key (L_Key) field lkey is used as the lkey field of struct ibv_sge when
+        // posting buffers with ibv_post_* verbs, and the the remote key (R_Key)  field rkey  is
+        // used by remote processes to perform Atomic and RDMA operations.  The remote process
+        // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
+        // function.
+
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(MemoryRegion { mr, data })
+        }
+    }
+
+    /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
+    ///
+    /// This process allows the RDMA device to read and write data to the allocated memory. Only
+    /// registered memory can be sent from and received to by `QueuePair`s. Performing this
+    /// registration takes some time, so performing memory registration isn't recommended in the
+    /// data path, when fast response is required.
+    ///
+    /// Every successful registration will result with a MR which has unique (within a specific
+    /// RDMA device) `lkey` and `rkey` values. These keys must be communicated to the other end's
+    /// `QueuePair` for direct memory access.
+    ///
+    /// The maximum size of the block that can be registered is limited to
+    /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
+    /// that can be registered for a specific device.
+    ///
     /// `allocate` currently sets the following permissions for each new `MemoryRegion`:
     ///
     ///  - `IBV_ACCESS_LOCAL_WRITE`: Enables Local Write Access
@@ -1396,38 +1458,11 @@ impl<'ctx> ProtectionDomain<'ctx> {
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
     pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> io::Result<MemoryRegion<T>> {
-        assert!(n > 0);
-        assert!(mem::size_of::<T>() > 0);
-
-        let mut data = Vec::with_capacity(n);
-        data.resize(n, T::default());
-
-        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+        let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
-        let mr = unsafe {
-            ffi::ibv_reg_mr(
-                self.pd,
-                data.as_mut_ptr() as *mut _,
-                n * mem::size_of::<T>(),
-                access.0 as i32,
-            )
-        };
-
-        // TODO
-        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
-        // The local key (L_Key) field lkey is used as the lkey field of struct ibv_sge when
-        // posting buffers with ibv_post_* verbs, and the the remote key (R_Key)  field rkey  is
-        // used by remote processes to perform Atomic and RDMA operations.  The remote process
-        // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
-        // function.
-
-        if mr.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(MemoryRegion { mr, data })
-        }
+        self.allocate_with_permissions(n, access_flags)
     }
 }
 
