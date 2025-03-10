@@ -12,8 +12,8 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 #[derive(Debug, Copy, Clone)]
 pub struct ibv_wc {
     wr_id: u64,
-    status: ibv_wc_status::Type,
-    opcode: ibv_wc_opcode::Type,
+    status: ibv_wc_status,
+    opcode: ibv_wc_opcode,
     vendor_err: u32,
     byte_len: u32,
 
@@ -158,7 +158,7 @@ impl ibv_wc {
     ///  - `IBV_WC_FATAL_ERR`: Fatal Error.
     ///  - `IBV_WC_RESP_TIMEOUT_ERR`: Response Timeout Error.
     ///  - `IBV_WC_GENERAL_ERR`: General Error: other error which isn't one of the above errors.
-    pub fn error(&self) -> Option<(ibv_wc_status::Type, u32)> {
+    pub fn error(&self) -> Option<(ibv_wc_status, u32)> {
         match self.status {
             ibv_wc_status::IBV_WC_SUCCESS => None,
             status => Some((status, self.vendor_err)),
@@ -169,7 +169,7 @@ impl ibv_wc {
     ///
     /// This value controls the way that data was sent, the direction of the data flow and the
     /// valid attributes in the Work Completion.
-    pub fn opcode(&self) -> ibv_wc_opcode::Type {
+    pub fn opcode(&self) -> ibv_wc_opcode {
         self.opcode
     }
 
