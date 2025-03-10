@@ -70,6 +70,7 @@ use std::ffi::CStr;
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
+use std::os::fd::BorrowedFd;
 use std::os::raw::c_void;
 use std::ptr;
 use std::time::Duration;
@@ -431,15 +432,11 @@ impl Context {
         }
 
         let cc_fd = unsafe { *cc }.fd;
-        let flags = unsafe { libc::fcntl(cc_fd, libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-
-        let rc = unsafe { libc::fcntl(cc_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-        if rc < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)?;
+        let arg = nix::fcntl::FcntlArg::F_SETFL(
+            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+        );
+        nix::fcntl::fcntl(cc_fd, arg)?;
 
         let cq = unsafe {
             ffi::ibv_create_cq(
@@ -523,6 +520,10 @@ impl<'ctx> CompletionQueue<'ctx> {
     /// is not `IBV_WC_SUCCESS`, only the following attributes are valid: `wr_id`, `status`,
     /// `qp_num`, and `vendor_err`.
     ///
+    /// Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
+    ///  `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting
+    /// the number of inflight Work Requests.
+    ///
     /// Note that `poll` does not block or cause a context switch. This is why RDMA technologies
     /// can achieve very low latency (below 1 µs).
     #[inline]
@@ -566,12 +567,6 @@ impl<'ctx> CompletionQueue<'ctx> {
     /// # Errors
     /// - `TimedOut`: If the timeout expires before any completions are available.
     /// - System errors: From underlying calls like `req_notify_cq`, `poll`, or `ibv_get_cq_event`.
-    ///
-    /// # Notes
-    /// - This method blocks, unlike `poll`, but avoids busy-waiting by leveraging CQ events and
-    ///   system polling.
-    /// - Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
-    ///   `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable.
     pub fn wait<'c>(
         &self,
         completions: &'c mut [ffi::ibv_wc],
@@ -579,13 +574,15 @@ impl<'ctx> CompletionQueue<'ctx> {
     ) -> io::Result<&'c mut [ffi::ibv_wc]> {
         let c = completions as *mut [ffi::ibv_wc];
 
+        //
         loop {
-            let completions = self.poll(unsafe { &mut *c })?;
-            if !completions.is_empty() {
-                return Ok(completions);
+            let polled_completions = self.poll(unsafe { &mut *c })?;
+            if !polled_completions.is_empty() {
+                return Ok(polled_completions);
             }
 
-            let ctx: *mut ffi::ibv_context = unsafe { *self.cq }.context;
+            // SAFETY: dereferencing completion queue, which is guaranteed to not have been destroyed yet.
+            let ctx = unsafe { *self.cq }.context;
             let errno = unsafe {
                 let ops = &mut { &mut *ctx }.ops;
                 ops.req_notify_cq.as_mut().unwrap()(self.cq, 0)
@@ -594,25 +591,26 @@ impl<'ctx> CompletionQueue<'ctx> {
                 return Err(io::Error::from_raw_os_error(errno));
             }
 
-            let completions = self.poll(unsafe { &mut *c })?;
-            if !completions.is_empty() {
-                return Ok(completions);
+            // We poll again to avoid a race when Work Completions arrive between the first `poll()` and `req_notify_cq()`.
+            let polled_completions = self.poll(unsafe { &mut *c })?;
+            if !polled_completions.is_empty() {
+                return Ok(polled_completions);
             }
 
-            let mut pollfd = libc::pollfd {
-                fd: unsafe { *self.cc }.fd,
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let rc = unsafe {
-                libc::poll(
-                    &mut pollfd,
-                    1,
-                    timeout.map_or(-1, |x| x.as_millis() as libc::c_int),
-                )
-            };
-            match rc {
-                -1 => return Err(io::Error::last_os_error()),
+            // ibv_get_cq_event supports blocking operations, but the fd of cq_context was put into non blocking mode to support timeouts.
+            let pollfd = nix::poll::PollFd::new(
+                // SAFETY: dereferencing completion queue context, which is guaranteed to not have been destroyed yet.
+                unsafe { BorrowedFd::borrow_raw({ *self.cc }.fd) },
+                nix::poll::PollFlags::POLLIN,
+            );
+            let ret = nix::poll::poll(
+                &mut [pollfd],
+                timeout
+                    .map(nix::poll::PollTimeout::try_from)
+                    .transpose()
+                    .map_err(|_| io::Error::other("failedd to convert timeout to PollTimeout"))?,
+            )?;
+            match ret {
                 0 => {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
@@ -624,7 +622,10 @@ impl<'ctx> CompletionQueue<'ctx> {
             }
 
             let mut out_cq = std::ptr::null_mut();
+            // The cq_context is an opaque identifier that
             let mut out_cq_context = std::ptr::null_mut();
+            // The Completion Notification must be read using ibv_get_cq_event().
+            // SAFETY: c ffi call
             let rc = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
             if rc < 0 {
                 let e = io::Error::last_os_error();
@@ -635,9 +636,12 @@ impl<'ctx> CompletionQueue<'ctx> {
             }
 
             assert_eq!(self.cq, out_cq);
-            unsafe {
-                ffi::ibv_ack_cq_events(self.cq, 1);
-            };
+            // cq_context is the user defined value passed during ibv_create_cq().
+            assert!(out_cq_context.is_null());
+
+            // All completion events returned by ibv_get_cq_event() must eventually be acknowledged with ibv_ack_cq_events().
+            // SAFETY: c ffi call
+            unsafe { ffi::ibv_ack_cq_events(self.cq, 1) };
         }
     }
 }
