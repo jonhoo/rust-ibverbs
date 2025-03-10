@@ -564,7 +564,7 @@ pub struct QueuePairBuilder<'res> {
     max_recv_sge: u32,
     max_inline_data: u32,
 
-    qp_type: ffi::ibv_qp_type::Type,
+    qp_type: ffi::ibv_qp_type,
 
     // carried along to handshake phase
     /// only valid for RC and UC
@@ -606,7 +606,7 @@ impl<'res> QueuePairBuilder<'res> {
         max_send_wr: u32,
         recv: &'rcq CompletionQueue<'_>,
         max_recv_wr: u32,
-        qp_type: ffi::ibv_qp_type::Type,
+        qp_type: ffi::ibv_qp_type,
     ) -> QueuePairBuilder<'res>
     where
         'scq: 'res,
@@ -1354,7 +1354,7 @@ impl<'ctx> ProtectionDomain<'ctx> {
         &'pd self,
         send: &'scq CompletionQueue<'_>,
         recv: &'rcq CompletionQueue<'_>,
-        qp_type: ffi::ibv_qp_type::Type,
+        qp_type: ffi::ibv_qp_type,
     ) -> QueuePairBuilder<'res>
     where
         'scq: 'res,

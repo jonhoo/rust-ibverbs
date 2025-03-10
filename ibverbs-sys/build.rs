@@ -60,12 +60,6 @@ fn main() {
         .bitfield_enum("ibv_wc_flags")
         .bitfield_enum("ibv_send_flags")
         .bitfield_enum("ibv_port_cap_flags")
-        .constified_enum_module("ibv_qp_type")
-        .constified_enum_module("ibv_qp_state")
-        .constified_enum_module("ibv_port_state")
-        .constified_enum_module("ibv_wc_opcode")
-        .constified_enum_module("ibv_wr_opcode")
-        .constified_enum_module("ibv_wc_status")
         .default_enum_style(bindgen::EnumVariation::Rust {
             non_exhaustive: false,
         })
