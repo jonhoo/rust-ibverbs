@@ -76,7 +76,6 @@ use std::ptr;
 const PORT_NUM: u8 = 1;
 
 /// Direct access to low-level libverbs FFI.
-pub use ffi::ibv_access_flags;
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
 pub use ffi::ibv_qp_type;
@@ -86,6 +85,9 @@ pub use ffi::ibv_wc_status;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+/// Access flags for use with `QueuePair` and `MemoryRegion`.
+pub use ffi::ibv_access_flags;
 
 /// Because `std::slice::SliceIndex` is still unstable, we follow @alexcrichton's suggestion in
 /// https://github.com/rust-lang/rust/issues/35729 and implement it ourselves.
