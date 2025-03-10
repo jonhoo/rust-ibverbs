@@ -1351,8 +1351,8 @@ impl Drop for ProtectionDomainInner {
     }
 }
 
-unsafe impl Sync for ProtectionDomain {}
-unsafe impl Send for ProtectionDomain {}
+unsafe impl Sync for ProtectionDomainInner {}
+unsafe impl Send for ProtectionDomainInner {}
 
 /// A protection domain for a device's context.
 pub struct ProtectionDomain {
