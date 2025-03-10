@@ -66,6 +66,9 @@ fn main() {
         .constified_enum_module("ibv_wc_opcode")
         .constified_enum_module("ibv_wr_opcode")
         .constified_enum_module("ibv_wc_status")
+        .default_enum_style(bindgen::EnumVariation::Rust {
+            non_exhaustive: false,
+        })
         //.constified_enum_module("IBV_WC_.*")
         //.constified_enum_module("IBV_WR_.*")
         //.constified_enum_module("IBV_QPS_.*")

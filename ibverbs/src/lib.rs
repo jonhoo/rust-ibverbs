@@ -76,7 +76,9 @@ use std::ptr;
 const PORT_NUM: u8 = 1;
 
 /// Direct access to low-level libverbs FFI.
+pub use ffi::ibv_access_flags;
 pub use ffi::ibv_gid_type;
+pub use ffi::ibv_mtu;
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
@@ -84,9 +86,6 @@ pub use ffi::ibv_wc_status;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-
-/// Access flags for use with `QueuePair` and `MemoryRegion`.
-pub use ffi::ibv_access_flags;
 
 /// Because `std::slice::SliceIndex` is still unstable, we follow @alexcrichton's suggestion in
 /// https://github.com/rust-lang/rust/issues/35729 and implement it ourselves.
@@ -583,7 +582,7 @@ pub struct QueuePairBuilder<'res> {
     /// only valid for RC
     max_dest_rd_atomic: Option<u8>,
     /// only valid for RC and UC
-    path_mtu: Option<u32>,
+    path_mtu: Option<ibv_mtu>,
     /// only valid for RC and UC
     rq_psn: Option<u32>,
 }
@@ -856,11 +855,10 @@ impl<'res> QueuePairBuilder<'res> {
     ///  - 3: 1024
     ///  - 4: 2048
     ///  - 5: 4096
-    pub fn set_path_mtu(&mut self, path_mtu: u32) -> &mut Self {
+    pub fn set_path_mtu(&mut self, path_mtu: ibv_mtu) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
-            assert!((1..=5).contains(&path_mtu));
             self.path_mtu = Some(path_mtu);
         }
         self
@@ -1004,7 +1002,7 @@ pub struct PreparedQueuePair<'res> {
     /// only valid for RC
     max_dest_rd_atomic: Option<u8>,
     /// only valid for RC and UC
-    path_mtu: Option<u32>,
+    path_mtu: Option<ibv_mtu>,
     /// only valid for RC and UC
     rq_psn: Option<u32>,
 }
@@ -1090,7 +1088,7 @@ pub struct GidEntry {
     /// The port number that this GID belongs to.
     pub port_num: u32,
     /// enum ibv_gid_type, can be one of IBV_GID_TYPE_IB, IBV_GID_TYPE_ROCE_V1 or IBV_GID_TYPE_ROCE_V2.
-    pub gid_type: ffi::ibv_gid_type,
+    pub gid_type: ibv_gid_type,
     /// The interface index of the net device associated with this GID.
     ///
     /// It is 0 if there is no net device associated with it.
@@ -1103,7 +1101,12 @@ impl From<ffi::ibv_gid_entry> for GidEntry {
             gid: gid_entry.gid.into(),
             gid_index: gid_entry.gid_index,
             port_num: gid_entry.port_num,
-            gid_type: gid_entry.gid_type as ffi::ibv_gid_type,
+            gid_type: match gid_entry.gid_type {
+                0 => ibv_gid_type::IBV_GID_TYPE_IB,
+                1 => ibv_gid_type::IBV_GID_TYPE_ROCE_V1,
+                2 => ibv_gid_type::IBV_GID_TYPE_ROCE_V2,
+                x => panic!("unknown ibv_gid_type: {x}"),
+            },
             ndev_ifindex: gid_entry.ndev_ifindex,
         }
     }
