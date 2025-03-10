@@ -608,7 +608,7 @@ impl<'ctx> CompletionQueue<'ctx> {
                 timeout
                     .map(nix::poll::PollTimeout::try_from)
                     .transpose()
-                    .map_err(|_| io::Error::other("failedd to convert timeout to PollTimeout"))?,
+                    .map_err(|_| io::Error::other("failed to convert timeout to PollTimeout"))?,
             )?;
             match ret {
                 0 => {
