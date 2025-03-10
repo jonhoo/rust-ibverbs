@@ -320,25 +320,25 @@ impl<'devlist> Device<'devlist> {
     }
 }
 
-struct ContextHandle {
+struct ContextInner {
     ctx: *mut ffi::ibv_context,
     port_attr: ffi::ibv_port_attr,
     gid_table: Vec<GidEntry>,
 }
 
-impl Drop for ContextHandle {
+impl Drop for ContextInner {
     fn drop(&mut self) {
         let ok = unsafe { ffi::ibv_close_device(self.ctx) };
         assert_eq!(ok, 0);
     }
 }
 
-unsafe impl Sync for ContextHandle {}
-unsafe impl Send for ContextHandle {}
+unsafe impl Sync for ContextInner {}
+unsafe impl Send for ContextInner {}
 
 /// An RDMA context bound to a device.
 pub struct Context {
-    ctx: Arc<ContextHandle>,
+    inner: Arc<ContextInner>,
 }
 
 impl Context {
@@ -409,7 +409,7 @@ impl Context {
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
 
         Ok(Context {
-            ctx: Arc::new(ContextHandle {
+            inner: Arc::new(ContextInner {
                 ctx,
                 port_attr,
                 gid_table,
@@ -439,7 +439,7 @@ impl Context {
     pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
         let cq = unsafe {
             ffi::ibv_create_cq(
-                self.ctx.ctx,
+                self.inner.ctx,
                 min_cq_entries,
                 ptr::null::<c_void>().offset(id) as *mut _,
                 ptr::null::<c_void>() as *mut _,
@@ -451,8 +451,8 @@ impl Context {
             Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
-                cq: Arc::new(CompletionQueueHandle {
-                    _ctx: self.ctx.clone(),
+                inner: Arc::new(CompletionQueueInner {
+                    _ctx: self.inner.clone(),
                     cq,
                 }),
             })
@@ -467,7 +467,7 @@ impl Context {
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
     pub fn alloc_pd(&self) -> io::Result<ProtectionDomain> {
-        let pd = unsafe { ffi::ibv_alloc_pd(self.ctx.ctx) };
+        let pd = unsafe { ffi::ibv_alloc_pd(self.inner.ctx) };
         if pd.is_null() {
             Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -475,8 +475,8 @@ impl Context {
             ))
         } else {
             Ok(ProtectionDomain {
-                pd: Arc::new(ProtectionDomainHandle {
-                    ctx: self.ctx.clone(),
+                inner: Arc::new(ProtectionDomainInner {
+                    ctx: self.inner.clone(),
                     pd,
                 }),
             })
@@ -485,16 +485,16 @@ impl Context {
 
     /// Returns the valid GID table entries of this RDMA device context.
     pub fn gid_table(&self) -> &[GidEntry] {
-        &self.ctx.gid_table
+        &self.inner.gid_table
     }
 }
 
-struct CompletionQueueHandle {
-    _ctx: Arc<ContextHandle>,
+struct CompletionQueueInner {
+    _ctx: Arc<ContextInner>,
     cq: *mut ffi::ibv_cq,
 }
 
-impl Drop for CompletionQueueHandle {
+impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if errno != 0 {
@@ -504,12 +504,12 @@ impl Drop for CompletionQueueHandle {
     }
 }
 
-unsafe impl Send for CompletionQueueHandle {}
-unsafe impl Sync for CompletionQueueHandle {}
+unsafe impl Send for CompletionQueueInner {}
+unsafe impl Sync for CompletionQueueInner {}
 
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
 pub struct CompletionQueue {
-    cq: Arc<CompletionQueueHandle>,
+    inner: Arc<CompletionQueueInner>,
 }
 
 impl CompletionQueue {
@@ -544,11 +544,11 @@ impl CompletionQueue {
         //   (hold more Work Completions than the CQ size). In case of an CQ overrun, the async
         //   event `IBV_EVENT_CQ_ERR` will be triggered, and the CQ cannot be used anymore.
         //
-        let ctx: *mut ffi::ibv_context = unsafe { &*self.cq.cq }.context;
+        let ctx: *mut ffi::ibv_context = unsafe { &*self.inner.cq }.context;
         let ops = &mut unsafe { &mut *ctx }.ops;
         let n = unsafe {
             ops.poll_cq.as_mut().unwrap()(
-                self.cq.cq,
+                self.inner.cq,
                 completions.len() as i32,
                 completions.as_mut_ptr(),
             )
@@ -570,11 +570,11 @@ impl CompletionQueue {
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 pub struct QueuePairBuilder {
     ctx: isize,
-    pd: Arc<ProtectionDomainHandle>,
+    pd: Arc<ProtectionDomainInner>,
 
-    send: Arc<CompletionQueueHandle>,
+    send: Arc<CompletionQueueInner>,
     max_send_wr: u32,
-    recv: Arc<CompletionQueueHandle>,
+    recv: Arc<CompletionQueueInner>,
     max_recv_wr: u32,
 
     gid_index: Option<u32>,
@@ -618,11 +618,11 @@ impl QueuePairBuilder {
     /// There may be RDMA devices that for specific transport types may support less outstanding
     /// Work Requests than the maximum reported value. This value is ignored if the Queue Pair is
     /// associated with an SRQ
-    fn new<'scq, 'rcq, 'pd>(
-        pd: Arc<ProtectionDomainHandle>,
-        send: Arc<CompletionQueueHandle>,
+    fn new(
+        pd: Arc<ProtectionDomainInner>,
+        send: Arc<CompletionQueueInner>,
         max_send_wr: u32,
-        recv: Arc<CompletionQueueHandle>,
+        recv: Arc<CompletionQueueInner>,
         max_recv_wr: u32,
         qp_type: ffi::ibv_qp_type::Type,
     ) -> QueuePairBuilder {
@@ -1287,7 +1287,7 @@ impl PreparedQueuePair {
 
 /// A memory region that has been registered for use with RDMA.
 pub struct MemoryRegion<T> {
-    _pd: Arc<ProtectionDomainHandle>,
+    _pd: Arc<ProtectionDomainInner>,
     mr: *mut ffi::ibv_mr,
     data: Vec<T>,
 }
@@ -1336,12 +1336,12 @@ impl<T> Drop for MemoryRegion<T> {
     }
 }
 
-struct ProtectionDomainHandle {
-    ctx: Arc<ContextHandle>,
+struct ProtectionDomainInner {
+    ctx: Arc<ContextInner>,
     pd: *mut ffi::ibv_pd,
 }
 
-impl Drop for ProtectionDomainHandle {
+impl Drop for ProtectionDomainInner {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if errno != 0 {
@@ -1356,7 +1356,7 @@ unsafe impl Send for ProtectionDomain {}
 
 /// A protection domain for a device's context.
 pub struct ProtectionDomain {
-    pd: Arc<ProtectionDomainHandle>,
+    inner: Arc<ProtectionDomainInner>,
 }
 
 impl ProtectionDomain {
@@ -1380,10 +1380,10 @@ impl ProtectionDomain {
         qp_type: ffi::ibv_qp_type::Type,
     ) -> QueuePairBuilder {
         QueuePairBuilder::new(
-            self.pd.clone(),
-            send.cq.clone(),
+            self.inner.clone(),
+            send.inner.clone(),
             1,
-            recv.cq.clone(),
+            recv.inner.clone(),
             1,
             qp_type,
         )
@@ -1436,7 +1436,7 @@ impl ProtectionDomain {
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
         let mr = unsafe {
             ffi::ibv_reg_mr(
-                self.pd.pd,
+                self.inner.pd,
                 data.as_mut_ptr() as *mut _,
                 n * mem::size_of::<T>(),
                 access.0 as i32,
@@ -1455,7 +1455,7 @@ impl ProtectionDomain {
             Err(io::Error::last_os_error())
         } else {
             Ok(MemoryRegion {
-                _pd: self.pd.clone(),
+                _pd: self.inner.clone(),
                 mr,
                 data,
             })
@@ -1471,7 +1471,7 @@ impl ProtectionDomain {
 /// is a resource of an RDMA device and a QP number can be used by one process at the same time
 /// (similar to a socket that is associated with a specific TCP or UDP port number)
 pub struct QueuePair {
-    pd: Arc<ProtectionDomainHandle>,
+    pd: Arc<ProtectionDomainInner>,
     qp: *mut ffi::ibv_qp,
 }
 
