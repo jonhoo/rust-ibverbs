@@ -323,26 +323,13 @@ impl<'devlist> Device<'devlist> {
 /// An RDMA context bound to a device.
 pub struct Context {
     ctx: *mut ffi::ibv_context,
-    port_attr: ffi::ibv_port_attr,
-    gid_table: Vec<GidEntry>,
 }
 
 unsafe impl Sync for Context {}
 unsafe impl Send for Context {}
 
 impl Context {
-    /// Opens a context for the given device, and queries its port and gid.
-    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
-        assert!(!dev.is_null());
-
-        let ctx = unsafe { ffi::ibv_open_device(dev) };
-        if ctx.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to open device".to_string(),
-            ));
-        }
-
+    fn query_port(&self) -> io::Result<ffi::ibv_port_attr> {
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
         //
         //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
@@ -353,7 +340,7 @@ impl Context {
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe {
             ffi::ibv_query_port(
-                ctx,
+                self.ctx,
                 PORT_NUM,
                 &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
             )
@@ -377,31 +364,25 @@ impl Context {
                 ));
             }
         }
+        Ok(port_attr)
+    }
 
-        let mut gid_table = vec![ffi::ibv_gid_entry::default(); port_attr.gid_tbl_len as usize];
-        let num_entries = unsafe {
-            ffi::_ibv_query_gid_table(
-                ctx,
-                gid_table.as_mut_ptr(),
-                gid_table.len(),
-                0,
-                size_of::<ffi::ibv_gid_entry>(),
-            )
-        };
-        if num_entries < 0 {
+    /// Opens a context for the given device, and queries its port and gid.
+    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
+        assert!(!dev.is_null());
+
+        let ctx = unsafe { ffi::ibv_open_device(dev) };
+        if ctx.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("failed to query gid table, error={}", -num_entries),
+                "failed to open device".to_string(),
             ));
         }
-        gid_table.truncate(num_entries as usize);
-        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
 
-        Ok(Context {
-            ctx,
-            port_attr,
-            gid_table,
-        })
+        let ctx = Context { ctx };
+        // checks that the port is active/armed.
+        ctx.query_port()?;
+        Ok(ctx)
     }
 
     /// Create a completion queue (CQ).
@@ -464,8 +445,27 @@ impl Context {
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
-    pub fn gid_table(&self) -> &[GidEntry] {
-        &self.gid_table
+    pub fn gid_table(&self) -> io::Result<Vec<GidEntry>> {
+        let max_entries = self.query_port()?.gid_tbl_len as usize;
+        let mut gid_table = vec![ffi::ibv_gid_entry::default(); max_entries];
+        let num_entries = unsafe {
+            ffi::_ibv_query_gid_table(
+                self.ctx,
+                gid_table.as_mut_ptr(),
+                max_entries,
+                0,
+                size_of::<ffi::ibv_gid_entry>(),
+            )
+        };
+        if num_entries < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to query gid table, error={}", -num_entries),
+            ));
+        }
+        gid_table.truncate(num_entries as usize);
+        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
+        Ok(gid_table)
     }
 }
 
@@ -554,6 +554,7 @@ impl<'a> Drop for CompletionQueue<'a> {
 pub struct QueuePairBuilder<'res> {
     ctx: isize,
     pd: &'res ProtectionDomain<'res>,
+    port_attr: ffi::ibv_port_attr,
 
     send: &'res CompletionQueue<'res>,
     max_send_wr: u32,
@@ -603,6 +604,7 @@ impl<'res> QueuePairBuilder<'res> {
     /// associated with an SRQ
     fn new<'scq, 'rcq, 'pd>(
         pd: &'pd ProtectionDomain<'_>,
+        port_attr: ffi::ibv_port_attr,
         send: &'scq CompletionQueue<'_>,
         max_send_wr: u32,
         recv: &'rcq CompletionQueue<'_>,
@@ -617,6 +619,7 @@ impl<'res> QueuePairBuilder<'res> {
         QueuePairBuilder {
             ctx: 0,
             pd,
+            port_attr,
 
             gid_index: None,
             send,
@@ -641,7 +644,7 @@ impl<'res> QueuePairBuilder<'res> {
             max_dest_rd_atomic: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(1),
             path_mtu: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
-                .then_some(pd.ctx.port_attr.active_mtu),
+                .then_some(port_attr.active_mtu),
             rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
@@ -684,7 +687,6 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Defaults to unset.
     pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
-        assert!(gid_index < self.pd.ctx.gid_table.len() as u32);
         self.gid_index = Some(gid_index);
         self
     }
@@ -940,6 +942,7 @@ impl<'res> QueuePairBuilder<'res> {
         } else {
             Ok(PreparedQueuePair {
                 ctx: self.pd.ctx,
+                lid: self.port_attr.lid,
                 qp: QueuePair {
                     _phantom: PhantomData,
                     qp,
@@ -986,7 +989,8 @@ impl<'res> QueuePairBuilder<'res> {
 pub struct PreparedQueuePair<'res> {
     ctx: &'res Context,
     qp: QueuePair<'res>,
-
+    /// port local identifier
+    lid: u16,
     // carried from builder
     gid_index: Option<u32>,
     /// only valid for RC and UC
@@ -1127,19 +1131,24 @@ impl<'res> PreparedQueuePair<'res> {
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
-    pub fn endpoint(&self) -> QueuePairEndpoint {
+    pub fn endpoint(&self) -> io::Result<QueuePairEndpoint> {
         let num = unsafe { &*self.qp.qp }.qp_num;
-        let gid = self.gid_index.map(|gid_index| {
-            // NOTE: bounds check happened in `set_gid_index`.
-            let gid_entry = &self.ctx.gid_table[gid_index as usize];
-            assert_eq!(gid_entry.gid_index, gid_index);
-            gid_entry.gid
-        });
-        QueuePairEndpoint {
+        let gid = if let Some(gid_index) = self.gid_index {
+            let mut gid = ffi::ibv_gid::default();
+            let rc =
+                unsafe { ffi::ibv_query_gid(self.ctx.ctx, PORT_NUM, gid_index as i32, &mut gid) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(Gid::from(gid))
+        } else {
+            None
+        };
+        Ok(QueuePairEndpoint {
             num,
-            lid: self.ctx.port_attr.lid,
+            lid: self.lid,
             gid,
-        }
+        })
     }
 
     /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair`.
@@ -1352,13 +1361,16 @@ impl<'ctx> ProtectionDomain<'ctx> {
         send: &'scq CompletionQueue<'_>,
         recv: &'rcq CompletionQueue<'_>,
         qp_type: ffi::ibv_qp_type::Type,
-    ) -> QueuePairBuilder<'res>
+    ) -> io::Result<QueuePairBuilder<'res>>
     where
         'scq: 'res,
         'rcq: 'res,
         'pd: 'res,
     {
-        QueuePairBuilder::new(self, send, 1, recv, 1, qp_type)
+        let port_attr = self.ctx.query_port()?;
+        Ok(QueuePairBuilder::new(
+            self, port_attr, send, 1, recv, 1, qp_type,
+        ))
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
