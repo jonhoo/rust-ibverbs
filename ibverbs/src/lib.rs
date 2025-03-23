@@ -1144,8 +1144,8 @@ impl<'ctx> ProtectionDomain<'ctx> {
     /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
     /// that can be registered for a specific device.
     ///
-    /// `allocate` accepts a set of permission flags.
-    /// Local read access is always enabled for the MR.
+    /// `allocate_with_permissions` accepts a set of permission flags, with local read access
+    /// always enabled for the Memory Region (MR).
     ///
     /// # Panics
     ///
@@ -1213,7 +1213,8 @@ impl<'ctx> ProtectionDomain<'ctx> {
     ///  - `IBV_ACCESS_REMOTE_READ`: Enables Remote Read Access
     ///  - `IBV_ACCESS_REMOTE_ATOMIC`: Enables Remote Atomic Operation Access (if supported)
     ///
-    /// Local read access is always enabled for the MR.
+    /// Local read access is always enabled for the MR. For more fine-grained control over
+    /// permissions, see `allocate_with_permissions`.
     ///
     /// # Panics
     ///
