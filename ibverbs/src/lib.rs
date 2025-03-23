@@ -625,7 +625,7 @@ impl<'ctx> CompletionQueue<'ctx> {
                     ))
                 }
                 1 => {}
-                _ => unreachable!(),
+                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
             }
 
             let mut out_cq = std::ptr::null_mut();
