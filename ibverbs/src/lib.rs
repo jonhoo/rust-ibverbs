@@ -1280,20 +1280,6 @@ pub struct MemoryRegion<T> {
 unsafe impl<T> Send for MemoryRegion<T> {}
 unsafe impl<T> Sync for MemoryRegion<T> {}
 
-use std::ops::{Deref, DerefMut};
-impl<T> Deref for MemoryRegion<T> {
-    type Target = [T];
-    fn deref(&self) -> &Self::Target {
-        &self.data[..]
-    }
-}
-
-impl<T> DerefMut for MemoryRegion<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data[..]
-    }
-}
-
 impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
@@ -1302,8 +1288,25 @@ impl<T> MemoryRegion<T> {
         }
     }
 
+    /// Returns a constant pointer to the underlying data.
+    /// Warning: The memory might be modified by RDMA operations after this pointer is returned.
+    pub fn as_ptr(&self) -> *const T {
+        self.data.as_ptr()
+    }
+
+    /// Returns a mutable pointer to the underlying data.
+    /// Warning: The memory might be modified by RDMA operations after this pointer is returned.
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.data.as_mut_ptr()
+    }
+
+    /// Returns the number of elements of type T in the memory region.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
     /// Make a subslice of this memory region.
-    pub unsafe fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
         let (addr, length) = calc_addr_len::<T>(
             bounds,
             unsafe { *self.mr }.addr as u64,

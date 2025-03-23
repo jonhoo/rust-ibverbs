@@ -20,7 +20,9 @@ fn main() {
     let mut qp = qp_builder.handshake(endpoint).unwrap();
 
     let mut mr = pd.allocate::<u64>(2).unwrap();
-    mr[1] = 0x42;
+    unsafe {
+        *mr.as_mut_ptr().add(1) = 0x42;
+    }
 
     unsafe { qp.post_receive(&[mr.slice(..1)], 2) }.unwrap();
     unsafe { qp.post_send(&[mr.slice(1..)], 1) }.unwrap();
@@ -44,7 +46,7 @@ fn main() {
                 2 => {
                     assert!(!received);
                     received = true;
-                    assert_eq!(mr[0], 0x42);
+                    assert_eq!(unsafe { *mr.as_ptr() }, 0x42);
                     println!("received");
                 }
                 _ => unreachable!(),
