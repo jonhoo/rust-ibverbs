@@ -20,10 +20,10 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.3.0" }
-nix = { version = "0.29", default-features = false, features = ["fs", "poll"] }
+nix = { version = "0.29.0", default-features = false, features = ["fs", "poll"] }
 
 [dependencies.serde]
-version = "1"
+version = "1.0.100"
 optional = true
 features = ["derive"]
 

@@ -574,14 +574,17 @@ impl<'ctx> CompletionQueue<'ctx> {
     ) -> io::Result<&'c mut [ffi::ibv_wc]> {
         let c = completions as *mut [ffi::ibv_wc];
 
-        //
         loop {
             let polled_completions = self.poll(unsafe { &mut *c })?;
             if !polled_completions.is_empty() {
                 return Ok(polled_completions);
             }
 
-            // SAFETY: dereferencing completion queue, which is guaranteed to not have been destroyed yet.
+            // SAFETY: dereferencing completion queue context, which is guaranteed to not have
+            // been destroyed yet because we don't destroy it until in Drop, and given we have
+            // self, Drop has not been called. The context is guaranteed to not have been destroyed
+            // because the `CompletionQueue` holds a reference to the `Context` and we only destroy
+            // the context in Drop implementation of the `Context`.
             let ctx = unsafe { *self.cq }.context;
             let errno = unsafe {
                 let ops = &mut { &mut *ctx }.ops;
@@ -599,7 +602,11 @@ impl<'ctx> CompletionQueue<'ctx> {
 
             // ibv_get_cq_event supports blocking operations, but the fd of cq_context was put into non blocking mode to support timeouts.
             let pollfd = nix::poll::PollFd::new(
-                // SAFETY: dereferencing completion queue context, which is guaranteed to not have been destroyed yet.
+                // SAFETY: dereferencing completion queue context, which is guaranteed to not have
+                // been destroyed yet because we don't destroy it until in Drop, and given we have
+                // self, Drop has not been called. `fd` is guaranteed to not have been destroyed
+                // because only destroy it in the Drop implementation of this `CompletionQueue` and
+                // we still hold `self` here.
                 unsafe { BorrowedFd::borrow_raw({ *self.cc }.fd) },
                 nix::poll::PollFlags::POLLIN,
             );
@@ -622,7 +629,6 @@ impl<'ctx> CompletionQueue<'ctx> {
             }
 
             let mut out_cq = std::ptr::null_mut();
-            // The cq_context is an opaque identifier that
             let mut out_cq_context = std::ptr::null_mut();
             // The Completion Notification must be read using ibv_get_cq_event().
             // SAFETY: c ffi call
@@ -636,7 +642,7 @@ impl<'ctx> CompletionQueue<'ctx> {
             }
 
             assert_eq!(self.cq, out_cq);
-            // cq_context is the user defined value passed during ibv_create_cq().
+            // cq_context is the opaque user defined identifier passed to `ibv_create_cq()``.
             assert!(out_cq_context.is_null());
 
             // All completion events returned by ibv_get_cq_event() must eventually be acknowledged with ibv_ack_cq_events().
