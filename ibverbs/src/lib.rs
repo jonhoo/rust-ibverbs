@@ -433,6 +433,8 @@ impl Context {
 
         let cc_fd = unsafe { *cc }.fd;
         let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)?;
+        // the file descriptor needs to be set to non-blocking because `ibv_get_cq_event()`
+        // would block otherwise.
         let arg = nix::fcntl::FcntlArg::F_SETFL(
             nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
         );
@@ -600,7 +602,6 @@ impl<'ctx> CompletionQueue<'ctx> {
                 return Ok(polled_completions);
             }
 
-            // ibv_get_cq_event supports blocking operations, but the fd of cq_context was put into non blocking mode to support timeouts.
             let pollfd = nix::poll::PollFd::new(
                 // SAFETY: dereferencing completion queue context, which is guaranteed to not have
                 // been destroyed yet because we don't destroy it until in Drop, and given we have
@@ -630,7 +631,8 @@ impl<'ctx> CompletionQueue<'ctx> {
 
             let mut out_cq = std::ptr::null_mut();
             let mut out_cq_context = std::ptr::null_mut();
-            // The Completion Notification must be read using ibv_get_cq_event().
+            // The Completion Notification must be read using ibv_get_cq_event(). The file descriptor of
+            // `cq_context` was put into non-blocking mode to make `ibv_get_cq_event()` non-blocking.
             // SAFETY: c ffi call
             let rc = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
             if rc < 0 {
