@@ -644,7 +644,7 @@ impl<'ctx> CompletionQueue<'ctx> {
             }
 
             assert_eq!(self.cq, out_cq);
-            // cq_context is the opaque user defined identifier passed to `ibv_create_cq()``.
+            // cq_context is the opaque user defined identifier passed to `ibv_create_cq()`.
             assert!(out_cq_context.is_null());
 
             // All completion events returned by ibv_get_cq_event() must eventually be acknowledged with ibv_ack_cq_events().
