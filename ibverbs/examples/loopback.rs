@@ -12,11 +12,12 @@ fn main() {
 
     let qp_builder = pd
         .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
+        .unwrap()
         .set_gid_index(1)
         .build()
         .unwrap();
 
-    let endpoint = qp_builder.endpoint();
+    let endpoint = qp_builder.endpoint().unwrap();
     let mut qp = qp_builder.handshake(endpoint).unwrap();
 
     let mut mr = pd.allocate::<u64>(2).unwrap();

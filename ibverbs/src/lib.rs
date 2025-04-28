@@ -71,8 +71,10 @@ use std::io;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::RangeBounds;
+use std::os::fd::BorrowedFd;
 use std::os::raw::c_void;
 use std::ptr;
+use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
@@ -320,26 +322,13 @@ impl<'devlist> Device<'devlist> {
 /// An RDMA context bound to a device.
 pub struct Context {
     ctx: *mut ffi::ibv_context,
-    port_attr: ffi::ibv_port_attr,
-    gid_table: Vec<GidEntry>,
 }
 
 unsafe impl Sync for Context {}
 unsafe impl Send for Context {}
 
 impl Context {
-    /// Opens a context for the given device, and queries its port and gid.
-    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
-        assert!(!dev.is_null());
-
-        let ctx = unsafe { ffi::ibv_open_device(dev) };
-        if ctx.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to open device".to_string(),
-            ));
-        }
-
+    fn query_port(&self) -> io::Result<ffi::ibv_port_attr> {
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
         //
         //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
@@ -350,7 +339,7 @@ impl Context {
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe {
             ffi::ibv_query_port(
-                ctx,
+                self.ctx,
                 PORT_NUM,
                 &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
             )
@@ -374,31 +363,25 @@ impl Context {
                 ));
             }
         }
+        Ok(port_attr)
+    }
 
-        let mut gid_table = vec![ffi::ibv_gid_entry::default(); port_attr.gid_tbl_len as usize];
-        let num_entries = unsafe {
-            ffi::_ibv_query_gid_table(
-                ctx,
-                gid_table.as_mut_ptr(),
-                gid_table.len(),
-                0,
-                size_of::<ffi::ibv_gid_entry>(),
-            )
-        };
-        if num_entries < 0 {
+    /// Opens a context for the given device, and queries its port and gid.
+    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
+        assert!(!dev.is_null());
+
+        let ctx = unsafe { ffi::ibv_open_device(dev) };
+        if ctx.is_null() {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!("failed to query gid table, error={}", -num_entries),
+                "failed to open device".to_string(),
             ));
         }
-        gid_table.truncate(num_entries as usize);
-        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
 
-        Ok(Context {
-            ctx,
-            port_attr,
-            gid_table,
-        })
+        let ctx = Context { ctx };
+        // checks that the port is active/armed.
+        ctx.query_port()?;
+        Ok(ctx)
     }
 
     /// Create a completion queue (CQ).
@@ -421,12 +404,26 @@ impl Context {
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue<'_>> {
+        let cc = unsafe { ffi::ibv_create_comp_channel(self.ctx) };
+        if cc.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let cc_fd = unsafe { *cc }.fd;
+        let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)?;
+        // the file descriptor needs to be set to non-blocking because `ibv_get_cq_event()`
+        // would block otherwise.
+        let arg = nix::fcntl::FcntlArg::F_SETFL(
+            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+        );
+        nix::fcntl::fcntl(cc_fd, arg)?;
+
         let cq = unsafe {
             ffi::ibv_create_cq(
                 self.ctx,
                 min_cq_entries,
                 ptr::null::<c_void>().offset(id) as *mut _,
-                ptr::null::<c_void>() as *mut _,
+                cc,
                 0,
             )
         };
@@ -436,6 +433,7 @@ impl Context {
         } else {
             Ok(CompletionQueue {
                 _phantom: PhantomData,
+                cc,
                 cq,
             })
         }
@@ -461,8 +459,27 @@ impl Context {
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
-    pub fn gid_table(&self) -> &[GidEntry] {
-        &self.gid_table
+    pub fn gid_table(&self) -> io::Result<Vec<GidEntry>> {
+        let max_entries = self.query_port()?.gid_tbl_len as usize;
+        let mut gid_table = vec![ffi::ibv_gid_entry::default(); max_entries];
+        let num_entries = unsafe {
+            ffi::_ibv_query_gid_table(
+                self.ctx,
+                gid_table.as_mut_ptr(),
+                max_entries,
+                0,
+                size_of::<ffi::ibv_gid_entry>(),
+            )
+        };
+        if num_entries < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("failed to query gid table, error={}", -num_entries),
+            ));
+        }
+        gid_table.truncate(num_entries as usize);
+        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
+        Ok(gid_table)
     }
 }
 
@@ -476,6 +493,7 @@ impl Drop for Context {
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
 pub struct CompletionQueue<'ctx> {
     _phantom: PhantomData<&'ctx ()>,
+    cc: *mut ffi::ibv_comp_channel,
     cq: *mut ffi::ibv_cq,
 }
 
@@ -500,6 +518,10 @@ impl<'ctx> CompletionQueue<'ctx> {
     /// Not all attributes of the completed `ibv_wc`'s are always valid. If the completion status
     /// is not `IBV_WC_SUCCESS`, only the following attributes are valid: `wr_id`, `status`,
     /// `qp_num`, and `vendor_err`.
+    ///
+    /// Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
+    ///  `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting
+    /// the number of inflight Work Requests.
     ///
     /// Note that `poll` does not block or cause a context switch. This is why RDMA technologies
     /// can achieve very low latency (below 1 µs).
@@ -530,11 +552,114 @@ impl<'ctx> CompletionQueue<'ctx> {
             Ok(&mut completions[0..n as usize])
         }
     }
+
+    /// Waits for one or more work completions in a Completion Queue (CQ).
+    ///
+    /// Unlike `poll`, this method blocks until at least one work completion is available or the
+    /// optional timeout expires. It is designed to wait efficiently for completions when polling
+    /// alone is insufficient, such as in low-traffic scenarios.
+    ///
+    /// The returned slice reflects completed work requests (e.g., sends, receives) from the
+    /// associated Work Queue. Not all fields in `ibv_wc` are valid unless the status is
+    /// `IBV_WC_SUCCESS`.
+    ///
+    /// # Errors
+    /// - `TimedOut`: If the timeout expires before any completions are available.
+    /// - System errors: From underlying calls like `req_notify_cq`, `poll`, or `ibv_get_cq_event`.
+    pub fn wait<'c>(
+        &self,
+        completions: &'c mut [ffi::ibv_wc],
+        timeout: Option<Duration>,
+    ) -> io::Result<&'c mut [ffi::ibv_wc]> {
+        let c = completions as *mut [ffi::ibv_wc];
+
+        loop {
+            let polled_completions = self.poll(unsafe { &mut *c })?;
+            if !polled_completions.is_empty() {
+                return Ok(polled_completions);
+            }
+
+            // SAFETY: dereferencing completion queue context, which is guaranteed to not have
+            // been destroyed yet because we don't destroy it until in Drop, and given we have
+            // self, Drop has not been called. The context is guaranteed to not have been destroyed
+            // because the `CompletionQueue` holds a reference to the `Context` and we only destroy
+            // the context in Drop implementation of the `Context`.
+            let ctx = unsafe { *self.cq }.context;
+            let errno = unsafe {
+                let ops = &mut { &mut *ctx }.ops;
+                ops.req_notify_cq.as_mut().unwrap()(self.cq, 0)
+            };
+            if errno != 0 {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+
+            // We poll again to avoid a race when Work Completions arrive between the first `poll()` and `req_notify_cq()`.
+            let polled_completions = self.poll(unsafe { &mut *c })?;
+            if !polled_completions.is_empty() {
+                return Ok(polled_completions);
+            }
+
+            let pollfd = nix::poll::PollFd::new(
+                // SAFETY: dereferencing completion queue context, which is guaranteed to not have
+                // been destroyed yet because we don't destroy it until in Drop, and given we have
+                // self, Drop has not been called. `fd` is guaranteed to not have been destroyed
+                // because only destroy it in the Drop implementation of this `CompletionQueue` and
+                // we still hold `self` here.
+                unsafe { BorrowedFd::borrow_raw({ *self.cc }.fd) },
+                nix::poll::PollFlags::POLLIN,
+            );
+            let ret = nix::poll::poll(
+                &mut [pollfd],
+                timeout
+                    .map(nix::poll::PollTimeout::try_from)
+                    .transpose()
+                    .map_err(|_| io::Error::other("failed to convert timeout to PollTimeout"))?,
+            )?;
+            match ret {
+                0 => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Timed out during completion queue wait",
+                    ))
+                }
+                1 => {}
+                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            }
+
+            let mut out_cq = std::ptr::null_mut();
+            let mut out_cq_context = std::ptr::null_mut();
+            // The Completion Notification must be read using ibv_get_cq_event(). The file descriptor of
+            // `cq_context` was put into non-blocking mode to make `ibv_get_cq_event()` non-blocking.
+            // SAFETY: c ffi call
+            let rc = unsafe { ffi::ibv_get_cq_event(self.cc, &mut out_cq, &mut out_cq_context) };
+            if rc < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    continue;
+                }
+                return Err(e);
+            }
+
+            assert_eq!(self.cq, out_cq);
+            // cq_context is the opaque user defined identifier passed to `ibv_create_cq()`.
+            assert!(out_cq_context.is_null());
+
+            // All completion events returned by ibv_get_cq_event() must eventually be acknowledged with ibv_ack_cq_events().
+            // SAFETY: c ffi call
+            unsafe { ffi::ibv_ack_cq_events(self.cq, 1) };
+        }
+    }
 }
 
 impl<'a> Drop for CompletionQueue<'a> {
     fn drop(&mut self) {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{}", e);
+        }
+
+        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{}", e);
@@ -551,6 +676,7 @@ impl<'a> Drop for CompletionQueue<'a> {
 pub struct QueuePairBuilder<'res> {
     ctx: isize,
     pd: &'res ProtectionDomain<'res>,
+    port_attr: ffi::ibv_port_attr,
 
     send: &'res CompletionQueue<'res>,
     max_send_wr: u32,
@@ -600,6 +726,7 @@ impl<'res> QueuePairBuilder<'res> {
     /// associated with an SRQ
     fn new<'scq, 'rcq, 'pd>(
         pd: &'pd ProtectionDomain<'_>,
+        port_attr: ffi::ibv_port_attr,
         send: &'scq CompletionQueue<'_>,
         max_send_wr: u32,
         recv: &'rcq CompletionQueue<'_>,
@@ -614,6 +741,7 @@ impl<'res> QueuePairBuilder<'res> {
         QueuePairBuilder {
             ctx: 0,
             pd,
+            port_attr,
 
             gid_index: None,
             send,
@@ -638,7 +766,7 @@ impl<'res> QueuePairBuilder<'res> {
             max_dest_rd_atomic: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(1),
             path_mtu: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
-                .then_some(pd.ctx.port_attr.active_mtu),
+                .then_some(port_attr.active_mtu),
             rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
@@ -681,7 +809,6 @@ impl<'res> QueuePairBuilder<'res> {
     ///
     /// Defaults to unset.
     pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
-        assert!(gid_index < self.pd.ctx.gid_table.len() as u32);
         self.gid_index = Some(gid_index);
         self
     }
@@ -937,6 +1064,7 @@ impl<'res> QueuePairBuilder<'res> {
         } else {
             Ok(PreparedQueuePair {
                 ctx: self.pd.ctx,
+                lid: self.port_attr.lid,
                 qp: QueuePair {
                     _phantom: PhantomData,
                     qp,
@@ -983,7 +1111,8 @@ impl<'res> QueuePairBuilder<'res> {
 pub struct PreparedQueuePair<'res> {
     ctx: &'res Context,
     qp: QueuePair<'res>,
-
+    /// port local identifier
+    lid: u16,
     // carried from builder
     gid_index: Option<u32>,
     /// only valid for RC and UC
@@ -1124,19 +1253,24 @@ impl<'res> PreparedQueuePair<'res> {
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
-    pub fn endpoint(&self) -> QueuePairEndpoint {
+    pub fn endpoint(&self) -> io::Result<QueuePairEndpoint> {
         let num = unsafe { &*self.qp.qp }.qp_num;
-        let gid = self.gid_index.map(|gid_index| {
-            // NOTE: bounds check happened in `set_gid_index`.
-            let gid_entry = &self.ctx.gid_table[gid_index as usize];
-            assert_eq!(gid_entry.gid_index, gid_index);
-            gid_entry.gid
-        });
-        QueuePairEndpoint {
+        let gid = if let Some(gid_index) = self.gid_index {
+            let mut gid = ffi::ibv_gid::default();
+            let rc =
+                unsafe { ffi::ibv_query_gid(self.ctx.ctx, PORT_NUM, gid_index as i32, &mut gid) };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(Gid::from(gid))
+        } else {
+            None
+        };
+        Ok(QueuePairEndpoint {
             num,
-            lid: self.ctx.port_attr.lid,
+            lid: self.lid,
             gid,
-        }
+        })
     }
 
     /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair`.
@@ -1399,13 +1533,78 @@ impl<'ctx> ProtectionDomain<'ctx> {
         send: &'scq CompletionQueue<'_>,
         recv: &'rcq CompletionQueue<'_>,
         qp_type: ffi::ibv_qp_type::Type,
-    ) -> QueuePairBuilder<'res>
+    ) -> io::Result<QueuePairBuilder<'res>>
     where
         'scq: 'res,
         'rcq: 'res,
         'pd: 'res,
     {
-        QueuePairBuilder::new(self, send, 1, recv, 1, qp_type)
+        let port_attr = self.ctx.query_port()?;
+        Ok(QueuePairBuilder::new(
+            self, port_attr, send, 1, recv, 1, qp_type,
+        ))
+    }
+
+    /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
+    ///
+    /// This process allows the RDMA device to read and write data to the allocated memory. Only
+    /// registered memory can be sent from and received to by `QueuePair`s. Performing this
+    /// registration takes some time, so performing memory registration isn't recommended in the
+    /// data path, when fast response is required.
+    ///
+    /// Every successful registration will result with a MR which has unique (within a specific
+    /// RDMA device) `lkey` and `rkey` values. These keys must be communicated to the other end's
+    /// `QueuePair` for direct memory access.
+    ///
+    /// The maximum size of the block that can be registered is limited to
+    /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
+    /// that can be registered for a specific device.
+    ///
+    /// `allocate_with_permissions` accepts a set of permission flags, with local read access
+    /// always enabled for the Memory Region (MR).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the size of the memory region zero bytes, which can occur either if `n` is 0, or
+    /// if `mem::size_of::<T>()` is 0.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid access value.
+    ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
+    ///    complete this operation.
+    pub fn allocate_with_permissions<T: Sized + Copy + Default>(
+        &self,
+        n: usize,
+        access_flags: ffi::ibv_access_flags,
+    ) -> io::Result<MemoryRegion<T>> {
+        assert!(n > 0);
+        assert!(mem::size_of::<T>() > 0);
+        let mut data = Vec::with_capacity(n);
+        data.resize(n, T::default());
+
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.pd,
+                data.as_mut_ptr() as *mut _,
+                n * mem::size_of::<T>(),
+                access_flags.0 as i32,
+            )
+        };
+
+        // TODO
+        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
+        // The local key (L_Key) field lkey is used as the lkey field of struct ibv_sge when
+        // posting buffers with ibv_post_* verbs, and the the remote key (R_Key)  field rkey  is
+        // used by remote processes to perform Atomic and RDMA operations.  The remote process
+        // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
+        // function.
+
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(MemoryRegion { mr, data })
+        }
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
@@ -1430,7 +1629,8 @@ impl<'ctx> ProtectionDomain<'ctx> {
     ///  - `IBV_ACCESS_REMOTE_READ`: Enables Remote Read Access
     ///  - `IBV_ACCESS_REMOTE_ATOMIC`: Enables Remote Atomic Operation Access (if supported)
     ///
-    /// Local read access is always enabled for the MR.
+    /// Local read access is always enabled for the MR. For more fine-grained control over
+    /// permissions, see `allocate_with_permissions`.
     ///
     /// # Panics
     ///
@@ -1443,38 +1643,11 @@ impl<'ctx> ProtectionDomain<'ctx> {
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
     pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> io::Result<MemoryRegion<T>> {
-        assert!(n > 0);
-        assert!(mem::size_of::<T>() > 0);
-
-        let mut data = Vec::with_capacity(n);
-        data.resize(n, T::default());
-
-        let access = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+        let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
-        let mr = unsafe {
-            ffi::ibv_reg_mr(
-                self.pd,
-                data.as_mut_ptr() as *mut _,
-                n * mem::size_of::<T>(),
-                access.0 as i32,
-            )
-        };
-
-        // TODO
-        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
-        // The local key (L_Key) field lkey is used as the lkey field of struct ibv_sge when
-        // posting buffers with ibv_post_* verbs, and the the remote key (R_Key)  field rkey  is
-        // used by remote processes to perform Atomic and RDMA operations.  The remote process
-        // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
-        // function.
-
-        if mr.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(MemoryRegion { mr, data })
-        }
+        self.allocate_with_permissions(n, access_flags)
     }
 }
 
