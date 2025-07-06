@@ -354,10 +354,7 @@ impl ContextInner {
         match port_attr.state {
             ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "port is not ACTIVE or ARMED".to_string(),
-                ));
+                return Err(io::Error::other("port is not ACTIVE or ARMED"));
             }
         }
         Ok(port_attr)
@@ -386,10 +383,7 @@ impl Context {
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
         if ctx.is_null() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to open device".to_string(),
-            ));
+            return Err(io::Error::other("failed to open device"));
         }
         let inner = Arc::new(ContextInner { ctx });
 
@@ -466,10 +460,7 @@ impl Context {
     pub fn alloc_pd(&self) -> io::Result<ProtectionDomain> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.inner.ctx) };
         if pd.is_null() {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "obv_alloc_pd returned null",
-            ))
+            Err(io::Error::other("obv_alloc_pd returned null"))
         } else {
             Ok(ProtectionDomain {
                 inner: Arc::new(ProtectionDomainInner {
@@ -494,10 +485,10 @@ impl Context {
             )
         };
         if num_entries < 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("failed to query gid table, error={}", -num_entries),
-            ));
+            return Err(io::Error::other(format!(
+                "failed to query gid table, error={}",
+                -num_entries
+            )));
         }
         gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
@@ -582,7 +573,7 @@ impl CompletionQueue {
         };
 
         if n < 0 {
-            Err(io::Error::new(io::ErrorKind::Other, "ibv_poll_cq failed"))
+            Err(io::Error::other("ibv_poll_cq failed"))
         } else {
             Ok(&mut completions[0..n as usize])
         }
@@ -655,7 +646,7 @@ impl CompletionQueue {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "Timed out during completion queue wait",
-                    ))
+                    ));
                 }
                 1 => {}
                 _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
@@ -1452,6 +1443,7 @@ pub struct MemoryRegion<T> {
 unsafe impl<T> Send for MemoryRegion<T> {}
 unsafe impl<T> Sync for MemoryRegion<T> {}
 
+#[allow(clippy::len_without_is_empty)]
 impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
@@ -1790,10 +1782,11 @@ impl QueuePair {
         // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
         // immediately after the call returns.
 
-        let ctx = (*self.qp).context;
-        let ops = &mut (*ctx).ops;
-        let errno =
-            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+        };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
@@ -1856,10 +1849,11 @@ impl QueuePair {
         // means that in all cases, the actual data of the incoming message will start at an offset
         // of 40 bytes into the buffer(s) in the scatter list.
 
-        let ctx = (*self.qp).context;
-        let ops = &mut (*ctx).ops;
-        let errno =
-            ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _);
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+        };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
