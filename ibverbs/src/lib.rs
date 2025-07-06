@@ -69,6 +69,7 @@ use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
 use std::mem;
+use std::ops::RangeBounds;
 use std::os::fd::BorrowedFd;
 use std::os::raw::c_void;
 use std::ptr;
@@ -90,10 +91,6 @@ use serde::{Deserialize, Serialize};
 
 /// Access flags for use with `QueuePair` and `MemoryRegion`.
 pub use ffi::ibv_access_flags;
-
-/// Because `std::slice::SliceIndex` is still unstable, we follow @alexcrichton's suggestion in
-/// https://github.com/rust-lang/rust/issues/35729 and implement it ourselves.
-mod sliceindex;
 
 /// Get list of available RDMA devices.
 ///
@@ -1455,20 +1452,6 @@ pub struct MemoryRegion<T> {
 unsafe impl<T> Send for MemoryRegion<T> {}
 unsafe impl<T> Sync for MemoryRegion<T> {}
 
-use std::ops::{Deref, DerefMut};
-impl<T> Deref for MemoryRegion<T> {
-    type Target = [T];
-    fn deref(&self) -> &Self::Target {
-        &self.data[..]
-    }
-}
-
-impl<T> DerefMut for MemoryRegion<T> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.data[..]
-    }
-}
-
 impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
@@ -1476,6 +1459,66 @@ impl<T> MemoryRegion<T> {
             key: unsafe { &*self.mr }.rkey,
         }
     }
+
+    /// Returns a constant pointer to the underlying data.
+    /// Warning: The memory might be modified by RDMA operations after this pointer is returned.
+    pub fn as_ptr(&self) -> *const T {
+        self.data.as_ptr()
+    }
+
+    /// Returns a mutable pointer to the underlying data.
+    /// Warning: The memory might be modified by RDMA operations after this pointer is returned.
+    pub fn as_mut_ptr(&mut self) -> *mut T {
+        self.data.as_mut_ptr()
+    }
+
+    /// Returns the number of elements of type T in the memory region.
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Make a subslice of this memory region.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
+        let (addr, length) = calc_addr_len::<T>(
+            bounds,
+            unsafe { *self.mr }.addr as u64,
+            unsafe { *self.mr }.length,
+        );
+        let sge = ffi::ibv_sge {
+            addr,
+            length,
+            lkey: unsafe { *self.mr }.lkey,
+        };
+        LocalMemorySlice { _sge: sge }
+    }
+}
+
+fn calc_addr_len<T>(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, u32) {
+    let start = match bounds.start_bound() {
+        std::ops::Bound::Included(i) => *i,
+        std::ops::Bound::Excluded(i) => *i + 1,
+        std::ops::Bound::Unbounded => 0,
+    }
+    .checked_mul(size_of::<T>())
+    .unwrap();
+    let end = match bounds.end_bound() {
+        std::ops::Bound::Included(i) => (*i + 1).checked_mul(size_of::<T>()).unwrap(),
+        std::ops::Bound::Excluded(i) => i.checked_mul(size_of::<T>()).unwrap(),
+        std::ops::Bound::Unbounded => bytes_len,
+    };
+    assert!(start < end);
+    assert!(start <= bytes_len);
+    assert!(end <= bytes_len);
+    let addr = addr + start as u64;
+    let len: u32 = (end - start).try_into().unwrap();
+    (addr, len)
+}
+
+/// Local memory slice.
+#[derive(Debug, Default, Copy, Clone)]
+#[repr(transparent)]
+pub struct LocalMemorySlice {
+    _sge: ffi::ibv_sge,
 }
 
 /// A key that authorizes direct memory access to a memory region.
@@ -1718,26 +1761,12 @@ impl QueuePair {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub unsafe fn post_send<T, R>(
-        &mut self,
-        mr: &mut MemoryRegion<T>,
-        range: R,
-        wr_id: u64,
-    ) -> io::Result<()>
-    where
-        R: sliceindex::SliceIndex<[T], Output = [T]>,
-    {
-        let range = range.index(mr);
-        let mut sge = ffi::ibv_sge {
-            addr: range.as_ptr() as u64,
-            length: mem::size_of_val(range) as u32,
-            lkey: (*mr.mr).lkey,
-        };
+    pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: &mut sge as *mut _,
-            num_sge: 1,
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: Default::default(),
@@ -1802,26 +1831,16 @@ impl QueuePair {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub unsafe fn post_receive<T, R>(
+    pub unsafe fn post_receive(
         &mut self,
-        mr: &mut MemoryRegion<T>,
-        range: R,
+        local: &[LocalMemorySlice],
         wr_id: u64,
-    ) -> io::Result<()>
-    where
-        R: sliceindex::SliceIndex<[T], Output = [T]>,
-    {
-        let range = range.index(mr);
-        let mut sge = ffi::ibv_sge {
-            addr: range.as_ptr() as u64,
-            length: mem::size_of_val(range) as u32,
-            lkey: (*mr.mr).lkey,
-        };
+    ) -> io::Result<()> {
         let mut wr = ffi::ibv_recv_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: &mut sge as *mut _,
-            num_sge: 1,
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
         };
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null::<ffi::ibv_recv_wr>() as *mut _;
 
@@ -1893,5 +1912,17 @@ mod test_serde {
         assert_eq!(guid.raw, [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
         println!("{:#08x}", guid.oui());
         assert_eq!(guid.oui(), 0x123456);
+    }
+
+    #[test]
+    fn test_local_memory_slice_sge_memory_layout() {
+        assert_eq!(
+            std::mem::size_of::<LocalMemorySlice>(),
+            std::mem::size_of::<ffi::ibv_sge>()
+        );
+        assert_eq!(
+            std::mem::align_of::<LocalMemorySlice>(),
+            std::mem::align_of::<ffi::ibv_sge>()
+        );
     }
 }
