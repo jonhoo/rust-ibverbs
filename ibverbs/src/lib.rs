@@ -91,6 +91,15 @@ use serde::{Deserialize, Serialize};
 /// Access flags for use with `QueuePair` and `MemoryRegion`.
 pub use ffi::ibv_access_flags;
 
+/// Default access flags.
+pub const DEFAULT_ACCESS_FLAGS: ffi::ibv_access_flags = ffi::ibv_access_flags(
+    ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
+        | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
+        | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
+        | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC.0
+        | ffi::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0,
+);
+
 /// Get list of available RDMA devices.
 ///
 /// # Errors
@@ -1698,6 +1707,37 @@ impl ProtectionDomain {
                 _pd: self.inner.clone(),
                 mr,
                 data,
+            })
+        }
+    }
+
+    /// Registers an already allocated DMA-BUF memory region (MR) associated with this `ProtectionDomain`.
+    /// https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - The file descriptor of the DMA-BUF to be registered. This must refer to an already allocated buffer.
+    /// * `iova` - The IO virtual address (IOVA) at which the DMA-BUF will be made accessible to the RDMA device.
+    /// * `len` - The size in bytes of the memory region to be registered. This must be aligned to page size.
+    pub fn register_dmabuf(
+        &self,
+        fd: i32,
+        iova: u64,
+        len: usize,
+        access_flags: ffi::ibv_access_flags,
+    ) -> io::Result<MemoryRegion<()>> {
+        let mr = unsafe {
+            ffi::ibv_reg_dmabuf_mr(self.inner.pd, 0, len, iova, fd, access_flags.0 as i32)
+        };
+
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            // TODO: Add MemoryRegionUnownedOpaque class for return value which doesn't need to store the `data` ptr.
+            Ok(MemoryRegion {
+                _pd: self.inner.clone(),
+                mr,
+                data: (),
             })
         }
     }
