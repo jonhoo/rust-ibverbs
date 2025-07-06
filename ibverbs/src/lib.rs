@@ -506,13 +506,13 @@ impl Drop for CompletionQueueInner {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!("{e}");
         }
 
         let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!("{e}");
         }
     }
 }
@@ -1466,7 +1466,7 @@ impl<T> MemoryRegion<T> {
 
     /// Make a subslice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
-        let (addr, length) = calc_addr_len::<T>(
+        let (addr, length) = calc_addr_len(
             bounds,
             unsafe { *self.mr }.addr as u64,
             unsafe { *self.mr }.length,
@@ -1480,54 +1480,29 @@ impl<T> MemoryRegion<T> {
     }
 }
 
-fn calc_addr_len<T>(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, u32) {
-    let start = match bounds.start_bound() {
-        std::ops::Bound::Included(i) => *i,
-        std::ops::Bound::Excluded(i) => *i + 1,
-        std::ops::Bound::Unbounded => 0,
-    }
-    .checked_mul(size_of::<T>())
-    .unwrap();
-    let end = match bounds.end_bound() {
-        std::ops::Bound::Included(i) => (*i + 1).checked_mul(size_of::<T>()).unwrap(),
-        std::ops::Bound::Excluded(i) => i.checked_mul(size_of::<T>()).unwrap(),
-        std::ops::Bound::Unbounded => bytes_len,
-    };
-    assert!(start < end);
-    assert!(start <= bytes_len);
-    assert!(end <= bytes_len);
-    let addr = addr + start as u64;
-    let len: u32 = (end - start).try_into().unwrap();
-    (addr, len)
-}
-
-/// Remote memory slice.
-#[repr(C)]
+/// Local memory slice.
 #[derive(Debug, Default, Copy, Clone)]
-pub struct RemoteMemorySlice {
-    addr: u64,
-    length: u32,
-    rkey: u32,
+#[repr(transparent)]
+pub struct LocalMemorySlice {
+    _sge: ffi::ibv_sge,
 }
 
 /// Remote memory region.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct RemoteMemoryRegion {
-    addr: u64,
-    len: usize,
-    rkey: u32,
+    /// Memory address of the registered region.
+    pub addr: u64,
+    /// Length of the registered memory region.
+    pub len: usize,
+    /// Remote key for accessing this memory region.
+    pub rkey: u32,
 }
 
 #[allow(clippy::len_without_is_empty)]
 impl RemoteMemoryRegion {
-    /// Number of T elements in this slice.
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
     /// Make a subslice of this slice.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> RemoteMemorySlice {
-        let (addr, len) = calc_addr_len::<u8>(bounds, self.addr, self.len);
+        let (addr, len) = calc_addr_len(bounds, self.addr, self.len);
         RemoteMemorySlice {
             addr,
             length: len,
@@ -1536,11 +1511,13 @@ impl RemoteMemoryRegion {
     }
 }
 
-/// Local memory slice.
+/// Remote memory slice.
 #[derive(Debug, Default, Copy, Clone)]
-#[repr(transparent)]
-pub struct LocalMemorySlice {
-    _sge: ffi::ibv_sge,
+pub struct RemoteMemorySlice {
+    addr: u64,
+    #[allow(unused)]
+    length: u32,
+    rkey: u32,
 }
 
 /// A key that authorizes direct memory access to a memory region.
@@ -1556,7 +1533,7 @@ impl<T> Drop for MemoryRegion<T> {
         let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!("{e}");
         }
     }
 }
@@ -1571,7 +1548,7 @@ impl Drop for ProtectionDomainInner {
         let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!("{e}");
         }
     }
 }
@@ -1698,11 +1675,11 @@ impl ProtectionDomain {
     }
 
     /// Registers an already allocated Memory Region (MR) associated with this `ProtectionDomain`.
-    pub fn register<H: AsMut<[T]>, T: Sized + Copy + Default>(
+    pub fn register<T: AsMut<[E]>, E: Sized + Copy + Default>(
         &self,
-        mut data: H,
+        mut data: T,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegion<H>> {
+    ) -> io::Result<MemoryRegion<T>> {
         let len = std::mem::size_of_val(data.as_mut());
         assert!(std::mem::size_of::<T>() > 0);
         let mr = unsafe {
@@ -1731,7 +1708,7 @@ impl Drop for ProtectionDomain {
         let errno = unsafe { ffi::ibv_dealloc_pd(self.inner.pd) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!("{e}");
         }
     }
 }
@@ -1893,7 +1870,7 @@ impl QueuePair {
 
     #[inline]
     /// Remote RDMA write.
-    pub fn post_write<'a, T: 'a>(
+    pub fn post_write(
         &mut self,
         local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
@@ -1918,20 +1895,6 @@ impl QueuePair {
         };
         let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
 
-        // TODO:
-        //
-        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
-        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
-        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
-        // returns this failing WR through bad_wr.
-        //
-        // The user should not alter or destroy AHs associated with WRs until request is fully
-        // executed and  a  work  completion  has been retrieved from the corresponding completion
-        // queue (CQ) to avoid unexpected behavior.
-        //
-        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
-        // immediately after the call returns.
-
         let ctx = unsafe { *self.qp }.context;
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
@@ -1951,9 +1914,28 @@ impl Drop for QueuePair {
         let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{}", e);
+            panic!("{e}");
         }
     }
+}
+
+fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, u32) {
+    let start = match bounds.start_bound() {
+        std::ops::Bound::Included(i) => *i,
+        std::ops::Bound::Excluded(i) => *i + 1,
+        std::ops::Bound::Unbounded => 0,
+    };
+    let end = match bounds.end_bound() {
+        std::ops::Bound::Included(i) => *i + 1,
+        std::ops::Bound::Excluded(i) => *i,
+        std::ops::Bound::Unbounded => bytes_len,
+    };
+    assert!(start < end);
+    assert!(start <= bytes_len);
+    assert!(end <= bytes_len);
+    let addr = addr + start as u64;
+    let len: u32 = (end - start).try_into().unwrap();
+    (addr, len)
 }
 
 #[cfg(all(test, feature = "serde"))]
@@ -1996,10 +1978,6 @@ mod test_serde {
         assert_eq!(
             std::mem::size_of::<LocalMemorySlice>(),
             std::mem::size_of::<ffi::ibv_sge>()
-        );
-        assert_eq!(
-            std::mem::align_of::<LocalMemorySlice>(),
-            std::mem::align_of::<ffi::ibv_sge>()
         );
     }
 }
