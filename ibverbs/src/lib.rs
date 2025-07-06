@@ -1478,7 +1478,7 @@ impl<T> MemoryRegion<T> {
     }
 
     /// Make a subslice of this memory region.
-    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice<'_> {
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) = calc_addr_len::<T>(
             bounds,
             unsafe { *self.mr }.addr as u64,
@@ -1489,10 +1489,7 @@ impl<T> MemoryRegion<T> {
             length,
             lkey: unsafe { *self.mr }.lkey,
         };
-        LocalMemorySlice {
-            _sge: sge,
-            phantom: Default::default(),
-        }
+        LocalMemorySlice { _sge: sge }
     }
 }
 
@@ -1520,9 +1517,8 @@ fn calc_addr_len<T>(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize
 /// Local memory slice.
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(transparent)]
-pub struct LocalMemorySlice<'a> {
+pub struct LocalMemorySlice {
     _sge: ffi::ibv_sge,
-    phantom: PhantomData<&'a ()>,
 }
 
 /// A key that authorizes direct memory access to a memory region.
@@ -1767,7 +1763,7 @@ impl QueuePair {
     #[inline]
     pub unsafe fn post_send(
         &mut self,
-        local: &[LocalMemorySlice<'_>],
+        local: &[LocalMemorySlice],
         wr_id: u64,
     ) -> io::Result<()> {
         let mut wr = ffi::ibv_send_wr {
@@ -1841,7 +1837,7 @@ impl QueuePair {
     #[inline]
     pub unsafe fn post_receive(
         &mut self,
-        local: &[LocalMemorySlice<'_>],
+        local: &[LocalMemorySlice],
         wr_id: u64,
     ) -> io::Result<()> {
         let mut wr = ffi::ibv_recv_wr {
@@ -1925,11 +1921,11 @@ mod test_serde {
     #[test]
     fn test_local_memory_slice_sge_memory_layout() {
         assert_eq!(
-            std::mem::size_of::<LocalMemorySlice<'static>>(),
+            std::mem::size_of::<LocalMemorySlice>(),
             std::mem::size_of::<ffi::ibv_sge>()
         );
         assert_eq!(
-            std::mem::align_of::<LocalMemorySlice<'static>>(),
+            std::mem::align_of::<LocalMemorySlice>(),
             std::mem::align_of::<ffi::ibv_sge>()
         );
     }
