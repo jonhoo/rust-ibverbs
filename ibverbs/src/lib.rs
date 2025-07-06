@@ -1761,11 +1761,7 @@ impl QueuePair {
     ///
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub unsafe fn post_send(
-        &mut self,
-        local: &[LocalMemorySlice],
-        wr_id: u64,
-    ) -> io::Result<()> {
+    pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
