@@ -1650,8 +1650,7 @@ impl ProtectionDomain {
         access_flags: ffi::ibv_access_flags,
     ) -> io::Result<MemoryRegion<Vec<u8>>> {
         assert!(n > 0);
-        let mut data = Vec::with_capacity(n);
-        data.resize(n, 0);
+        let data = vec![0; n];
         self.register(data, access_flags)
     }
 
@@ -1704,12 +1703,13 @@ impl ProtectionDomain {
         mut data: H,
         access_flags: ffi::ibv_access_flags,
     ) -> io::Result<MemoryRegion<H>> {
+        let len = std::mem::size_of_val(data.as_mut());
         assert!(std::mem::size_of::<T>() > 0);
         let mr = unsafe {
             ffi::ibv_reg_mr(
                 self.inner.pd,
                 data.as_mut().as_mut_ptr() as *mut c_void,
-                data.as_mut().len() * std::mem::size_of::<T>(),
+                len,
                 access_flags.0 as i32,
             )
         };
