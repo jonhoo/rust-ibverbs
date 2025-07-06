@@ -68,6 +68,7 @@
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
+use std::marker::PhantomData;
 use std::mem;
 use std::ops::RangeBounds;
 use std::os::fd::BorrowedFd;
@@ -1452,6 +1453,16 @@ impl<T> MemoryRegion<T> {
         }
     }
 
+    /// Remote region.
+    pub fn remote(&self) -> RemoteMemoryRegion<T> {
+        RemoteMemoryRegion {
+            addr: unsafe { *self.mr }.addr as u64,
+            len: unsafe { *self.mr }.length,
+            rkey: unsafe { *self.mr }.rkey,
+            phantom: Default::default(),
+        }
+    }
+
     /// Returns a constant pointer to the underlying data.
     /// Warning: The memory might be modified by RDMA operations after this pointer is returned.
     pub fn as_ptr(&self) -> *const T {
@@ -1504,6 +1515,42 @@ fn calc_addr_len<T>(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize
     let addr = addr + start as u64;
     let len: u32 = (end - start).try_into().unwrap();
     (addr, len)
+}
+
+/// Remote memory slice.
+#[repr(C)]
+#[derive(Debug, Default, Copy, Clone)]
+pub struct RemoteMemorySlice {
+    addr: u64,
+    length: u32,
+    rkey: u32,
+}
+
+/// Remote memory region.
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct RemoteMemoryRegion<T> {
+    addr: u64,
+    len: usize,
+    rkey: u32,
+    phantom: PhantomData<T>,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl<T> RemoteMemoryRegion<T> {
+    /// Number of T elements in this slice.
+    pub fn len(&self) -> usize {
+        self.len / size_of::<T>()
+    }
+
+    /// Make a subslice of this slice.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> RemoteMemorySlice {
+        let (addr, len) = calc_addr_len::<T>(bounds, self.addr, self.len);
+        RemoteMemorySlice {
+            addr,
+            length: len,
+            rkey: self.rkey,
+        }
+    }
 }
 
 /// Local memory slice.
@@ -1853,6 +1900,59 @@ impl QueuePair {
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
             ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+        };
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
+
+    #[inline]
+    /// Remote RDMA write.
+    pub fn post_write<'a, T: 'a>(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        let mut wr = ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: 1,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: remote.addr,
+                    rkey: remote.rkey,
+                },
+            },
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        // TODO:
+        //
+        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
+        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
+        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
+        // returns this failing WR through bad_wr.
+        //
+        // The user should not alter or destroy AHs associated with WRs until request is fully
+        // executed and  a  work  completion  has been retrieved from the corresponding completion
+        // queue (CQ) to avoid unexpected behavior.
+        //
+        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
+        // immediately after the call returns.
+
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
         };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
