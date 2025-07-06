@@ -68,8 +68,6 @@
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
-use std::marker::PhantomData;
-use std::mem;
 use std::ops::RangeBounds;
 use std::os::fd::BorrowedFd;
 use std::os::raw::c_void;
@@ -1438,13 +1436,12 @@ impl PreparedQueuePair {
 pub struct MemoryRegion<T> {
     _pd: Arc<ProtectionDomainInner>,
     mr: *mut ffi::ibv_mr,
-    data: Vec<T>,
+    data: T,
 }
 
 unsafe impl<T> Send for MemoryRegion<T> {}
 unsafe impl<T> Sync for MemoryRegion<T> {}
 
-#[allow(clippy::len_without_is_empty)]
 impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
@@ -1454,30 +1451,17 @@ impl<T> MemoryRegion<T> {
     }
 
     /// Remote region.
-    pub fn remote(&self) -> RemoteMemoryRegion<T> {
+    pub fn remote(&self) -> RemoteMemoryRegion {
         RemoteMemoryRegion {
             addr: unsafe { *self.mr }.addr as u64,
             len: unsafe { *self.mr }.length,
             rkey: unsafe { *self.mr }.rkey,
-            phantom: Default::default(),
         }
     }
 
-    /// Returns a constant pointer to the underlying data.
-    /// Warning: The memory might be modified by RDMA operations after this pointer is returned.
-    pub fn as_ptr(&self) -> *const T {
-        self.data.as_ptr()
-    }
-
-    /// Returns a mutable pointer to the underlying data.
-    /// Warning: The memory might be modified by RDMA operations after this pointer is returned.
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.data.as_mut_ptr()
-    }
-
-    /// Returns the number of elements of type T in the memory region.
-    pub fn len(&self) -> usize {
-        self.data.len()
+    /// Get inner data.
+    pub fn inner(&mut self) -> &mut T {
+        &mut self.data
     }
 
     /// Make a subslice of this memory region.
@@ -1528,23 +1512,22 @@ pub struct RemoteMemorySlice {
 
 /// Remote memory region.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct RemoteMemoryRegion<T> {
+pub struct RemoteMemoryRegion {
     addr: u64,
     len: usize,
     rkey: u32,
-    phantom: PhantomData<T>,
 }
 
 #[allow(clippy::len_without_is_empty)]
-impl<T> RemoteMemoryRegion<T> {
+impl RemoteMemoryRegion {
     /// Number of T elements in this slice.
     pub fn len(&self) -> usize {
-        self.len / size_of::<T>()
+        self.len
     }
 
     /// Make a subslice of this slice.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> RemoteMemorySlice {
-        let (addr, len) = calc_addr_len::<T>(bounds, self.addr, self.len);
+        let (addr, len) = calc_addr_len::<u8>(bounds, self.addr, self.len);
         RemoteMemorySlice {
             addr,
             length: len,
@@ -1661,42 +1644,15 @@ impl ProtectionDomain {
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
-    pub fn allocate_with_permissions<T: Sized + Copy + Default>(
+    pub fn allocate_with_permissions(
         &self,
         n: usize,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegion<T>> {
+    ) -> io::Result<MemoryRegion<Vec<u8>>> {
         assert!(n > 0);
-        assert!(mem::size_of::<T>() > 0);
         let mut data = Vec::with_capacity(n);
-        data.resize(n, T::default());
-
-        let mr = unsafe {
-            ffi::ibv_reg_mr(
-                self.inner.pd,
-                data.as_mut_ptr() as *mut _,
-                n * mem::size_of::<T>(),
-                access_flags.0 as i32,
-            )
-        };
-
-        // TODO
-        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
-        // The local key (L_Key) field lkey is used as the lkey field of struct ibv_sge when
-        // posting buffers with ibv_post_* verbs, and the the remote key (R_Key)  field rkey  is
-        // used by remote processes to perform Atomic and RDMA operations.  The remote process
-        // places this rkey as the rkey field of struct ibv_send_wr passed to the ibv_post_send
-        // function.
-
-        if mr.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(MemoryRegion {
-                _pd: self.inner.clone(),
-                mr,
-                data,
-            })
-        }
+        data.resize(n, 0);
+        self.register(data, access_flags)
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
@@ -1734,12 +1690,39 @@ impl ProtectionDomain {
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
-    pub fn allocate<T: Sized + Copy + Default>(&self, n: usize) -> io::Result<MemoryRegion<T>> {
+    pub fn allocate(&self, n: usize) -> io::Result<MemoryRegion<Vec<u8>>> {
         let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
         self.allocate_with_permissions(n, access_flags)
+    }
+
+    /// Registers an already allocated Memory Region (MR) associated with this `ProtectionDomain`.
+    pub fn register<H: AsMut<[T]>, T: Sized + Copy + Default>(
+        &self,
+        mut data: H,
+        access_flags: ffi::ibv_access_flags,
+    ) -> io::Result<MemoryRegion<H>> {
+        assert!(std::mem::size_of::<T>() > 0);
+        let mr = unsafe {
+            ffi::ibv_reg_mr(
+                self.inner.pd,
+                data.as_mut().as_mut_ptr() as *mut c_void,
+                data.as_mut().len() * std::mem::size_of::<T>(),
+                access_flags.0 as i32,
+            )
+        };
+        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(MemoryRegion {
+                _pd: self.inner.clone(),
+                mr,
+                data,
+            })
+        }
     }
 }
 
