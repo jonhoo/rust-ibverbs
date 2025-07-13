@@ -1902,16 +1902,59 @@ impl QueuePair {
     /// Remote RDMA write.
     pub fn post_write(
         &mut self,
-        local: &[LocalMemorySlice],
+        local: LocalMemorySlice,
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        // immediate data can be used to signal the completion of the write operation
+        // the other side uses post_recv on a dummy buffer and get the imm data from the work completion
+        imm_data: Option<u32>,
+    ) -> io::Result<()> {
+        let opcode = if imm_data.is_some() {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+        } else {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
+        };
+
+        let anon_1 = if imm_data.is_some() {
+            ffi::ibv_send_wr__bindgen_ty_1 {
+                imm_data: imm_data.unwrap().to_be(),
+            }
+        } else {
+            Default::default()
+        };
+
+        self._post_one_sided(local, remote, wr_id, opcode, anon_1)
+    }
+
+    #[inline]
+    /// Remote RDMA read.
+    /// RDMA read does not support immediate data.
+    pub fn post_read(
+        &mut self,
+        local: LocalMemorySlice,
         remote: RemoteMemorySlice,
         wr_id: u64,
     ) -> io::Result<()> {
+        let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
+        self._post_one_sided(local, remote, wr_id, opcode, Default::default())
+    }
+
+    // internal function to do one sided communication
+    fn _post_one_sided(
+        &mut self,
+        local: LocalMemorySlice,
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        anon_1: ffi::ibv_send_wr__bindgen_ty_1,
+    ) -> io::Result<()> {
+        let sg_list = &[local];
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            sg_list: sg_list.as_ptr() as *mut ffi::ibv_sge,
             num_sge: 1,
-            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            opcode: opcode,
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: ffi::ibv_send_wr__bindgen_ty_2 {
                 rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
@@ -1920,7 +1963,7 @@ impl QueuePair {
                 },
             },
             qp_type: Default::default(),
-            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_1: anon_1,
             __bindgen_anon_2: Default::default(),
         };
         let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
