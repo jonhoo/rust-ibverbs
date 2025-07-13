@@ -371,6 +371,7 @@ impl ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
+        println!("dropping context");
         let ok = unsafe { ffi::ibv_close_device(self.ctx) };
         assert_eq!(ok, 0);
     }
@@ -1554,6 +1555,7 @@ struct ProtectionDomainInner {
 
 impl Drop for ProtectionDomainInner {
     fn drop(&mut self) {
+        println!("dropping protection domain");
         let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
@@ -1743,15 +1745,15 @@ impl ProtectionDomain {
     }
 }
 
-impl Drop for ProtectionDomain {
-    fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dealloc_pd(self.inner.pd) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
-        }
-    }
-}
+// impl Drop for ProtectionDomain {
+//     fn drop(&mut self) {
+//         let errno = unsafe { ffi::ibv_dealloc_pd(self.inner.pd) };
+//         if errno != 0 {
+//             let e = io::Error::from_raw_os_error(errno);
+//             panic!("{e}");
+//         }
+//     }
+// }
 
 /// A fully initialized and ready `QueuePair`.
 ///
