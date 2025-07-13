@@ -1915,9 +1915,9 @@ impl QueuePair {
             ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
         };
 
-        let anon_1 = if imm_data.is_some() {
+        let anon_1 = if let Some(imm_data) = imm_data {
             ffi::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm_data.unwrap().to_be(),
+                imm_data: imm_data.to_be(),
             }
         } else {
             Default::default()
@@ -1954,7 +1954,7 @@ impl QueuePair {
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
             sg_list: sg_list.as_ptr() as *mut ffi::ibv_sge,
             num_sge: 1,
-            opcode: opcode,
+            opcode,
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: ffi::ibv_send_wr__bindgen_ty_2 {
                 rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
