@@ -1743,16 +1743,6 @@ impl ProtectionDomain {
     }
 }
 
-impl Drop for ProtectionDomain {
-    fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dealloc_pd(self.inner.pd) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
-        }
-    }
-}
-
 /// A fully initialized and ready `QueuePair`.
 ///
 /// A queue pair is the actual object that sends and receives data in the RDMA architecture
