@@ -730,6 +730,8 @@ pub struct QueuePairBuilder {
     path_mtu: Option<ibv_mtu>,
     /// only valid for RC and UC
     rq_psn: Option<u32>,
+    /// service level (0-15). Higher value means higher priority.
+    service_level: u8,
 }
 
 impl QueuePairBuilder {
@@ -788,6 +790,7 @@ impl QueuePairBuilder {
             rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
+            service_level: 0,
         }
     }
 
@@ -818,6 +821,14 @@ impl QueuePairBuilder {
                     | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ,
             );
         }
+        self
+    }
+
+    /// Set the service level of the new `QueuePair`.
+    ///
+    /// Defaults to 0.
+    pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
+        self.service_level = service_level;
         self
     }
 
@@ -1107,6 +1118,7 @@ impl QueuePairBuilder {
                 max_dest_rd_atomic: self.max_dest_rd_atomic,
                 path_mtu: self.path_mtu,
                 rq_psn: self.rq_psn,
+                service_level: self.service_level,
             })
         }
     }
@@ -1162,6 +1174,8 @@ pub struct PreparedQueuePair {
     path_mtu: Option<ibv_mtu>,
     /// only valid for RC and UC
     rq_psn: Option<u32>,
+    /// service level (0-15). Higher value means higher priority.
+    service_level: u8,
 }
 
 /// A Global identifier for ibv.
@@ -1367,7 +1381,7 @@ impl PreparedQueuePair {
             // TODO: this is only valid for RC and UC
             ah_attr: ffi::ibv_ah_attr {
                 dlid: remote.lid,
-                sl: 0,
+                sl: self.service_level,
                 src_path_bits: 0,
                 port_num: PORT_NUM,
                 grh: Default::default(),
