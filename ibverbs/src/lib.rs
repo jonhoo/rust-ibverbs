@@ -1643,7 +1643,7 @@ impl ProtectionDomain {
             1,
             qp_type,
             1,
-            1
+            1,
         ))
     }
 
