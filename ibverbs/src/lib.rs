@@ -1900,13 +1900,13 @@ impl QueuePair {
 
     #[inline]
     /// Remote RDMA write.
+    /// immediate data can be used to signal the completion of the write operation
+    /// the other side uses post_recv on a dummy buffer and get the imm data from the work completion
     pub fn post_write(
         &mut self,
         local: LocalMemorySlice,
         remote: RemoteMemorySlice,
         wr_id: u64,
-        // immediate data can be used to signal the completion of the write operation
-        // the other side uses post_recv on a dummy buffer and get the imm data from the work completion
         imm_data: Option<u32>,
     ) -> io::Result<()> {
         let opcode = if imm_data.is_some() {
