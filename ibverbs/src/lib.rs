@@ -1758,8 +1758,7 @@ impl ProtectionDomain {
         &self,
         data: T,
     ) -> io::Result<MemoryRegion<T>> {
-        let access_flags = DEFAULT_ACCESS_FLAGS;
-        self.register_with_permissions(data, access_flags)
+        self.register_with_permissions(data, DEFAULT_ACCESS_FLAGS)
     }
 
     /// Registers an already allocated DMA-BUF memory region (MR) associated with this `ProtectionDomain`.
@@ -1951,18 +1950,60 @@ impl QueuePair {
 
     #[inline]
     /// Remote RDMA write.
+    /// immediate data can be used to signal the completion of the write operation
+    /// the other side uses post_recv on a dummy buffer and get the imm data from the work completion
     pub fn post_write(
         &mut self,
         local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         wr_id: u64,
+        imm_data: Option<u32>,
     ) -> io::Result<()> {
+        let opcode = if imm_data.is_some() {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+        } else {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
+        };
+
+        self._post_one_sided(local, remote, wr_id, opcode, imm_data)
+    }
+
+    #[inline]
+    /// Remote RDMA read.
+    /// RDMA read does not support immediate data.
+    pub fn post_read(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
+        self._post_one_sided(local, remote, wr_id, opcode, None)
+    }
+
+    // internal function to do one sided communication
+    fn _post_one_sided(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        imm_data: Option<u32>,
+    ) -> io::Result<()> {
+        let anon_1 = if let Some(imm_data) = imm_data {
+            ffi::ibv_send_wr__bindgen_ty_1 {
+                imm_data: imm_data.to_be(),
+            }
+        } else {
+            Default::default()
+        };
+
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
             sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: 1,
-            opcode: ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE,
+            num_sge: local.len() as i32,
+            opcode,
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: ffi::ibv_send_wr__bindgen_ty_2 {
                 rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
@@ -1971,7 +2012,7 @@ impl QueuePair {
                 },
             },
             qp_type: Default::default(),
-            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_1: anon_1,
             __bindgen_anon_2: Default::default(),
         };
         let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
