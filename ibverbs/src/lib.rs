@@ -1540,7 +1540,7 @@ pub struct LocalMemorySlice {
 }
 
 /// Remote memory region.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize, Debug))]
 pub struct RemoteMemoryRegion {
     /// Memory address of the registered region.
     pub addr: u64,
@@ -1682,7 +1682,7 @@ impl ProtectionDomain {
     ) -> io::Result<MemoryRegion<Vec<u8>>> {
         assert!(n > 0);
         let data = vec![0; n];
-        self.register(data, access_flags)
+        self.register_with_permissions(data, access_flags)
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
@@ -1721,15 +1721,12 @@ impl ProtectionDomain {
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
     pub fn allocate(&self, n: usize) -> io::Result<MemoryRegion<Vec<u8>>> {
-        let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
+        let access_flags = DEFAULT_ACCESS_FLAGS;
         self.allocate_with_permissions(n, access_flags)
     }
 
-    /// Registers an already allocated Memory Region (MR) associated with this `ProtectionDomain`.
-    pub fn register<T: AsMut<[E]>, E: Sized + Copy + Default>(
+    /// Registers an already allocated Memory Region (MR) with the given access permissions.
+    pub fn register_with_permissions<T: AsMut<[E]>, E: Sized + Copy + Default>(
         &self,
         mut data: T,
         access_flags: ffi::ibv_access_flags,
@@ -1754,6 +1751,15 @@ impl ProtectionDomain {
                 data,
             })
         }
+    }
+
+    /// Registers an already allocated Memory Region (MR) with the default access permissions.
+    pub fn register<T: AsMut<[E]>, E: Sized + Copy + Default>(
+        &self,
+        data: T,
+    ) -> io::Result<MemoryRegion<T>> {
+        let access_flags = DEFAULT_ACCESS_FLAGS;
+        self.register_with_permissions(data, access_flags)
     }
 
     /// Registers an already allocated DMA-BUF memory region (MR) associated with this `ProtectionDomain`.
