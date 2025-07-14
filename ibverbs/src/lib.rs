@@ -1728,7 +1728,7 @@ impl ProtectionDomain {
     /// Registers an already allocated Memory Region (MR) with the default access permissions.
     pub fn register<T: AsMut<[E]>, E: Sized + Copy + Default>(
         &self,
-        mut data: T,
+        data: T,
     ) -> io::Result<MemoryRegion<T>> {
         let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
@@ -1942,15 +1942,7 @@ impl QueuePair {
             ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
         };
 
-        let anon_1 = if let Some(imm_data) = imm_data {
-            ffi::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm_data.to_be(),
-            }
-        } else {
-            Default::default()
-        };
-
-        self._post_one_sided(local, remote, wr_id, opcode, anon_1)
+        self._post_one_sided(local, remote, wr_id, opcode, imm_data)
     }
 
     #[inline]
@@ -1963,7 +1955,7 @@ impl QueuePair {
         wr_id: u64,
     ) -> io::Result<()> {
         let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
-        self._post_one_sided(local, remote, wr_id, opcode, Default::default())
+        self._post_one_sided(local, remote, wr_id, opcode, None)
     }
 
     // internal function to do one sided communication
@@ -1973,8 +1965,16 @@ impl QueuePair {
         remote: RemoteMemorySlice,
         wr_id: u64,
         opcode: ffi::ibv_wr_opcode,
-        anon_1: ffi::ibv_send_wr__bindgen_ty_1,
+        imm_data: Option<u32>,
     ) -> io::Result<()> {
+        let anon_1 = if let Some(imm_data) = imm_data {
+            ffi::ibv_send_wr__bindgen_ty_1 {
+                imm_data: imm_data.to_be(),
+            }
+        } else {
+            Default::default()
+        };
+
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
