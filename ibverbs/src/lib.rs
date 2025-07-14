@@ -825,7 +825,7 @@ impl QueuePairBuilder {
     }
 
     /// Set the service level of the new `QueuePair`.
-    ///
+    /// service level (0-15). Higher value means higher priority.
     /// Defaults to 0.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
         self.service_level = service_level;
