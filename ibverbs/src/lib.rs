@@ -730,6 +730,8 @@ pub struct QueuePairBuilder {
     path_mtu: Option<ibv_mtu>,
     /// only valid for RC and UC
     rq_psn: Option<u32>,
+    /// service level (0-15). Higher value means higher priority.
+    service_level: u8,
 }
 
 impl QueuePairBuilder {
@@ -788,6 +790,7 @@ impl QueuePairBuilder {
             rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
+            service_level: 0,
         }
     }
 
@@ -818,6 +821,14 @@ impl QueuePairBuilder {
                     | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ,
             );
         }
+        self
+    }
+
+    /// Set the service level of the new `QueuePair`.
+    /// service level (0-15). Higher value means higher priority.
+    /// Defaults to 0.
+    pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
+        self.service_level = service_level;
         self
     }
 
@@ -1107,6 +1118,7 @@ impl QueuePairBuilder {
                 max_dest_rd_atomic: self.max_dest_rd_atomic,
                 path_mtu: self.path_mtu,
                 rq_psn: self.rq_psn,
+                service_level: self.service_level,
             })
         }
     }
@@ -1162,6 +1174,8 @@ pub struct PreparedQueuePair {
     path_mtu: Option<ibv_mtu>,
     /// only valid for RC and UC
     rq_psn: Option<u32>,
+    /// service level (0-15). Higher value means higher priority.
+    service_level: u8,
 }
 
 /// A Global identifier for ibv.
@@ -1367,7 +1381,7 @@ impl PreparedQueuePair {
             // TODO: this is only valid for RC and UC
             ah_attr: ffi::ibv_ah_attr {
                 dlid: remote.lid,
-                sl: 0,
+                sl: self.service_level,
                 src_path_bits: 0,
                 port_num: PORT_NUM,
                 grh: Default::default(),
@@ -1716,7 +1730,6 @@ impl ProtectionDomain {
         &self,
         mut data: T,
     ) -> io::Result<MemoryRegion<T>> {
-
         let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
@@ -1918,7 +1931,7 @@ impl QueuePair {
     /// the other side uses post_recv on a dummy buffer and get the imm data from the work completion
     pub fn post_write(
         &mut self,
-        local: LocalMemorySlice,
+        local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         wr_id: u64,
         imm_data: Option<u32>,
@@ -1945,7 +1958,7 @@ impl QueuePair {
     /// RDMA read does not support immediate data.
     pub fn post_read(
         &mut self,
-        local: LocalMemorySlice,
+        local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         wr_id: u64,
     ) -> io::Result<()> {
@@ -1956,18 +1969,17 @@ impl QueuePair {
     // internal function to do one sided communication
     fn _post_one_sided(
         &mut self,
-        local: LocalMemorySlice,
+        local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         wr_id: u64,
         opcode: ffi::ibv_wr_opcode,
         anon_1: ffi::ibv_send_wr__bindgen_ty_1,
     ) -> io::Result<()> {
-        let sg_list = &[local];
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: sg_list.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: 1,
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
             opcode,
             send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
             wr: ffi::ibv_send_wr__bindgen_ty_2 {
