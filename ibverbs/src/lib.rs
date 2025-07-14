@@ -755,6 +755,8 @@ impl QueuePairBuilder {
         recv: Arc<CompletionQueueInner>,
         max_recv_wr: u32,
         qp_type: ffi::ibv_qp_type,
+        max_send_sge: u32,
+        max_recv_sge: u32,
     ) -> QueuePairBuilder {
         let port_active_mtu = port_attr.active_mtu;
         QueuePairBuilder {
@@ -769,8 +771,8 @@ impl QueuePairBuilder {
             recv,
             max_recv_wr,
 
-            max_send_sge: 1,
-            max_recv_sge: 1,
+            max_send_sge,
+            max_recv_sge,
             max_inline_data: 0,
 
             qp_type,
@@ -1058,11 +1060,38 @@ impl QueuePairBuilder {
         self
     }
 
+    /// The maximum number of scatter/gather elements in any Work Request
+    /// that can be posted to the Send Queue in that Queue Pair.
+    ///
+    /// Value can be [0..dev_cap.max_sge]. There may be RDMA devices that
+    /// for specific transport types may support less scatter/gather elements
+    /// than the maximum reported value.
+    ///
+    /// Defaults to 1.
+    pub fn set_max_send_sge(&mut self, max_send_sge: u32) -> &mut Self {
+        self.max_send_sge = max_send_sge;
+        self
+    }
+
     /// Set the maximum number of receive requests in the work queue
     ///
     /// Defaults to 1.
     pub fn set_max_recv_wr(&mut self, max_recv_wr: u32) -> &mut Self {
         self.max_recv_wr = max_recv_wr;
+        self
+    }
+
+    /// The maximum number of scatter/gather elements in any Work Request
+    /// that can be posted to the Receive Queue in that Queue Pair.
+    ///
+    /// Value can be [0..dev_cap.max_sge]. There may be RDMA devices that
+    /// for specific transport types may support less scatter/gather elements
+    /// than the maximum reported value. This value is ignored if the
+    /// Queue Pair is associated with an SRQ.
+    ///
+    /// Defaults to 1.
+    pub fn set_max_recv_sge(&mut self, max_recv_sge: u32) -> &mut Self {
+        self.max_recv_sge = max_recv_sge;
         self
     }
 
@@ -1613,6 +1642,8 @@ impl ProtectionDomain {
             recv.inner.clone(),
             1,
             qp_type,
+            1,
+            1,
         ))
     }
 
