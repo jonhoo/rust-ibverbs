@@ -1690,10 +1690,7 @@ impl ProtectionDomain {
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
     pub fn allocate(&self, n: usize) -> io::Result<MemoryRegion<Vec<u8>>> {
-        let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
+        let access_flags = DEFAULT_ACCESS_FLAGS;
         self.allocate_with_permissions(n, access_flags)
     }
 
@@ -1728,13 +1725,9 @@ impl ProtectionDomain {
     /// Registers an already allocated Memory Region (MR) with the default access permissions.
     pub fn register<T: AsMut<[E]>, E: Sized + Copy + Default>(
         &self,
-        mut data: T,
+        data: T,
     ) -> io::Result<MemoryRegion<T>> {
-        let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
-            | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC;
-
+        let access_flags = DEFAULT_ACCESS_FLAGS;
         self.register_with_permissions(data, access_flags)
     }
 
