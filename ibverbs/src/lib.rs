@@ -1730,7 +1730,6 @@ impl ProtectionDomain {
         &self,
         mut data: T,
     ) -> io::Result<MemoryRegion<T>> {
-
         let access_flags = ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
             | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
