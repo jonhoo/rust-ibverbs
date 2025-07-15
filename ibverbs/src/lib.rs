@@ -1539,8 +1539,25 @@ pub struct LocalMemorySlice {
     _sge: ffi::ibv_sge,
 }
 
+impl LocalMemorySlice {
+    /// Get the address of the local memory slice.
+    pub fn addr(&self) -> u64 {
+        self._sge.addr
+    }
+
+    /// Get the length of the local memory slice.
+    pub fn len(&self) -> usize {
+        self._sge.length as usize
+    }
+
+    /// Get the remote key of the local memory slice.
+    pub fn rkey(&self) -> u32 {
+        self._sge.lkey
+    }
+}
+
 /// Remote memory region.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize, Debug))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize, Debug, Clone))]
 pub struct RemoteMemoryRegion {
     /// Memory address of the registered region.
     pub addr: u64,
