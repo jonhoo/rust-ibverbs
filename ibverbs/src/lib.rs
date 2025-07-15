@@ -183,8 +183,8 @@ impl<'iter> Iterator for DeviceListIter<'iter> {
 
 /// An RDMA device.
 pub struct Device<'devlist>(&'devlist *mut ffi::ibv_device);
-unsafe impl<'devlist> Sync for Device<'devlist> {}
-unsafe impl<'devlist> Send for Device<'devlist> {}
+unsafe impl Sync for Device<'_> {}
+unsafe impl Send for Device<'_> {}
 
 impl<'d> From<&'d *mut ffi::ibv_device> for Device<'d> {
     fn from(d: &'d *mut ffi::ibv_device) -> Self {
@@ -747,6 +747,7 @@ impl QueuePairBuilder {
     /// There may be RDMA devices that for specific transport types may support less outstanding
     /// Work Requests than the maximum reported value. This value is ignored if the Queue Pair is
     /// associated with an SRQ
+    #[allow(clippy::too_many_arguments)]
     fn new(
         pd: Arc<ProtectionDomainInner>,
         port_attr: ffi::ibv_port_attr,
@@ -2095,7 +2096,7 @@ mod test_serde {
 
         let mut qpe = qpe_default;
         qpe.gid.as_mut().unwrap().raw =
-            unsafe { std::mem::transmute([87_u64.to_be(), 192_u64.to_be()]) };
+            unsafe { std::mem::transmute::<[u64; 2], [u8; 16]>([87_u64.to_be(), 192_u64.to_be()]) };
         let encoded = bincode::serialize(&qpe).unwrap();
 
         let decoded: QueuePairEndpoint = bincode::deserialize(&encoded).unwrap();
@@ -2111,7 +2112,7 @@ mod test_serde {
         let _be: ffi::__be64 = guid_u64.to_be();
         let guid: Guid = guid_u64.into();
 
-        assert_eq!(guid.is_reserved(), false);
+        assert!(!guid.is_reserved());
         assert_eq!(guid.raw, [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
         println!("{:#08x}", guid.oui());
         assert_eq!(guid.oui(), 0x123456);
