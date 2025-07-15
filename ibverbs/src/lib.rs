@@ -1550,6 +1550,11 @@ impl LocalMemorySlice {
         self._sge.length as usize
     }
 
+    /// Get is_empty
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Get the remote key of the local memory slice.
     pub fn rkey(&self) -> u32 {
         self._sge.lkey
