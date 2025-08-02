@@ -1821,6 +1821,8 @@ impl ProtectionDomain {
 ///
 /// New fields might be added in the future, so prefer constructing this struct with
 /// SendOptions{ foo: bar, ..Default::default() } to ensure forwards compatibility.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
 pub struct SendOptions {
     /// Flags used to modify the send operation, refer to libibverbs documentation for
     /// the meaning of each flag.
