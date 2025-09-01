@@ -1264,6 +1264,18 @@ impl From<Gid> for ffi::ibv_gid {
     }
 }
 
+impl From<Gid> for [u8; 16] {
+    fn from(gid: Gid) -> Self {
+        gid.raw
+    }
+}
+
+impl From<[u8; 16]> for Gid {
+    fn from(raw: [u8; 16]) -> Self {
+        Self { raw }
+    }
+}
+
 impl AsRef<ffi::ibv_gid> for Gid {
     fn as_ref(&self) -> &ffi::ibv_gid {
         unsafe { &*self.raw.as_ptr().cast::<ffi::ibv_gid>() }
@@ -2124,5 +2136,20 @@ mod test_serde {
             std::mem::size_of::<LocalMemorySlice>(),
             std::mem::size_of::<ffi::ibv_sge>()
         );
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn gid_array_conversion() {
+        let arr = [
+            0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
+            0x77, 0x88,
+        ];
+        let arr2: [u8; 16] = Gid::from(arr).into();
+        assert_eq!(arr, arr2);
     }
 }
