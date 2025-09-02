@@ -123,6 +123,7 @@ pub fn devices() -> io::Result<DeviceList> {
 }
 
 /// List of available RDMA devices.
+#[must_use]
 pub struct DeviceList(&'static mut [*mut ffi::ibv_device]);
 
 unsafe impl Sync for DeviceList {}
@@ -380,6 +381,7 @@ unsafe impl Sync for ContextInner {}
 unsafe impl Send for ContextInner {}
 
 /// An RDMA context bound to a device.
+#[must_use]
 pub struct Context {
     inner: Arc<ContextInner>,
 }
@@ -530,6 +532,7 @@ unsafe impl Send for CompletionQueueInner {}
 unsafe impl Sync for CompletionQueueInner {}
 
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
+#[must_use]
 pub struct CompletionQueue {
     inner: Arc<CompletionQueueInner>,
 }
@@ -1644,6 +1647,7 @@ unsafe impl Sync for ProtectionDomainInner {}
 unsafe impl Send for ProtectionDomainInner {}
 
 /// A protection domain for a device's context.
+#[must_use]
 pub struct ProtectionDomain {
     inner: Arc<ProtectionDomainInner>,
 }
@@ -1835,6 +1839,7 @@ impl ProtectionDomain {
 /// which is maintained by the network stack and doesn't have a physical resource behind it. A QP
 /// is a resource of an RDMA device and a QP number can be used by one process at the same time
 /// (similar to a socket that is associated with a specific TCP or UDP port number)
+#[must_use = "QueuePair is immediately destroyed via drop() unless assigned to a variable"]
 pub struct QueuePair {
     pd: Arc<ProtectionDomainInner>,
     qp: *mut ffi::ibv_qp,
