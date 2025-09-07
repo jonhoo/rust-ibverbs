@@ -1573,7 +1573,7 @@ impl LocalMemorySlice {
 
     /// Get the remote key of the local memory slice.
     pub fn rkey(&self) -> u32 {
-        self._sge.lkey
+        self._sge.rkey
     }
 }
 
