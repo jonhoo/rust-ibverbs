@@ -1806,17 +1806,19 @@ impl ProtectionDomain {
     /// # Arguments
     ///
     /// * `fd` - The file descriptor of the DMA-BUF to be registered. This must refer to an already allocated buffer.
-    /// * `iova` - The IO virtual address (IOVA) at which the DMA-BUF will be made accessible to the RDMA device.
-    /// * `len` - The size in bytes of the memory region to be registered. This must be aligned to page size.
+    /// * `offset`, `len` - The MR starts at `offset` of the dma-buf and its size is `len``.
+    /// * `iova` - The argument iova specifies the virtual base address of the MR when accessed through a lkey or rkey.
+    /// Note: It must have the same page offset as offset
     pub fn register_dmabuf(
         &self,
         fd: i32,
-        iova: u64,
+        offset: u64,
         len: usize,
+        iova: u64,
         access_flags: ffi::ibv_access_flags,
     ) -> io::Result<MemoryRegion<()>> {
         let mr = unsafe {
-            ffi::ibv_reg_dmabuf_mr(self.inner.pd, 0, len, iova, fd, access_flags.0 as i32)
+            ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
         };
 
         if mr.is_null() {
