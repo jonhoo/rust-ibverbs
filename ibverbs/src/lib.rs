@@ -1806,7 +1806,7 @@ impl ProtectionDomain {
     /// # Arguments
     ///
     /// * `fd` - The file descriptor of the DMA-BUF to be registered. This must refer to an already allocated buffer.
-    /// * `offset`, `len` - The MR starts at `offset` of the dma-buf and its size is `len``.
+    /// * `offset`, `len` - The MR starts at `offset` of the dma-buf and its size is `len`.
     /// * `iova` - The argument iova specifies the virtual base address of the MR when accessed through a lkey or rkey.
     /// Note: `iova` must have the same page offset as offset
     pub fn register_dmabuf(
