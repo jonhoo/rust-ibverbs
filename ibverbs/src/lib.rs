@@ -2107,7 +2107,7 @@ impl QueuePair {
             };
 
             *wr = ffi::ibv_send_wr {
-                wr_id,
+                wr_id: *wr_id,
                 next: if idx < wrs.len() - 1 {
                     &mut wrs[idx + 1] as *mut ffi::ibv_send_wr
                 } else {
