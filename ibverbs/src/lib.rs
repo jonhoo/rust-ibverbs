@@ -2128,8 +2128,6 @@ impl QueuePair {
                 __bindgen_anon_2: Default::default(),
             };
         }
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
         let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
 
         let ctx = unsafe { *self.qp }.context;
