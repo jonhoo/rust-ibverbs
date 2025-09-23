@@ -2083,7 +2083,7 @@ impl QueuePair {
         remotes: &[RemoteMemorySlice],
     ) -> Option<(usize, io::Error)> {
         if wrids_locals_imms.len() != remotes.len() {
-            return Err((0, io::Error::from(io::ErrorKind::InvalidInput)));
+            return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
         }
 
         let mut wrs = vec![ffi::ibv_send_wr::default(); wrids_locals_imms.len()];
