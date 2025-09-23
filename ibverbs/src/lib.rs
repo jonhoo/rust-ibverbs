@@ -2070,6 +2070,80 @@ impl QueuePair {
             Ok(())
         }
     }
+
+    /// Post multiple one-sided requests of the same type (i.e., all WRITE
+    /// or all READ) at once, exploiting doorbell batching.
+    /// On success, returns None, else, on failure, returns the error message and
+    /// the index of the first request that failed to be posted (all prior ones
+    /// were successfully posted).
+    pub fn post_one_sided_batch_single_type(
+        &mut self,
+        is_read: bool,
+        wrids_locals_imms: &[(u64, &[LocalMemorySlice], Option<u32>)],
+        remotes: &[RemoteMemorySlice],
+    ) -> Option<(isize, io::Error)> {
+        if wrids_locals_imms.len() != remotes.len() {
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        }
+
+        let mut wrs = vec![ffi::ibv_send_wr::default(); wrids_locals_imms.len()];
+        for (((idx, wr), (wr_id, local, imm_data)), remote) in wrs
+            .iter_mut()
+            .enumerate()
+            .zip(wrids_locals_imms)
+            .zip(remotes)
+        {
+            let (opcode, anon_1) = if is_read {
+                (ffi::ibv_wr_opcode::IBV_WR_RDMA_READ, Default::default())
+            } else if let Some(imm_data) = imm_data {
+                (
+                    ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM,
+                    ffi::ibv_send_wr__bindgen_ty_1 {
+                        imm_data: imm_data.to_be(),
+                    },
+                )
+            } else {
+                (ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE, Default::default())
+            };
+
+            *wr = ffi::ibv_send_wr {
+                wr_id,
+                next: if idx < wrs.len() - 1 {
+                    &mut wrs[idx + 1] as *mut ffi::ibv_send_wr
+                } else {
+                    ptr::null::<ffi::ibv_send_wr>() as *mut _
+                },
+                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                num_sge: local.len() as i32,
+                opcode,
+                send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+                wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                    rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                        remote_addr: remote.addr,
+                        rkey: remote.rkey,
+                    },
+                },
+                qp_type: Default::default(),
+                __bindgen_anon_1: anon_1,
+                __bindgen_anon_2: Default::default(),
+            };
+        }
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+
+        let ctx = unsafe { *self.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_send.as_mut().unwrap()(self.qp, wrs.as_mut_ptr(), &mut bad_wr as *mut _)
+        };
+        if errno != 0 {
+            let bad_idx = unsafe { bad_wr.offset_from(wrs.as_ptr()) };
+            Some((bad_idx, io::Error::from_raw_os_error(errno)))
+        } else {
+            None
+        }
+    }
 }
 
 impl Drop for QueuePair {
