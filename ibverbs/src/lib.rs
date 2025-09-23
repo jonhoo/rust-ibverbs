@@ -2081,9 +2081,9 @@ impl QueuePair {
         is_read: bool,
         wrids_locals_imms: &[(u64, &[LocalMemorySlice], Option<u32>)],
         remotes: &[RemoteMemorySlice],
-    ) -> Option<(isize, io::Error)> {
+    ) -> Option<(usize, io::Error)> {
         if wrids_locals_imms.len() != remotes.len() {
-            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+            return Err((0, io::Error::from(io::ErrorKind::InvalidInput)));
         }
 
         let mut wrs = vec![ffi::ibv_send_wr::default(); wrids_locals_imms.len()];
@@ -2138,7 +2138,7 @@ impl QueuePair {
             ops.post_send.as_mut().unwrap()(self.qp, wrs.as_mut_ptr(), &mut bad_wr as *mut _)
         };
         if errno != 0 {
-            let bad_idx = unsafe { bad_wr.offset_from(wrs.as_ptr()) };
+            let bad_idx = unsafe { bad_wr.offset_from(wrs.as_ptr()) } as usize;
             Some((bad_idx, io::Error::from_raw_os_error(errno)))
         } else {
             None
