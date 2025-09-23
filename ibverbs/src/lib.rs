@@ -2086,7 +2086,9 @@ impl QueuePair {
             return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
         }
 
-        let mut wrs = vec![ffi::ibv_send_wr::default(); wrids_locals_imms.len()];
+        let num_wrs = wrids_locals_imms.len();
+        let mut wrs = vec![ffi::ibv_send_wr::default(); num_wrs];
+        let base_wr_ptr = wrs.as_mut_ptr();
         for (((idx, wr), (wr_id, local, imm_data)), remote) in wrs
             .iter_mut()
             .enumerate()
@@ -2108,8 +2110,8 @@ impl QueuePair {
 
             *wr = ffi::ibv_send_wr {
                 wr_id: *wr_id,
-                next: if idx < wrs.len() - 1 {
-                    &mut wrs[idx + 1] as *mut ffi::ibv_send_wr
+                next: if idx < num_wrs - 1 {
+                    unsafe { base_wr_ptr.add(idx + 1) }
                 } else {
                     ptr::null::<ffi::ibv_send_wr>() as *mut _
                 },
@@ -2132,9 +2134,8 @@ impl QueuePair {
 
         let ctx = unsafe { *self.qp }.context;
         let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_send.as_mut().unwrap()(self.qp, wrs.as_mut_ptr(), &mut bad_wr as *mut _)
-        };
+        let errno =
+            unsafe { ops.post_send.as_mut().unwrap()(self.qp, base_wr_ptr, &mut bad_wr as *mut _) };
         if errno != 0 {
             let bad_idx = unsafe { bad_wr.offset_from(wrs.as_ptr()) } as usize;
             Some((bad_idx, io::Error::from_raw_os_error(errno)))
