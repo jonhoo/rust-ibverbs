@@ -1606,6 +1606,8 @@ impl RemoteMemoryRegion {
 /// Remote memory slice.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct RemoteMemorySlice {
+    /// Memory address of the registered region. Visible to enable user bookkeeping for
+    /// doorbell batching.
     pub addr: u64,
     #[allow(unused)]
     length: u32,
