@@ -77,6 +77,8 @@ use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
+/// The doorbell batching API(s) will process only up to these many work requests at a time
+/// to prevent inefficient dynamic heap allocations.
 pub const DOORBELL_BATCH_LIMIT: usize = 32;
 
 /// Direct access to low-level libverbs FFI.
