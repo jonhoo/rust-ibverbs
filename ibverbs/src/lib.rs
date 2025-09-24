@@ -1604,7 +1604,7 @@ impl RemoteMemoryRegion {
 /// Remote memory slice.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct RemoteMemorySlice {
-    addr: u64,
+    pub addr: u64,
     #[allow(unused)]
     length: u32,
     rkey: u32,
