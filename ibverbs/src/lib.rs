@@ -2123,7 +2123,7 @@ impl QueuePair {
                 } else {
                     ptr::null::<ffi::ibv_send_wr>() as *mut _
                 },
-                sg_list: local as *mut ffi::ibv_sge,
+                sg_list: local as *mut LocalMemorySlice as *mut ffi::ibv_sge,
                 num_sge: 1i32,
                 opcode,
                 send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
