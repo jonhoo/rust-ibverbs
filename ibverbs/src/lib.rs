@@ -77,7 +77,7 @@ use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
-const DOORBELL_BATCH_LIMIT: usize = 32;
+pub const DOORBELL_BATCH_LIMIT: usize = 32;
 
 /// Direct access to low-level libverbs FFI.
 pub use ffi::ibv_gid_type;
