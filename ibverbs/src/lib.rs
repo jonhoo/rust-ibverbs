@@ -2086,7 +2086,7 @@ impl QueuePair {
     pub fn post_one_sided_batch_single_type(
         &mut self,
         is_read: bool,
-        wrids_locals_imms: &[(u64, &[LocalMemorySlice], Option<u32>)],
+        wrids_locals_imms: &[(u64, Vec<LocalMemorySlice>, Option<u32>)],
         remotes: &[RemoteMemorySlice],
     ) -> Option<(usize, io::Error)> {
         if wrids_locals_imms.len() != remotes.len() {
