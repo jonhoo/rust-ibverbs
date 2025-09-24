@@ -77,6 +77,8 @@ use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
+const DOORBELL_BATCH_LIMIT: usize = 32;
+
 /// Direct access to low-level libverbs FFI.
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
@@ -2072,7 +2074,8 @@ impl QueuePair {
     }
 
     /// Post multiple one-sided requests of the same type (i.e., all WRITE
-    /// or all READ) at once, exploiting doorbell batching.
+    /// or all READ) at once, exploiting doorbell batching, up to `DOORBELL_BATCH_LIMIT`
+    /// at a time.
     /// On success, returns None, else, on failure, returns the error message and
     /// the index of the first request that failed to be posted (all prior ones
     /// were successfully posted).
@@ -2086,14 +2089,15 @@ impl QueuePair {
             return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
         }
 
-        let num_wrs = wrids_locals_imms.len();
-        let mut wrs = vec![ffi::ibv_send_wr::default(); num_wrs];
+        let num_wrs = std::cmp::min(wrids_locals_imms.len(), DOORBELL_BATCH_LIMIT);
+        let mut wrs = [ffi::ibv_send_wr::default(); DOORBELL_BATCH_LIMIT];
         let base_wr_ptr = wrs.as_mut_ptr();
         for (((idx, wr), (wr_id, local, imm_data)), remote) in wrs
             .iter_mut()
             .enumerate()
             .zip(wrids_locals_imms)
             .zip(remotes)
+            .take(num_wrs)
         {
             let (opcode, anon_1) = if is_read {
                 (ffi::ibv_wr_opcode::IBV_WR_RDMA_READ, Default::default())
