@@ -1587,7 +1587,7 @@ impl MemorySlicer {
 
 /// A `MemoryRegion` with buffer (slice) semantics, convenient to pass in to a buffer pool structure
 /// to own.
-pub struct OwnedMemoryRegion<T: AsRef<[u8]> + AsMut<[u8]>>(MemoryRegion<T>);
+pub struct OwnedMemoryRegion<T: AsRef<[u8]> + AsMut<[u8]>>(pub MemoryRegion<T>);
 impl<T: AsRef<[u8]> + AsMut<[u8]>> AsRef<[u8]> for OwnedMemoryRegion<T> {
     fn as_ref(&self) -> &[u8] {
         self.0.inner_immut().as_ref()
