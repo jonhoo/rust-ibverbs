@@ -1536,6 +1536,10 @@ impl<T> MemoryRegion<T> {
         &mut self.data
     }
 
+    fn inner_immut(&self) -> &T {
+        &self.data
+    }
+
     /// Make a subslice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) = calc_addr_len(
@@ -1586,7 +1590,7 @@ impl MemorySlicer {
 pub struct OwnedMemoryRegion<T: AsRef<[u8]> + AsMut<[u8]>>(MemoryRegion<T>);
 impl<T: AsRef<[u8]> + AsMut<[u8]>> AsRef<[u8]> for OwnedMemoryRegion<T> {
     fn as_ref(&self) -> &[u8] {
-        self.0.inner().as_ref()
+        self.0.inner_immut().as_ref()
     }
 }
 impl<T: AsRef<[u8]> + AsMut<[u8]>> AsMut<[u8]> for OwnedMemoryRegion<T> {
