@@ -1587,6 +1587,18 @@ impl MemorySlicer {
     }
 }
 
+pub struct OwnedMemoryRegion<T: AsRef<[u8]> + AsMut<[u8]>>(MemoryRegion<T>);
+impl<T: AsRef<[u8]> + AsMut<[u8]>> AsRef<[u8]> for OwnedMemoryRegion<T> {
+    fn as_ref(&self) -> &[u8] {
+        self.0.inner().as_ref()
+    }
+}
+impl<T: AsRef<[u8]> + AsMut<[u8]>> AsMut<[u8]> for OwnedMemoryRegion<T> {
+    fn as_mut(&mut self) -> &mut [u8] {
+        self.0.inner().as_mut()
+    }
+}
+
 /// Local memory slice.
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(transparent)]
