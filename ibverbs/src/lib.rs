@@ -1551,12 +1551,13 @@ impl<T> MemoryRegion<T> {
         LocalMemorySlice { _sge: sge }
     }
 
+    /// Make a convenient `MemorySlicer`, useful for buffer pools that need to own `MemoryRegions`.
     pub fn mk_slicer(&self) -> MemorySlicer {
-        MemorySlicer::new(
-            unsafe { *self.mr }.addr as u64,
-            unsafe { *self.mr }.length,
-            unsafe { *self.mr }.lkey,
-        )
+        MemorySlicer {
+            addr: unsafe { *self.mr }.addr as u64,
+            bytes_len: unsafe { *self.mr }.length,
+            lkey: unsafe { *self.mr }.lkey,
+        }
     }
 }
 
@@ -1568,13 +1569,6 @@ pub struct MemorySlicer {
     lkey: u32,
 }
 impl MemorySlicer {
-    pub fn new(addr: u64, bytes_len: usize, lkey: u32) -> Self {
-        Self {
-            addr,
-            bytes_len,
-            lkey,
-        }
-    }
     /// Make a subslice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) = calc_addr_len(bounds, self.addr, self.bytes_len);
@@ -1587,6 +1581,8 @@ impl MemorySlicer {
     }
 }
 
+/// A `MemoryRegion` with buffer (slice) semantics, convenient to pass in to a buffer pool structure
+/// to own.
 pub struct OwnedMemoryRegion<T: AsRef<[u8]> + AsMut<[u8]>>(MemoryRegion<T>);
 impl<T: AsRef<[u8]> + AsMut<[u8]>> AsRef<[u8]> for OwnedMemoryRegion<T> {
     fn as_ref(&self) -> &[u8] {
