@@ -1550,6 +1550,34 @@ impl<T> MemoryRegion<T> {
         };
         LocalMemorySlice { _sge: sge }
     }
+
+    pub fn mk_slicer(&self) -> MemorySlicer {
+        MemorySlicer {
+            addr: unsafe { *self.mr }.addr as u64,
+            bytes_len: unsafe { *self.mr }.length,
+            lkey: unsafe { *self.mr }.lkey,
+        }
+    }
+}
+
+/// A non-owning utility wrapper to compute subslices of a preregistered memory region. Useful
+/// for safe buffer pooling wherein the buffer pool can own the original `MemoryRegion`.
+pub struct MemorySlicer {
+    addr: u64,
+    bytes_len: usize,
+    lkey: u32,
+}
+impl MemorySlicer {
+    /// Make a subslice of this memory region.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
+        let (addr, length) = calc_addr_len(bounds, self.addr, self.bytes_len);
+        let sge = ffi::ibv_sge {
+            addr,
+            length,
+            lkey: self.lkey,
+        };
+        LocalMemorySlice { _sge: sge }
+    }
 }
 
 /// Local memory slice.
