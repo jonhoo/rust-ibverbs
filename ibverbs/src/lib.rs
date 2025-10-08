@@ -1552,11 +1552,11 @@ impl<T> MemoryRegion<T> {
     }
 
     pub fn mk_slicer(&self) -> MemorySlicer {
-        MemorySlicer {
-            addr: unsafe { *self.mr }.addr as u64,
-            bytes_len: unsafe { *self.mr }.length,
-            lkey: unsafe { *self.mr }.lkey,
-        }
+        MemorySlicer::new(
+            unsafe { *self.mr }.addr as u64,
+            unsafe { *self.mr }.length,
+            unsafe { *self.mr }.lkey,
+        )
     }
 }
 
@@ -1568,6 +1568,13 @@ pub struct MemorySlicer {
     lkey: u32,
 }
 impl MemorySlicer {
+    pub fn new(addr: u64, bytes_len: usize, lkey: u32) -> Self {
+        Self {
+            addr,
+            bytes_len,
+            lkey,
+        }
+    }
     /// Make a subslice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) = calc_addr_len(bounds, self.addr, self.bytes_len);
