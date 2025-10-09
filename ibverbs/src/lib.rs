@@ -2137,11 +2137,14 @@ impl QueuePair {
         locals: &mut [LocalMemorySlice],
         remotes: &[RemoteMemorySlice],
     ) -> Option<(usize, io::Error)> {
-        if wrids_locals_imms.len() != remotes.len() {
+        if wrids_imms_imms.len() != remotes.len() {
+            return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
+        }
+        if locals.len() != remotes.len() {
             return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
         }
 
-        let num_wrs = std::cmp::min(wrids_locals_imms.len(), DOORBELL_BATCH_LIMIT);
+        let num_wrs = std::cmp::min(wrids_imms.len(), DOORBELL_BATCH_LIMIT);
         let mut wrs = [ffi::ibv_send_wr::default(); DOORBELL_BATCH_LIMIT];
         let base_wr_ptr = wrs.as_mut_ptr();
         for (((((idx, wr), (wr_id, imm_data)), local), remote)) in wrs
