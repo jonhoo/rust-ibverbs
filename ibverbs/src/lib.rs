@@ -2124,7 +2124,7 @@ impl QueuePair {
         }
     }
 
-    /// Post multiple one-sided requests of the same type (i.e., all WRITE
+    /// Post multiple one-sided, non-vectored requests of the same type (i.e., all WRITE
     /// or all READ) at once, exploiting doorbell batching, up to `DOORBELL_BATCH_LIMIT`
     /// at a time.
     /// On success, returns None, else, on failure, returns the error message and
@@ -2133,7 +2133,8 @@ impl QueuePair {
     pub fn post_one_sided_batch_single_type(
         &mut self,
         is_read: bool,
-        wrids_locals_imms: &mut [(u64, LocalMemorySlice, Option<u32>)],
+        wrids_imms: &mut [(u64, Option<u32>)],
+        locals: &mut [LocalMemorySlice],
         remotes: &[RemoteMemorySlice],
     ) -> Option<(usize, io::Error)> {
         if wrids_locals_imms.len() != remotes.len() {
@@ -2143,10 +2144,11 @@ impl QueuePair {
         let num_wrs = std::cmp::min(wrids_locals_imms.len(), DOORBELL_BATCH_LIMIT);
         let mut wrs = [ffi::ibv_send_wr::default(); DOORBELL_BATCH_LIMIT];
         let base_wr_ptr = wrs.as_mut_ptr();
-        for (((idx, wr), (wr_id, local, imm_data)), remote) in wrs
+        for (((((idx, wr), (wr_id, imm_data)), local), remote)) in wrs
             .iter_mut()
             .enumerate()
-            .zip(wrids_locals_imms.iter_mut())
+            .zip(wrids_imms)
+            .zip(locals)
             .zip(remotes)
             .take(num_wrs)
         {
@@ -2199,7 +2201,7 @@ impl QueuePair {
         }
     }
 
-    /// Post multiple one-sided requests of the same type (i.e., all WRITE
+    /// Post multiple one-sided, vectored requests of the same type (i.e., all WRITE
     /// or all READ) at once, exploiting doorbell batching, up to `DOORBELL_BATCH_LIMIT`
     /// at a time.
     /// On success, returns None, else, on failure, returns the error message and
@@ -2208,20 +2210,25 @@ impl QueuePair {
     pub fn post_one_sided_batch_single_type_vectored(
         &mut self,
         is_read: bool,
-        wrids_locals_imms: &[(u64, Vec<LocalMemorySlice>, Option<u32>)],
+        wrids_imms: &[(u64, Option<u32>)],
+        locals: &[Vec<LocalMemorySlice>],
         remotes: &[RemoteMemorySlice],
     ) -> Option<(usize, io::Error)> {
-        if wrids_locals_imms.len() != remotes.len() {
+        if wrids_imms.len() != remotes.len() {
+            return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
+        }
+        if locals.len() != remotes.len() {
             return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
         }
 
-        let num_wrs = std::cmp::min(wrids_locals_imms.len(), DOORBELL_BATCH_LIMIT);
+        let num_wrs = std::cmp::min(wrids_imms.len(), DOORBELL_BATCH_LIMIT);
         let mut wrs = [ffi::ibv_send_wr::default(); DOORBELL_BATCH_LIMIT];
         let base_wr_ptr = wrs.as_mut_ptr();
-        for (((idx, wr), (wr_id, local, imm_data)), remote) in wrs
+        for (((((idx, wr), (wr_id, imm_data)), local), remote)) in wrs
             .iter_mut()
             .enumerate()
-            .zip(wrids_locals_imms)
+            .zip(wrids_imms)
+            .zip(locals)
             .zip(remotes)
             .take(num_wrs)
         {
