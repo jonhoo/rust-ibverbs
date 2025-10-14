@@ -77,10 +77,6 @@ use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
-/// The doorbell batching API(s) will process only up to these many work requests at a time
-/// to prevent inefficient dynamic heap allocations.
-pub const DOORBELL_BATCH_LIMIT: usize = 32;
-
 /// Direct access to low-level libverbs FFI.
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
@@ -1655,9 +1651,7 @@ impl RemoteMemoryRegion {
 /// Remote memory slice.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct RemoteMemorySlice {
-    /// Memory address of the registered region. Visible to enable user bookkeeping for
-    /// doorbell batching.
-    pub addr: u64,
+    addr: u64,
     #[allow(unused)]
     length: u32,
     rkey: u32,
@@ -2121,166 +2115,6 @@ impl QueuePair {
             Err(io::Error::from_raw_os_error(errno))
         } else {
             Ok(())
-        }
-    }
-
-    /// Post multiple one-sided, non-vectored requests of the same type (i.e., all WRITE
-    /// or all READ) at once, exploiting doorbell batching, up to `DOORBELL_BATCH_LIMIT`
-    /// at a time.
-    /// On success, returns None, else, on failure, returns the error message and
-    /// the index of the first request that failed to be posted (all prior ones
-    /// were successfully posted).
-    pub fn post_one_sided_batch_single_type(
-        &mut self,
-        is_read: bool,
-        wrids_imms: &mut [(u64, Option<u32>)],
-        locals: &mut [LocalMemorySlice],
-        remotes: &[RemoteMemorySlice],
-    ) -> Option<(usize, io::Error)> {
-        if wrids_imms.len() != remotes.len() {
-            return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
-        }
-        if locals.len() != remotes.len() {
-            return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
-        }
-
-        let num_wrs = std::cmp::min(wrids_imms.len(), DOORBELL_BATCH_LIMIT);
-        let mut wrs = [ffi::ibv_send_wr::default(); DOORBELL_BATCH_LIMIT];
-        let base_wr_ptr = wrs.as_mut_ptr();
-        for ((((idx, wr), (wr_id, imm_data)), local), remote) in wrs
-            .iter_mut()
-            .enumerate()
-            .zip(wrids_imms)
-            .zip(locals)
-            .zip(remotes)
-            .take(num_wrs)
-        {
-            let (opcode, anon_1) = if is_read {
-                (ffi::ibv_wr_opcode::IBV_WR_RDMA_READ, Default::default())
-            } else if let Some(imm_data) = imm_data {
-                (
-                    ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM,
-                    ffi::ibv_send_wr__bindgen_ty_1 {
-                        imm_data: imm_data.to_be(),
-                    },
-                )
-            } else {
-                (ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE, Default::default())
-            };
-
-            *wr = ffi::ibv_send_wr {
-                wr_id: *wr_id,
-                next: if idx < num_wrs - 1 {
-                    unsafe { base_wr_ptr.add(idx + 1) }
-                } else {
-                    ptr::null::<ffi::ibv_send_wr>() as *mut _
-                },
-                sg_list: local as *mut LocalMemorySlice as *mut ffi::ibv_sge,
-                num_sge: 1i32,
-                opcode,
-                send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
-                wr: ffi::ibv_send_wr__bindgen_ty_2 {
-                    rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
-                        remote_addr: remote.addr,
-                        rkey: remote.rkey,
-                    },
-                },
-                qp_type: Default::default(),
-                __bindgen_anon_1: anon_1,
-                __bindgen_anon_2: Default::default(),
-            };
-        }
-        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
-
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno =
-            unsafe { ops.post_send.as_mut().unwrap()(self.qp, base_wr_ptr, &mut bad_wr as *mut _) };
-        if errno != 0 {
-            let bad_idx = unsafe { bad_wr.offset_from(wrs.as_ptr()) } as usize;
-            Some((bad_idx, io::Error::from_raw_os_error(errno)))
-        } else {
-            None
-        }
-    }
-
-    /// Post multiple one-sided, vectored requests of the same type (i.e., all WRITE
-    /// or all READ) at once, exploiting doorbell batching, up to `DOORBELL_BATCH_LIMIT`
-    /// at a time.
-    /// On success, returns None, else, on failure, returns the error message and
-    /// the index of the first request that failed to be posted (all prior ones
-    /// were successfully posted).
-    pub fn post_one_sided_batch_single_type_vectored(
-        &mut self,
-        is_read: bool,
-        wrids_imms: &[(u64, Option<u32>)],
-        locals: &[Vec<LocalMemorySlice>],
-        remotes: &[RemoteMemorySlice],
-    ) -> Option<(usize, io::Error)> {
-        if wrids_imms.len() != remotes.len() {
-            return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
-        }
-        if locals.len() != remotes.len() {
-            return Some((0, io::Error::from(io::ErrorKind::InvalidInput)));
-        }
-
-        let num_wrs = std::cmp::min(wrids_imms.len(), DOORBELL_BATCH_LIMIT);
-        let mut wrs = [ffi::ibv_send_wr::default(); DOORBELL_BATCH_LIMIT];
-        let base_wr_ptr = wrs.as_mut_ptr();
-        for ((((idx, wr), (wr_id, imm_data)), local), remote) in wrs
-            .iter_mut()
-            .enumerate()
-            .zip(wrids_imms)
-            .zip(locals)
-            .zip(remotes)
-            .take(num_wrs)
-        {
-            let (opcode, anon_1) = if is_read {
-                (ffi::ibv_wr_opcode::IBV_WR_RDMA_READ, Default::default())
-            } else if let Some(imm_data) = imm_data {
-                (
-                    ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM,
-                    ffi::ibv_send_wr__bindgen_ty_1 {
-                        imm_data: imm_data.to_be(),
-                    },
-                )
-            } else {
-                (ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE, Default::default())
-            };
-
-            *wr = ffi::ibv_send_wr {
-                wr_id: *wr_id,
-                next: if idx < num_wrs - 1 {
-                    unsafe { base_wr_ptr.add(idx + 1) }
-                } else {
-                    ptr::null::<ffi::ibv_send_wr>() as *mut _
-                },
-                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-                num_sge: local.len() as i32,
-                opcode,
-                send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
-                wr: ffi::ibv_send_wr__bindgen_ty_2 {
-                    rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
-                        remote_addr: remote.addr,
-                        rkey: remote.rkey,
-                    },
-                },
-                qp_type: Default::default(),
-                __bindgen_anon_1: anon_1,
-                __bindgen_anon_2: Default::default(),
-            };
-        }
-        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
-
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno =
-            unsafe { ops.post_send.as_mut().unwrap()(self.qp, base_wr_ptr, &mut bad_wr as *mut _) };
-        if errno != 0 {
-            let bad_idx = unsafe { bad_wr.offset_from(wrs.as_ptr()) } as usize;
-            Some((bad_idx, io::Error::from_raw_os_error(errno)))
-        } else {
-            None
         }
     }
 }
