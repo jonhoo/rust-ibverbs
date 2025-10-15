@@ -21,7 +21,7 @@ fn main() {
     let mut qp = qp_builder.handshake(endpoint).unwrap();
 
     let mut mr = pd.allocate(16).unwrap();
-    mr.inner()[9] = 0x42;
+    mr.inner_mut()[9] = 0x42;
 
     unsafe { qp.post_receive(&[mr.slice(..8)], 2) }.unwrap();
     unsafe { qp.post_send(&[mr.slice(8..)], 1) }.unwrap();
@@ -45,7 +45,7 @@ fn main() {
                 2 => {
                     assert!(!received);
                     received = true;
-                    assert_eq!(mr.inner()[1], 0x42);
+                    assert_eq!(mr.inner_mut()[1], 0x42);
                     println!("received");
                 }
                 _ => unreachable!(),
