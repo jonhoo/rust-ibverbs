@@ -81,6 +81,7 @@ const PORT_NUM: u8 = 1;
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
 pub use ffi::ibv_qp_type;
+pub use ffi::ibv_send_flags;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
 pub use ffi::ibv_wc_status;
@@ -1845,6 +1846,26 @@ impl ProtectionDomain {
     }
 }
 
+/// Additional flags passed in send send (in the "send_wr` sense) operations.
+///
+/// New fields might be added in the future, so prefer constructing this struct with
+/// SendOptions{ foo: bar, ..Default::default() } to ensure forwards compatibility.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[non_exhaustive]
+pub struct SendOptions {
+    /// Flags used to modify the send operation, refer to libibverbs documentation for
+    /// the meaning of each flag.
+    pub flags: ffi::ibv_send_flags,
+}
+
+impl Default for SendOptions {
+    fn default() -> Self {
+        Self {
+            flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED,
+        }
+    }
+}
+
 /// A fully initialized and ready `QueuePair`.
 ///
 /// A queue pair is the actual object that sends and receives data in the RDMA architecture
@@ -1894,13 +1915,27 @@ impl QueuePair {
     /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
     pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
+        self.post_send_with_options(local, wr_id, SendOptions::default())
+    }
+
+    #[inline]
+    /// post_send() with additional ibverbs flags. Refer to SendOptions for more details.
+    ///
+    /// # Safety
+    /// see post_send.
+    pub unsafe fn post_send_with_options(
+        &mut self,
+        local: &[LocalMemorySlice],
+        wr_id: u64,
+        options: SendOptions,
+    ) -> io::Result<()> {
         let mut wr = ffi::ibv_send_wr {
             wr_id,
             next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
             sg_list: local.as_ptr() as *mut ffi::ibv_sge,
             num_sge: local.len() as i32,
             opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            send_flags: options.flags.0,
             wr: Default::default(),
             qp_type: Default::default(),
             __bindgen_anon_1: Default::default(),
@@ -2018,7 +2053,33 @@ impl QueuePair {
             ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
         };
 
-        self._post_one_sided(local, remote, wr_id, opcode, imm_data)
+        self._post_one_sided(
+            local,
+            remote,
+            wr_id,
+            opcode,
+            imm_data,
+            SendOptions::default(),
+        )
+    }
+
+    #[inline]
+    /// post_write() with additional ibverbs flags. Refer to SendOptions for more details.
+    pub fn post_write_with_options(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        imm_data: Option<u32>,
+        options: SendOptions,
+    ) -> io::Result<()> {
+        let opcode = if imm_data.is_some() {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+        } else {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
+        };
+
+        self._post_one_sided(local, remote, wr_id, opcode, imm_data, options)
     }
 
     #[inline]
@@ -2031,9 +2092,23 @@ impl QueuePair {
         wr_id: u64,
     ) -> io::Result<()> {
         let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
-        self._post_one_sided(local, remote, wr_id, opcode, None)
+        self._post_one_sided(local, remote, wr_id, opcode, None, SendOptions::default())
     }
 
+    #[inline]
+    /// post_read() with additional ibverbs flags. Refer to SendOptions for more details.
+    pub fn post_read_with_options(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        options: SendOptions,
+    ) -> io::Result<()> {
+        let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
+        self._post_one_sided(local, remote, wr_id, opcode, None, options)
+    }
+
+    #[inline(always)]
     // internal function to do one sided communication
     fn _post_one_sided(
         &mut self,
@@ -2042,6 +2117,7 @@ impl QueuePair {
         wr_id: u64,
         opcode: ffi::ibv_wr_opcode,
         imm_data: Option<u32>,
+        options: SendOptions,
     ) -> io::Result<()> {
         let anon_1 = if let Some(imm_data) = imm_data {
             ffi::ibv_send_wr__bindgen_ty_1 {
@@ -2057,7 +2133,7 @@ impl QueuePair {
             sg_list: local.as_ptr() as *mut ffi::ibv_sge,
             num_sge: local.len() as i32,
             opcode,
-            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            send_flags: options.flags.0,
             wr: ffi::ibv_send_wr__bindgen_ty_2 {
                 rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
                     remote_addr: remote.addr,
