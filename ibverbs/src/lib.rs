@@ -1500,51 +1500,70 @@ impl PreparedQueuePair {
     }
 }
 
-/// A memory region that has been registered for use with RDMA.
-pub struct MemoryRegion<T> {
+struct MemoryRegionInner {
     _pd: Arc<ProtectionDomainInner>,
     mr: *mut ffi::ibv_mr,
-    data: T,
 }
 
-unsafe impl<T> Send for MemoryRegion<T> {}
-unsafe impl<T> Sync for MemoryRegion<T> {}
+unsafe impl Sync for MemoryRegionInner {}
+unsafe impl Send for MemoryRegionInner {}
+
+impl Drop for MemoryRegionInner {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{e}");
+        }
+    }
+}
+
+/// A memory region that has been registered for use with RDMA.
+pub struct MemoryRegion<T> {
+    inner: MemoryRegionInner,
+    data: T,
+}
 
 impl<T> MemoryRegion<T> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
         RemoteKey {
-            key: unsafe { &*self.mr }.rkey,
+            key: unsafe { &*self.inner.mr }.rkey,
         }
     }
 
     /// Remote region.
-    pub fn remote(&self) -> RemoteMemoryRegion {
-        RemoteMemoryRegion {
-            addr: unsafe { *self.mr }.addr as u64,
-            len: unsafe { *self.mr }.length,
-            rkey: unsafe { *self.mr }.rkey,
+    pub fn remote(&self) -> RemoteMemorySlice {
+        RemoteMemorySlice {
+            addr: unsafe { *self.inner.mr }.addr as u64,
+            len: unsafe { *self.inner.mr }.length,
+            rkey: unsafe { *self.inner.mr }.rkey,
         }
     }
 
     /// Get inner data.
-    pub fn inner(&mut self) -> &mut T {
+    pub fn inner(&self) -> &T {
+        &self.data
+    }
+
+    /// Get inner data mutably.
+    pub fn inner_mut(&mut self) -> &mut T {
         &mut self.data
+    }
+
+    /// Consume the memory region and return the inner data.
+    pub fn into_inner(self) -> T {
+        self.data
     }
 
     /// Make a subslice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
-        let (addr, length) = calc_addr_len(
-            bounds,
-            unsafe { *self.mr }.addr as u64,
-            unsafe { *self.mr }.length,
-        );
         let sge = ffi::ibv_sge {
-            addr,
-            length,
-            lkey: unsafe { *self.mr }.lkey,
+            addr: unsafe { *self.inner.mr }.addr as u64,
+            length: unsafe { *self.inner.mr }.length as u32,
+            lkey: unsafe { *self.inner.mr }.lkey,
         };
-        LocalMemorySlice { _sge: sge }
+        LocalMemorySlice { _sge: sge }.slice(bounds)
     }
 }
 
@@ -1575,39 +1594,41 @@ impl LocalMemorySlice {
     pub fn lkey(&self) -> u32 {
         self._sge.lkey
     }
+
+    /// Make a subslice of this slice.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
+        let (addr, len) = calc_addr_len(bounds, self.addr(), self.len());
+        Self {
+            _sge: ffi::ibv_sge {
+                addr,
+                length: len as u32,
+                lkey: self.lkey(),
+            },
+        }
+    }
 }
 
 /// Remote memory region.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize, Debug, Clone))]
-pub struct RemoteMemoryRegion {
-    /// Memory address of the registered region.
+pub struct RemoteMemorySlice {
+    /// Memory address of the registered region (might have been offset by slicing).
     pub addr: u64,
-    /// Length of the registered memory region.
+    /// Length of the registered memory region (might have been offset by slicing).
     pub len: usize,
     /// Remote key for accessing this memory region.
     pub rkey: u32,
 }
 
-#[allow(clippy::len_without_is_empty)]
-impl RemoteMemoryRegion {
+impl RemoteMemorySlice {
     /// Make a subslice of this slice.
-    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> RemoteMemorySlice {
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
         let (addr, len) = calc_addr_len(bounds, self.addr, self.len);
-        RemoteMemorySlice {
+        Self {
             addr,
-            length: len,
+            len,
             rkey: self.rkey,
         }
     }
-}
-
-/// Remote memory slice.
-#[derive(Debug, Default, Copy, Clone)]
-pub struct RemoteMemorySlice {
-    addr: u64,
-    #[allow(unused)]
-    length: u32,
-    rkey: u32,
 }
 
 /// A key that authorizes direct memory access to a memory region.
@@ -1616,16 +1637,6 @@ pub struct RemoteMemorySlice {
 pub struct RemoteKey {
     /// The actual key value.
     pub key: u32,
-}
-
-impl<T> Drop for MemoryRegion<T> {
-    fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
-        }
-    }
 }
 
 struct ProtectionDomainInner {
@@ -1784,11 +1795,11 @@ impl ProtectionDomain {
         if mr.is_null() {
             Err(io::Error::last_os_error())
         } else {
-            Ok(MemoryRegion {
+            let inner = MemoryRegionInner {
                 _pd: self.inner.clone(),
                 mr,
-                data,
-            })
+            };
+            Ok(MemoryRegion { inner, data })
         }
     }
 
@@ -1825,11 +1836,11 @@ impl ProtectionDomain {
             Err(io::Error::last_os_error())
         } else {
             // TODO: Add MemoryRegionUnownedOpaque class for return value which doesn't need to store the `data` ptr.
-            Ok(MemoryRegion {
+            let inner = MemoryRegionInner {
                 _pd: self.inner.clone(),
                 mr,
-                data: (),
-            })
+            };
+            Ok(MemoryRegion { inner, data: () })
         }
     }
 }
@@ -2083,7 +2094,7 @@ impl Drop for QueuePair {
     }
 }
 
-fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, u32) {
+fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, usize) {
     let start = match bounds.start_bound() {
         std::ops::Bound::Included(i) => *i,
         std::ops::Bound::Excluded(i) => *i + 1,
@@ -2098,7 +2109,7 @@ fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -
     assert!(start <= bytes_len);
     assert!(end <= bytes_len);
     let addr = addr + start as u64;
-    let len: u32 = (end - start).try_into().unwrap();
+    let len = end - start;
     (addr, len)
 }
 
