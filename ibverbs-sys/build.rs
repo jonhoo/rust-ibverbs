@@ -7,6 +7,10 @@ fn main() {
     println!("cargo:include={manifest_dir}/vendor/rdma-core/build/include");
     println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
     println!("cargo:rustc-link-lib=ibverbs");
+    // Only link EFA if the library exists (i.e., on EFA-capable hosts)
+    if Path::new("/opt/amazon/efa/lib/").exists() {
+        println!("cargo:rustc-link-lib=efa");
+    }
 
     if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
         // don't touch source dir if not necessary
@@ -50,11 +54,28 @@ fn main() {
     eprintln!("run bindgen");
     let bindings = bindgen::Builder::default()
         .header("vendor/rdma-core/libibverbs/verbs.h")
+        .header("vendor/rdma-core/providers/efa/efadv.h")
         .clang_arg(format!("-I{built_in}/include/"))
         .allowlist_function("ibv_.*")
         .allowlist_function("_ibv_.*")
+        .allowlist_function("efadv_.*")
+        .allowlist_function("ibv_cq_ex_to_cq")
+        .allowlist_function("ibv_start_poll")
+        .allowlist_type("ibv_cq_ex")
+        .allowlist_type("ibv_poll_cq_attr")
+        .allowlist_function("ibv_next_poll")
+        .allowlist_function("ibv_end_poll")
+        .allowlist_function("ibv_wc_read_opcode")
+        .allowlist_function("ibv_wc_read_vendor_err")
+        .allowlist_function("ibv_wc_read_byte_len")
+        .allowlist_function("ibv_wc_read_imm_data")
+        .allowlist_function("ibv_wr_rdma_write_imm")
+        .allowlist_function("ibv_wr_rdma_write")
+        .allowlist_function("ibv_wr_rdma_read")
         .allowlist_type("ibv_.*")
+        .allowlist_type("efa.*")
         .allowlist_var("IBV_LINK_LAYER_.*")
+        .allowlist_var("EFADV_QP_DRIVER_TYPE_.*")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_create_cq_wc_flags")
         .bitfield_enum("ibv_device_cap_flags")
@@ -64,6 +85,7 @@ fn main() {
         .bitfield_enum("ibv_qp_attr_mask")
         .bitfield_enum("ibv_qp_create_send_ops_flags")
         .bitfield_enum("ibv_qp_init_attr_mask")
+        .bitfield_enum("ibv_qp_init_attr_ex_mask")
         .bitfield_enum("ibv_qp_open_attr_mask")
         .bitfield_enum("ibv_raw_packet_caps")
         .bitfield_enum("ibv_rx_hash_fields")
