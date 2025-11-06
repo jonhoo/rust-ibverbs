@@ -1162,7 +1162,7 @@ impl QueuePairBuilder {
                     pd: self.pd.clone(),
                     qp,
                     ah: ptr::null_mut(),
-                    remote_endpoint: Default::default(),
+                    remote_endpoint: None,
                     enable_efa: self.enable_efa,
                 },
                 gid_index: self.gid_index,
@@ -1263,7 +1263,7 @@ impl QueuePairBuilder {
                     pd: self.pd.clone(),
                     qp,
                     ah: ptr::null_mut(),
-                    remote_endpoint: Default::default(),
+                    remote_endpoint: None,
                     enable_efa: self.enable_efa,
                 },
                 gid_index: self.gid_index,
@@ -1460,7 +1460,7 @@ impl From<ffi::ibv_gid_entry> for GidEntry {
 /// An identifier for the network endpoint of a `QueuePair`.
 ///
 /// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num`
@@ -1496,48 +1496,6 @@ impl PreparedQueuePair {
         })
     }
 
-    /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair`.
-    ///
-    /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
-    /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`).
-    /// Further discussion of the protocol can be found on [RDMAmojo].
-    ///
-    /// If `enable_efa` is set to `true`, this will use EFA-specific handshake. Otherwise,
-    /// it uses the standard ibverbs handshake.
-    ///
-    /// If the endpoint contains a Gid, the routing will be global. This means:
-    /// ```text,ignore
-    /// ah_attr.is_global = 1;
-    /// ah_attr.grh.hop_limit = 0xff;
-    /// ```
-    ///
-    /// The handshake also sets the following parameters, which are currently not configurable:
-    ///
-    /// # Examples
-    ///
-    /// ```text,ignore
-    /// port_num = PORT_NUM;
-    /// pkey_index = 0;
-    /// sq_psn = 0;
-    ///
-    /// ah_attr.sl = 0;
-    /// ah_attr.src_path_bits = 0;
-    /// ```
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid value provided in `attr` or in `attr_mask`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
-    ///
-    /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
-    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
-        if self.enable_efa {
-            self.handshake_efa(remote)
-        } else {
-            self.handshake_regular(remote)
-        }
-    }
-
     /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair` using standard ibverbs.
     ///
     /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
@@ -1562,15 +1520,21 @@ impl PreparedQueuePair {
     /// ah_attr.sl = 0;
     /// ah_attr.src_path_bits = 0;
     /// ```
-    ///
+    /// Note(EFA): EFA is a connectionless protocol, the handshake is simply modifying the QP 
+    /// state from INIT -> RTS. A successful handshake does NOT gurantee that the remote endpoint
+    /// has successfully completed its own handshake. As such, the sender usually needs to retry
+    /// the first write request, OR have some other mechanism with which to gurantee that the 
+    /// receiver has completed its handshake first.
+    /// 
     /// # Errors
     ///
     ///  - `EINVAL`: Invalid value provided in `attr` or in `attr_mask`.
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
-    fn handshake_regular(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
+    pub fn handshake(mut self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
         // init and associate with port
+        let qp_type = unsafe { (*self.qp.qp).qp_type };
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             pkey_index: 0,
@@ -1580,44 +1544,54 @@ impl PreparedQueuePair {
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
             | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_PORT;
-        if let Some(access) = self.access {
-            attr.qp_access_flags = access.0;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
+
+        if !self.enable_efa {
+            if let Some(access) = self.access {
+                attr.qp_access_flags = access.0;
+                mask |= ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
+            }
         }
+
+        if self.enable_efa {
+            attr.qkey = UD_QKEY;
+            mask |= ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
+            attr.port_num = PORT_NUM;
+            mask |= ffi::ibv_qp_attr_mask::IBV_QP_PORT;
+        }
+
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
         // set ready to receive
+        let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-            // TODO: this is only valid for RC and UC
-            dest_qp_num: remote.num,
-            // TODO: this is only valid for RC and UC
-            ah_attr: ffi::ibv_ah_attr {
-                dlid: remote.lid,
-                sl: self.service_level,
-                src_path_bits: 0,
-                port_num: PORT_NUM,
-                grh: Default::default(),
-                ..Default::default()
-            },
             ..Default::default()
         };
-        if let Some(gid) = remote.gid {
-            attr.ah_attr.is_global = 1;
-            attr.ah_attr.grh.dgid = gid.into();
-            attr.ah_attr.grh.hop_limit = 0xff;
-            attr.ah_attr.grh.sgid_index = self
-                .gid_index
-                .ok_or_else(|| io::Error::other("gid was set for remote but not local"))?
-                as u8;
-            attr.ah_attr.grh.traffic_class = self.traffic_class;
+
+        if qp_type == ffi::ibv_qp_type::IBV_QPT_RC || qp_type == ffi::ibv_qp_type::IBV_QPT_UC {
+            attr.dest_qp_num = remote.num;
+            attr.ah_attr.dlid = remote.lid;
+            attr.ah_attr.sl = self.service_level;
+            attr.ah_attr.src_path_bits = 0;
+            attr.ah_attr.port_num = PORT_NUM;
+            attr.ah_attr.grh = Default::default();
+            if let Some(gid) = remote.gid {
+                attr.ah_attr.is_global = 1;
+                attr.ah_attr.grh.dgid = gid.into();
+                attr.ah_attr.grh.hop_limit = 0xff;
+                attr.ah_attr.grh.sgid_index = self
+                    .gid_index
+                    .ok_or_else(|| io::Error::other("gid was set for remote but not local"))?
+                    as u8;
+                attr.ah_attr.grh.traffic_class = self.traffic_class;
+            }
+            mask |= ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN;
+            mask |= ffi::ibv_qp_attr_mask::IBV_QP_AV;
         }
-        let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
-            | ffi::ibv_qp_attr_mask::IBV_QP_AV
-            | ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN;
+        
         if let Some(max_dest_rd_atomic) = self.max_dest_rd_atomic {
             attr.max_dest_rd_atomic = max_dest_rd_atomic;
             mask |= ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC;
@@ -1667,102 +1641,34 @@ impl PreparedQueuePair {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
-        Ok(self.qp)
-    }
-
-    /// Build a new QueuePair for EFA.
-    /// Modifies the QP state to INIT, RTR, and RTS. It also creates an AH for the remote endpoint,
-    /// allowing for RDMA operations to that endpoint.
-    ///
-    /// Note that since EFA is a connectionless protocol, the handshake is simply modifying the QP 
-    /// state from INIT -> RTS. A successful handshake does NOT gurantee that the remote endpoint
-    /// has successfully completed its own handshake. As such, the sender usually needs to retry
-    /// the first write request, OR have some other mechanism with which to gurantee that the 
-    /// receiver has completed its handshake first.
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid value provided in `attr` or in `attr_mask`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn handshake_efa(mut self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
-        let qp = self.qp.qp;
-        let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_attr>::uninit();
-        unsafe {
-            std::ptr::write_bytes(attr.as_mut_ptr(), 0, 1);
-            let attr_ptr = attr.as_mut_ptr();
-            (*attr_ptr).qp_state = ffi::ibv_qp_state::IBV_QPS_INIT;
-            (*attr_ptr).qkey = UD_QKEY;
-            (*attr_ptr).pkey_index = 0;
-            (*attr_ptr).port_num = PORT_NUM;
-        }
-
-        let mask = (ffi::ibv_qp_attr_mask::IBV_QP_STATE.0 |
-                   ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX.0 |
-                   ffi::ibv_qp_attr_mask::IBV_QP_PORT.0 |
-                   ffi::ibv_qp_attr_mask::IBV_QP_QKEY.0) as i32;
-
-        let errno = unsafe { ffi::ibv_modify_qp(qp, attr.as_mut_ptr(), mask) };
-        if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
-
-        // set RTR
-        unsafe {
-            std::ptr::write_bytes(attr.as_mut_ptr(), 0, 1);
-            (*attr.as_mut_ptr()).qp_state = ffi::ibv_qp_state::IBV_QPS_RTR;
-        }
-
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE.0 as i32;
-
-        let errno = unsafe { ffi::ibv_modify_qp(qp, attr.as_mut_ptr(), mask) };
-        if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
-
-        // set RTS
-        unsafe {
-            std::ptr::write_bytes(attr.as_mut_ptr(), 0, 1);
-            let attr_ptr = attr.as_mut_ptr();
-            (*attr_ptr).qp_state = ffi::ibv_qp_state::IBV_QPS_RTS;
-            (*attr_ptr).rnr_retry = self.rnr_retry.unwrap_or(3);
-        }
-
-        let mask = (ffi::ibv_qp_attr_mask::IBV_QP_STATE.0 |
-                   ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN.0 |
-                   ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY.0) as i32;
-
-        let errno = unsafe { ffi::ibv_modify_qp(qp, attr.as_mut_ptr(), mask) };
-        if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
-        }
-
-        // Ensure we have a valid AH for EFA operations
-        let ah = if self.qp.ah.is_null() {
-            let mut ah_attr = ffi::ibv_ah_attr {
-                dlid: remote.lid,
-                sl: 0,
-                src_path_bits: 0,
-                port_num: PORT_NUM,
-                is_global: 1,
-                static_rate: 0,
-                grh: ffi::ibv_global_route {
-                    dgid: remote.gid.unwrap().into(),
+        if self.enable_efa {
+            // EFA QP requires an AH to be created for the remote endpoint.
+            let ah = if self.qp.ah.is_null() {
+                let mut ah_attr = ffi::ibv_ah_attr {
+                    dlid: remote.lid,
+                    sl: 0,
+                    src_path_bits: 0,
+                    port_num: PORT_NUM,
+                    is_global: 1,
+                    static_rate: 0,
+                    grh: ffi::ibv_global_route {
+                        dgid: remote.gid.unwrap().into(),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                },
-                ..Default::default()
+                };
+    
+                let test_ah = unsafe { ffi::ibv_create_ah(self.qp.pd.pd, &mut ah_attr as *mut _) };
+                if test_ah.is_null() {
+                    return Err(io::Error::last_os_error());
+                }
+                test_ah
+            } else {
+                self.qp.ah
             };
-
-            let test_ah = unsafe { ffi::ibv_create_ah(self.qp.pd.pd, &mut ah_attr as *mut _) };
-            if test_ah.is_null() {
-                return Err(io::Error::last_os_error());
-            }
-            test_ah
-        } else {
-            self.qp.ah
-        };
-
-        self.qp.ah = ah;
-        self.qp.remote_endpoint = remote;
+            self.qp.ah = ah;
+            self.qp.remote_endpoint = Some(remote);
+        }
 
         Ok(self.qp)
     }
@@ -2125,7 +2031,7 @@ pub struct QueuePair {
     pd: Arc<ProtectionDomainInner>,
     qp: *mut ffi::ibv_qp,
     ah: *mut ffi::ibv_ah,
-    remote_endpoint: QueuePairEndpoint,
+    remote_endpoint: Option<QueuePairEndpoint>,
     enable_efa: bool,
 }
 
@@ -2288,7 +2194,7 @@ impl QueuePair {
     ) -> io::Result<()> {
         if self.enable_efa {
             // This is an EFA QP, use EFA write
-            self.post_write_efa(local, remote, self.remote_endpoint, wr_id, imm_data)
+            self.post_write_efa(local, remote, self.remote_endpoint.unwrap(), wr_id, imm_data)
         } else {
             // This is a regular QP, use standard write
             self.post_write_regular(local, remote, wr_id, imm_data)
