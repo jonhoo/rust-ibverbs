@@ -1121,67 +1121,6 @@ impl QueuePairBuilder {
         self
     }
 
-    /// Create a new `QueuePair` from this builder template using standard ibverbs API.
-    ///
-    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
-    ///
-    /// This method will fail if asked to create QP of a type other than `IBV_QPT_RC` or
-    /// `IBV_QPT_UD` associated with an SRQ.
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid `ProtectionDomain`, sending or receiving `Context`, or invalid value
-    ///    provided in `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
-    ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
-    ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
-    fn build_regular(&self) -> io::Result<PreparedQueuePair> {
-        let mut attr = ffi::ibv_qp_init_attr {
-            qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
-            send_cq: self.send.cq as *const _ as *mut _,
-            recv_cq: self.recv.cq as *const _ as *mut _,
-            srq: ptr::null::<ffi::ibv_srq>() as *mut _,
-            cap: ffi::ibv_qp_cap {
-                max_send_wr: self.max_send_wr,
-                max_recv_wr: self.max_recv_wr,
-                max_send_sge: self.max_send_sge,
-                max_recv_sge: self.max_recv_sge,
-                max_inline_data: self.max_inline_data,
-            },
-            qp_type: self.qp_type,
-            sq_sig_all: 0,
-        };
-
-        let qp = unsafe { ffi::ibv_create_qp(self.pd.pd, &mut attr as *mut _) };
-        if qp.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(PreparedQueuePair {
-                lid: self.port_attr.lid,
-                qp: QueuePair {
-                    pd: self.pd.clone(),
-                    qp,
-                    ah: ptr::null_mut(),
-                    remote_endpoint: None,
-                    enable_efa: self.enable_efa,
-                },
-                gid_index: self.gid_index,
-                traffic_class: self.traffic_class,
-                access: self.access,
-                timeout: self.timeout,
-                retry_count: self.retry_count,
-                rnr_retry: self.rnr_retry,
-                min_rnr_timer: self.min_rnr_timer,
-                max_rd_atomic: self.max_rd_atomic,
-                max_dest_rd_atomic: self.max_dest_rd_atomic,
-                path_mtu: self.path_mtu,
-                rq_psn: self.rq_psn,
-                service_level: self.service_level,
-                enable_efa: self.enable_efa,
-            })
-        }
-    }
-
     /// Create a new `QueuePair` from this builder template.
     ///
     /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
@@ -1200,43 +1139,24 @@ impl QueuePairBuilder {
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
     pub fn build(&self) -> io::Result<PreparedQueuePair> {
-        if self.enable_efa {
-            self.build_efa()
-        } else {
-            self.build_regular()
-        }
-    }
 
-    /// Build a new `QueuePair` for that is EFA compatible, using the builder's attributes.
-    ///
-    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
-    ///
-    /// This uses extended API to create an SRD QP.
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid `ProtectionDomain`, sending or receiving `Context`, or invalid value
-    ///    provided in `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
-    ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
-    ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
-    pub fn build_efa(&self) -> io::Result<PreparedQueuePair> {
-        // Set send_ops_flags to enable RDMA operations (matching C++ example)
-        let send_ops_flags = (ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE.0 |
-                             ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0 |
-                             ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_READ.0 |
-                             ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND.0 |
-                             ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND_WITH_IMM.0) as u32;
-        let mut attr = ffi::ibv_qp_init_attr_ex {
+        let qp = if self.enable_efa {
+            // EFA uses extended API to create an SRD QP.
+            let send_ops_flags = (ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE.0 |
+                ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0 |
+                ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_READ.0 |
+                ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND.0 |
+                ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND_WITH_IMM.0) as u32;
+            let mut attr = ffi::ibv_qp_init_attr_ex {
             qp_context: self.pd.ctx.ctx as *mut _,
             send_cq: self.send.cq as *const _ as *mut _,
             recv_cq: self.recv.cq as *const _ as *mut _,
             cap: ffi::ibv_qp_cap {
-                max_send_wr: self.max_send_wr,
-                max_recv_wr: self.max_recv_wr,
-                max_send_sge: self.max_send_sge,
-                max_recv_sge: self.max_recv_sge,
-                max_inline_data: self.max_inline_data,
+            max_send_wr: self.max_send_wr,
+            max_recv_wr: self.max_recv_wr,
+            max_send_sge: self.max_send_sge,
+            max_recv_sge: self.max_recv_sge,
+            max_inline_data: self.max_inline_data,
             },
             qp_type: self.qp_type,
             sq_sig_all: 1,
@@ -1245,15 +1165,34 @@ impl QueuePairBuilder {
             pd: self.pd.pd,
             send_ops_flags: send_ops_flags as u64,
             ..Default::default()
-        };
+            };
 
-        let mut efa_attr = ffi::efadv_qp_init_attr {
-            driver_qp_type: ffi::EFADV_QP_DRIVER_TYPE_SRD as u32,
-            sl: 0 as u8,
-            ..Default::default()
-        };
+            let mut efa_attr = ffi::efadv_qp_init_attr {
+                driver_qp_type: ffi::EFADV_QP_DRIVER_TYPE_SRD as u32,
+                sl: 0 as u8,
+                ..Default::default()
+            };
 
-        let qp = unsafe { ffi::efadv_create_qp_ex(self.pd.ctx.ctx, &mut attr, &mut efa_attr as *mut _, std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32) };
+            unsafe { ffi::efadv_create_qp_ex(self.pd.ctx.ctx, &mut attr, &mut efa_attr as *mut _, std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32) }
+        } else {
+            // otherwise, use standard ibverbs API to create a regular QP.
+            let mut attr = ffi::ibv_qp_init_attr {
+                qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
+                send_cq: self.send.cq as *const _ as *mut _,
+                recv_cq: self.recv.cq as *const _ as *mut _,
+                srq: ptr::null::<ffi::ibv_srq>() as *mut _,
+                cap: ffi::ibv_qp_cap {
+                    max_send_wr: self.max_send_wr,
+                    max_recv_wr: self.max_recv_wr,
+                    max_send_sge: self.max_send_sge,
+                    max_recv_sge: self.max_recv_sge,
+                    max_inline_data: self.max_inline_data,
+                },
+                qp_type: self.qp_type,
+                sq_sig_all: 0,
+            };
+            unsafe { ffi::ibv_create_qp(self.pd.pd, &mut attr as *mut _) }
+        };
         if qp.is_null() {
             Err(io::Error::last_os_error())
         } else {
