@@ -264,7 +264,16 @@ impl<'devlist> Device<'devlist> {
     ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
     ///  - Other: the device is not in `ACTIVE` or `ARMED` state.
     pub fn open(&self) -> io::Result<Context> {
-        Context::with_device(*self.0)
+        Context::with_device(*self.0, false)
+    }
+
+    /// Opens an RDMA device and creates a context for further use with EFA support enabled.
+    ///
+    /// # Errors
+    ///
+    /// Same as `open()`.
+    pub fn open_with_efa(&self) -> io::Result<Context> {
+        Context::with_device(*self.0, true)
     }
 
     /// Returns a string of the name, which is associated with this RDMA device.
@@ -339,6 +348,7 @@ impl<'devlist> Device<'devlist> {
 
 struct ContextInner {
     ctx: *mut ffi::ibv_context,
+    enable_efa: bool,
 }
 
 impl ContextInner {
@@ -396,20 +406,21 @@ pub struct Context {
 
 impl Context {
     /// Opens a context for the given device, and queries its port and gid.
-    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
+    fn with_device(dev: *mut ffi::ibv_device, enable_efa: bool) -> io::Result<Context> {
         assert!(!dev.is_null());
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
         if ctx.is_null() {
             return Err(io::Error::other("failed to open device"));
         }
-        let inner = Arc::new(ContextInner { ctx });
+        let inner = Arc::new(ContextInner { ctx, enable_efa });
 
         let ctx = Context { inner };
         // checks that the port is active/armed.
         ctx.inner.query_port()?;
         Ok(ctx)
     }
+
 
     /// Create a completion queue (CQ).
     ///
@@ -743,8 +754,6 @@ pub struct QueuePairBuilder {
     rq_psn: Option<u32>,
     /// service level (0-15). Higher value means higher priority.
     service_level: u8,
-    /// Enable EFA (Elastic Fabric Adapter) support.
-    enable_efa: bool,
 }
 
 impl QueuePairBuilder {
@@ -808,7 +817,6 @@ impl QueuePairBuilder {
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
             service_level: 0,
-            enable_efa: false,
         }
     }
 
@@ -848,15 +856,6 @@ impl QueuePairBuilder {
     /// Defaults to 0.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
         self.service_level = service_level;
-        self
-    }
-
-    /// Enable or disable EFA (Elastic Fabric Adapter) support for the new `QueuePair`.
-    ///
-    /// When enabled, the `build()` method will use EFA-specific QP creation and handshake methods.
-    /// Defaults to false.
-    pub fn enable_efa(&mut self, enable_efa: bool) -> &mut Self {
-        self.enable_efa = enable_efa;
         self
     }
 
@@ -1140,7 +1139,7 @@ impl QueuePairBuilder {
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
     pub fn build(&self) -> io::Result<PreparedQueuePair> {
 
-        let qp = if self.enable_efa {
+        let qp = if self.pd.ctx.enable_efa {
             // EFA uses extended API to create an SRD QP.
             let send_ops_flags = (ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE.0 |
                 ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0 |
@@ -1203,7 +1202,6 @@ impl QueuePairBuilder {
                     qp,
                     ah: ptr::null_mut(),
                     remote_endpoint: None,
-                    enable_efa: self.enable_efa,
                 },
                 gid_index: self.gid_index,
                 traffic_class: self.traffic_class,
@@ -1217,7 +1215,6 @@ impl QueuePairBuilder {
                 path_mtu: self.path_mtu,
                 rq_psn: self.rq_psn,
                 service_level: self.service_level,
-                enable_efa: self.enable_efa,
             })
         }
     }
@@ -1275,8 +1272,6 @@ pub struct PreparedQueuePair {
     rq_psn: Option<u32>,
     /// service level (0-15). Higher value means higher priority.
     service_level: u8,
-    /// Enable EFA (Elastic Fabric Adapter) support.
-    enable_efa: bool,
 }
 
 /// A Global identifier for ibv.
@@ -1484,14 +1479,14 @@ impl PreparedQueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_PORT;
 
-        if !self.enable_efa {
+        if !self.qp.pd.ctx.enable_efa {
             if let Some(access) = self.access {
                 attr.qp_access_flags = access.0;
                 mask |= ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
             }
         }
 
-        if self.enable_efa {
+        if self.qp.pd.ctx.enable_efa {
             attr.qkey = UD_QKEY;
             mask |= ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
             attr.port_num = PORT_NUM;
@@ -1580,7 +1575,7 @@ impl PreparedQueuePair {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
-        if self.enable_efa {
+        if self.qp.pd.ctx.enable_efa {
             // EFA QP requires an AH to be created for the remote endpoint.
             let ah = if self.qp.ah.is_null() {
                 let mut ah_attr = ffi::ibv_ah_attr {
@@ -1884,7 +1879,11 @@ impl ProtectionDomain {
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
     pub fn allocate(&self, n: usize) -> io::Result<MemoryRegion<Vec<u8>>> {
-        let access_flags = DEFAULT_ACCESS_FLAGS;
+        let access_flags = if self.inner.ctx.enable_efa {
+            EFA_DEFAULT_ACCESS_FLAGS
+        } else {
+            DEFAULT_ACCESS_FLAGS
+        };
         self.allocate_with_permissions(n, access_flags)
     }
 
@@ -1921,7 +1920,12 @@ impl ProtectionDomain {
         &self,
         data: T,
     ) -> io::Result<MemoryRegion<T>> {
-        self.register_with_permissions(data, DEFAULT_ACCESS_FLAGS)
+        let access_flags = if self.inner.ctx.enable_efa {
+            EFA_DEFAULT_ACCESS_FLAGS
+        } else {
+            DEFAULT_ACCESS_FLAGS
+        };
+        self.register_with_permissions(data, access_flags)
     }
 
     /// Registers an already allocated DMA-BUF memory region (MR) associated with this `ProtectionDomain`.
@@ -1971,7 +1975,6 @@ pub struct QueuePair {
     qp: *mut ffi::ibv_qp,
     ah: *mut ffi::ibv_ah,
     remote_endpoint: Option<QueuePairEndpoint>,
-    enable_efa: bool,
 }
 
 unsafe impl Send for QueuePair {}
@@ -2131,7 +2134,7 @@ impl QueuePair {
         wr_id: u64,
         imm_data: Option<u32>,
     ) -> io::Result<()> {
-        if self.enable_efa {
+        if self.pd.ctx.enable_efa {
             // This is an EFA QP, use EFA write
             self.post_write_efa(local, remote, self.remote_endpoint.unwrap(), wr_id, imm_data)
         } else {

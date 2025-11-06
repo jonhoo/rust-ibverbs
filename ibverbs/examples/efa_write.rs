@@ -5,7 +5,7 @@
 //!   both sides and then we can use the AHs to send and receive data. This is because SRD
 //!   is a connectionless protocol. It does not gurantee that both sides are ready.
 //! - We use the QP_EX API to create the QP. This is primarily needed so that we can create an SRD QP.
-//! - All MRs must be registered before the QP is created and handshaked...
+//! - All MRs must be registered before the QP is handshaked...
 //! - All post_receives on receiver side must be posted before the writer sends.
 //!   Failure to do so will result in a `IBV_WC_RNR_RETRY_EXC_ERR` error in WCE
 //! - Writes are non ordered. You must not depend on the "last" write with imm data to be received as a
@@ -55,7 +55,7 @@ fn sender_task(
         .unwrap()
         .iter()
         .nth(1) {
-        Some(dev) => dev.open().unwrap(),
+        Some(dev) => dev.open_with_efa().unwrap(),
         None => {
             eprintln!("No RDMA devices found!");
             return Ok(());
@@ -69,7 +69,7 @@ fn sender_task(
     // Create EFA QP
     let qp_builder_result = pd
         .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_DRIVER)
-        .and_then(|mut builder| builder.set_gid_index(0).enable_efa(true).build());
+        .and_then(|mut builder| builder.set_gid_index(0).build());
 
     let qp_builder = match qp_builder_result {
         Ok(builder) => builder,
@@ -139,7 +139,7 @@ fn receiver_task(
         .unwrap()
         .iter()
         .nth(2) {
-        Some(dev) => dev.open().unwrap(),
+        Some(dev) => dev.open_with_efa().unwrap(),
         None => {
             eprintln!("No RDMA devices found!");
             return Ok(());
@@ -153,7 +153,7 @@ fn receiver_task(
     // Create EFA QP
     let qp_builder_result = pd
         .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_DRIVER)
-        .and_then(|mut builder| builder.set_gid_index(0).enable_efa(true).build());
+        .and_then(|mut builder| builder.set_gid_index(0).build());
 
     let qp_builder = match qp_builder_result {
         Ok(builder) => builder,
