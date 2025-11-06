@@ -23,6 +23,9 @@ license = "MIT OR Apache-2.0"
 
 exclude = ["vendor/rdma-core/build/"]
 
+[features]
+efa = []
+
 [build-dependencies]
 bindgen = "0.71.1"
 cmake = "0.1.50"

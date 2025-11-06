@@ -29,6 +29,7 @@ features = ["derive"]
 
 [features]
 default = ["serde"]
+efa = ["ffi/efa"]
 
 [dev-dependencies]
 bincode = "1.3"

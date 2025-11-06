@@ -1,4 +1,6 @@
 //! EFA Read Example
+//! 
+//! Run with `cargo run --example efa_read --features efa`
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Starting EFA one-sided read example with separate reader/writer tasks...");

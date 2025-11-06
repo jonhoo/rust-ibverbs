@@ -10,6 +10,8 @@
 //!   Failure to do so will result in a `IBV_WC_RNR_RETRY_EXC_ERR` error in WCE
 //! - Writes are non ordered. You must not depend on the "last" write with imm data to be received as a
 //!   signal of last write completion.
+//! 
+//! Run with `cargo run --example efa_write --features efa`
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Starting EFA one-sided write example with separate sender/receiver tasks...");
