@@ -743,6 +743,8 @@ pub struct QueuePairBuilder {
     rq_psn: Option<u32>,
     /// service level (0-15). Higher value means higher priority.
     service_level: u8,
+    /// Enable EFA (Elastic Fabric Adapter) support.
+    enable_efa: bool,
 }
 
 impl QueuePairBuilder {
@@ -806,6 +808,7 @@ impl QueuePairBuilder {
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
             service_level: 0,
+            enable_efa: false,
         }
     }
 
@@ -845,6 +848,15 @@ impl QueuePairBuilder {
     /// Defaults to 0.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
         self.service_level = service_level;
+        self
+    }
+
+    /// Enable or disable EFA (Elastic Fabric Adapter) support for the new `QueuePair`.
+    ///
+    /// When enabled, the `build()` method will use EFA-specific QP creation and handshake methods.
+    /// Defaults to false.
+    pub fn enable_efa(&mut self, enable_efa: bool) -> &mut Self {
+        self.enable_efa = enable_efa;
         self
     }
 
@@ -1109,7 +1121,7 @@ impl QueuePairBuilder {
         self
     }
 
-    /// Create a new `QueuePair` from this builder template.
+    /// Create a new `QueuePair` from this builder template using standard ibverbs API.
     ///
     /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
     ///
@@ -1123,7 +1135,7 @@ impl QueuePairBuilder {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
-    pub fn build(&self) -> io::Result<PreparedQueuePair> {
+    fn build_regular(&self) -> io::Result<PreparedQueuePair> {
         let mut attr = ffi::ibv_qp_init_attr {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
             send_cq: self.send.cq as *const _ as *mut _,
@@ -1150,6 +1162,8 @@ impl QueuePairBuilder {
                     pd: self.pd.clone(),
                     qp,
                     ah: ptr::null_mut(),
+                    remote_endpoint: Default::default(),
+                    enable_efa: self.enable_efa,
                 },
                 gid_index: self.gid_index,
                 traffic_class: self.traffic_class,
@@ -1163,7 +1177,33 @@ impl QueuePairBuilder {
                 path_mtu: self.path_mtu,
                 rq_psn: self.rq_psn,
                 service_level: self.service_level,
+                enable_efa: self.enable_efa,
             })
+        }
+    }
+
+    /// Create a new `QueuePair` from this builder template.
+    ///
+    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
+    ///
+    /// This method will fail if asked to create QP of a type other than `IBV_QPT_RC` or
+    /// `IBV_QPT_UD` associated with an SRQ.
+    ///
+    /// If `enable_efa` is set to `true`, this will use EFA-specific QP creation. Otherwise,
+    /// it uses the standard ibverbs API.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid `ProtectionDomain`, sending or receiving `Context`, or invalid value
+    ///    provided in `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
+    ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
+    pub fn build(&self) -> io::Result<PreparedQueuePair> {
+        if self.enable_efa {
+            self.build_efa()
+        } else {
+            self.build_regular()
         }
     }
 
@@ -1223,6 +1263,8 @@ impl QueuePairBuilder {
                     pd: self.pd.clone(),
                     qp,
                     ah: ptr::null_mut(),
+                    remote_endpoint: Default::default(),
+                    enable_efa: self.enable_efa,
                 },
                 gid_index: self.gid_index,
                 traffic_class: self.traffic_class,
@@ -1236,6 +1278,7 @@ impl QueuePairBuilder {
                 path_mtu: self.path_mtu,
                 rq_psn: self.rq_psn,
                 service_level: self.service_level,
+                enable_efa: self.enable_efa,
             })
         }
     }
@@ -1293,6 +1336,8 @@ pub struct PreparedQueuePair {
     rq_psn: Option<u32>,
     /// service level (0-15). Higher value means higher priority.
     service_level: u8,
+    /// Enable EFA (Elastic Fabric Adapter) support.
+    enable_efa: bool,
 }
 
 /// A Global identifier for ibv.
@@ -1457,6 +1502,9 @@ impl PreparedQueuePair {
     /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`).
     /// Further discussion of the protocol can be found on [RDMAmojo].
     ///
+    /// If `enable_efa` is set to `true`, this will use EFA-specific handshake. Otherwise,
+    /// it uses the standard ibverbs handshake.
+    ///
     /// If the endpoint contains a Gid, the routing will be global. This means:
     /// ```text,ignore
     /// ah_attr.is_global = 1;
@@ -1483,6 +1531,45 @@ impl PreparedQueuePair {
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
     pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
+        if self.enable_efa {
+            self.handshake_efa(remote)
+        } else {
+            self.handshake_regular(remote)
+        }
+    }
+
+    /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair` using standard ibverbs.
+    ///
+    /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
+    /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`).
+    /// Further discussion of the protocol can be found on [RDMAmojo].
+    ///
+    /// If the endpoint contains a Gid, the routing will be global. This means:
+    /// ```text,ignore
+    /// ah_attr.is_global = 1;
+    /// ah_attr.grh.hop_limit = 0xff;
+    /// ```
+    ///
+    /// The handshake also sets the following parameters, which are currently not configurable:
+    ///
+    /// # Examples
+    ///
+    /// ```text,ignore
+    /// port_num = PORT_NUM;
+    /// pkey_index = 0;
+    /// sq_psn = 0;
+    ///
+    /// ah_attr.sl = 0;
+    /// ah_attr.src_path_bits = 0;
+    /// ```
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in `attr` or in `attr_mask`.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///
+    /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
+    fn handshake_regular(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
@@ -1675,6 +1762,7 @@ impl PreparedQueuePair {
         };
 
         self.qp.ah = ah;
+        self.qp.remote_endpoint = remote;
 
         Ok(self.qp)
     }
@@ -2037,6 +2125,8 @@ pub struct QueuePair {
     pd: Arc<ProtectionDomainInner>,
     qp: *mut ffi::ibv_qp,
     ah: *mut ffi::ibv_ah,
+    remote_endpoint: QueuePairEndpoint,
+    enable_efa: bool,
 }
 
 unsafe impl Send for QueuePair {}
@@ -2186,7 +2276,30 @@ impl QueuePair {
     /// Remote RDMA write.
     /// immediate data can be used to signal the completion of the write operation
     /// the other side uses post_recv on a dummy buffer and get the imm data from the work completion
+    ///
+    /// If this QueuePair was created with EFA support, this will use EFA-specific write operations.
+    /// Otherwise, it uses standard ibverbs RDMA write operations.
     pub fn post_write(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        imm_data: Option<u32>,
+    ) -> io::Result<()> {
+        if self.enable_efa {
+            // This is an EFA QP, use EFA write
+            self.post_write_efa(local, remote, self.remote_endpoint, wr_id, imm_data)
+        } else {
+            // This is a regular QP, use standard write
+            self.post_write_regular(local, remote, wr_id, imm_data)
+        }
+    }
+
+    #[inline]
+    /// Remote RDMA write using standard ibverbs.
+    /// immediate data can be used to signal the completion of the write operation
+    /// the other side uses post_recv on a dummy buffer and get the imm data from the work completion
+    fn post_write_regular(
         &mut self,
         local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
@@ -2244,6 +2357,45 @@ impl QueuePair {
     /// Get raw QP pointer (for testing/debugging purposes only).
     pub fn raw_qp_ptr(&self) -> *mut ffi::ibv_qp {
         self.qp
+    }
+
+    /// Remote RDMA read with EFA.
+    /// Upgrades QP to QP_EX
+    /// Note: EFA may not support immediate data with reads
+    pub fn post_read_efa(
+        &mut self,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        remote_endpoint: QueuePairEndpoint,
+        wr_id: u64,
+        _imm_data: Option<u32>,
+    ) -> io::Result<()> {
+
+        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(self.qp) };
+
+        unsafe {
+            (*qp_ex).wr_start.unwrap()(qp_ex);
+            (*qp_ex).wr_id = wr_id;
+            // set comp_mask to 0
+            (*qp_ex).comp_mask = 0;
+            // set wr_flags = IBV_SEND_SIGNALED
+            (*qp_ex).wr_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+
+            // Set RDMA read parameters first (following write pattern)
+            (*qp_ex).wr_rdma_read.unwrap()(qp_ex, remote.rkey, remote.addr);
+
+            // set sge_list with num_Sge and sg_list
+            (*qp_ex).wr_set_sge_list.unwrap()(qp_ex, local.len(), local.as_ptr() as *mut ffi::ibv_sge);
+            // set ud_addr as remote->ah, remote_qpn, qkey
+            (*qp_ex).wr_set_ud_addr.unwrap()(qp_ex, self.ah, remote_endpoint.num, UD_QKEY);
+        };
+
+        let errno = unsafe {(*qp_ex).wr_complete.unwrap()(qp_ex)};
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
     }
 
     #[inline]

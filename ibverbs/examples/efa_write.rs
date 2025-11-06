@@ -69,7 +69,7 @@ async fn sender_task(
     // Create EFA QP
     let qp_builder_result = pd
         .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_DRIVER)
-        .and_then(|mut builder| builder.set_gid_index(0).build_efa());
+        .and_then(|mut builder| builder.set_gid_index(0).enable_efa(true).build());
 
     let qp_builder = match qp_builder_result {
         Ok(builder) => builder,
@@ -97,7 +97,7 @@ async fn sender_task(
     remote_mr_tx.send(local_mr.remote()).unwrap();
 
     // Move QP to RTR states and create remote AH
-    let mut qp = qp_builder.handshake_efa(peer_endpoint).unwrap();
+    let mut qp = qp_builder.handshake(peer_endpoint).unwrap();
 
     // Wait for receiver to be ready
     let receiver_is_ready = receiver_is_ready_rx.await.unwrap();
@@ -106,7 +106,7 @@ async fn sender_task(
     }
 
     // Post EFA write with immediate data
-    qp.post_write_efa(&[local_mr.slice(..4096)], remote_mr, peer_endpoint, 0, Some(0x67)).unwrap();
+    qp.post_write(&[local_mr.slice(..4096)], remote_mr, 0, Some(0x67)).unwrap();
 
     // Wait for completion
     let mut completions = [ibverbs::ibv_wc::default(); 16];
@@ -153,7 +153,7 @@ async fn receiver_task(
     // Create EFA QP
     let qp_builder_result = pd
         .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_DRIVER)
-        .and_then(|mut builder| builder.set_gid_index(0).build_efa());
+        .and_then(|mut builder| builder.set_gid_index(0).enable_efa(true).build());
 
     let qp_builder = match qp_builder_result {
         Ok(builder) => builder,
@@ -181,7 +181,7 @@ async fn receiver_task(
     let _remote_mr = remote_mr_rx.await.unwrap();
 
     // Move QP to RTR states and create remote AH
-    let mut qp = qp_builder.handshake_efa(peer_endpoint).unwrap();
+    let mut qp = qp_builder.handshake(peer_endpoint).unwrap();
 
     // Post receive for the write operation
     let dummy_buffer = pd.allocate_with_permissions(4096, efa_access_flags).unwrap();
