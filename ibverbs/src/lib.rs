@@ -1141,29 +1141,33 @@ impl QueuePairBuilder {
 
         let qp = if self.pd.ctx.enable_efa {
             // EFA uses extended API to create an SRD QP.
-            let send_ops_flags = (ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE.0 |
+            let send_ops_flags = (
+                ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE.0 |
                 ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0 |
                 ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_READ.0 |
                 ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND.0 |
-                ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND_WITH_IMM.0) as u32;
+                ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_SEND_WITH_IMM.0
+            ) as u32;
             let mut attr = ffi::ibv_qp_init_attr_ex {
-            qp_context: self.pd.ctx.ctx as *mut _,
-            send_cq: self.send.cq as *const _ as *mut _,
-            recv_cq: self.recv.cq as *const _ as *mut _,
-            cap: ffi::ibv_qp_cap {
-            max_send_wr: self.max_send_wr,
-            max_recv_wr: self.max_recv_wr,
-            max_send_sge: self.max_send_sge,
-            max_recv_sge: self.max_recv_sge,
-            max_inline_data: self.max_inline_data,
-            },
-            qp_type: self.qp_type,
-            sq_sig_all: 1,
-            // attr ex specific
-            comp_mask: (ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS).0,
-            pd: self.pd.pd,
-            send_ops_flags: send_ops_flags as u64,
-            ..Default::default()
+                qp_context: self.pd.ctx.ctx as *mut _,
+                send_cq: self.send.cq as *const _ as *mut _,
+                recv_cq: self.recv.cq as *const _ as *mut _,
+                cap: ffi::ibv_qp_cap {
+                    max_send_wr: self.max_send_wr,
+                    max_recv_wr: self.max_recv_wr,
+                    max_send_sge: self.max_send_sge,
+                    max_recv_sge: self.max_recv_sge,
+                    max_inline_data: self.max_inline_data,
+                },
+                qp_type: self.qp_type,
+                sq_sig_all: 1,
+                comp_mask: (
+                    ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD |
+                    ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS
+                ).0,
+                pd: self.pd.pd,
+                send_ops_flags: send_ops_flags as u64,
+                ..Default::default()
             };
 
             let mut efa_attr = ffi::efadv_qp_init_attr {
@@ -1466,9 +1470,10 @@ impl PreparedQueuePair {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
-    pub fn handshake(mut self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
+    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
         // init and associate with port
-        let qp_type = unsafe { (*self.qp.qp).qp_type };
+        let mut qp = self.qp;
+        let qp_type = unsafe { (*qp.qp).qp_type };
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             pkey_index: 0,
@@ -1479,21 +1484,19 @@ impl PreparedQueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
             | ffi::ibv_qp_attr_mask::IBV_QP_PORT;
 
-        if !self.qp.pd.ctx.enable_efa {
+        if qp.pd.ctx.enable_efa {
+            attr.qkey = UD_QKEY;
+            mask |= ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
+            attr.port_num = PORT_NUM;
+            mask |= ffi::ibv_qp_attr_mask::IBV_QP_PORT;
+        } else {
             if let Some(access) = self.access {
                 attr.qp_access_flags = access.0;
                 mask |= ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
             }
         }
 
-        if self.qp.pd.ctx.enable_efa {
-            attr.qkey = UD_QKEY;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
-            attr.port_num = PORT_NUM;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_PORT;
-        }
-
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -1542,7 +1545,7 @@ impl PreparedQueuePair {
             attr.rq_psn = rq_psn;
             mask |= ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN;
         }
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
@@ -1570,41 +1573,34 @@ impl PreparedQueuePair {
             attr.max_rd_atomic = max_rd_atomic;
             mask |= ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
         }
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_qp(qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
 
-        if self.qp.pd.ctx.enable_efa {
+        if qp.pd.ctx.enable_efa {
             // EFA QP requires an AH to be created for the remote endpoint.
-            let ah = if self.qp.ah.is_null() {
-                let mut ah_attr = ffi::ibv_ah_attr {
-                    dlid: remote.lid,
-                    sl: 0,
-                    src_path_bits: 0,
-                    port_num: PORT_NUM,
-                    is_global: 1,
-                    static_rate: 0,
-                    grh: ffi::ibv_global_route {
-                        dgid: remote.gid.unwrap().into(),
-                        ..Default::default()
-                    },
+            let mut ah_attr = ffi::ibv_ah_attr {
+                dlid: remote.lid,
+                sl: 0,
+                src_path_bits: 0,
+                port_num: PORT_NUM,
+                is_global: 1,
+                static_rate: 0,
+                grh: ffi::ibv_global_route {
+                    dgid: remote.gid.unwrap().into(),
                     ..Default::default()
-                };
-    
-                let test_ah = unsafe { ffi::ibv_create_ah(self.qp.pd.pd, &mut ah_attr as *mut _) };
-                if test_ah.is_null() {
-                    return Err(io::Error::last_os_error());
-                }
-                test_ah
-            } else {
-                self.qp.ah
+                },
+                ..Default::default()
             };
-            self.qp.ah = ah;
-            self.qp.remote_endpoint = Some(remote);
+            qp.ah = unsafe { ffi::ibv_create_ah(qp.pd.pd, &mut ah_attr as *mut _) };
+            if qp.ah.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            qp.remote_endpoint = Some(remote);
         }
 
-        Ok(self.qp)
+        Ok(qp)
     }
 }
 
@@ -2135,10 +2131,8 @@ impl QueuePair {
         imm_data: Option<u32>,
     ) -> io::Result<()> {
         if self.pd.ctx.enable_efa {
-            // This is an EFA QP, use EFA write
-            self.post_write_efa(local, remote, self.remote_endpoint.unwrap(), wr_id, imm_data)
+            self.post_write_efa(local, remote, wr_id, imm_data)
         } else {
-            // This is a regular QP, use standard write
             self.post_write_regular(local, remote, wr_id, imm_data)
         }
     }
@@ -2171,29 +2165,32 @@ impl QueuePair {
         &mut self,
         local: &[LocalMemorySlice],
         remote_mr: RemoteMemorySlice,
-        remote_endpoint: QueuePairEndpoint,
         wr_id: u64,
         imm_data: Option<u32>,
     ) -> io::Result<()> {
-        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(self.qp) };
+        let qp_ex_ptr = unsafe { ffi::ibv_qp_to_qp_ex(self.qp) };
+        if qp_ex_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
 
-        unsafe {
-            (*qp_ex).wr_start.unwrap()(qp_ex);
-            (*qp_ex).wr_id = wr_id;
-            (*qp_ex).comp_mask = 0;
-            (*qp_ex).wr_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+        let qp_ex = unsafe { &mut *qp_ex_ptr };
+
+        let errno = unsafe {
+            qp_ex.wr_start.unwrap()(qp_ex);
+            qp_ex.wr_id = wr_id;
+            qp_ex.comp_mask = 0;
+            qp_ex.wr_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
             if imm_data.is_some() {
-                (*qp_ex).wr_rdma_write_imm.unwrap()(qp_ex, remote_mr.rkey, remote_mr.addr, imm_data.unwrap().to_be());
+                qp_ex.wr_rdma_write_imm.unwrap()(qp_ex, remote_mr.rkey, remote_mr.addr, imm_data.unwrap().to_be());
             } else {
-                (*qp_ex).wr_rdma_write.unwrap()(qp_ex, remote_mr.rkey, remote_mr.addr);
+                qp_ex.wr_rdma_write.unwrap()(qp_ex, remote_mr.rkey, remote_mr.addr);
             };
-            (*qp_ex).wr_set_sge_list.unwrap()(qp_ex, local.len(), local.as_ptr() as *mut ffi::ibv_sge);
+            qp_ex.wr_set_sge_list.unwrap()(qp_ex, local.len(), local.as_ptr() as *mut ffi::ibv_sge);
             // TODO(Eric): Consider creating and caching AH for each remote_endpoint...
             // This way a single QP can be shared for multiple remote endpoints.
-            (*qp_ex).wr_set_ud_addr.unwrap()(qp_ex, self.ah, remote_endpoint.num, UD_QKEY);
+            qp_ex.wr_set_ud_addr.unwrap()(qp_ex, self.ah, self.remote_endpoint.unwrap().num, UD_QKEY);
+            qp_ex.wr_complete.unwrap()(qp_ex)
         };
-
-        let errno = unsafe {(*qp_ex).wr_complete.unwrap()(qp_ex)};
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
@@ -2219,26 +2216,32 @@ impl QueuePair {
         _imm_data: Option<u32>,
     ) -> io::Result<()> {
 
-        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(self.qp) };
+        let qp_ex_ptr = unsafe { ffi::ibv_qp_to_qp_ex(self.qp) };
 
-        unsafe {
-            (*qp_ex).wr_start.unwrap()(qp_ex);
-            (*qp_ex).wr_id = wr_id;
+        if qp_ex_ptr.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let qp_ex = unsafe { &mut *qp_ex_ptr };
+
+        let errno = unsafe {
+            qp_ex.wr_start.unwrap()(qp_ex);
+            qp_ex.wr_id = wr_id;
             // set comp_mask to 0
-            (*qp_ex).comp_mask = 0;
+            qp_ex.comp_mask = 0;
             // set wr_flags = IBV_SEND_SIGNALED
-            (*qp_ex).wr_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+            qp_ex.wr_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
 
             // Set RDMA read parameters first (following write pattern)
-            (*qp_ex).wr_rdma_read.unwrap()(qp_ex, remote.rkey, remote.addr);
+            qp_ex.wr_rdma_read.unwrap()(qp_ex, remote.rkey, remote.addr);
 
             // set sge_list with num_Sge and sg_list
-            (*qp_ex).wr_set_sge_list.unwrap()(qp_ex, local.len(), local.as_ptr() as *mut ffi::ibv_sge);
+            qp_ex.wr_set_sge_list.unwrap()(qp_ex, local.len(), local.as_ptr() as *mut ffi::ibv_sge);
             // set ud_addr as remote->ah, remote_qpn, qkey
-            (*qp_ex).wr_set_ud_addr.unwrap()(qp_ex, self.ah, remote_endpoint.num, UD_QKEY);
-        };
+            qp_ex.wr_set_ud_addr.unwrap()(qp_ex, self.ah, remote_endpoint.num, UD_QKEY);
 
-        let errno = unsafe {(*qp_ex).wr_complete.unwrap()(qp_ex)};
+            qp_ex.wr_complete.unwrap()(qp_ex)
+        };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {

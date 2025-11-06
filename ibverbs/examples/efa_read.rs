@@ -1,54 +1,46 @@
-//! EFA Write Example
-//! 
-//! Key Notes:
-//! - "handshakes" in SRD is not exactly a handshake. We really just need to create the AHs on 
-//!   both sides and then we can use the AHs to send and receive data. This is because SRD
-//!   is a connectionless protocol. It does not gurantee that both sides are ready.
-//! - We use the QP_EX API to create the QP. This is primarily needed so that we can create an SRD QP.
-//! - All MRs must be registered before the QP is handshaked...
-//! - All post_receives on receiver side must be posted before the writer sends.
-//!   Failure to do so will result in a `IBV_WC_RNR_RETRY_EXC_ERR` error in WCE
-//! - Writes are non ordered. You must not depend on the "last" write with imm data to be received as a
-//!   signal of last write completion.
+//! EFA Read Example
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    println!("Starting EFA one-sided write example with separate sender/receiver tasks...");
+    println!("Starting EFA one-sided read example with separate reader/writer tasks...");
 
-    // Channels to communicate the endpoints between sender and receiver.
-    let (sender_tx, sender_rx) = std::sync::mpsc::channel();
-    let (receiver_tx, receiver_rx) = std::sync::mpsc::channel();
-    // Channels to communicate the remote MRs between sender and receiver.
-    let (sender_remote_mr_tx, sender_remote_mr_rx) = std::sync::mpsc::channel();
-    let (receiver_remote_mr_tx, receiver_remote_mr_rx) = std::sync::mpsc::channel();
-    // Chan to communicate that the receiver is ready to receive data.
-    let (receiver_is_ready_tx, receiver_is_ready_rx) = std::sync::mpsc::channel();
+    // Channels to communicate the endpoints between reader and writer.
+    let (reader_tx, reader_rx) = std::sync::mpsc::channel();
+    let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+    // Channels to communicate the remote MRs between reader and writer.
+    let (reader_remote_mr_tx, reader_remote_mr_rx) = std::sync::mpsc::channel();
+    let (writer_remote_mr_tx, writer_remote_mr_rx) = std::sync::mpsc::channel();
+    // Chan to communicate that the writer is ready with data.
+    let (writer_is_ready_tx, writer_is_ready_rx) = std::sync::mpsc::channel();
+    // Chan to communicate that the reader has finished reading.
+    let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
 
-    // Spawn sender and receiver tasks
-    let sender_handle = std::thread::spawn(move || {
-        sender_task(sender_tx, receiver_rx, sender_remote_mr_tx, receiver_remote_mr_rx, receiver_is_ready_rx)
+    // Spawn reader and writer tasks
+    let reader_handle = std::thread::spawn(move || {
+        reader_task(reader_tx, writer_rx, reader_remote_mr_tx, writer_remote_mr_rx, writer_is_ready_rx, reader_done_tx)
     });
 
-    let receiver_handle = std::thread::spawn(move || {
-        receiver_task(receiver_tx, sender_rx, receiver_remote_mr_tx, sender_remote_mr_rx, receiver_is_ready_tx)
+    let writer_handle = std::thread::spawn(move || {
+        writer_task(writer_tx, reader_rx, writer_remote_mr_tx, reader_remote_mr_rx, writer_is_ready_tx, reader_done_rx)
     });
 
     // Wait for both tasks to complete
-    let sender_result = sender_handle.join().map_err(|_| "Sender thread panicked")?;
-    let receiver_result = receiver_handle.join().map_err(|_| "Receiver thread panicked")?;
+    let reader_result = reader_handle.join().map_err(|_| "Reader thread panicked")?;
+    let writer_result = writer_handle.join().map_err(|_| "Writer thread panicked")?;
 
-    sender_result?;
-    receiver_result?;
+    reader_result?;
+    writer_result?;
 
-    println!("Both sender and receiver tasks completed successfully!");
+    println!("Both reader and writer tasks completed successfully!");
     Ok(())
 }
 
-fn sender_task(
+fn reader_task(
     endpoint_tx: std::sync::mpsc::Sender<ibverbs::QueuePairEndpoint>,
     peer_rx: std::sync::mpsc::Receiver<ibverbs::QueuePairEndpoint>,
     remote_mr_tx: std::sync::mpsc::Sender<ibverbs::RemoteMemorySlice>,
     remote_mr_rx: std::sync::mpsc::Receiver<ibverbs::RemoteMemorySlice>,
-    receiver_is_ready_rx: std::sync::mpsc::Receiver<bool>,
+    writer_is_ready_rx: std::sync::mpsc::Receiver<bool>,
+    reader_done_tx: std::sync::mpsc::Sender<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Open RDMA device - assume EFA compatibility
     let ctx = match ibverbs::devices()
@@ -99,14 +91,14 @@ fn sender_task(
     // Move QP to RTR states and create remote AH
     let mut qp = qp_builder.handshake(peer_endpoint).unwrap();
 
-    // Wait for receiver to be ready
-    let receiver_is_ready = receiver_is_ready_rx.recv().unwrap();
-    if !receiver_is_ready {
-        return Err("Receiver is not ready".into());
+    // Wait for writer to be ready with data
+    let writer_is_ready = writer_is_ready_rx.recv().unwrap();
+    if !writer_is_ready {
+        return Err("Writer is not ready".into());
     }
 
-    // Post EFA write with immediate data
-    qp.post_write(&[local_mr.slice(..4096)], remote_mr, 0, Some(0x67)).unwrap();
+    // Post EFA read from remote memory into local memory
+    qp.post_read_efa(&[local_mr.slice(..4096)], remote_mr, peer_endpoint, 0, None).unwrap();
 
     // Wait for completion
     let mut completions = [ibverbs::ibv_wc::default(); 16];
@@ -118,21 +110,31 @@ fn sender_task(
         for wr in completed {
             if wr.wr_id() == 0 {
                 if let Some((wc_code, vendor_err)) = wr.error() {
-                    println!("EFA write failed: wc_code={:?}, vendor_err={:?}", wc_code, vendor_err);
-                    return Err("EFA write failed".into());
+                    println!("EFA read failed: wc_code={:?}, vendor_err={:?}", wc_code, vendor_err);
+                    return Err("EFA read failed".into());
                 }
+                // Check the data that was read
+                let data = local_mr.inner();
+                let read_number = u64::from_le_bytes(data[..8].try_into().unwrap());
+                println!("Read number: {}", read_number);
+
+                // Notify writer that reading is complete
+                reader_done_tx.send(true).unwrap();
+                println!("Reader notified writer of completion");
+
                 return Ok(());
             }
         }
     }
 }
 
-fn receiver_task(
+fn writer_task(
     endpoint_tx: std::sync::mpsc::Sender<ibverbs::QueuePairEndpoint>,
     peer_rx: std::sync::mpsc::Receiver<ibverbs::QueuePairEndpoint>,
     remote_mr_tx: std::sync::mpsc::Sender<ibverbs::RemoteMemorySlice>,
     remote_mr_rx: std::sync::mpsc::Receiver<ibverbs::RemoteMemorySlice>,
-    receiver_is_ready_tx: std::sync::mpsc::Sender<bool>,
+    writer_is_ready_tx: std::sync::mpsc::Sender<bool>,
+    reader_done_rx: std::sync::mpsc::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Open RDMA device - assume EFA compatibility
     let ctx = match ibverbs::devices()
@@ -172,7 +174,12 @@ fn receiver_task(
         ibverbs::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
     );
 
-    let local_mr = pd.allocate_with_permissions(4096, efa_access_flags).unwrap();
+    let mut local_mr = pd.allocate_with_permissions(4096, efa_access_flags).unwrap();
+
+    // Write a simple number to the local memory region
+    let test_number: u64 = 42;
+    local_mr.inner_mut()[..std::mem::size_of::<u64>()].copy_from_slice(&test_number.to_le_bytes());
+    println!("Writer prepared test number: {}", test_number);
 
     // Exchange endpoints and memory regions
     endpoint_tx.send(my_endpoint).map_err(|_| "Failed to send endpoint")?;
@@ -181,29 +188,17 @@ fn receiver_task(
     let _remote_mr = remote_mr_rx.recv().unwrap();
 
     // Move QP to RTR states and create remote AH
-    let mut qp = qp_builder.handshake(peer_endpoint).unwrap();
+    let _qp = qp_builder.handshake(peer_endpoint).unwrap();
 
-    // Post receive for the write operation
-    let dummy_buffer = pd.allocate_with_permissions(4096, efa_access_flags).unwrap();
-    unsafe { qp.post_receive(&[dummy_buffer.slice(..)], 1) }.unwrap();
+    // Signal ready to reader
+    writer_is_ready_tx.send(true).unwrap();
 
-    // Signal ready to sender
-    receiver_is_ready_tx.send(true).unwrap();
-
-    // Wait for completion
-    let mut completions = [ibverbs::ibv_wc::default(); 16];
-    loop {
-        let completed = cq.poll(&mut completions[..]).unwrap();
-        if completed.is_empty() {
-            continue;
-        }
-        for wr in completed {
-            if wr.wr_id() == 1 {
-                let imm_data = wr.imm_data();
-                let imm_data_host_order = u32::from_be(imm_data.unwrap());
-                println!("Received immediate data: {} (0x{:08x})", imm_data_host_order, imm_data_host_order);
-                return Ok(());
-            }
-        }
+    // Writer waits for reader to complete reading
+    println!("Writer is ready and waiting for reader to complete...");
+    let reader_done = reader_done_rx.recv().unwrap();
+    if reader_done {
+        println!("Writer received completion notification from reader");
     }
+
+    Ok(())
 }
