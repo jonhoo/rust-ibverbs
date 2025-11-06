@@ -11,30 +11,30 @@
 //! - Writes are non ordered. You must not depend on the "last" write with imm data to be received as a
 //!   signal of last write completion.
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Starting EFA one-sided write example with separate sender/receiver tasks...");
 
     // Channels to communicate the endpoints between sender and receiver.
-    let (sender_tx, sender_rx) = tokio::sync::oneshot::channel();
-    let (receiver_tx, receiver_rx) = tokio::sync::oneshot::channel();
+    let (sender_tx, sender_rx) = std::sync::mpsc::channel();
+    let (receiver_tx, receiver_rx) = std::sync::mpsc::channel();
     // Channels to communicate the remote MRs between sender and receiver.
-    let (sender_remote_mr_tx, sender_remote_mr_rx) = tokio::sync::oneshot::channel();
-    let (receiver_remote_mr_tx, receiver_remote_mr_rx) = tokio::sync::oneshot::channel();
+    let (sender_remote_mr_tx, sender_remote_mr_rx) = std::sync::mpsc::channel();
+    let (receiver_remote_mr_tx, receiver_remote_mr_rx) = std::sync::mpsc::channel();
     // Chan to communicate that the receiver is ready to receive data.
-    let (receiver_is_ready_tx, receiver_is_ready_rx) = tokio::sync::oneshot::channel();
+    let (receiver_is_ready_tx, receiver_is_ready_rx) = std::sync::mpsc::channel();
 
     // Spawn sender and receiver tasks
-    let sender_handle = tokio::spawn(async move {
-        sender_task(sender_tx, receiver_rx, sender_remote_mr_tx, receiver_remote_mr_rx, receiver_is_ready_rx).await
+    let sender_handle = std::thread::spawn(move || {
+        sender_task(sender_tx, receiver_rx, sender_remote_mr_tx, receiver_remote_mr_rx, receiver_is_ready_rx)
     });
 
-    let receiver_handle = tokio::spawn(async move {
-        receiver_task(receiver_tx, sender_rx, receiver_remote_mr_tx, sender_remote_mr_rx, receiver_is_ready_tx).await
+    let receiver_handle = std::thread::spawn(move || {
+        receiver_task(receiver_tx, sender_rx, receiver_remote_mr_tx, sender_remote_mr_rx, receiver_is_ready_tx)
     });
 
     // Wait for both tasks to complete
-    let (sender_result, receiver_result) = tokio::try_join!(sender_handle, receiver_handle)?;
+    let sender_result = sender_handle.join().map_err(|_| "Sender thread panicked")?;
+    let receiver_result = receiver_handle.join().map_err(|_| "Receiver thread panicked")?;
 
     sender_result?;
     receiver_result?;
@@ -43,12 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn sender_task(
-    endpoint_tx: tokio::sync::oneshot::Sender<ibverbs::QueuePairEndpoint>,
-    peer_rx: tokio::sync::oneshot::Receiver<ibverbs::QueuePairEndpoint>,
-    remote_mr_tx: tokio::sync::oneshot::Sender<ibverbs::RemoteMemorySlice>,
-    remote_mr_rx: tokio::sync::oneshot::Receiver<ibverbs::RemoteMemorySlice>,
-    receiver_is_ready_rx: tokio::sync::oneshot::Receiver<bool>,
+fn sender_task(
+    endpoint_tx: std::sync::mpsc::Sender<ibverbs::QueuePairEndpoint>,
+    peer_rx: std::sync::mpsc::Receiver<ibverbs::QueuePairEndpoint>,
+    remote_mr_tx: std::sync::mpsc::Sender<ibverbs::RemoteMemorySlice>,
+    remote_mr_rx: std::sync::mpsc::Receiver<ibverbs::RemoteMemorySlice>,
+    receiver_is_ready_rx: std::sync::mpsc::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Open RDMA device - assume EFA compatibility
     let ctx = match ibverbs::devices()
@@ -92,15 +92,15 @@ async fn sender_task(
 
     // Exchange endpoints and memory regions
     endpoint_tx.send(my_endpoint).map_err(|_| "Failed to send endpoint")?;
-    let peer_endpoint = peer_rx.await.map_err(|_| "Failed to receive peer endpoint")?;
-    let remote_mr = remote_mr_rx.await.unwrap();
+    let peer_endpoint = peer_rx.recv().map_err(|_| "Failed to receive peer endpoint")?;
+    let remote_mr = remote_mr_rx.recv().unwrap();
     remote_mr_tx.send(local_mr.remote()).unwrap();
 
     // Move QP to RTR states and create remote AH
     let mut qp = qp_builder.handshake(peer_endpoint).unwrap();
 
     // Wait for receiver to be ready
-    let receiver_is_ready = receiver_is_ready_rx.await.unwrap();
+    let receiver_is_ready = receiver_is_ready_rx.recv().unwrap();
     if !receiver_is_ready {
         return Err("Receiver is not ready".into());
     }
@@ -127,12 +127,12 @@ async fn sender_task(
     }
 }
 
-async fn receiver_task(
-    endpoint_tx: tokio::sync::oneshot::Sender<ibverbs::QueuePairEndpoint>,
-    peer_rx: tokio::sync::oneshot::Receiver<ibverbs::QueuePairEndpoint>,
-    remote_mr_tx: tokio::sync::oneshot::Sender<ibverbs::RemoteMemorySlice>,
-    remote_mr_rx: tokio::sync::oneshot::Receiver<ibverbs::RemoteMemorySlice>,
-    receiver_is_ready_tx: tokio::sync::oneshot::Sender<bool>,
+fn receiver_task(
+    endpoint_tx: std::sync::mpsc::Sender<ibverbs::QueuePairEndpoint>,
+    peer_rx: std::sync::mpsc::Receiver<ibverbs::QueuePairEndpoint>,
+    remote_mr_tx: std::sync::mpsc::Sender<ibverbs::RemoteMemorySlice>,
+    remote_mr_rx: std::sync::mpsc::Receiver<ibverbs::RemoteMemorySlice>,
+    receiver_is_ready_tx: std::sync::mpsc::Sender<bool>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Open RDMA device - assume EFA compatibility
     let ctx = match ibverbs::devices()
@@ -176,9 +176,9 @@ async fn receiver_task(
 
     // Exchange endpoints and memory regions
     endpoint_tx.send(my_endpoint).map_err(|_| "Failed to send endpoint")?;
-    let peer_endpoint = peer_rx.await.map_err(|_| "Failed to receive peer endpoint")?;
+    let peer_endpoint = peer_rx.recv().map_err(|_| "Failed to receive peer endpoint")?;
     remote_mr_tx.send(local_mr.remote()).unwrap();
-    let _remote_mr = remote_mr_rx.await.unwrap();
+    let _remote_mr = remote_mr_rx.recv().unwrap();
 
     // Move QP to RTR states and create remote AH
     let mut qp = qp_builder.handshake(peer_endpoint).unwrap();
@@ -195,7 +195,7 @@ async fn receiver_task(
     loop {
         let completed = cq.poll(&mut completions[..]).unwrap();
         if completed.is_empty() {
-            tokio::task::yield_now().await;
+            std::thread::sleep(std::time::Duration::from_millis(1));
             continue;
         }
         for wr in completed {
