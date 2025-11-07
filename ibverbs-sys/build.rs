@@ -8,9 +8,9 @@ fn main() {
     println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
     println!("cargo:rustc-link-lib=ibverbs");
 
-    // Link EFA library when the feature is enabled
-    if env::var("CARGO_FEATURE_EFA").is_ok() {
+    if env::var("CARGO_FEATURE_EFA").is_ok() && Path::new("/opt/amazon/efa/lib/").exists() {
         println!("cargo:rustc-link-lib=efa");
+        println!("cargo:rustc-cfg=feature=\"efa\"");
     }
 
     if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {

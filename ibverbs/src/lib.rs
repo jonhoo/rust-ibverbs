@@ -421,6 +421,10 @@ impl Context {
         Ok(ctx)
     }
 
+    /// Returns true if EFA is enabled for this context.
+    pub fn is_efa_enabled(&self) -> bool {
+        self.inner.enable_efa
+    }
 
     /// Create a completion queue (CQ).
     ///
@@ -1140,6 +1144,7 @@ impl QueuePairBuilder {
     pub fn build(&self) -> io::Result<PreparedQueuePair> {
 
         let qp = if self.pd.ctx.enable_efa {
+            #[cfg(feature = "efa")] {
             // EFA uses extended API to create an SRD QP.
             let send_ops_flags = (
                 ffi::ibv_qp_create_send_ops_flags::IBV_QP_EX_WITH_RDMA_WRITE.0 |
@@ -1177,6 +1182,10 @@ impl QueuePairBuilder {
             };
 
             unsafe { ffi::efadv_create_qp_ex(self.pd.ctx.ctx, &mut attr, &mut efa_attr as *mut _, std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32) }
+            }
+            #[cfg(not(feature = "efa"))] {
+                panic!("EFA feature is not enabled but ctx.enable_efa is true");
+            }
         } else {
             // otherwise, use standard ibverbs API to create a regular QP.
             let mut attr = ffi::ibv_qp_init_attr {
