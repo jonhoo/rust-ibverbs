@@ -5,7 +5,54 @@
 // Suppress expected warnings from bindgen-generated code.
 // See https://github.com/rust-lang/rust-bindgen/issues/1651.
 #![allow(deref_nullptr)]
+
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+
+// Dynamic EFA loading module
+#[cfg(feature = "efa")]
+mod efa_dynamic {
+    use libloading::{Library, Symbol};
+    use std::sync::OnceLock;
+
+    static EFA_LIBRARY: OnceLock<Result<Library, libloading::Error>> = OnceLock::new();
+
+    fn load_efa_library() -> Result<&'static Library, &'static libloading::Error> {
+        EFA_LIBRARY.get_or_init(|| {
+            unsafe { Library::new("libefa.so") }
+        }).as_ref()
+    }
+
+    // Function pointer types for EFA functions
+    type EfadvCreateQpExFn = unsafe extern "C" fn(
+        ibv_ctx: *mut crate::ibv_context,
+        attr: *mut crate::ibv_qp_init_attr_ex,
+        efa_attr: *mut crate::efadv_qp_init_attr,
+        efa_attr_size: u32,
+    ) -> *mut crate::ibv_qp;
+
+    // Lazy-loaded EFA functions
+    pub struct EfaFunctions {
+        pub efadv_create_qp_ex: Symbol<'static, EfadvCreateQpExFn>,
+    }
+
+    impl EfaFunctions {
+        pub fn load() -> Result<Self, String> {
+            let lib = load_efa_library().map_err(|e| format!("Failed to load EFA library: {}", e))?;
+
+            unsafe {
+                Ok(Self {
+                    efadv_create_qp_ex: lib.get(b"efadv_create_qp_ex").map_err(|e| format!("Failed to load efadv_create_qp_ex: {}", e))?,
+                })
+            }
+        }
+    }
+
+    static EFA_FUNCTIONS: OnceLock<Result<EfaFunctions, String>> = OnceLock::new();
+
+    pub fn get_efa_functions() -> Result<&'static EfaFunctions, &'static String> {
+        EFA_FUNCTIONS.get_or_init(|| EfaFunctions::load()).as_ref()
+    }
+}
 
 /// An ibverb work completion.
 #[repr(C)]

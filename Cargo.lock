@@ -124,6 +124,7 @@ version = "0.3.2+55.0"
 dependencies = [
  "bindgen",
  "cmake",
+ "libloading",
  "proc-macro2",
 ]
 

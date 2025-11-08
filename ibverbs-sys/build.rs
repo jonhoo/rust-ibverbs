@@ -8,11 +8,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
     println!("cargo:rustc-link-lib=ibverbs");
 
-    if env::var("CARGO_FEATURE_EFA").is_ok() && Path::new("/opt/amazon/efa/lib/").exists() {
-        println!("cargo:rustc-link-lib=efa");
-        println!("cargo:rustc-cfg=feature=\"efa\"");
-    }
-
     if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
         // don't touch source dir if not necessary
     } else if Path::new(".git").is_dir() {
@@ -72,6 +67,7 @@ fn main() {
         .allowlist_function("ibv_wc_read_imm_data")
         .allowlist_function("ibv_wr_rdma_write_imm")
         .allowlist_function("ibv_wr_rdma_write")
+        .allowlist_function("ibv_wr_send")
         .allowlist_function("ibv_wr_rdma_read")
         .allowlist_type("ibv_.*")
         .allowlist_type("efa.*")
