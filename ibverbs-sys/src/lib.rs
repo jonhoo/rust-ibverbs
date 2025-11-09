@@ -54,6 +54,9 @@ mod efa_dynamic {
     }
 }
 
+#[cfg(feature = "efa")]
+pub use efa_dynamic::get_efa_functions;
+
 /// An ibverb work completion.
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
