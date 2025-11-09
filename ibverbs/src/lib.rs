@@ -2453,16 +2453,6 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_efa_dynamic_loading() {
-        // Test that EFA loading works (or gracefully fails if library not available)
-        // This demonstrates that EFA library is loaded lazily at runtime
-        let result = ffi::test_efa_loading();
-        // The test passes regardless of whether EFA library is available
-        // The important thing is that it doesn't crash during compilation/linking
-        let _ = result;
-    }
-
-    #[test]
     fn gid_array_conversion() {
         let arr = [
             0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
