@@ -1606,7 +1606,7 @@ impl LocalMemorySlice {
         Self {
             _sge: ffi::ibv_sge {
                 addr,
-                length: len as u32,
+                length: len.try_into().unwrap(),
                 lkey: self.lkey(),
             },
         }
