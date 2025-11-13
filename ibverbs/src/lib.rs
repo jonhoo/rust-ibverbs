@@ -1565,7 +1565,7 @@ impl<T> MemoryRegion<T> {
         );
         let sge = ffi::ibv_sge {
             addr,
-            length: length as u32,
+            length: length.try_into().unwrap(),
             lkey: unsafe { *self.inner.mr }.lkey,
         };
         LocalMemorySlice { _sge: sge }
