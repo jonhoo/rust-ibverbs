@@ -1571,6 +1571,21 @@ impl<T> MemoryRegion<T> {
             lkey: unsafe { *self.inner.mr }.lkey,
         }
     }
+
+    /// Make a subslice of this memory region.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
+        let (addr, length) = calc_addr_len(
+            bounds,
+            unsafe { *self.inner.mr }.addr as u64,
+            unsafe { *self.inner.mr }.length,
+        );
+        let sge = ffi::ibv_sge {
+            addr,
+            length: length.try_into().unwrap(),
+            lkey: unsafe { *self.inner.mr }.lkey,
+        };
+        LocalMemorySlice { _sge: sge }
+    }
 }
 
 /// Local memory slice.
