@@ -1559,15 +1559,9 @@ impl<T> MemoryRegion<T> {
     /// Make a lifetime-independent slice representation of this memory region.
     /// Unlike `LocalMemorySlice`, this supports 64-bit memory region lengths.
     pub fn as_slice(&self) -> MemoryRegionSlice {
-        let bounds = (..unsafe { *self.inner.mr }.length);
-        let (addr, length) = calc_addr_len(
-            bounds,
-            unsafe { *self.inner.mr }.addr as u64,
-            unsafe { *self.inner.mr }.length,
-        );
         MemoryRegionSlice {
             addr,
-            length: length as u64,
+            length: unsafe { *self.inner.mr }.length as u64,
             lkey: unsafe { *self.inner.mr }.lkey,
         }
     }
@@ -1633,40 +1627,23 @@ impl LocalMemorySlice {
 /// Unlike `LocalMemorySlice`, this supports 64-bit memory region lengths.
 #[derive(Debug, Default, Copy, Clone)]
 pub struct MemoryRegionSlice {
-    addr: u64,
-    length: u64,
-    lkey: u32,
+    /// Memory region base address
+    pub addr: u64,
+    /// Memory region length
+    pub length: u64,
+    /// Memory region lkey
+    pub lkey: u32,
 }
 
 impl MemoryRegionSlice {
-    /// Get the address of the memory region.
-    pub fn addr(&self) -> u64 {
-        self.addr
-    }
-
-    /// Get the length of the memory region.
-    pub fn len(&self) -> usize {
-        self.length as usize
-    }
-
-    /// Get is_empty
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Get the local key of the memory region.
-    pub fn lkey(&self) -> u32 {
-        self.lkey
-    }
-
     /// Make a slice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
-        let (addr, len) = calc_addr_len(bounds, self.addr(), self.len());
+        let (addr, len) = calc_addr_len(bounds, self.addr, self.len());
         LocalMemorySlice {
             _sge: ffi::ibv_sge {
                 addr,
                 length: len.try_into().unwrap(),
-                lkey: self.lkey(),
+                lkey: self.lkey,
             },
         }
     }
