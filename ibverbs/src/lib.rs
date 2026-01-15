@@ -1560,7 +1560,7 @@ impl<T> MemoryRegion<T> {
     /// Unlike `LocalMemorySlice`, this supports 64-bit memory region lengths.
     pub fn as_slice(&self) -> MemoryRegionSlice {
         MemoryRegionSlice {
-            addr,
+            addr: unsafe { *self.inner.mr }.addr as u64,
             length: unsafe { *self.inner.mr }.length as u64,
             lkey: unsafe { *self.inner.mr }.lkey,
         }
@@ -1638,7 +1638,7 @@ pub struct MemoryRegionSlice {
 impl MemoryRegionSlice {
     /// Make a slice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
-        let (addr, len) = calc_addr_len(bounds, self.addr, self.len());
+        let (addr, len) = calc_addr_len(bounds, self.addr, self.length as usize);
         LocalMemorySlice {
             _sge: ffi::ibv_sge {
                 addr,
