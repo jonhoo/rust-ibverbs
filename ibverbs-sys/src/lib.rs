@@ -5,11 +5,7 @@
 // Suppress expected warnings from bindgen-generated code.
 // See https://github.com/rust-lang/rust-bindgen/issues/1651.
 #![allow(deref_nullptr)]
-// For Bazel builds, use pre-generated bindings
-// For Cargo builds, the build.rs generates these
-#[cfg(bazel)]
-include!("bindings.rs");
-#[cfg(not(bazel))]
+
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 /// An ibverb work completion.

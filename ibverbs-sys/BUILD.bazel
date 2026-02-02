@@ -1,20 +1,35 @@
 load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
 
 package(default_visibility = ["//visibility:public"])
 
+# Build script that generates bindings using system headers.
+# Runs outside sandbox (local=True) to access system headers and libclang.
+cargo_build_script(
+    name = "build_script",
+    srcs = ["build.rs"],
+    build_script_env = {
+        # Tell build.rs to use system headers instead of vendored rdma-core
+        "IBVERBS_USE_SYSTEM_HEADERS": "1",
+    },
+    edition = "2021",
+    # Run locally (not sandboxed) to access system headers and libclang
+    tags = ["local"],
+    deps = [
+        # bindgen from the parent workspace's crates
+        "@crates//:bindgen",
+    ],
+)
+
 # FFI bindings for libibverbs
-# Uses pre-generated bindings.rs (generated via: bindgen /usr/include/infiniband/verbs.h)
 rust_library(
     name = "ibverbs-sys",
     srcs = glob(["src/**/*.rs"]),
     crate_name = "ibverbs_sys",
     edition = "2021",
-    # Enable the 'bazel' cfg flag to use pre-generated bindings
-    crate_features = [],
     rustc_flags = [
-        "--cfg=bazel",
-        # Link against system libibverbs
         "-l", "ibverbs",
         "-L", "/usr/lib/x86_64-linux-gnu",
     ],
+    deps = [":build_script"],
 )
