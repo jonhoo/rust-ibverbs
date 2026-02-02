@@ -1,4 +1,4 @@
-load("@rules_rust//rust:defs.bzl", "rust_library")
+load("@rules_rust//rust:defs.bzl", "rust_binary", "rust_library")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -19,3 +19,12 @@ rust_library(
         "@crates//:serde",
     ],
 )
+
+# Loopback example for testing
+rust_binary(
+    name = "loopback",
+    srcs = ["examples/loopback.rs"],
+    edition = "2021",
+    deps = [":ibverbs"],
+)
+
