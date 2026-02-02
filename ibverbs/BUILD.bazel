@@ -1,0 +1,16 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Safe Rust wrapper for ibverbs
+rust_library(
+    name = "ibverbs",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "ibverbs",
+    edition = "2021",
+    deps = [
+        "//ibverbs-sys",
+        # These deps need to be provided by the consuming workspace
+        # via crate.annotation or direct deps
+    ],
+)

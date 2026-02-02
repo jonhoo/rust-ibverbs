@@ -1,0 +1,17 @@
+load("@rules_rust//rust:defs.bzl", "rust_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# FFI bindings for libibverbs
+# Uses pre-generated bindings.rs (generated via: bindgen /usr/include/infiniband/verbs.h)
+rust_library(
+    name = "ibverbs-sys",
+    srcs = glob(["src/**/*.rs"]),
+    crate_name = "ibverbs_sys",
+    edition = "2021",
+    # Enable the 'bazel' cfg flag to use pre-generated bindings
+    crate_features = [],
+    rustc_flags = ["--cfg=bazel"],
+    # Link against system libibverbs
+    linkopts = ["-libverbs"],
+)

@@ -1,0 +1,2 @@
+# Root BUILD file for rust-ibverbs
+package(default_visibility = ["//visibility:public"])
