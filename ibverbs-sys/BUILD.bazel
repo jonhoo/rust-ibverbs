@@ -4,15 +4,16 @@ load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen")
 
 package(default_visibility = ["//visibility:public"])
 
-# C library for ibverbs headers (system-installed libibverbs)
+# C library for ibverbs - uses vendored rdma-core headers, links against system libibverbs
 cc_library(
     name = "ibverbs_c_headers",
     srcs = ["empty.c"],
     hdrs = ["wrapper.h"],
     linkopts = ["-libverbs"],
+    deps = ["@rdma_core//:ibverbs_headers"],
 )
 
-# Generate FFI bindings from system verbs.h
+# Generate FFI bindings from vendored rdma-core headers
 rust_bindgen(
     name = "ibverbs_bindings_rs",
     bindgen_flags = [

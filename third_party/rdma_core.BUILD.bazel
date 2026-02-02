@@ -1,0 +1,37 @@
+# BUILD file for rdma-core headers
+# This exposes the libibverbs headers for bindgen
+
+load("@rules_cc//cc:defs.bzl", "cc_library")
+
+package(default_visibility = ["//visibility:public"])
+
+# Headers from libibverbs exposed as infiniband/*
+cc_library(
+    name = "libibverbs_headers",
+    hdrs = glob([
+        "libibverbs/*.h",
+    ]),
+    includes = ["."],
+    strip_include_prefix = "libibverbs",
+    include_prefix = "infiniband",
+)
+
+# Kernel headers exposed as infiniband/*
+cc_library(
+    name = "kernel_headers",
+    hdrs = glob([
+        "kernel-headers/rdma/*.h",
+    ]),
+    includes = ["."],
+    strip_include_prefix = "kernel-headers/rdma",
+    include_prefix = "infiniband",
+)
+
+# Combined headers for ibverbs
+cc_library(
+    name = "ibverbs_headers",
+    deps = [
+        ":kernel_headers",
+        ":libibverbs_headers",
+    ],
+)
