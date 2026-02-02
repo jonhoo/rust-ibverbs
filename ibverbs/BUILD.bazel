@@ -6,11 +6,16 @@ package(default_visibility = ["//visibility:public"])
 rust_library(
     name = "ibverbs",
     srcs = glob(["src/**/*.rs"]),
+    aliases = {
+        "//ibverbs-sys": "ffi",
+    },
+    crate_features = ["serde"],
     crate_name = "ibverbs",
     edition = "2021",
     deps = [
         "//ibverbs-sys",
-        # These deps need to be provided by the consuming workspace
-        # via crate.annotation or direct deps
+        # These deps should be provided by the consuming workspace's crates repository
+        "@crates//:nix",
+        "@crates//:serde",
     ],
 )

@@ -1,35 +1,64 @@
+load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_rust//rust:defs.bzl", "rust_library")
-load("@rules_rust//cargo:defs.bzl", "cargo_build_script")
+load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen")
 
 package(default_visibility = ["//visibility:public"])
 
-# Build script that generates bindings using system headers.
-# Runs outside sandbox (local=True) to access system headers and libclang.
-cargo_build_script(
-    name = "build_script",
-    srcs = ["build.rs"],
-    build_script_env = {
-        # Tell build.rs to use system headers instead of vendored rdma-core
-        "IBVERBS_USE_SYSTEM_HEADERS": "1",
-    },
-    edition = "2021",
-    # Run locally (not sandboxed) to access system headers and libclang
-    tags = ["local"],
-    deps = [
-        # bindgen from the parent workspace's crates
-        "@crates//:bindgen",
+# C library for ibverbs headers (system-installed libibverbs)
+cc_library(
+    name = "ibverbs_c_headers",
+    srcs = ["empty.c"],
+    hdrs = ["wrapper.h"],
+    linkopts = ["-libverbs"],
+)
+
+# Generate FFI bindings from system verbs.h
+rust_bindgen(
+    name = "ibverbs_bindings_rs",
+    bindgen_flags = [
+        "--no-layout-tests",
+        "--with-derive-default",
+        "--allowlist-function=ibv_.*",
+        "--allowlist-function=_ibv_.*",
+        "--allowlist-type=ibv_.*",
+        "--allowlist-var=IBV_LINK_LAYER_.*",
+        "--bitfield-enum=ibv_access_flags",
+        "--bitfield-enum=ibv_create_cq_wc_flags",
+        "--bitfield-enum=ibv_device_cap_flags",
+        "--bitfield-enum=ibv_odp_transport_cap_bits",
+        "--bitfield-enum=ibv_port_cap_flags",
+        "--bitfield-enum=ibv_port_cap_flags2",
+        "--bitfield-enum=ibv_qp_attr_mask",
+        "--bitfield-enum=ibv_qp_create_send_ops_flags",
+        "--bitfield-enum=ibv_qp_init_attr_mask",
+        "--bitfield-enum=ibv_qp_open_attr_mask",
+        "--bitfield-enum=ibv_raw_packet_caps",
+        "--bitfield-enum=ibv_rx_hash_fields",
+        "--bitfield-enum=ibv_send_flags",
+        "--bitfield-enum=ibv_srq_init_attr_mask",
+        "--bitfield-enum=ibv_wc_flags",
+        "--bitfield-enum=ibv_wq_attr_mask",
+        "--bitfield-enum=ibv_wq_flags",
+        "--bitfield-enum=ibv_xrcd_init_attr_mask",
+        "--default-enum-style=rust",
+        "--blocklist-type=ibv_wc",
     ],
+    cc_lib = ":ibverbs_c_headers",
+    header = "wrapper.h",
 )
 
 # FFI bindings for libibverbs
 rust_library(
     name = "ibverbs-sys",
-    srcs = glob(["src/**/*.rs"]),
+    srcs = [
+        "src/lib.rs",
+        ":ibverbs_bindings_rs",
+    ],
     crate_name = "ibverbs_sys",
     edition = "2021",
-    rustc_flags = [
-        "-l", "ibverbs",
-        "-L", "/usr/lib/x86_64-linux-gnu",
+    rustc_flags = ["--cfg=bazel"],
+    deps = [
+        ":ibverbs_c_headers",
     ],
-    deps = [":build_script"],
 )
+
