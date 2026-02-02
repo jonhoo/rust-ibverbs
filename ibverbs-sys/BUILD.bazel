@@ -11,7 +11,10 @@ rust_library(
     edition = "2021",
     # Enable the 'bazel' cfg flag to use pre-generated bindings
     crate_features = [],
-    rustc_flags = ["--cfg=bazel"],
-    # Link against system libibverbs
-    linkopts = ["-libverbs"],
+    rustc_flags = [
+        "--cfg=bazel",
+        # Link against system libibverbs
+        "-l", "ibverbs",
+        "-L", "/usr/lib/x86_64-linux-gnu",
+    ],
 )
