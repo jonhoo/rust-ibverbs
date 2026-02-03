@@ -3,9 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn main() {
-    // Tell cargo about the custom cfg flag used for Bazel builds
-    println!("cargo::rustc-check-cfg=cfg(bazel)");
-
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("failed to get current directory");
     println!("cargo:include={manifest_dir}/vendor/rdma-core/build/include");
     println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
