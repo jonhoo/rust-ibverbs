@@ -14,8 +14,9 @@ cc_library(
 )
 
 # Generate FFI bindings directly from rdma-core verbs.h
+# Named "bindings" so output is bindings.rs (matching Cargo's OUT_DIR/bindings.rs)
 rust_bindgen(
-    name = "ibverbs_bindings_rs",
+    name = "bindings",
     bindgen_flags = [
         "--no-layout-tests",
         "--with-derive-default",
@@ -53,11 +54,15 @@ rust_library(
     name = "ibverbs-sys",
     srcs = [
         "src/lib.rs",
-        ":ibverbs_bindings_rs",
     ],
+    compile_data = [":bindings"],
     crate_name = "ibverbs_sys",
     edition = "2021",
-    rustc_flags = ["--cfg=bazel"],
+    rustc_env = {
+        # Set OUT_DIR relative to src/ directory where lib.rs lives
+        # bindings.rs is at ibverbs-sys/bindings.rs, lib.rs is at ibverbs-sys/src/lib.rs
+        "OUT_DIR": "..",
+    },
     deps = [
         ":ibverbs_c",
     ],
