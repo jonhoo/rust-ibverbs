@@ -90,4 +90,3 @@ fn main() {
         .write_to_file(out_path.join("bindings.rs"))
         .expect("Could not write bindings");
 }
-
