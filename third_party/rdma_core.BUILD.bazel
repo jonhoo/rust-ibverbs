@@ -5,6 +5,9 @@ load("@rules_cc//cc:defs.bzl", "cc_library")
 
 package(default_visibility = ["//visibility:public"])
 
+# Export verbs.h for direct use by rust_bindgen
+exports_files(["libibverbs/verbs.h"])
+
 # Headers from libibverbs exposed as infiniband/*
 cc_library(
     name = "libibverbs_headers",
