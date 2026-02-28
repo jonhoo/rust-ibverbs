@@ -2,29 +2,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-fn main() {
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("failed to get current directory");
-    println!("cargo:include={manifest_dir}/vendor/rdma-core/build/include");
-    println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
-    println!("cargo:rustc-link-lib=ibverbs");
-
-    if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
-        // don't touch source dir if not necessary
-    } else if Path::new(".git").is_dir() {
-        // initialize and update submodules
-        Command::new("git")
-            .args(["submodule", "update", "--init"])
-            .status()
-            .expect("Failed to update submodules.");
-    } else {
-        assert!(
-            Path::new("vendor/rdma-core").is_dir(),
-            "vendor source not included"
-        );
-    }
-
-    // build vendor/rdma-core
-    // note that we only build it to generate the bindings!
+fn build_vendored_rdma() -> String {
     eprintln!("run cmake");
     let built_in = cmake::Config::new("vendor/rdma-core")
         .define("NO_MAN_PAGES", "1")
@@ -43,14 +21,63 @@ fn main() {
         .no_build_target(true)
         .build();
     let built_in = built_in
-        .to_str()
+        .into_os_string()
+        .into_string()
         .expect("build directory path is not valid UTF-8");
+
+    built_in
+}
+
+fn update_submodule() {
+    if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
+        // don't touch source dir if not necessary
+    } else if Path::new(".git").is_dir() {
+        // initialize and update submodules
+        Command::new("git")
+            .args(["submodule", "update", "--init"])
+            .status()
+            .expect("Failed to update submodules.");
+    } else {
+        assert!(
+            Path::new("vendor/rdma-core").is_dir(),
+            "vendor source not included"
+        );
+    }
+}
+
+fn main() {
+    println!("cargo:rustc-link-lib=ibverbs");
+
+    let rdma_core_include_dir = if let Ok(rdma_core_include_dir) = env::var("RDMA_CORE_INCLUDE_DIR")
+    {
+        let rdma_core_lib_dir = env::var("RDMA_CORE_LIB_DIR").expect(
+            "When supplying RDMA_CORE_INCLUDE_DIR, you also need to supply RDMA_CORE_LIB_DIR",
+        );
+        println!("cargo:include={rdma_core_include_dir}");
+        println!("cargo:rustc-link-search=native={rdma_core_lib_dir}");
+        rdma_core_include_dir
+    } else {
+        // build vendor/rdma-core
+        // note that we only build it to generate the bindings!
+        update_submodule();
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("failed to get current directory");
+        println!("cargo:include={manifest_dir}/vendor/rdma-core/build/include");
+        println!("cargo:rustc-link-search=native={manifest_dir}/vendor/rdma-core/build/lib");
+        format!("{}/include/", build_vendored_rdma())
+    };
+
+    let ibverbs_header_dir = if let Ok(ibverbs_header_dir) = env::var("IBVERBS_HEADER_DIR") {
+        ibverbs_header_dir
+    } else {
+        update_submodule();
+        "vendor/rdma-core/libibverbs".to_string()
+    };
 
     // generate the bindings
     eprintln!("run bindgen");
     let bindings = bindgen::Builder::default()
-        .header("vendor/rdma-core/libibverbs/verbs.h")
-        .clang_arg(format!("-I{built_in}/include/"))
+        .header(format!("{ibverbs_header_dir}/verbs.h"))
+        .clang_arg(format!("-I{rdma_core_include_dir}"))
         .allowlist_function("ibv_.*")
         .allowlist_function("_ibv_.*")
         .allowlist_type("ibv_.*")
