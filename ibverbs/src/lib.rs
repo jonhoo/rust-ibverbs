@@ -735,6 +735,8 @@ pub struct QueuePairBuilder {
     rq_psn: Option<u32>,
     /// service level (0-15). Higher value means higher priority.
     service_level: u8,
+    /// shared receive queue
+    srq: Option<SharedReceiveQueue>,
 }
 
 impl QueuePairBuilder {
@@ -797,6 +799,7 @@ impl QueuePairBuilder {
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(0),
             service_level: 0,
+            srq: None,
         }
     }
 
@@ -994,6 +997,12 @@ impl QueuePairBuilder {
         self
     }
 
+    /// Set the Shared Receive Queue (SRQ) associated with this QP.
+    pub fn set_srq(&mut self, srq: &SharedReceiveQueue) -> &mut Self {
+        self.srq = Some(srq.clone());
+        self
+    }
+
     /// Set the number of outstanding RDMA reads & atomic operations on the destination Queue Pair.
     ///
     /// This defaults to 1.
@@ -1118,7 +1127,11 @@ impl QueuePairBuilder {
             qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
             send_cq: self.send.cq as *const _ as *mut _,
             recv_cq: self.recv.cq as *const _ as *mut _,
-            srq: ptr::null::<ffi::ibv_srq>() as *mut _,
+            srq: self
+                .srq
+                .as_ref()
+                .map(|s| s.inner.srq)
+                .unwrap_or(ptr::null_mut()),
             cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
@@ -1138,6 +1151,7 @@ impl QueuePairBuilder {
                 lid: self.port_attr.lid,
                 qp: QueuePair {
                     pd: self.pd.clone(),
+                    _srq: self.srq.clone(),
                     qp,
                 },
                 gid_index: self.gid_index,
@@ -1848,6 +1862,131 @@ impl ProtectionDomain {
             Ok(MemoryRegion { inner, data: () })
         }
     }
+
+    /// Creates a shared receive queue (SRQ) associated with this protection domain.
+    ///
+    /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
+    /// `max_sge` is the maximum number of scatter/gather elements per work request.
+    /// `srq_limit` is the limit value of the SRQ (only valid for asynchronous events).
+    ///
+    /// See also [RDMAmojo's `ibv_create_srq` documentation][1] and the [man page][2].
+    ///
+    /// [1]: https://www.rdmamojo.com/2013/01/30/ibv_create_srq/
+    /// [2]: https://man7.org/linux/man-pages/man3/ibv_create_srq.3.html
+    pub fn create_srq(
+        &self,
+        max_wr: u32,
+        max_sge: u32,
+        srq_limit: u32,
+    ) -> io::Result<SharedReceiveQueue> {
+        let mut srq_init_attr = ffi::ibv_srq_init_attr {
+            srq_context: ptr::null_mut(),
+            attr: ffi::ibv_srq_attr {
+                max_wr,
+                max_sge,
+                srq_limit,
+            },
+        };
+        let srq = unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) };
+        if srq.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(SharedReceiveQueue {
+                inner: Arc::new(SharedReceiveQueueInner {
+                    _pd: self.inner.clone(),
+                    srq,
+                }),
+            })
+        }
+    }
+}
+
+struct SharedReceiveQueueInner {
+    _pd: Arc<ProtectionDomainInner>,
+    srq: *mut ffi::ibv_srq,
+}
+
+unsafe impl Sync for SharedReceiveQueueInner {}
+unsafe impl Send for SharedReceiveQueueInner {}
+
+impl Drop for SharedReceiveQueueInner {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_destroy_srq(self.srq) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{e}");
+        }
+    }
+}
+
+/// A shared receive queue (SRQ) that allows sharing receive buffers across multiple queue pairs.
+#[derive(Clone)]
+pub struct SharedReceiveQueue {
+    inner: Arc<SharedReceiveQueueInner>,
+}
+
+impl SharedReceiveQueue {
+    /// Posts a linked list of Work Requests (WRs) to this Shared Receive Queue (SRQ).
+    ///
+    /// Generates a HW-specific Receive Request out of it and adds it to the tail of the SRQ
+    /// without performing any context switch. The RDMA device will take one of those Work Requests
+    /// as soon as an incoming opcode to any Queue Pair (QP) associated with this SRQ consumes a
+    /// Receive Request (RR). If there is a failure in one of the WRs because the SRQ is full or
+    /// one of the attributes in the WR is bad, it stops immediately and returns the pointer to that
+    /// WR.
+    ///
+    /// `wr_id` is a 64-bit value associated with this WR. When a Work Completion is generated
+    /// when this Work Request ends, it will contain this value.
+    ///
+    /// Internally, the memory at `local[range]` will be received into as a single `ibv_recv_wr`.
+    ///
+    /// If a WR is being posted to a UD QP associated with an SRQ, the Global Routing Header (GRH)
+    /// of the incoming message will be placed in the first 40 bytes of the buffer(s) in the
+    /// scatter list. If no GRH is present in the incoming message, then the first bytes will be
+    /// undefined. This means that in all cases, the actual data of the incoming message will start
+    /// at an offset of 40 bytes into the buffer(s) in the scatter list.
+    ///
+    /// See also [RDMAmojo's `ibv_post_srq_recv` documentation][1] and the [man page][2].
+    ///
+    /// # Safety
+    ///
+    /// The memory region can only be safely reused or dropped after the request is fully executed
+    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
+    /// until `CompletionQueue::poll` returns a completion for this receive).
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in the Work Request.
+    ///  - `ENOMEM`: Receive Queue is full or not enough resources to complete this operation.
+    ///  - `EFAULT`: Invalid value provided in `SharedReceiveQueue`.
+    ///
+    /// [1]: https://www.rdmamojo.com/2013/02/08/ibv_post_srq_recv/
+    /// [2]: https://man7.org/linux/man-pages/man3/ibv_post_srq_recv.3.html
+    #[inline]
+    pub unsafe fn post_receive(&self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
+        let mut wr = ffi::ibv_recv_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
+        };
+        let mut bad_wr = ptr::null_mut();
+
+        let ctx = unsafe { *self.inner.srq }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_srq_recv.as_mut().unwrap()(
+                self.inner.srq,
+                &mut wr as *mut _,
+                &mut bad_wr as *mut _,
+            )
+        };
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
+        }
+    }
 }
 
 /// A fully initialized and ready `QueuePair`.
@@ -1860,6 +1999,7 @@ impl ProtectionDomain {
 #[must_use = "QueuePair is immediately destroyed via drop() unless assigned to a variable"]
 pub struct QueuePair {
     pd: Arc<ProtectionDomainInner>,
+    _srq: Option<SharedReceiveQueue>,
     qp: *mut ffi::ibv_qp,
 }
 
