@@ -2008,6 +2008,11 @@ unsafe impl Send for QueuePair {}
 unsafe impl Sync for QueuePair {}
 
 impl QueuePair {
+    /// Returns the local QP number of this QueuePair.
+    pub fn qp_num(&self) -> u32 {
+        unsafe { *self.qp }.qp_num
+    }
+
     /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
     ///
     /// Generates a HW-specific Send Request for the memory at `mr[range]`, and adds it to the tail
