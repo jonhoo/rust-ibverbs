@@ -1678,6 +1678,7 @@ unsafe impl Send for ProtectionDomainInner {}
 
 /// A protection domain for a device's context.
 #[must_use]
+#[derive(Clone)]
 pub struct ProtectionDomain {
     inner: Arc<ProtectionDomainInner>,
 }
