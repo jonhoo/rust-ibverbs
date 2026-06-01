@@ -1570,6 +1570,16 @@ impl<T> MemoryRegion<T> {
         self.data
     }
 
+    /// Make a lifetime-independent slice representation of this memory region.
+    /// Unlike `LocalMemorySlice`, this supports 64-bit memory region lengths.
+    pub fn as_slice(&self) -> MemoryRegionSlice {
+        MemoryRegionSlice {
+            addr: unsafe { *self.inner.mr }.addr as u64,
+            length: unsafe { *self.inner.mr }.length as u64,
+            lkey: unsafe { *self.inner.mr }.lkey,
+        }
+    }
+
     /// Make a subslice of this memory region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) = calc_addr_len(
@@ -1622,6 +1632,32 @@ impl LocalMemorySlice {
                 addr,
                 length: len.try_into().unwrap(),
                 lkey: self.lkey(),
+            },
+        }
+    }
+}
+
+/// Lifetime-independent slice representation of a memory region.
+/// Unlike `LocalMemorySlice`, this supports 64-bit memory region lengths.
+#[derive(Debug, Default, Copy, Clone)]
+pub struct MemoryRegionSlice {
+    /// Memory region base address
+    pub addr: u64,
+    /// Memory region length
+    pub length: u64,
+    /// Memory region lkey
+    pub lkey: u32,
+}
+
+impl MemoryRegionSlice {
+    /// Make a slice of this memory region.
+    pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
+        let (addr, len) = calc_addr_len(bounds, self.addr, self.length as usize);
+        LocalMemorySlice {
+            _sge: ffi::ibv_sge {
+                addr,
+                length: len.try_into().unwrap(),
+                lkey: self.lkey,
             },
         }
     }
