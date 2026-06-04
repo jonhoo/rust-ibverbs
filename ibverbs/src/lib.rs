@@ -533,6 +533,7 @@ unsafe impl Sync for CompletionQueueInner {}
 
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
 #[must_use]
+#[derive(Clone)]
 pub struct CompletionQueue {
     inner: Arc<CompletionQueueInner>,
 }
