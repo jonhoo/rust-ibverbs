@@ -81,6 +81,7 @@ const PORT_NUM: u8 = 1;
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
 pub use ffi::ibv_qp_type;
+pub use ffi::ibv_send_wr;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
 pub use ffi::ibv_wc_status;
@@ -2233,6 +2234,36 @@ impl QueuePair {
             Ok(())
         }
     }
+
+    /// Create a builder to post a chain of work requests to the Send Queue.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice, ibv_send_wr};
+    /// fn write_payload_and_signal_done(
+    ///     qp: &mut QueuePair,
+    ///     data: LocalMemorySlice,
+    ///     remote_dest: RemoteMemorySlice,
+    ///     done_notification: LocalMemorySlice,
+    /// ) -> std::io::Result<()> {
+    ///     let mut wrs = [ibv_send_wr::default(); 2];
+    ///
+    ///     unsafe {
+    ///         qp.send_chain(&mut wrs)
+    ///             .write(&[data], remote_dest, 1, None)
+    ///             .send(&[done_notification], 2)
+    ///             .post()
+    ///     }?;
+    ///     Ok(())
+    /// }
+    /// ```
+    pub fn send_chain<'qp, 'buf>(
+        &'qp mut self,
+        buffer: &'buf mut [ffi::ibv_send_wr],
+    ) -> ChainBuilder<'qp, 'buf> {
+        ChainBuilder::new(self, buffer)
+    }
 }
 
 impl Drop for QueuePair {
@@ -2242,6 +2273,183 @@ impl Drop for QueuePair {
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{e}");
+        }
+    }
+}
+
+/// A builder to construct and post a dynamically sized chain of work requests to the Send Queue.
+pub struct ChainBuilder<'qp, 'buf> {
+    qp: &'qp mut QueuePair,
+    buffer: &'buf mut [ffi::ibv_send_wr],
+    len: usize,
+    error: Option<io::Error>,
+}
+
+impl<'qp, 'buf> ChainBuilder<'qp, 'buf> {
+    fn new(qp: &'qp mut QueuePair, buffer: &'buf mut [ffi::ibv_send_wr]) -> Self {
+        Self {
+            qp,
+            buffer,
+            len: 0,
+            error: None,
+        }
+    }
+
+    fn push(&mut self, mut wr: ffi::ibv_send_wr) {
+        if self.error.is_some() {
+            return;
+        }
+        if self.len >= self.buffer.len() {
+            self.error = Some(io::Error::new(
+                io::ErrorKind::OutOfMemory,
+                "ChainBuilder buffer capacity exceeded",
+            ));
+            return;
+        }
+        wr.next = ptr::null_mut();
+        self.buffer[self.len] = wr;
+
+        if self.len > 0 {
+            let next_ptr = &mut self.buffer[self.len] as *mut ffi::ibv_send_wr;
+            self.buffer[self.len - 1].next = next_ptr;
+        }
+        self.len += 1;
+    }
+
+    /// Add a Send work request to the chain.
+    ///
+    /// For more info, see [`QueuePair::post_send`].
+    pub fn send(mut self, local: &'buf [LocalMemorySlice], wr_id: u64) -> Self {
+        let wr = ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
+            opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
+            send_flags: 0, // Unsignaled; post() sets IBV_SEND_SIGNALED on the last WR
+            wr: Default::default(),
+            qp_type: Default::default(),
+            __bindgen_anon_1: Default::default(),
+            __bindgen_anon_2: Default::default(),
+        };
+
+        self.push(wr);
+        self
+    }
+
+    /// Add an RDMA Write work request to the chain.
+    ///
+    /// Immediate data can be used to signal the completion of the write operation.
+    /// The other side uses `post_recv` on a dummy buffer and receives the immediate data
+    /// from the corresponding work completion.
+    ///
+    /// For more info, see [`QueuePair::post_write`].
+    pub fn write(
+        mut self,
+        local: &'buf [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        imm_data: Option<u32>,
+    ) -> Self {
+        let opcode = if imm_data.is_some() {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+        } else {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
+        };
+        self._push_one_sided(local, remote, wr_id, opcode, imm_data);
+        self
+    }
+
+    /// Add an RDMA Read work request to the chain.
+    ///
+    /// RDMA read does not support immediate data.
+    ///
+    /// For more info, see [`QueuePair::post_read`].
+    pub fn read(
+        mut self,
+        local: &'buf [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+    ) -> Self {
+        let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
+        self._push_one_sided(local, remote, wr_id, opcode, None);
+        self
+    }
+
+    // Helper function to build and push one-sided (RDMA Read/Write) work requests
+    fn _push_one_sided(
+        &mut self,
+        local: &'buf [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        imm_data: Option<u32>,
+    ) {
+        let anon_1 = if let Some(imm) = imm_data {
+            ffi::ibv_send_wr__bindgen_ty_1 {
+                imm_data: imm.to_be(),
+            }
+        } else {
+            Default::default()
+        };
+
+        let wr = ffi::ibv_send_wr {
+            wr_id,
+            next: ptr::null_mut(),
+            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+            num_sge: local.len() as i32,
+            opcode,
+            send_flags: 0, // Unsignaled; post() sets IBV_SEND_SIGNALED on the last WR
+            wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                    remote_addr: remote.addr,
+                    rkey: remote.rkey,
+                },
+            },
+            qp_type: Default::default(),
+            __bindgen_anon_1: anon_1,
+            __bindgen_anon_2: Default::default(),
+        };
+
+        self.push(wr);
+    }
+
+    /// Post the chain of work requests to the QueuePair.
+    ///
+    /// This method automatically links the work requests together, setting only
+    /// the last operation as signaled (`IBV_SEND_SIGNALED`) to generate a single CQ event
+    /// for the entire chain.
+    ///
+    /// # Safety
+    ///
+    /// The memory regions can only be safely reused or dropped after the requests are fully executed
+    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
+    /// until `CompletionQueue::poll` returns a completion for this send).
+    pub unsafe fn post(self) -> io::Result<()> {
+        if let Some(err) = self.error {
+            return Err(err);
+        }
+        if self.len == 0 {
+            return Ok(());
+        }
+
+        // Signal only the very last request in the chain to generate a single CQ event
+        self.buffer[self.len - 1].send_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
+        let ctx = unsafe { *self.qp.qp }.context;
+        let ops = &mut unsafe { *ctx }.ops;
+        let errno = unsafe {
+            ops.post_send.as_mut().unwrap()(
+                self.qp.qp,
+                self.buffer.as_mut_ptr(),
+                &mut bad_wr as *mut _,
+            )
+        };
+        if errno != 0 {
+            Err(io::Error::from_raw_os_error(errno))
+        } else {
+            Ok(())
         }
     }
 }
