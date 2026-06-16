@@ -1,4 +1,8 @@
-use ibverbs::{ibv_send_wr, LocalMemorySlice, RemoteMemorySlice};
+//! An example showcasing how to chain multiple Work Requests (WRs) together
+//! into a single linked list and post them to the Send Queue using the `post` API,
+//! with only the final operation generating a Completion Queue Event (CQE).
+
+use ibverbs::{LocalMemorySlice, RemoteMemorySlice, WorkRequest};
 
 const RECEIVE_NOTIFICATION_WR_ID: u64 = 100;
 const NOTIFY_BUF_SIZE: usize = std::mem::size_of::<u32>();
@@ -50,21 +54,14 @@ fn main() {
     unsafe { qp.post_receive(&[recv_mr.slice(..)], RECEIVE_NOTIFICATION_WR_ID) }.unwrap();
 
     // 6. Split the string into slices by space delimiter and prepare the notification payload
-    let locals: Vec<[LocalMemorySlice; 1]> = text
+    let (locals, remotes): (Vec<[LocalMemorySlice; 1]>, Vec<RemoteMemorySlice>) = text
         .split_inclusive(|&b| b == b' ')
         .map(|sub| {
             let offset = sub.as_ptr() as usize - text.as_ptr() as usize;
-            [src_mr.slice(offset..offset + sub.len())]
+            let range = offset..offset + sub.len();
+            ([src_mr.slice(range.clone())], dest_mr.remote().slice(range))
         })
-        .collect();
-
-    let remotes: Vec<RemoteMemorySlice> = text
-        .split_inclusive(|&b| b == b' ')
-        .map(|sub| {
-            let offset = sub.as_ptr() as usize - text.as_ptr() as usize;
-            dest_mr.remote().slice(offset..offset + sub.len())
-        })
-        .collect();
+        .unzip();
 
     let num_writes = locals.len();
     let send_chain_completion_wr_id = (num_writes + 1) as u64;
@@ -75,19 +72,22 @@ fn main() {
     let notify_slice = [notify_mr.slice(..)];
 
     // 7. Build and post the chain of work requests
-    // Allocate the WR buffer dynamically based on the total number of send requests
-    let mut wrs = vec![ibv_send_wr::default(); total_send_wrs];
+    let mut wrs = Vec::with_capacity(total_send_wrs);
 
-    let mut chain = qp.send_chain(&mut wrs);
     // Chain the RDMA Write operations for each word segment
     for i in 0..num_writes {
-        chain = chain.write(&locals[i], remotes[i].clone(), (i + 1) as u64, None);
+        wrs.push(WorkRequest::write(
+            &locals[i],
+            remotes[i].clone(),
+            (i + 1) as u64,
+            None,
+        ));
     }
     // Append the final Send operation to signal completion of the chain and carry the write count
-    chain = chain.send(&notify_slice, send_chain_completion_wr_id);
+    wrs.push(WorkRequest::send(&notify_slice, send_chain_completion_wr_id, None).signaled());
 
     // Post the completed chain to the Queue Pair
-    unsafe { chain.post() }.unwrap();
+    unsafe { qp.post(&mut wrs) }.unwrap();
 
     // 8. Poll completion queue until both the send chain and the receive completion are done.
     // Note that because the writes and the send are chained, only the last operation (the Send)

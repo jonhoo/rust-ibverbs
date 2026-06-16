@@ -1992,6 +1992,165 @@ impl SharedReceiveQueue {
     }
 }
 
+/// A single work request wrapper that binds the lifetime of the local buffer.
+#[repr(transparent)]
+pub struct WorkRequest<'local> {
+    wr: ffi::ibv_send_wr,
+    /// `ffi::ibv_send_wr` contains a raw pointer (`sg_list`) to the local memory slice.
+    /// `PhantomData` ensures the compiler knows this struct logically borrows the slice,
+    /// preventing the slice from being dropped or moved while the `WorkRequest` exists.
+    _local: std::marker::PhantomData<&'local [LocalMemorySlice]>,
+}
+
+impl<'local> WorkRequest<'local> {
+    /// Create a Send work request.
+    #[inline]
+    pub fn send(local: &'local [LocalMemorySlice], wr_id: u64, imm: Option<u32>) -> Self {
+        let opcode = if imm.is_some() {
+            ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM
+        } else {
+            ffi::ibv_wr_opcode::IBV_WR_SEND
+        };
+        let anon_1 = if let Some(imm_data) = imm {
+            ffi::ibv_send_wr__bindgen_ty_1 {
+                imm_data: imm_data.to_be(),
+            }
+        } else {
+            Default::default()
+        };
+
+        Self {
+            wr: ffi::ibv_send_wr {
+                wr_id,
+                next: ptr::null_mut(),
+                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                num_sge: local.len() as i32,
+                opcode,
+                send_flags: 0,
+                wr: Default::default(),
+                qp_type: Default::default(),
+                __bindgen_anon_1: anon_1,
+                __bindgen_anon_2: Default::default(),
+            },
+            _local: std::marker::PhantomData,
+        }
+    }
+
+    // Helper function to build one-sided (RDMA Read/Write) work requests
+    #[inline]
+    fn _one_sided(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        imm: Option<u32>,
+    ) -> Self {
+        let anon_1 = if let Some(imm_data) = imm {
+            ffi::ibv_send_wr__bindgen_ty_1 {
+                imm_data: imm_data.to_be(),
+            }
+        } else {
+            Default::default()
+        };
+
+        Self {
+            wr: ffi::ibv_send_wr {
+                wr_id,
+                next: ptr::null_mut(),
+                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                num_sge: local.len() as i32,
+                opcode,
+                send_flags: 0,
+                wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                    rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+                        remote_addr: remote.addr,
+                        rkey: remote.rkey,
+                    },
+                },
+                qp_type: Default::default(),
+                __bindgen_anon_1: anon_1,
+                __bindgen_anon_2: Default::default(),
+            },
+            _local: std::marker::PhantomData,
+        }
+    }
+
+    /// Create an RDMA Write work request.
+    #[inline]
+    pub fn write(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        imm: Option<u32>,
+    ) -> Self {
+        let opcode = if imm.is_some() {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+        } else {
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
+        };
+        Self::_one_sided(local, remote, wr_id, opcode, imm)
+    }
+
+    /// Create an RDMA Read work request.
+    #[inline]
+    pub fn read(local: &'local [LocalMemorySlice], remote: RemoteMemorySlice, wr_id: u64) -> Self {
+        Self::_one_sided(
+            local,
+            remote,
+            wr_id,
+            ffi::ibv_wr_opcode::IBV_WR_RDMA_READ,
+            None,
+        )
+    }
+
+    /// Set the `IBV_SEND_FENCE` flag.
+    ///
+    /// Prevents this Work Request from being processed until all prior RDMA Read and Atomic
+    /// operations on this Queue Pair have completed.
+    #[inline]
+    pub fn fenced(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
+        self
+    }
+
+    /// Set the `IBV_SEND_SIGNALED` flag.
+    ///
+    /// Generates a Completion Queue Entry (CQE) when this Work Request completes.
+    #[inline]
+    pub fn signaled(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+        self
+    }
+
+    /// Set the `IBV_SEND_SOLICITED` flag.
+    ///
+    /// Generates a Solicited Event on the remote side, waking up the receiver if they are
+    /// waiting on a completion channel for solicited events.
+    #[inline]
+    pub fn solicited(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_SOLICITED.0;
+        self
+    }
+
+    /// Set the `IBV_SEND_INLINE` flag.
+    ///
+    /// The payload is copied directly into the Send Queue (WQE) rather than being DMA'd
+    /// from host memory. Useful for small messages to reduce latency.
+    #[inline]
+    pub fn inline(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_INLINE.0;
+        self
+    }
+
+    /// Set the `IBV_SEND_IP_CSUM` flag.
+    ///
+    /// Instructs the NIC to offload IPv4 and TCP/UDP checksum calculation for Raw Ethernet Queue Pairs.
+    #[inline]
+    pub fn ip_csum(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_IP_CSUM.0;
+        self
+    }
+}
 /// A fully initialized and ready `QueuePair`.
 ///
 /// A queue pair is the actual object that sends and receives data in the RDMA architecture
@@ -2015,79 +2174,25 @@ impl QueuePair {
         unsafe { *self.qp }.qp_num
     }
 
-    /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
-    ///
-    /// Generates a HW-specific Send Request for the memory at `mr[range]`, and adds it to the tail
-    /// of the Queue Pair's Send Queue without performing any context switch. The RDMA device will
-    /// handle it (later) in asynchronous way. If there is a failure in one of the WRs because the
-    /// Send Queue is full or one of the attributes in the WR is bad, it stops immediately and
-    /// return the pointer to that WR.
+    /// Posts a single send Work Request (WR) containing a scatter-gather list of local
+    /// memory slices to the Send Queue of this Queue Pair.
     ///
     /// `wr_id` is a 64 bits value associated with this WR. If a Work Completion will be generated
     /// when this Work Request ends, it will contain this value.
     ///
-    /// Internally, the memory at `mr[range]` will be sent as a single `ibv_send_wr` using
-    /// `IBV_WR_SEND`. The send has `IBV_SEND_SIGNALED` set, so a work completion will also be
-    /// triggered as a result of this send.
-    ///
-    /// See also [RDMAmojo's `ibv_post_send` documentation][1].
-    ///
+    /// Internally, this is a convenience wrapper around [`post`](Self::post). The local memory
+    /// slices will be sent as a single `ibv_send_wr` using `IBV_WR_SEND`. The send has
+    /// `IBV_SEND_SIGNALED` set, so a work completion will also be triggered as a result of this send.
     /// # Safety
     ///
-    /// The memory region can only be safely reused or dropped after the request is fully executed
-    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
-    /// until `CompletionQueue::poll` returns a completion for this send).
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid value provided in the Work Request.
-    ///  - `ENOMEM`: Send Queue is full or not enough resources to complete this operation.
-    ///  - `EFAULT`: Invalid value provided in `QueuePair`.
-    ///
-    /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
+    /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
     #[inline]
     pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
-        let mut wr = ffi::ibv_send_wr {
-            wr_id,
-            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: local.len() as i32,
-            opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
-            wr: Default::default(),
-            qp_type: Default::default(),
-            __bindgen_anon_1: Default::default(),
-            __bindgen_anon_2: Default::default(),
-        };
-        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
-
-        // TODO:
-        //
-        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
-        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
-        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
-        // returns this failing WR through bad_wr.
-        //
-        // The user should not alter or destroy AHs associated with WRs until request is fully
-        // executed and  a  work  completion  has been retrieved from the corresponding completion
-        // queue (CQ) to avoid unexpected behavior.
-        //
-        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
-        // immediately after the call returns.
-
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
-        };
-        if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
-        } else {
-            Ok(())
-        }
+        self.post([WorkRequest::send(local, wr_id, None).signaled()])
     }
 
-    /// Posts a linked list of Work Requests (WRs) to the Receive Queue of this Queue Pair.
+    /// Posts a single receive Work Request (WR) containing a scatter-gather list of local
+    /// memory slices to the Receive Queue of this Queue Pair.
     ///
     /// Generates a HW-specific Receive Request out of it and add it to the tail of the Queue
     /// Pair's Receive Queue without performing any context switch. The RDMA device will take one
@@ -2099,9 +2204,9 @@ impl QueuePair {
     /// `wr_id` is a 64 bits value associated with this WR. When a Work Completion is generated
     /// when this Work Request ends, it will contain this value.
     ///
-    /// Internally, the memory at `mr[range]` will be received into as a single `ibv_recv_wr`.
+    /// Internally, the local memory slices will be received into as a single `ibv_recv_wr`.
     ///
-    /// See also [DDMAmojo's `ibv_post_recv` documentation][1].
+    /// See also [RDMAmojo's `ibv_post_recv` documentation][1].
     ///
     /// # Safety
     ///
@@ -2156,113 +2261,165 @@ impl QueuePair {
 
     #[inline]
     /// Remote RDMA write.
-    /// immediate data can be used to signal the completion of the write operation
-    /// the other side uses post_recv on a dummy buffer and get the imm data from the work completion
-    pub fn post_write(
+    ///
+    /// Immediate data can be used to signal the completion of the write operation.
+    /// The other side uses `post_recv` on a dummy buffer and gets the imm data from the work completion.
+    ///
+    /// Internally, this is a convenience wrapper around [`post`](Self::post).
+    ///
+    /// # Safety
+    ///
+    /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
+    pub unsafe fn post_write(
         &mut self,
         local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         wr_id: u64,
         imm_data: Option<u32>,
     ) -> io::Result<()> {
-        let opcode = if imm_data.is_some() {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
-        } else {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
-        };
-
-        self._post_one_sided(local, remote, wr_id, opcode, imm_data)
+        self.post([WorkRequest::write(local, remote, wr_id, imm_data).signaled()])
     }
 
     #[inline]
     /// Remote RDMA read.
+    ///
     /// RDMA read does not support immediate data.
-    pub fn post_read(
+    ///
+    /// Internally, this is a convenience wrapper around [`post`](Self::post).
+    ///
+    /// # Safety
+    ///
+    /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
+    pub unsafe fn post_read(
         &mut self,
         local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         wr_id: u64,
     ) -> io::Result<()> {
-        let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
-        self._post_one_sided(local, remote, wr_id, opcode, None)
+        self.post([WorkRequest::read(local, remote, wr_id).signaled()])
     }
 
-    // internal function to do one sided communication
-    fn _post_one_sided(
+    /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
+    ///
+    /// This method modifies `wrs` to link the work requests together.
+    ///
+    /// Unlike the simpler helper methods (such as [`post_send`](Self::post_send)), it does *not*
+    /// automatically set the signaled flag (`IBV_SEND_SIGNALED`) on the last request. The caller
+    /// must explicitly call [`.signaled()`](WorkRequest::signaled) on the work requests for which
+    /// they want to generate a Completion Queue Entry (CQE) in the Completion Queue (CQ).
+    ///
+    /// Generates HW-specific Send Requests and adds them to the tail of the Queue Pair's Send
+    /// Queue without performing any context switch. The RDMA device will handle them (later) in an
+    /// asynchronous way. If there is a failure in one of the WRs because the Send Queue is full or
+    /// one of the attributes in the WR is bad, it stops immediately and returns an error.
+    ///
+    /// Each `WorkRequest` contains a `wr_id` (a 64-bit value). If a Work Completion is generated
+    /// when a Work Request completes, the completion will contain this value.
+    ///
+    /// See also [RDMAmojo's `ibv_post_send` documentation][1].
+    ///
+    /// # Examples
+    ///
+    /// Passing an inline array by value (ideal for a fixed number of operations):
+    /// ```no_run
+    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice, WorkRequest};
+    /// fn post_write_and_send(
+    ///     qp: &mut QueuePair,
+    ///     payload: LocalMemorySlice,
+    ///     remote_dest: RemoteMemorySlice,
+    ///     notification: LocalMemorySlice,
+    /// ) -> std::io::Result<()> {
+    ///     unsafe {
+    ///         qp.post([
+    ///             WorkRequest::write(&[payload], remote_dest, 1, None),
+    ///             WorkRequest::send(&[notification], 2, None).signaled(),
+    ///         ])
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// Passing a dynamically allocated `Vec` by reference (ideal for reuse and zero-copy):
+    /// ```no_run
+    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice, WorkRequest};
+    /// fn post_many<'local>(
+    ///     qp: &mut QueuePair,
+    ///     local: &'local [LocalMemorySlice],
+    ///     remote: &[RemoteMemorySlice],
+    ///     wrs: &mut Vec<WorkRequest<'local>>,
+    /// ) -> std::io::Result<()> {
+    ///     wrs.clear();
+    ///     for i in 0..local.len() {
+    ///         wrs.push(WorkRequest::write(&local[i..i+1], remote[i].clone(), i as u64, None));
+    ///     }
+    ///     // Append a final signaled send request to get a completion notification for the whole chain
+    ///     wrs.push(WorkRequest::send(&[], local.len() as u64, None).signaled());
+    ///
+    ///     unsafe {
+    ///         // Passed by mutable reference, the `Vec` is not consumed and can be reused later
+    ///         qp.post(wrs)
+    ///     }
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// The memory regions can only be safely reused or dropped after the requests are fully executed
+    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
+    /// until `CompletionQueue::poll` returns a completion for each request).
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in a Work Request.
+    ///  - `ENOMEM`: Send Queue is full or not enough resources to complete this operation.
+    ///  - `EFAULT`: Invalid value provided in `QueuePair`.
+    ///
+    /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
+    #[inline]
+    pub unsafe fn post<'local>(
         &mut self,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-        opcode: ffi::ibv_wr_opcode,
-        imm_data: Option<u32>,
+        mut wrs: impl AsMut<[WorkRequest<'local>]>,
     ) -> io::Result<()> {
-        let anon_1 = if let Some(imm_data) = imm_data {
-            ffi::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm_data.to_be(),
-            }
-        } else {
-            Default::default()
-        };
+        let wrs = wrs.as_mut();
+        if wrs.is_empty() {
+            return Ok(());
+        }
 
-        let mut wr = ffi::ibv_send_wr {
-            wr_id,
-            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: local.len() as i32,
-            opcode,
-            send_flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
-            wr: ffi::ibv_send_wr__bindgen_ty_2 {
-                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
-                    remote_addr: remote.addr,
-                    rkey: remote.rkey,
-                },
-            },
-            qp_type: Default::default(),
-            __bindgen_anon_1: anon_1,
-            __bindgen_anon_2: Default::default(),
-        };
-        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null::<ffi::ibv_send_wr>() as *mut _;
+        for i in 0..wrs.len() - 1 {
+            let next_ptr = &mut wrs[i + 1].wr as *mut ffi::ibv_send_wr;
+            wrs[i].wr.next = next_ptr;
+        }
+        wrs.last_mut().unwrap().wr.next = ptr::null_mut();
+
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
+
+        // TODO:
+        //
+        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
+        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
+        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
+        // returns this failing WR through bad_wr.
+        //
+        // The user should not alter or destroy AHs associated with WRs until request is fully
+        // executed and  a  work  completion  has been retrieved from the corresponding completion
+        // queue (CQ) to avoid unexpected behavior.
+        //
+        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
+        // immediately after the call returns.
 
         let ctx = unsafe { *self.qp }.context;
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
-            ops.post_send.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+            ops.post_send.as_mut().unwrap()(
+                self.qp,
+                &mut wrs[0].wr as *mut _,
+                &mut bad_wr as *mut _,
+            )
         };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
         } else {
             Ok(())
         }
-    }
-
-    /// Create a builder to post a chain of work requests to the Send Queue.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice, ibv_send_wr};
-    /// fn write_payload_and_signal_done(
-    ///     qp: &mut QueuePair,
-    ///     data: LocalMemorySlice,
-    ///     remote_dest: RemoteMemorySlice,
-    ///     done_notification: LocalMemorySlice,
-    /// ) -> std::io::Result<()> {
-    ///     let mut wrs = [ibv_send_wr::default(); 2];
-    ///
-    ///     unsafe {
-    ///         qp.send_chain(&mut wrs)
-    ///             .write(&[data], remote_dest, 1, None)
-    ///             .send(&[done_notification], 2)
-    ///             .post()
-    ///     }?;
-    ///     Ok(())
-    /// }
-    /// ```
-    pub fn send_chain<'qp, 'buf>(
-        &'qp mut self,
-        buffer: &'buf mut [ffi::ibv_send_wr],
-    ) -> ChainBuilder<'qp, 'buf> {
-        ChainBuilder::new(self, buffer)
     }
 }
 
@@ -2273,183 +2430,6 @@ impl Drop for QueuePair {
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{e}");
-        }
-    }
-}
-
-/// A builder to construct and post a dynamically sized chain of work requests to the Send Queue.
-pub struct ChainBuilder<'qp, 'buf> {
-    qp: &'qp mut QueuePair,
-    buffer: &'buf mut [ffi::ibv_send_wr],
-    len: usize,
-    error: Option<io::Error>,
-}
-
-impl<'qp, 'buf> ChainBuilder<'qp, 'buf> {
-    fn new(qp: &'qp mut QueuePair, buffer: &'buf mut [ffi::ibv_send_wr]) -> Self {
-        Self {
-            qp,
-            buffer,
-            len: 0,
-            error: None,
-        }
-    }
-
-    fn push(&mut self, mut wr: ffi::ibv_send_wr) {
-        if self.error.is_some() {
-            return;
-        }
-        if self.len >= self.buffer.len() {
-            self.error = Some(io::Error::new(
-                io::ErrorKind::OutOfMemory,
-                "ChainBuilder buffer capacity exceeded",
-            ));
-            return;
-        }
-        wr.next = ptr::null_mut();
-        self.buffer[self.len] = wr;
-
-        if self.len > 0 {
-            let next_ptr = &mut self.buffer[self.len] as *mut ffi::ibv_send_wr;
-            self.buffer[self.len - 1].next = next_ptr;
-        }
-        self.len += 1;
-    }
-
-    /// Add a Send work request to the chain.
-    ///
-    /// For more info, see [`QueuePair::post_send`].
-    pub fn send(mut self, local: &'buf [LocalMemorySlice], wr_id: u64) -> Self {
-        let wr = ffi::ibv_send_wr {
-            wr_id,
-            next: ptr::null_mut(),
-            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: local.len() as i32,
-            opcode: ffi::ibv_wr_opcode::IBV_WR_SEND,
-            send_flags: 0, // Unsignaled; post() sets IBV_SEND_SIGNALED on the last WR
-            wr: Default::default(),
-            qp_type: Default::default(),
-            __bindgen_anon_1: Default::default(),
-            __bindgen_anon_2: Default::default(),
-        };
-
-        self.push(wr);
-        self
-    }
-
-    /// Add an RDMA Write work request to the chain.
-    ///
-    /// Immediate data can be used to signal the completion of the write operation.
-    /// The other side uses `post_recv` on a dummy buffer and receives the immediate data
-    /// from the corresponding work completion.
-    ///
-    /// For more info, see [`QueuePair::post_write`].
-    pub fn write(
-        mut self,
-        local: &'buf [LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-        imm_data: Option<u32>,
-    ) -> Self {
-        let opcode = if imm_data.is_some() {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
-        } else {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
-        };
-        self._push_one_sided(local, remote, wr_id, opcode, imm_data);
-        self
-    }
-
-    /// Add an RDMA Read work request to the chain.
-    ///
-    /// RDMA read does not support immediate data.
-    ///
-    /// For more info, see [`QueuePair::post_read`].
-    pub fn read(
-        mut self,
-        local: &'buf [LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-    ) -> Self {
-        let opcode = ffi::ibv_wr_opcode::IBV_WR_RDMA_READ;
-        self._push_one_sided(local, remote, wr_id, opcode, None);
-        self
-    }
-
-    // Helper function to build and push one-sided (RDMA Read/Write) work requests
-    fn _push_one_sided(
-        &mut self,
-        local: &'buf [LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-        opcode: ffi::ibv_wr_opcode,
-        imm_data: Option<u32>,
-    ) {
-        let anon_1 = if let Some(imm) = imm_data {
-            ffi::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm.to_be(),
-            }
-        } else {
-            Default::default()
-        };
-
-        let wr = ffi::ibv_send_wr {
-            wr_id,
-            next: ptr::null_mut(),
-            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: local.len() as i32,
-            opcode,
-            send_flags: 0, // Unsignaled; post() sets IBV_SEND_SIGNALED on the last WR
-            wr: ffi::ibv_send_wr__bindgen_ty_2 {
-                rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
-                    remote_addr: remote.addr,
-                    rkey: remote.rkey,
-                },
-            },
-            qp_type: Default::default(),
-            __bindgen_anon_1: anon_1,
-            __bindgen_anon_2: Default::default(),
-        };
-
-        self.push(wr);
-    }
-
-    /// Post the chain of work requests to the QueuePair.
-    ///
-    /// This method automatically links the work requests together, setting only
-    /// the last operation as signaled (`IBV_SEND_SIGNALED`) to generate a single CQ event
-    /// for the entire chain.
-    ///
-    /// # Safety
-    ///
-    /// The memory regions can only be safely reused or dropped after the requests are fully executed
-    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
-    /// until `CompletionQueue::poll` returns a completion for this send).
-    pub unsafe fn post(self) -> io::Result<()> {
-        if let Some(err) = self.error {
-            return Err(err);
-        }
-        if self.len == 0 {
-            return Ok(());
-        }
-
-        // Signal only the very last request in the chain to generate a single CQ event
-        self.buffer[self.len - 1].send_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
-
-        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
-        let ctx = unsafe { *self.qp.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_send.as_mut().unwrap()(
-                self.qp.qp,
-                self.buffer.as_mut_ptr(),
-                &mut bad_wr as *mut _,
-            )
-        };
-        if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
-        } else {
-            Ok(())
         }
     }
 }
