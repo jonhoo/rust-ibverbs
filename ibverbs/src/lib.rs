@@ -2333,6 +2333,86 @@ impl<'local> WorkRequest<'local> {
         )
     }
 
+    // Helper to build atomic (compare-and-swap / fetch-and-add) work requests.
+    #[inline]
+    fn _atomic(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        compare_add: u64,
+        swap: u64,
+    ) -> Self {
+        Self {
+            wr: ffi::ibv_send_wr {
+                wr_id,
+                next: ptr::null_mut(),
+                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                num_sge: local.len() as i32,
+                opcode,
+                send_flags: 0,
+                wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                    atomic: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_2 {
+                        remote_addr: remote.addr,
+                        compare_add,
+                        swap,
+                        rkey: remote.rkey,
+                    },
+                },
+                qp_type: Default::default(),
+                __bindgen_anon_1: Default::default(),
+                __bindgen_anon_2: Default::default(),
+            },
+            _local: std::marker::PhantomData,
+        }
+    }
+
+    /// Create an atomic compare-and-swap work request (`IBV_WR_ATOMIC_CMP_AND_SWP`).
+    ///
+    /// Atomically compares the 8-byte value at `remote` against `compare` and, if they are equal,
+    /// writes `swap`. The original remote value is returned into `local`, which must be 8 bytes and
+    /// 8-byte aligned. Valid only for RC queue pairs, and the remote memory region must permit
+    /// `IBV_ACCESS_REMOTE_ATOMIC`.
+    #[inline]
+    pub fn atomic_cmp_swap(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        compare: u64,
+        swap: u64,
+        wr_id: u64,
+    ) -> Self {
+        Self::_atomic(
+            local,
+            remote,
+            wr_id,
+            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP,
+            compare,
+            swap,
+        )
+    }
+
+    /// Create an atomic fetch-and-add work request (`IBV_WR_ATOMIC_FETCH_AND_ADD`).
+    ///
+    /// Atomically adds `add` to the 8-byte value at `remote`, returning the original remote value
+    /// into `local`, which must be 8 bytes and 8-byte aligned. Valid only for RC queue pairs, and
+    /// the remote memory region must permit `IBV_ACCESS_REMOTE_ATOMIC`.
+    #[inline]
+    pub fn atomic_fetch_add(
+        local: &'local [LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        add: u64,
+        wr_id: u64,
+    ) -> Self {
+        Self::_atomic(
+            local,
+            remote,
+            wr_id,
+            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD,
+            add,
+            0,
+        )
+    }
+
     /// Set the `IBV_SEND_FENCE` flag.
     ///
     /// Prevents this Work Request from being processed until all prior RDMA Read and Atomic

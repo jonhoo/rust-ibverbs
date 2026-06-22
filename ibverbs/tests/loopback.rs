@@ -10,8 +10,8 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    ibv_qp_type, AddressHandleAttribute, CompletionQueue, Context, ProtectionDomain, QueuePair,
-    WorkRequest,
+    ibv_access_flags, ibv_qp_type, AddressHandleAttribute, CompletionQueue, Context,
+    ProtectionDomain, QueuePair, WorkRequest,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -60,8 +60,18 @@ fn loopback_of(qp_type: ibv_qp_type) -> Loopback {
         .set_max_recv_wr(16)
         .set_max_send_sge(4)
         .set_max_recv_sge(4);
-    // One-sided ops loop back to this same QP, so it must grant remote access (RC/UC only).
-    builder.allow_remote_rw();
+    // One-sided ops loop back to this same QP, so it must grant remote access (RC/UC only). RC also
+    // serves the atomic loopback, which additionally requires remote-atomic access.
+    if qp_type == ibv_qp_type::IBV_QPT_RC {
+        builder.set_access(
+            ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+                | ibv_access_flags::IBV_ACCESS_REMOTE_READ
+                | ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC,
+        );
+    } else {
+        builder.allow_remote_rw();
+    }
 
     let prepared = builder.build().expect("failed to build queue pair");
     let endpoint = prepared.endpoint().expect("failed to read local endpoint");
@@ -104,6 +114,11 @@ fn drain(cq: &CompletionQueue, n: usize) -> Vec<ibverbs::ibv_wc> {
             observed.len()
         );
     }
+}
+
+/// Read the first 8 bytes of a buffer as a host-order `u64`.
+fn first_u64(bytes: &[u8]) -> u64 {
+    u64::from_ne_bytes(bytes[..8].try_into().unwrap())
 }
 
 /// Reading the GID table of the device exercises the control path.
@@ -495,4 +510,82 @@ fn unreliable_datagram() {
     );
     // The payload starts after the 40-byte GRH.
     assert_eq!(&recv.inner_mut()[40..40 + payload.len()], payload);
+}
+
+/// Atomic compare-and-swap and fetch-and-add against a remote 8-byte value on an RC queue pair.
+///
+/// RDMA atomics operate on 8-byte, 8-byte-aligned operands whose in-memory byte order is
+/// implementation defined, so the value assertions accept either endianness.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn atomic_operations() {
+    let mut lb = loopback();
+
+    let mut target = lb.pd.allocate(8).expect("failed to register target MR");
+    let mut local = lb.pd.allocate(8).expect("failed to register local MR");
+
+    // The compare matches the zeroed target, so the swap takes effect and the original value (0) is
+    // returned into `local`.
+    let swapped = 0x0102_0304_0506_0708_u64;
+    {
+        let sg = [local.slice(..)];
+        let remote = target.remote().slice(..);
+        unsafe {
+            lb.qp
+                .post([WorkRequest::atomic_cmp_swap(&sg, remote, 0, swapped, 1).signaled()])
+        }
+        .expect("post atomic_cmp_swap failed");
+    }
+    assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 1);
+    assert_eq!(first_u64(local.inner_mut()), 0, "CAS returns the old value");
+    let stored = first_u64(target.inner_mut());
+    assert!(
+        stored == swapped || stored == swapped.swap_bytes(),
+        "CAS should have stored the swap value"
+    );
+
+    // A non-matching compare leaves the target untouched and returns the current value.
+    {
+        let sg = [local.slice(..)];
+        let remote = target.remote().slice(..);
+        unsafe {
+            lb.qp
+                .post([WorkRequest::atomic_cmp_swap(&sg, remote, 0, 0, 2).signaled()])
+        }
+        .expect("post atomic_cmp_swap failed");
+    }
+    assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 2);
+    assert_eq!(
+        first_u64(target.inner_mut()),
+        stored,
+        "CAS must not modify the target on a compare mismatch"
+    );
+    assert_eq!(
+        first_u64(local.inner_mut()),
+        stored,
+        "CAS returns the current value on a mismatch"
+    );
+
+    // Fetch-and-add on a fresh zeroed counter returns the old value and adds in place.
+    let mut counter = lb.pd.allocate(8).expect("failed to register counter MR");
+    {
+        let sg = [local.slice(..)];
+        let remote = counter.remote().slice(..);
+        unsafe {
+            lb.qp
+                .post([WorkRequest::atomic_fetch_add(&sg, remote, 5, 3).signaled()])
+        }
+        .expect("post atomic_fetch_add failed");
+    }
+    assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 3);
+    assert_eq!(
+        first_u64(local.inner_mut()),
+        0,
+        "fetch-add returns the old value"
+    );
+    let sum = first_u64(counter.inner_mut());
+    assert!(
+        sum == 5 || sum == 5u64.swap_bytes(),
+        "fetch-add should add 5"
+    );
 }
