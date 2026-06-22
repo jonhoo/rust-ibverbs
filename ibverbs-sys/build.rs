@@ -82,6 +82,9 @@ fn main() {
         // needed to reach the static-inline `ibv_create_cq_ex` / `ibv_create_qp_ex`, which dispatch
         // through the provider op table embedded in `verbs_context`
         .allowlist_type("verbs_context")
+        // the `ibv_advise_mr_advice` / `ibv_advise_mr_flags` the public API spells are macro
+        // aliases for these kernel enums, which `ibv_advise_mr` takes
+        .allowlist_type("ib_uverbs_advise_mr_.*")
         .allowlist_var("IBV_LINK_LAYER_.*")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_create_cq_wc_flags")
