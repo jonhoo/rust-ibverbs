@@ -68,7 +68,7 @@
 use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
-use std::ops::RangeBounds;
+use std::ops::{Deref, DerefMut, RangeBounds};
 use std::os::fd::BorrowedFd;
 use std::os::raw::c_void;
 use std::ptr;
@@ -1694,13 +1694,13 @@ impl Drop for MemoryRegionInner {
     }
 }
 
-/// A memory region that has been registered for use with RDMA.
-pub struct MemoryRegion<T> {
+/// A region of memory registered for use with RDMA.
+pub struct MemoryRegion<O> {
     inner: MemoryRegionInner,
-    data: T,
+    owner: O,
 }
 
-impl<T> MemoryRegion<T> {
+impl<O> MemoryRegion<O> {
     /// Get the remote authentication key used to allow direct remote access to this memory region.
     pub fn rkey(&self) -> RemoteKey {
         RemoteKey {
@@ -1717,19 +1717,9 @@ impl<T> MemoryRegion<T> {
         }
     }
 
-    /// Get inner data.
-    pub fn inner(&self) -> &T {
-        &self.data
-    }
-
-    /// Get inner data mutably.
-    pub fn inner_mut(&mut self) -> &mut T {
-        &mut self.data
-    }
-
-    /// Consume the memory region and return the inner data.
-    pub fn into_inner(self) -> T {
-        self.data
+    /// Deregister the memory region and return the buffer that backed it.
+    pub fn into_inner(self) -> O {
+        self.owner
     }
 
     /// Make a subslice of this memory region.
@@ -1745,6 +1735,22 @@ impl<T> MemoryRegion<T> {
             lkey: unsafe { *self.inner.mr }.lkey,
         };
         LocalMemorySlice { _sge: sge }
+    }
+}
+
+impl<O: Deref<Target = [u8]>> MemoryRegion<O> {
+    /// The registered bytes.
+    pub fn bytes(&self) -> &[u8] {
+        &self.owner
+    }
+}
+
+impl<O: DerefMut<Target = [u8]>> MemoryRegion<O> {
+    /// The registered bytes, mutably.
+    ///
+    /// The length is fixed at registration; the buffer can be written but not resized.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        &mut self.owner
     }
 }
 
@@ -1940,6 +1946,30 @@ impl ProtectionDomain {
         ))
     }
 
+    /// Register `[ptr, ptr + len)` and wrap the resulting MR handle, deduplicating the
+    /// `ibv_reg_mr` call and null check shared by the registration entry points.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be valid for `len` bytes and outlive the returned `MemoryRegionInner`.
+    unsafe fn reg_mr(
+        &self,
+        ptr: *mut c_void,
+        len: usize,
+        access_flags: ffi::ibv_access_flags,
+    ) -> io::Result<MemoryRegionInner> {
+        let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
+        // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
+        if mr.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(MemoryRegionInner {
+                _pd: self.inner.clone(),
+                mr,
+            })
+        }
+    }
+
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
     ///
     /// This process allows the RDMA device to read and write data to the allocated memory. Only
@@ -1960,8 +1990,7 @@ impl ProtectionDomain {
     ///
     /// # Panics
     ///
-    /// Panics if the size of the memory region zero bytes, which can occur either if `n` is 0, or
-    /// if `mem::size_of::<T>()` is 0.
+    /// Panics if `n` is 0.
     ///
     /// # Errors
     ///
@@ -1972,10 +2001,11 @@ impl ProtectionDomain {
         &self,
         n: usize,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegion<Vec<u8>>> {
+    ) -> io::Result<MemoryRegion<Box<[u8]>>> {
         assert!(n > 0);
-        let data = vec![0; n];
-        self.register_with_permissions(data, access_flags)
+        let mut data = vec![0u8; n].into_boxed_slice();
+        let inner = unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags)? };
+        Ok(MemoryRegion { inner, owner: data })
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
@@ -2005,53 +2035,57 @@ impl ProtectionDomain {
     ///
     /// # Panics
     ///
-    /// Panics if the size of the memory region zero bytes, which can occur either if `n` is 0, or
-    /// if `mem::size_of::<T>()` is 0.
+    /// Panics if `n` is 0.
     ///
     /// # Errors
     ///
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
-    pub fn allocate(&self, n: usize) -> io::Result<MemoryRegion<Vec<u8>>> {
+    pub fn allocate(&self, n: usize) -> io::Result<MemoryRegion<Box<[u8]>>> {
         let access_flags = DEFAULT_ACCESS_FLAGS;
         self.allocate_with_permissions(n, access_flags)
     }
 
-    /// Registers an already allocated Memory Region (MR) with the given access permissions.
-    pub fn register_with_permissions<T: AsMut<[E]>, E: Sized + Copy + Default>(
+    /// Registers externally managed memory as a Memory Region (MR), with the given access
+    /// permissions.
+    ///
+    /// This registers the `len` bytes starting at `ptr`. Unlike [`allocate`](Self::allocate), the
+    /// returned [`MemoryRegion`] does *not* own the underlying memory — it is the entry point for
+    /// registering memory you manage yourself, such as an `mmap`/hugepage mapping. Use the returned
+    /// region's [`slice`](MemoryRegion::slice) / [`remote`](MemoryRegion::remote) handles for RDMA;
+    /// access the bytes through your own pointer.
+    ///
+    /// `access_flags` is always required here: registering memory directly is a low-level operation,
+    /// so the permissions are spelled out rather than defaulted (see [`DEFAULT_ACCESS_FLAGS`] for the
+    /// set [`allocate`](Self::allocate) uses).
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that, for the entire lifetime of the returned `MemoryRegion`:
+    ///
+    ///  - `ptr` is valid for reads and writes of `len` bytes,
+    ///  - the memory is not moved, freed, or unmapped, and
+    ///  - the memory is not accessed in a way that races with the device reading or writing it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `len` is 0.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid access value.
+    ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
+    ///    complete this operation.
+    pub unsafe fn register_from_raw(
         &self,
-        mut data: T,
+        ptr: *mut u8,
+        len: usize,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegion<T>> {
-        let len = std::mem::size_of_val(data.as_mut());
-        assert!(std::mem::size_of::<T>() > 0);
-        let mr = unsafe {
-            ffi::ibv_reg_mr(
-                self.inner.pd,
-                data.as_mut().as_mut_ptr() as *mut c_void,
-                len,
-                access_flags.0 as i32,
-            )
-        };
-        // ibv_reg_mr()  returns  a  pointer to the registered MR, or NULL if the request fails.
-        if mr.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            let inner = MemoryRegionInner {
-                _pd: self.inner.clone(),
-                mr,
-            };
-            Ok(MemoryRegion { inner, data })
-        }
-    }
-
-    /// Registers an already allocated Memory Region (MR) with the default access permissions.
-    pub fn register<T: AsMut<[E]>, E: Sized + Copy + Default>(
-        &self,
-        data: T,
-    ) -> io::Result<MemoryRegion<T>> {
-        self.register_with_permissions(data, DEFAULT_ACCESS_FLAGS)
+    ) -> io::Result<MemoryRegion<()>> {
+        assert!(len > 0);
+        let inner = self.reg_mr(ptr as *mut c_void, len, access_flags)?;
+        Ok(MemoryRegion { inner, owner: () })
     }
 
     /// Registers an already allocated DMA-BUF memory region (MR) associated with this `ProtectionDomain`.
@@ -2078,12 +2112,11 @@ impl ProtectionDomain {
         if mr.is_null() {
             Err(io::Error::last_os_error())
         } else {
-            // TODO: Add MemoryRegionUnownedOpaque class for return value which doesn't need to store the `data` ptr.
             let inner = MemoryRegionInner {
                 _pd: self.inner.clone(),
                 mr,
             };
-            Ok(MemoryRegion { inner, data: () })
+            Ok(MemoryRegion { inner, owner: () })
         }
     }
 
