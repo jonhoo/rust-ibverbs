@@ -86,6 +86,11 @@ pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
 pub use ffi::ibv_wc_status;
 
+/// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
+pub use ffi::ib_uverbs_advise_mr_advice as ibv_advise_mr_advice;
+/// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
+pub use ffi::ib_uverbs_advise_mr_flag as ibv_advise_mr_flags;
+
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -1863,6 +1868,42 @@ impl ProtectionDomain {
                 _pd: self.inner.clone(),
                 ah,
             })
+        }
+    }
+
+    /// Give advice to the kernel about an address range in memory regions registered under this
+    /// protection domain (`ibv_advise_mr`).
+    ///
+    /// This is mainly useful with on-demand-paging (ODP) memory regions: for example, prefetching
+    /// pages with `IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH` so that a later access does not take a page
+    /// fault. `flags` is a bitmask of [`ibv_advise_mr_flags`] (`0` for none), and `sg_list`
+    /// describes the ranges to act on; every entry must lie within a memory region registered under
+    /// this protection domain.
+    ///
+    /// # Errors
+    ///
+    ///  - `EOPNOTSUPP`: The device does not support `ibv_advise_mr`.
+    ///  - `EINVAL`: Invalid value provided in the arguments.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    pub fn advise_mr(
+        &self,
+        advice: ibv_advise_mr_advice,
+        flags: u32,
+        sg_list: &[LocalMemorySlice],
+    ) -> io::Result<()> {
+        let ret = unsafe {
+            ffi::ibv_advise_mr(
+                self.inner.pd,
+                advice,
+                flags,
+                sg_list.as_ptr() as *mut ffi::ibv_sge,
+                sg_list.len() as u32,
+            )
+        };
+        if ret == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(ret))
         }
     }
 

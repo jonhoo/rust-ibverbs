@@ -399,3 +399,30 @@ pub unsafe fn ibv_create_qp_ex(
         _ => ::std::ptr::null_mut(),
     }
 }
+
+/// Give advice about an address range in memory regions (`ibv_advise_mr`).
+///
+/// Returns `EOPNOTSUPP` if the provider does not implement the verb (matching the C inline).
+///
+/// # Safety
+///
+/// `pd` must be a valid protection domain, and `sg_list` must point to `num_sge` valid scatter/
+/// gather entries describing ranges in memory regions registered under `pd`.
+#[inline]
+pub unsafe fn ibv_advise_mr(
+    pd: *mut ibv_pd,
+    advice: ib_uverbs_advise_mr_advice,
+    flags: u32,
+    sg_list: *mut ibv_sge,
+    num_sge: u32,
+) -> ::std::os::raw::c_int {
+    let vctx = verbs_get_ctx((*pd).context);
+    let need =
+        ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, advise_mr);
+    match (*vctx).advise_mr {
+        Some(advise_mr) if (*vctx).sz >= need => advise_mr(pd, advice, flags, sg_list, num_sge),
+        // The provider does not implement advise_mr; mirror the C inline's `return EOPNOTSUPP`
+        // (95 on Linux, the only platform rdma-core targets).
+        _ => 95,
+    }
+}
