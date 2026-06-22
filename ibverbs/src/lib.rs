@@ -1154,6 +1154,8 @@ impl QueuePairBuilder {
                 qp: QueuePair {
                     pd: self.pd.clone(),
                     _srq: self.srq.clone(),
+                    _send_cq: self.send.clone(),
+                    _recv_cq: self.recv.clone(),
                     qp,
                 },
                 gid_index: self.gid_index,
@@ -2162,6 +2164,10 @@ impl<'local> WorkRequest<'local> {
 pub struct QueuePair {
     pd: Arc<ProtectionDomainInner>,
     _srq: Option<SharedReceiveQueue>,
+    // Keep the completion queues alive while the queue pair references them; `ibv_destroy_cq` fails
+    // with EBUSY if a queue pair is still attached.
+    _send_cq: Arc<CompletionQueueInner>,
+    _recv_cq: Arc<CompletionQueueInner>,
     qp: *mut ffi::ibv_qp,
 }
 

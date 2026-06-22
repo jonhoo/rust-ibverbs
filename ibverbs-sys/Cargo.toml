@@ -24,7 +24,7 @@ license = "MIT OR Apache-2.0"
 exclude = ["vendor/rdma-core/build/"]
 
 [build-dependencies]
-bindgen = "0.71.1"
+bindgen = "0.72"
 cmake = "0.1.50"
 
 # to make -Zminimal-versions work
