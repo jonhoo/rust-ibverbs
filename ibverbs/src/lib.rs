@@ -1516,6 +1516,159 @@ impl PreparedQueuePair {
 
         Ok(self.qp)
     }
+
+    /// Activate this queue pair as an unreliable datagram (UD) queue pair.
+    ///
+    /// Unlike [`handshake`](Self::handshake), UD is connectionless: there is no remote endpoint to
+    /// exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with the given `qkey`.
+    /// Incoming datagrams whose Q_Key does not match `qkey` are discarded (unless the sender's Q_Key
+    /// has its most significant bit set, meaning "use the QP's Q_Key").
+    ///
+    /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
+    /// [`QueuePair::post_send_ud`].
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in `attr` or `attr_mask`.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    pub fn activate_ud(self, qkey: u32) -> io::Result<QueuePair> {
+        // INIT: associate with the port and set the Q_Key. UD has no access flags.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
+            pkey_index: 0,
+            port_num: PORT_NUM,
+            qkey,
+            ..Default::default()
+        };
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
+            | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
+            | ffi::ibv_qp_attr_mask::IBV_QP_PORT
+            | ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+
+        // RTR: a UD queue pair needs no path or destination information.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
+            ..Default::default()
+        };
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+
+        // RTS.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
+            sq_psn: 0,
+            ..Default::default()
+        };
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+
+        Ok(self.qp)
+    }
+}
+
+/// Attributes describing how to reach a destination, used to build an [`AddressHandle`].
+///
+/// Defaults to a non-global (LID-only) route on the crate's port. For RoCE and routed InfiniBand,
+/// set a global route with [`set_grh`](Self::set_grh).
+#[derive(Clone)]
+pub struct AddressHandleAttribute {
+    attr: ffi::ibv_ah_attr,
+}
+
+impl Default for AddressHandleAttribute {
+    fn default() -> Self {
+        AddressHandleAttribute {
+            attr: ffi::ibv_ah_attr {
+                port_num: PORT_NUM,
+                ..Default::default()
+            },
+        }
+    }
+}
+
+impl AddressHandleAttribute {
+    /// A new address-handle attribute on the default port.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the destination LID (InfiniBand). Not used for RoCE / Ethernet link layers.
+    pub fn set_dest_lid(&mut self, lid: u16) -> &mut Self {
+        self.attr.dlid = lid;
+        self
+    }
+
+    /// Set the service level.
+    pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
+        self.attr.sl = service_level;
+        self
+    }
+
+    /// Set the local physical port through which the destination is reached.
+    pub fn set_port(&mut self, port_num: u8) -> &mut Self {
+        self.attr.port_num = port_num;
+        self
+    }
+
+    /// Set the global route (GRH), required for RoCE and routed InfiniBand.
+    ///
+    /// `dgid` is the destination GID, `sgid_index` indexes the *local* port's GID table to source
+    /// from, and `hop_limit` is the IP hop limit (commonly `0xff`).
+    pub fn set_grh(
+        &mut self,
+        dgid: Gid,
+        sgid_index: u8,
+        hop_limit: u8,
+        traffic_class: u8,
+    ) -> &mut Self {
+        self.attr.is_global = 1;
+        self.attr.grh.dgid = dgid.into();
+        self.attr.grh.sgid_index = sgid_index;
+        self.attr.grh.hop_limit = hop_limit;
+        self.attr.grh.traffic_class = traffic_class;
+        self
+    }
+}
+
+/// A handle to a destination, used to address unreliable-datagram (UD) sends.
+///
+/// Created with [`ProtectionDomain::create_address_handle`] and passed by reference to each UD send;
+/// a single UD queue pair can address many destinations with different handles (see
+/// [`QueuePair::post_send_ud`]).
+pub struct AddressHandle {
+    // Keeps the protection domain (and so its context) alive until the handle is destroyed.
+    _pd: Arc<ProtectionDomainInner>,
+    ah: *mut ffi::ibv_ah,
+}
+
+unsafe impl Send for AddressHandle {}
+unsafe impl Sync for AddressHandle {}
+
+impl AddressHandle {
+    #[inline]
+    fn as_ptr(&self) -> *mut ffi::ibv_ah {
+        self.ah
+    }
+}
+
+impl Drop for AddressHandle {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_destroy_ah(self.ah) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{e}");
+        }
+    }
 }
 
 struct MemoryRegionInner {
@@ -1688,6 +1841,31 @@ pub struct ProtectionDomain {
 }
 
 impl ProtectionDomain {
+    /// Create an [`AddressHandle`] for the destination described by `attr`.
+    ///
+    /// Address handles are used to address unreliable-datagram (UD) sends. One handle can be reused
+    /// across many sends, and a single UD queue pair can hold handles to many destinations.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid value provided in `attr`.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    pub fn create_address_handle(
+        &self,
+        attr: &AddressHandleAttribute,
+    ) -> io::Result<AddressHandle> {
+        let mut ah_attr = attr.attr;
+        let ah = unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) };
+        if ah.is_null() {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(AddressHandle {
+                _pd: self.inner.clone(),
+                ah,
+            })
+        }
+    }
+
     /// Creates a queue pair builder associated with this protection domain.
     ///
     /// `send` and `recv` are the device `Context` to associate with the send and receive queues
@@ -2038,6 +2216,56 @@ impl<'local> WorkRequest<'local> {
         }
     }
 
+    /// Create an unreliable-datagram (UD) send work request addressed to `ah` / `remote_qpn` /
+    /// `remote_qkey`.
+    ///
+    /// Only valid on a UD queue pair (see [`PreparedQueuePair::activate_ud`]). The address handle
+    /// must outlive the operation, so it is borrowed for `'local` alongside the buffers.
+    #[inline]
+    pub fn send_ud(
+        local: &'local [LocalMemorySlice],
+        ah: &'local AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+        wr_id: u64,
+        imm: Option<u32>,
+    ) -> Self {
+        let opcode = if imm.is_some() {
+            ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM
+        } else {
+            ffi::ibv_wr_opcode::IBV_WR_SEND
+        };
+        let anon_1 = if let Some(imm_data) = imm {
+            ffi::ibv_send_wr__bindgen_ty_1 {
+                imm_data: imm_data.to_be(),
+            }
+        } else {
+            Default::default()
+        };
+
+        Self {
+            wr: ffi::ibv_send_wr {
+                wr_id,
+                next: ptr::null_mut(),
+                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                num_sge: local.len() as i32,
+                opcode,
+                send_flags: 0,
+                wr: ffi::ibv_send_wr__bindgen_ty_2 {
+                    ud: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_3 {
+                        ah: ah.as_ptr(),
+                        remote_qpn,
+                        remote_qkey,
+                    },
+                },
+                qp_type: Default::default(),
+                __bindgen_anon_1: anon_1,
+                __bindgen_anon_2: Default::default(),
+            },
+            _local: std::marker::PhantomData,
+        }
+    }
+
     // Helper function to build one-sided (RDMA Read/Write) work requests
     #[inline]
     fn _one_sided(
@@ -2195,6 +2423,30 @@ impl QueuePair {
     #[inline]
     pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
         self.post([WorkRequest::send(local, wr_id, None).signaled()])
+    }
+
+    /// Posts a single unreliable-datagram (UD) send, addressed by `ah` / `remote_qpn` /
+    /// `remote_qkey`. The request is signaled, so it generates a work completion.
+    ///
+    /// Only valid on a UD queue pair (see [`PreparedQueuePair::activate_ud`]). A single UD queue
+    /// pair can address many destinations by passing a different [`AddressHandle`] per call.
+    ///
+    /// # Safety
+    ///
+    /// See [`post`](Self::post). The address handle and the local buffers must remain valid until a
+    /// work completion for this request has been retrieved.
+    #[inline]
+    pub unsafe fn post_send_ud(
+        &mut self,
+        local: &[LocalMemorySlice],
+        ah: &AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+        wr_id: u64,
+    ) -> io::Result<()> {
+        self.post([
+            WorkRequest::send_ud(local, ah, remote_qpn, remote_qkey, wr_id, None).signaled(),
+        ])
     }
 
     /// Posts a single receive Work Request (WR) containing a scatter-gather list of local
