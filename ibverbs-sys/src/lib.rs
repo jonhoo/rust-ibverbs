@@ -173,16 +173,14 @@ impl ibv_wc {
         self.opcode
     }
 
-    /// Returns a 32 bits number, in network order, in an SEND or RDMA WRITE opcodes that is being
-    /// sent along with the payload to the remote side and placed in a Receive Work Completion and
-    /// not in a remote memory buffer
+    /// Returns the 32-bit immediate value sent along with the payload in a SEND or RDMA WRITE, if
+    /// one was present (i.e. `IBV_WC_WITH_IMM` is set).
     ///
-    /// Note that IMM is only returned if `IBV_WC_WITH_IMM` is set in `wc_flags`. If this is not
-    /// the case, no immediate value was provided, and `imm_data` should be interpreted
-    /// differently. See `man ibv_poll_cq` for details.
+    /// The immediate is carried in network byte order on the wire; this returns it in host byte
+    /// order, matching the host-order value passed to the work request that sent it.
     pub fn imm_data(&self) -> Option<u32> {
         if self.is_valid() && ((self.wc_flags & ibv_wc_flags::IBV_WC_WITH_IMM).0 != 0) {
-            Some(self.imm_data)
+            Some(u32::from_be(self.imm_data))
         } else {
             None
         }
