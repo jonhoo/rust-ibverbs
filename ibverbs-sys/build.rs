@@ -20,12 +20,10 @@ fn build_vendored_rdma() -> String {
         .define("CMAKE_INSTALL_PREFIX", "/usr")
         .no_build_target(true)
         .build();
-    let built_in = built_in
+    built_in
         .into_os_string()
         .into_string()
-        .expect("build directory path is not valid UTF-8");
-
-    built_in
+        .expect("build directory path is not valid UTF-8")
 }
 
 fn update_submodule() {
