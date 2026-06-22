@@ -81,6 +81,9 @@ fn main() {
         .allowlist_function("ibv_.*")
         .allowlist_function("_ibv_.*")
         .allowlist_type("ibv_.*")
+        // needed to reach the static-inline `ibv_create_cq_ex` / `ibv_create_qp_ex`, which dispatch
+        // through the provider op table embedded in `verbs_context`
+        .allowlist_type("verbs_context")
         .allowlist_var("IBV_LINK_LAYER_.*")
         .bitfield_enum("ibv_access_flags")
         .bitfield_enum("ibv_create_cq_wc_flags")
