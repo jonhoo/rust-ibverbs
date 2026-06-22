@@ -138,7 +138,7 @@ fn send_recv() {
 
     let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
     let mut send = lb.pd.allocate(64).expect("failed to register send MR");
-    send.inner_mut()[..5].copy_from_slice(b"hello");
+    send.bytes_mut()[..5].copy_from_slice(b"hello");
 
     unsafe { lb.qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
     unsafe { lb.qp.post_send(&[send.slice(..5)], 2) }.expect("post_send failed");
@@ -152,7 +152,7 @@ fn send_recv() {
         comps.iter().any(|wc| wc.wr_id() == 2),
         "missing send completion"
     );
-    assert_eq!(&recv.inner_mut()[..5], b"hello");
+    assert_eq!(&recv.bytes_mut()[..5], b"hello");
 }
 
 /// A larger transfer that spans multiple MTU-sized packets reports the right received byte length.
@@ -162,9 +162,9 @@ fn send_recv_large() {
     let mut lb = loopback();
 
     const LEN: usize = 4096;
-    let mut recv = lb.pd.allocate(LEN).expect("failed to register recv MR");
+    let recv = lb.pd.allocate(LEN).expect("failed to register recv MR");
     let mut send = lb.pd.allocate(LEN).expect("failed to register send MR");
-    for (i, b) in send.inner_mut().iter_mut().enumerate() {
+    for (i, b) in send.bytes_mut().iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
 
@@ -177,7 +177,7 @@ fn send_recv_large() {
         .find(|wc| wc.wr_id() == 1)
         .expect("missing recv completion");
     assert_eq!(recv_wc.len(), LEN, "received byte length mismatch");
-    assert_eq!(recv.inner_mut().as_slice(), send.inner_mut().as_slice());
+    assert_eq!(recv.bytes(), send.bytes());
 }
 
 /// Scatter-gather: a send gathers two non-contiguous source slices, and the receive scatters the
@@ -189,8 +189,8 @@ fn scatter_gather() {
 
     let mut send = lb.pd.allocate(64).expect("failed to register send MR");
     let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
-    send.inner_mut()[0..4].copy_from_slice(b"AAAA");
-    send.inner_mut()[16..20].copy_from_slice(b"BBBB");
+    send.bytes_mut()[0..4].copy_from_slice(b"AAAA");
+    send.bytes_mut()[16..20].copy_from_slice(b"BBBB");
 
     unsafe {
         lb.qp
@@ -207,8 +207,8 @@ fn scatter_gather() {
         .expect("missing recv completion");
     assert_eq!(recv_wc.len(), 8, "scattered byte length mismatch");
     // The 8-byte gathered message "AAAABBBB" is scattered into the two receive slices in order.
-    assert_eq!(&recv.inner_mut()[0..4], b"AAAA");
-    assert_eq!(&recv.inner_mut()[32..36], b"BBBB");
+    assert_eq!(&recv.bytes_mut()[0..4], b"AAAA");
+    assert_eq!(&recv.bytes_mut()[32..36], b"BBBB");
 }
 
 /// One-sided RDMA WRITE: the initiator writes directly into a remote memory region.
@@ -219,14 +219,14 @@ fn rdma_write() {
 
     let mut src = lb.pd.allocate(64).expect("failed to register src MR");
     let mut dst = lb.pd.allocate(64).expect("failed to register dst MR");
-    src.inner_mut()[..6].copy_from_slice(b"verbs!");
+    src.bytes_mut()[..6].copy_from_slice(b"verbs!");
 
     let remote = dst.remote().slice(..6);
     unsafe { lb.qp.post_write(&[src.slice(..6)], remote, 1, None) }.expect("post_write failed");
 
     let comps = drain(&lb.cq, 1);
     assert_eq!(comps[0].wr_id(), 1);
-    assert_eq!(&dst.inner_mut()[..6], b"verbs!");
+    assert_eq!(&dst.bytes_mut()[..6], b"verbs!");
 }
 
 /// RDMA WRITE with immediate: the write lands in remote memory and also consumes a receive work
@@ -239,7 +239,7 @@ fn rdma_write_with_imm() {
     let mut src = lb.pd.allocate(64).expect("failed to register src MR");
     let mut dst = lb.pd.allocate(64).expect("failed to register dst MR");
     let dummy = lb.pd.allocate(64).expect("failed to register dummy MR");
-    src.inner_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
+    src.bytes_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
 
     // A write-with-immediate consumes a receive work request on the target queue pair.
     unsafe { lb.qp.post_receive(&[dummy.slice(..1)], 10) }.expect("post_receive failed");
@@ -250,7 +250,7 @@ fn rdma_write_with_imm() {
         .expect("post_write failed");
 
     let comps = drain(&lb.cq, 2);
-    assert_eq!(&dst.inner_mut()[..4], &[1, 2, 3, 4]);
+    assert_eq!(&dst.bytes_mut()[..4], &[1, 2, 3, 4]);
     let recv = comps
         .iter()
         .find(|wc| wc.wr_id() == 10)
@@ -266,14 +266,14 @@ fn rdma_read() {
 
     let mut remote_mr = lb.pd.allocate(64).expect("failed to register remote MR");
     let mut local = lb.pd.allocate(64).expect("failed to register local MR");
-    remote_mr.inner_mut()[..8].copy_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
+    remote_mr.bytes_mut()[..8].copy_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
 
     let remote = remote_mr.remote().slice(..8);
     unsafe { lb.qp.post_read(&[local.slice(..8)], remote, 1) }.expect("post_read failed");
 
     let comps = drain(&lb.cq, 1);
     assert_eq!(comps[0].wr_id(), 1);
-    assert_eq!(&local.inner_mut()[..8], &[9, 8, 7, 6, 5, 4, 3, 2]);
+    assert_eq!(&local.bytes_mut()[..8], &[9, 8, 7, 6, 5, 4, 3, 2]);
 }
 
 /// Batched posting: a single `post` call chains an (unsignaled) RDMA write followed by a signaled
@@ -287,8 +287,8 @@ fn batched_post() {
     let mut dst = lb.pd.allocate(64).expect("failed to register dst MR");
     let mut note = lb.pd.allocate(64).expect("failed to register note MR");
     let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
-    payload.inner_mut()[..3].copy_from_slice(&[42, 43, 44]);
-    note.inner_mut()[..2].copy_from_slice(&[1, 2]);
+    payload.bytes_mut()[..3].copy_from_slice(&[42, 43, 44]);
+    note.bytes_mut()[..2].copy_from_slice(&[1, 2]);
 
     unsafe { lb.qp.post_receive(&[recv.slice(..2)], 100) }.expect("post_receive failed");
 
@@ -313,8 +313,8 @@ fn batched_post() {
         comps.iter().any(|wc| wc.wr_id() == 102),
         "missing send completion"
     );
-    assert_eq!(&dst.inner_mut()[..3], &[42, 43, 44]);
-    assert_eq!(&recv.inner_mut()[..2], &[1, 2]);
+    assert_eq!(&dst.bytes_mut()[..3], &[42, 43, 44]);
+    assert_eq!(&recv.bytes_mut()[..2], &[1, 2]);
 }
 
 /// Many outstanding work requests complete: post a batch of receives and sends, then confirm every
@@ -335,7 +335,7 @@ fn multiple_outstanding() {
     let mut send_mrs = Vec::new();
     for i in 0..N {
         let mut mr = lb.pd.allocate(8).expect("failed to register send MR");
-        mr.inner_mut()[0] = i as u8;
+        mr.bytes_mut()[0] = i as u8;
         unsafe { lb.qp.post_send(&[mr.slice(..8)], i) }.expect("post_send failed");
         send_mrs.push(mr);
     }
@@ -361,7 +361,7 @@ fn wait_for_completion() {
 
     let mut recv = lb.pd.allocate(16).expect("failed to register recv MR");
     let mut send = lb.pd.allocate(16).expect("failed to register send MR");
-    send.inner_mut()[..4].copy_from_slice(b"wait");
+    send.bytes_mut()[..4].copy_from_slice(b"wait");
 
     unsafe { lb.qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
     unsafe { lb.qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
@@ -383,7 +383,7 @@ fn wait_for_completion() {
         ids.contains(&1) && ids.contains(&2),
         "missing completions: {ids:?}"
     );
-    assert_eq!(&recv.inner_mut()[..4], b"wait");
+    assert_eq!(&recv.bytes_mut()[..4], b"wait");
 }
 
 /// An unreliable-connected (UC) queue pair carries SEND/RECV traffic to itself.
@@ -394,7 +394,7 @@ fn unreliable_connection() {
 
     let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
     let mut send = lb.pd.allocate(64).expect("failed to register send MR");
-    send.inner_mut()[..3].copy_from_slice(b"ucq");
+    send.bytes_mut()[..3].copy_from_slice(b"ucq");
 
     unsafe { lb.qp.post_receive(&[recv.slice(..3)], 1) }.expect("post_receive failed");
     unsafe { lb.qp.post_send(&[send.slice(..3)], 2) }.expect("post_send failed");
@@ -408,7 +408,7 @@ fn unreliable_connection() {
         comps.iter().any(|wc| wc.wr_id() == 2),
         "missing send completion"
     );
-    assert_eq!(&recv.inner_mut()[..3], b"ucq");
+    assert_eq!(&recv.bytes_mut()[..3], b"ucq");
 }
 
 /// Shared receive queue: the queue pair draws its receive buffers from an SRQ rather than its own
@@ -434,7 +434,7 @@ fn shared_receive_queue() {
 
     let mut recv = pd.allocate(64).expect("failed to register recv MR");
     let mut send = pd.allocate(64).expect("failed to register send MR");
-    send.inner_mut()[..4].copy_from_slice(b"srq!");
+    send.bytes_mut()[..4].copy_from_slice(b"srq!");
 
     // Receives go to the SRQ, not the queue pair's own receive queue.
     unsafe { srq.post_receive(&[recv.slice(..4)], 1) }.expect("SRQ post_receive failed");
@@ -449,7 +449,7 @@ fn shared_receive_queue() {
         comps.iter().any(|wc| wc.wr_id() == 2),
         "missing send completion"
     );
-    assert_eq!(&recv.inner_mut()[..4], b"srq!");
+    assert_eq!(&recv.bytes_mut()[..4], b"srq!");
 }
 
 /// Unreliable datagram (UD): a connectionless queue pair sends a datagram to itself via an address
@@ -487,7 +487,7 @@ fn unreliable_datagram() {
     // UD receives prepend a 40-byte GRH, so the receive buffer must allow for it.
     let mut recv = pd.allocate(40 + 64).expect("failed to register recv MR");
     let mut send = pd.allocate(64).expect("failed to register send MR");
-    send.inner_mut()[..payload.len()].copy_from_slice(payload);
+    send.bytes_mut()[..payload.len()].copy_from_slice(payload);
 
     unsafe { qp.post_receive(&[recv.slice(..40 + payload.len())], 1) }
         .expect("post_receive failed");
@@ -509,7 +509,7 @@ fn unreliable_datagram() {
         "missing send completion"
     );
     // The payload starts after the 40-byte GRH.
-    assert_eq!(&recv.inner_mut()[40..40 + payload.len()], payload);
+    assert_eq!(&recv.bytes_mut()[40..40 + payload.len()], payload);
 }
 
 /// Atomic compare-and-swap and fetch-and-add against a remote 8-byte value on an RC queue pair.
@@ -537,8 +537,8 @@ fn atomic_operations() {
         .expect("post atomic_cmp_swap failed");
     }
     assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 1);
-    assert_eq!(first_u64(local.inner_mut()), 0, "CAS returns the old value");
-    let stored = first_u64(target.inner_mut());
+    assert_eq!(first_u64(local.bytes_mut()), 0, "CAS returns the old value");
+    let stored = first_u64(target.bytes_mut());
     assert!(
         stored == swapped || stored == swapped.swap_bytes(),
         "CAS should have stored the swap value"
@@ -556,12 +556,12 @@ fn atomic_operations() {
     }
     assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 2);
     assert_eq!(
-        first_u64(target.inner_mut()),
+        first_u64(target.bytes_mut()),
         stored,
         "CAS must not modify the target on a compare mismatch"
     );
     assert_eq!(
-        first_u64(local.inner_mut()),
+        first_u64(local.bytes_mut()),
         stored,
         "CAS returns the current value on a mismatch"
     );
@@ -579,11 +579,11 @@ fn atomic_operations() {
     }
     assert_eq!(drain(&lb.cq, 1)[0].wr_id(), 3);
     assert_eq!(
-        first_u64(local.inner_mut()),
+        first_u64(local.bytes_mut()),
         0,
         "fetch-add returns the old value"
     );
-    let sum = first_u64(counter.inner_mut());
+    let sum = first_u64(counter.bytes_mut());
     assert!(
         sum == 5 || sum == 5u64.swap_bytes(),
         "fetch-add should add 5"
@@ -611,4 +611,38 @@ fn advise_mr() {
         Err(e) if e.raw_os_error() == Some(95) => {}
         Err(e) => panic!("advise_mr returned an unexpected error: {e}"),
     }
+}
+
+/// Registering externally managed memory through the unsafe raw entry point, then using it for a
+/// loopback transfer. The caller owns the buffers and keeps them alive past the regions.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn register_from_raw() {
+    let mut lb = loopback();
+
+    let mut send_buf = vec![0u8; 16];
+    let mut recv_buf = vec![0u8; 16];
+    send_buf[..6].copy_from_slice(b"extern");
+
+    // SAFETY: both buffers outlive their regions (they are declared first, so dropped last) and are
+    // never moved or resized while registered.
+    let access = ibverbs::DEFAULT_ACCESS_FLAGS;
+    let send_mr = unsafe {
+        lb.pd
+            .register_from_raw(send_buf.as_mut_ptr(), send_buf.len(), access)
+    }
+    .expect("register_from_raw send failed");
+    let recv_mr = unsafe {
+        lb.pd
+            .register_from_raw(recv_buf.as_mut_ptr(), recv_buf.len(), access)
+    }
+    .expect("register_from_raw recv failed");
+
+    unsafe { lb.qp.post_receive(&[recv_mr.slice(..6)], 1) }.expect("post_receive failed");
+    unsafe { lb.qp.post_send(&[send_mr.slice(..6)], 2) }.expect("post_send failed");
+
+    let comps = drain(&lb.cq, 2);
+    assert!(comps.iter().any(|wc| wc.wr_id() == 1), "missing recv");
+    assert!(comps.iter().any(|wc| wc.wr_id() == 2), "missing send");
+    assert_eq!(&recv_buf[..6], b"extern");
 }

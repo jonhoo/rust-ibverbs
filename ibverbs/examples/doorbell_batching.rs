@@ -43,7 +43,7 @@ fn main() {
     // then send a final notification containing the count of write operations.
     let text = b"Hello from chained RDMA writes!";
     let mut src_mr = pd.allocate(text.len()).unwrap();
-    src_mr.inner_mut().copy_from_slice(text);
+    src_mr.bytes_mut().copy_from_slice(text);
 
     let dest_mr = pd.allocate(text.len()).unwrap();
 
@@ -68,7 +68,7 @@ fn main() {
     let total_send_wrs = num_writes + 1;
 
     // Write the count of write operations to the notification buffer as payload
-    notify_mr.inner_mut()[..NOTIFY_BUF_SIZE].copy_from_slice(&(num_writes as u32).to_ne_bytes());
+    notify_mr.bytes_mut()[..NOTIFY_BUF_SIZE].copy_from_slice(&(num_writes as u32).to_ne_bytes());
     let notify_slice = [notify_mr.slice(..)];
 
     // 7. Build and post the chain of work requests
@@ -121,7 +121,7 @@ fn main() {
                 assert!(!receive_completed);
                 receive_completed = true;
                 let received_count =
-                    u32::from_ne_bytes(recv_mr.inner()[..NOTIFY_BUF_SIZE].try_into().unwrap());
+                    u32::from_ne_bytes(recv_mr.bytes()[..NOTIFY_BUF_SIZE].try_into().unwrap());
                 println!(
                     "Receive notification completed successfully. Count of writes: {}",
                     received_count
@@ -134,7 +134,7 @@ fn main() {
     }
 
     // 9. Print the written data on the receiver side
-    let written_str = std::str::from_utf8(dest_mr.inner()).unwrap();
+    let written_str = std::str::from_utf8(dest_mr.bytes()).unwrap();
     println!("Written data in destination buffer: {:?}", written_str);
     assert_eq!(written_str, "Hello from chained RDMA writes!");
 }
