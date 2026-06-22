@@ -10,8 +10,8 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    ibv_access_flags, ibv_qp_type, AddressHandleAttribute, CompletionQueue, Context,
-    ProtectionDomain, QueuePair, WorkRequest,
+    ibv_access_flags, ibv_advise_mr_advice, ibv_qp_type, AddressHandleAttribute, CompletionQueue,
+    Context, ProtectionDomain, QueuePair, WorkRequest,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -588,4 +588,27 @@ fn atomic_operations() {
         sum == 5 || sum == 5u64.swap_bytes(),
         "fetch-add should add 5"
     );
+}
+
+/// `ibv_advise_mr` against a registered memory region. Prefetch advice is meant for on-demand-paging
+/// MRs, which Soft-RoCE does not support, so the device may report the verb as unsupported; the
+/// point of the test is that the dispatch path works and returns a result rather than crashing.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn advise_mr() {
+    let lb = loopback();
+    let mr = lb.pd.allocate(4096).expect("failed to register MR");
+    let sg = [mr.slice(..)];
+
+    match lb.pd.advise_mr(
+        ibv_advise_mr_advice::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
+        0,
+        &sg,
+    ) {
+        // Either the device prefetched, or it does not implement advise_mr / on-demand paging
+        // (EOPNOTSUPP is 95 on Linux).
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(95) => {}
+        Err(e) => panic!("advise_mr returned an unexpected error: {e}"),
+    }
 }
