@@ -9,7 +9,10 @@
 
 use std::time::{Duration, Instant};
 
-use ibverbs::{ibv_qp_type, CompletionQueue, Context, ProtectionDomain, QueuePair, WorkRequest};
+use ibverbs::{
+    ibv_qp_type, AddressHandleAttribute, CompletionQueue, Context, ProtectionDomain, QueuePair,
+    WorkRequest,
+};
 
 /// A queue pair connected to itself, with the resources it uses.
 struct Loopback {
@@ -432,4 +435,64 @@ fn shared_receive_queue() {
         "missing send completion"
     );
     assert_eq!(&recv.inner_mut()[..4], b"srq!");
+}
+
+/// Unreliable datagram (UD): a connectionless queue pair sends a datagram to itself via an address
+/// handle pointing at its own GID. UD prepends a 40-byte GRH to received messages.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn unreliable_datagram() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+
+    const GID_INDEX: u32 = 1;
+    const QKEY: u32 = 0x1234_5678;
+
+    let prepared = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_UD)
+        .expect("failed to create UD QP")
+        .set_gid_index(GID_INDEX)
+        .build()
+        .expect("failed to build UD QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared
+        .activate_ud(QKEY)
+        .expect("failed to activate UD QP");
+
+    // Address handle pointing at our own GID, so the datagram loops back to us.
+    let my_gid = endpoint.gid.expect("RoCE requires a GID");
+    let mut ah_attr = AddressHandleAttribute::new();
+    ah_attr.set_grh(my_gid, GID_INDEX as u8, 64, 0);
+    let ah = pd
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+
+    let payload = b"datagram";
+    // UD receives prepend a 40-byte GRH, so the receive buffer must allow for it.
+    let mut recv = pd.allocate(40 + 64).expect("failed to register recv MR");
+    let mut send = pd.allocate(64).expect("failed to register send MR");
+    send.inner_mut()[..payload.len()].copy_from_slice(payload);
+
+    unsafe { qp.post_receive(&[recv.slice(..40 + payload.len())], 1) }
+        .expect("post_receive failed");
+    unsafe { qp.post_send_ud(&[send.slice(..payload.len())], &ah, endpoint.num, QKEY, 2) }
+        .expect("post_send_ud failed");
+
+    let comps = drain(&cq, 2);
+    let recv_wc = comps
+        .iter()
+        .find(|wc| wc.wr_id() == 1)
+        .expect("missing recv completion");
+    assert_eq!(
+        recv_wc.len(),
+        40 + payload.len(),
+        "UD receive length should include the 40-byte GRH"
+    );
+    assert!(
+        comps.iter().any(|wc| wc.wr_id() == 2),
+        "missing send completion"
+    );
+    // The payload starts after the 40-byte GRH.
+    assert_eq!(&recv.inner_mut()[40..40 + payload.len()], payload);
 }
