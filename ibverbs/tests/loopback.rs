@@ -768,3 +768,47 @@ fn query_device_and_port() {
         "a RoCE port should expose a GID table"
     );
 }
+
+/// The raw-handle escape hatches return the live, non-null FFI pointers for each resource.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn raw_handles() {
+    let ctx = open_test_device();
+    assert!(!ctx.as_raw().is_null());
+
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    assert!(!pd.as_raw().is_null());
+
+    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    assert!(!cq.as_raw().is_null());
+    assert!(!cq.as_raw_ex().is_null());
+    // The plain and extended views are the same underlying completion queue.
+    assert_eq!(cq.as_raw() as *const (), cq.as_raw_ex() as *const ());
+
+    let mr = pd.allocate(64).expect("failed to register MR");
+    assert!(!mr.as_raw().is_null());
+
+    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    assert!(!srq.as_raw().is_null());
+
+    // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
+    let prepared = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_UD)
+        .expect("failed to create UD QP")
+        .set_gid_index(1)
+        .build()
+        .expect("failed to build UD QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let qp = prepared
+        .activate_ud(0x1234_5678)
+        .expect("failed to activate UD QP");
+    assert!(!qp.as_raw().is_null());
+    assert!(!qp.as_raw_ex().is_null());
+
+    let mut ah_attr = AddressHandleAttribute::new();
+    ah_attr.set_grh(endpoint.gid.expect("RoCE requires a GID"), 1, 64, 0);
+    let ah = pd
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+    assert!(!ah.as_raw().is_null());
+}

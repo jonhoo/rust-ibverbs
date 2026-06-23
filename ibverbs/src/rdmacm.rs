@@ -297,7 +297,7 @@ impl CmId {
         if ret != 0 {
             return Err(io::Error::last_os_error());
         }
-        let errno = unsafe { ffi::ibv_modify_qp(qp.as_raw_qp(), attr.as_mut_ptr(), mask) };
+        let errno = unsafe { ffi::ibv_modify_qp(qp.as_raw(), attr.as_mut_ptr(), mask) };
         if errno != 0 {
             return Err(io::Error::from_raw_os_error(errno));
         }
