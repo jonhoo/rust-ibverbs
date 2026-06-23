@@ -854,3 +854,37 @@ fn inline_send() {
     assert_eq!(comps[0].wr_id(), 3);
     assert_eq!(&dst.bytes()[..4], b"wxyz");
 }
+
+/// A queue pair created on an explicitly chosen port (port 1) connects and transfers data. The test
+/// device has a single port, so this exercises the port-threading path rather than a second port.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn queue_pair_on_explicit_port() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+
+    let mut builder = pd
+        .create_qp_on_port(&cq, &cq, ibv_qp_type::IBV_QPT_RC, 1)
+        .expect("failed to create QP on port 1");
+    builder.set_gid_index(1).set_access(
+        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+    );
+    let prepared = builder.build().expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+
+    let recv = pd.allocate(64).expect("failed to register recv MR");
+    let mut send = pd.allocate(64).expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"port");
+
+    unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
+    unsafe { qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
+
+    let comps = drain(&cq, 2);
+    assert!(comps.iter().any(|c| c.wr_id() == 1), "missing recv");
+    assert!(comps.iter().any(|c| c.wr_id() == 2), "missing send");
+    assert_eq!(&recv.bytes()[..4], b"port");
+}
