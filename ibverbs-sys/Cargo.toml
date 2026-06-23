@@ -27,6 +27,9 @@ exclude = ["vendor/rdma-core/build/"]
 # Bind and link the EFA provider direct-verbs (`efadv`), for AWS Elastic Fabric Adapter SRD queue
 # pairs. Requires `libefa` at build and run time.
 efa = []
+# Bind and link the RDMA connection manager (`librdmacm`, `rdma_cma.h`). Requires `librdmacm` at
+# build and run time.
+rdmacm = []
 
 [build-dependencies]
 bindgen = "0.72"
