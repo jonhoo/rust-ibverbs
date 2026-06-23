@@ -45,6 +45,67 @@ jobs:
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
         run: cargo test --locked --all-features --doc
+  integration:
+    # Exercise the data path against a real RDMA device. The integration tests are #[ignore]d
+    # because they need a device, so the rest of CI only compile-checks them. Here we stand up a
+    # Soft-RoCE (rxe) device by building the rdma_rxe kernel module from the matching upstream
+    # kernel source (the runner's own kernel ships only siw) and attaching it to the runner's
+    # network interface, then run the ignored tests against it. Pinned to 22.04: the rxe module we
+    # build from v6.8 source is reliable, whereas the build for ubuntu-latest's newer (6.17) kernel
+    # drops completions on most two-sided transfers (its source diverges more from the azure kernel).
+    runs-on: ubuntu-22.04
+    name: ubuntu / stable / soft-roce
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Configure CI host
+        run: ./configure-ci.sh
+      - name: Set up a Soft-RoCE (rxe) device
+        run: |
+          set -euxo pipefail
+          # GitHub-hosted runner kernels ship the siw module but not rdma_rxe, so build the rxe
+          # module from the matching upstream kernel source against the running kernel's headers
+          # and load that. rxe is a software RoCE provider, so this needs no special hardware.
+          sudo apt-get install -y --no-install-recommends \
+            linux-headers-"$(uname -r)" build-essential libelf-dev dwarves git \
+            ibverbs-providers ibverbs-utils iproute2
+          src=$(uname -r); src=${src%%-*}; src=${src%.0}   # 6.8.0-1059-azure -> 6.8 (the tag name)
+          # Fetch just the rxe driver directory rather than the whole kernel tree.
+          git clone --quiet --depth 1 --filter=tree:0 --sparse --branch "v${src}" \
+            https://github.com/torvalds/linux.git linux-src
+          git -C linux-src sparse-checkout set drivers/infiniband/sw/rxe
+          cd linux-src/drivers/infiniband/sw/rxe
+          # Turn the in-tree build file into an out-of-tree module build forced on.
+          mv Makefile Kbuild
+          sed -i 's/$(CONFIG_RDMA_RXE)/m/g' Kbuild
+          make -C "/lib/modules/$(uname -r)/build" M="$PWD" modules
+          sudo mkdir -p "/lib/modules/$(uname -r)/extra"
+          sudo cp rdma_rxe.ko "/lib/modules/$(uname -r)/extra/"
+          sudo depmod -a
+          sudo modprobe rdma_rxe
+          netdev=$(ip -o -4 route show to default | awk '{print $5; exit}')
+          echo "Attaching rxe0 to $netdev"
+          sudo rdma link add rxe0 type rxe netdev "$netdev"
+          rdma link
+          ibv_devices
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo generate-lockfile
+        if: hashFiles('Cargo.lock') == ''
+        run: cargo generate-lockfile
+      - name: cargo test -- --ignored
+        env:
+          IBVERBS_TEST_DEVICE: rxe0
+        # Run serially: the tests share one rxe device, and Soft-RoCE drops completions when many
+        # queue pairs drive it concurrently. The three skipped tests cover RC atomics and the UC/UD
+        # transports, which this rxe build does not handle correctly (they pass on real hardware and
+        # a current 7.x kernel); everything else gates the full RC data path.
+        run: |
+          cargo test --locked --test loopback -- --ignored --test-threads=1 \
+            --skip atomic_operations \
+            --skip unreliable_connection \
+            --skip unreliable_datagram
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
     # that this crate is compatible with the minimal version that this crate and its dependencies
