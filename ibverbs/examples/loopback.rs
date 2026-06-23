@@ -28,15 +28,12 @@ fn main() {
 
     let mut sent = false;
     let mut received = false;
-    let mut completions = [ibverbs::ibv_wc::default(); 16];
     while !sent || !received {
-        let completed = cq.poll(&mut completions[..]).unwrap();
-        if completed.is_empty() {
+        let Some(mut completions) = cq.poll().unwrap() else {
             continue;
-        }
-        assert!(completed.len() <= 2);
-        for wr in completed {
-            match wr.wr_id() {
+        };
+        while let Some(wc) = completions.next() {
+            match wc.wr_id() {
                 1 => {
                     assert!(!sent);
                     sent = true;

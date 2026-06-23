@@ -443,24 +443,33 @@ impl Context {
         );
         nix::fcntl::fcntl(cc_fd, arg)?;
 
-        let cq = unsafe {
-            ffi::ibv_create_cq(
-                self.inner.ctx,
-                min_cq_entries,
-                ptr::null::<c_void>().offset(id) as *mut _,
-                cc,
-                0,
-            )
+        // Request the standard work-completion fields so the lazy readers in `WorkCompletion` can
+        // serve them. Optional fields (timestamps, CVLAN, ...) are not requested, since not every
+        // provider supports them.
+        let wc_flags = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0;
+        let mut cq_attr = ffi::ibv_cq_init_attr_ex {
+            cqe: min_cq_entries as u32,
+            cq_context: unsafe { ptr::null::<c_void>().offset(id) } as *mut _,
+            channel: cc,
+            comp_vector: 0,
+            wc_flags: wc_flags as u64,
+            comp_mask: 0,
+            flags: 0,
+            parent_domain: ptr::null_mut(),
         };
+        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.inner.ctx, &mut cq_attr as *mut _) };
 
-        if cq.is_null() {
+        if cq_ex.is_null() {
             Err(io::Error::last_os_error())
         } else {
             Ok(CompletionQueue {
                 inner: Arc::new(CompletionQueueInner {
                     _ctx: self.inner.clone(),
                     cc,
-                    cq,
+                    cq_ex,
                 }),
             })
         }
@@ -514,13 +523,23 @@ impl Context {
 
 struct CompletionQueueInner {
     _ctx: Arc<ContextInner>,
-    cq: *mut ffi::ibv_cq,
+    cq_ex: *mut ffi::ibv_cq_ex,
     cc: *mut ffi::ibv_comp_channel,
+}
+
+impl CompletionQueueInner {
+    /// The underlying `ibv_cq`. An `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this is
+    /// just a pointer cast (exactly what `ibv_cq_ex_to_cq` does in C). Used for the verbs that still
+    /// take a plain `ibv_cq`: queue-pair creation, completion-event notification, and teardown.
+    #[inline]
+    fn cq(&self) -> *mut ffi::ibv_cq {
+        self.cq_ex as *mut ffi::ibv_cq
+    }
 }
 
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_cq(self.cq) };
+        let errno = unsafe { ffi::ibv_destroy_cq(self.cq()) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
             panic!("{e}");
@@ -537,6 +556,128 @@ impl Drop for CompletionQueueInner {
 unsafe impl Send for CompletionQueueInner {}
 unsafe impl Sync for CompletionQueueInner {}
 
+/// A single work completion, borrowed from the completion queue being polled.
+///
+/// Returned by [`Completions::next`]. Fields are read lazily through the extended completion-queue
+/// interface, so you only pay for the ones you access (`wr_id` and `status` are plain reads; the
+/// rest dispatch to the provider). The handle borrows the [`Completions`] iterator, so it must be
+/// dropped before advancing — the completion data is only valid until then.
+pub struct WorkCompletion<'iter> {
+    cq: *mut ffi::ibv_cq_ex,
+    _iter: std::marker::PhantomData<&'iter Completions<'iter>>,
+}
+
+#[allow(clippy::len_without_is_empty)]
+impl WorkCompletion<'_> {
+    /// The 64-bit id that was associated with the corresponding work request when it was posted.
+    #[inline]
+    pub fn wr_id(&self) -> u64 {
+        unsafe { (*self.cq).wr_id }
+    }
+
+    /// Whether this work request completed successfully (`IBV_WC_SUCCESS`).
+    #[inline]
+    pub fn is_success(&self) -> bool {
+        unsafe { (*self.cq).status == ffi::ibv_wc_status::IBV_WC_SUCCESS }
+    }
+
+    /// `Ok(())` if the work request completed successfully, otherwise the status and vendor error.
+    #[inline]
+    pub fn ok(&self) -> Result<(), (ffi::ibv_wc_status, u32)> {
+        match self.error() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The completion status and vendor error syndrome if the work request did not succeed.
+    #[inline]
+    pub fn error(&self) -> Option<(ffi::ibv_wc_status, u32)> {
+        match unsafe { (*self.cq).status } {
+            ffi::ibv_wc_status::IBV_WC_SUCCESS => None,
+            status => Some((status, unsafe {
+                (*self.cq).read_vendor_err.unwrap()(self.cq)
+            })),
+        }
+    }
+
+    /// The opcode of the completed work request.
+    #[inline]
+    pub fn opcode(&self) -> ffi::ibv_wc_opcode {
+        unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }
+    }
+
+    /// The number of bytes transferred.
+    #[inline]
+    pub fn len(&self) -> usize {
+        unsafe { (*self.cq).read_byte_len.unwrap()(self.cq) as usize }
+    }
+
+    /// The 32-bit immediate value (host byte order) if one was carried (`IBV_WC_WITH_IMM`).
+    #[inline]
+    pub fn imm_data(&self) -> Option<u32> {
+        let flags = ffi::ibv_wc_flags(unsafe { (*self.cq).read_wc_flags.unwrap()(self.cq) });
+        if self.is_success() && (flags & ffi::ibv_wc_flags::IBV_WC_WITH_IMM).0 != 0 {
+            Some(u32::from_be(unsafe {
+                (*self.cq).read_imm_data.unwrap()(self.cq)
+            }))
+        } else {
+            None
+        }
+    }
+
+    /// The local QP number of the completed work request.
+    #[inline]
+    pub fn qp_num(&self) -> u32 {
+        unsafe { (*self.cq).read_qp_num.unwrap()(self.cq) }
+    }
+
+    /// The source (remote) QP number, relevant for datagram receive completions.
+    #[inline]
+    pub fn src_qp(&self) -> u32 {
+        unsafe { (*self.cq).read_src_qp.unwrap()(self.cq) }
+    }
+}
+
+/// An in-progress poll of a [`CompletionQueue`], yielding work completions one at a time.
+///
+/// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
+/// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
+/// call (which is why it cannot implement [`Iterator`]). The completion queue is released
+/// (`ibv_end_poll`) when the `Completions` is dropped.
+#[must_use]
+pub struct Completions<'cq> {
+    cq: *mut ffi::ibv_cq_ex,
+    first: bool,
+    _cq: std::marker::PhantomData<&'cq CompletionQueueInner>,
+}
+
+impl Completions<'_> {
+    /// Return the next work completion, or `None` once the queue has no more.
+    ///
+    /// Consume with `while let Some(wc) = completions.next() { ... }`.
+    #[allow(clippy::should_implement_trait)]
+    #[inline]
+    pub fn next(&mut self) -> Option<WorkCompletion<'_>> {
+        if self.first {
+            self.first = false;
+        } else if unsafe { (*self.cq).next_poll.unwrap()(self.cq) } != 0 {
+            // ENOENT (no more) or an error: either way the poll is finished.
+            return None;
+        }
+        Some(WorkCompletion {
+            cq: self.cq,
+            _iter: std::marker::PhantomData,
+        })
+    }
+}
+
+impl Drop for Completions<'_> {
+    fn drop(&mut self) {
+        unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+    }
+}
+
 /// A completion queue that allows subscribing to the completion of queued sends and receives.
 #[must_use]
 #[derive(Clone)]
@@ -545,110 +686,76 @@ pub struct CompletionQueue {
 }
 
 impl CompletionQueue {
-    /// Poll for (possibly multiple) work completions.
+    /// Begin polling for work completions through the extended interface.
     ///
-    /// A Work Completion indicates that a Work Request in a Work Queue, and all of the outstanding
-    /// unsignaled Work Requests that posted to that Work Queue, associated with this CQ have
-    /// completed. Any Receive Requests, signaled Send Requests and Send Requests that ended with
-    /// an error will generate Work Completions.
-    ///
-    /// When a Work Request ends, a Work Completion is added to the tail of the CQ that this Work
-    /// Queue is associated with. `poll` checks if Work Completions are present in a CQ, and pop
-    /// them from the head of the CQ in the order they entered it (FIFO) into `completions`. After
-    /// a Work Completion was popped from a CQ, it cannot be returned to it. `poll` returns the
-    /// subset of `completions` that successfully completed. If the returned slice has fewer
-    /// elements than the provided `completions` slice, the CQ was emptied.
-    ///
-    /// Not all attributes of the completed `ibv_wc`'s are always valid. If the completion status
-    /// is not `IBV_WC_SUCCESS`, only the following attributes are valid: `wr_id`, `status`,
-    /// `qp_num`, and `vendor_err`.
+    /// Returns `None` if the queue is currently empty. The returned [`Completions`] is a lending
+    /// iterator whose [`WorkCompletion`]s read their fields lazily, so you only pay for the fields
+    /// you read.
     ///
     /// Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
-    ///  `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting
-    /// the number of inflight Work Requests.
+    /// `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting the
+    /// number of inflight work requests.
     ///
-    /// Note that `poll` does not block or cause a context switch. This is why RDMA technologies
-    /// can achieve very low latency (below 1 µs).
+    /// `poll` does not block or cause a context switch; use [`wait`](Self::wait) to block.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ibverbs::CompletionQueue;
+    /// # fn drain(cq: &CompletionQueue) -> std::io::Result<()> {
+    /// if let Some(mut completions) = cq.poll()? {
+    ///     while let Some(wc) = completions.next() {
+    ///         if let Err((status, _)) = wc.ok() {
+    ///             eprintln!("work request {} failed: {status:?}", wc.wr_id());
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     #[inline]
-    pub fn poll<'c>(
-        &self,
-        completions: &'c mut [ffi::ibv_wc],
-    ) -> io::Result<&'c mut [ffi::ibv_wc]> {
-        // TODO: from http://www.rdmamojo.com/2013/02/15/ibv_poll_cq/
-        //
-        //   One should consume Work Completions at a rate that prevents the CQ from being overrun
-        //   (hold more Work Completions than the CQ size). In case of an CQ overrun, the async
-        //   event `IBV_EVENT_CQ_ERR` will be triggered, and the CQ cannot be used anymore.
-        //
-        let ctx: *mut ffi::ibv_context = unsafe { &*self.inner.cq }.context;
-        let ops = &mut unsafe { &mut *ctx }.ops;
-        let n = unsafe {
-            ops.poll_cq.as_mut().unwrap()(
-                self.inner.cq,
-                completions.len() as i32,
-                completions.as_mut_ptr(),
-            )
-        };
-
-        if n < 0 {
-            Err(io::Error::other("ibv_poll_cq failed"))
-        } else {
-            Ok(&mut completions[0..n as usize])
+    pub fn poll(&self) -> io::Result<Option<Completions<'_>>> {
+        let cq = self.inner.cq_ex;
+        let mut attr = ffi::ibv_poll_cq_attr { comp_mask: 0 };
+        // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
+        // paired with `end_poll`) when the queue is empty.
+        match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
+            0 => Ok(Some(Completions {
+                cq,
+                first: true,
+                _cq: std::marker::PhantomData,
+            })),
+            e if e == nix::libc::ENOENT => Ok(None),
+            e => Err(io::Error::from_raw_os_error(e)),
         }
     }
 
-    /// Waits for one or more work completions in a Completion Queue (CQ).
+    /// Block until at least one work completion is available, then begin polling.
     ///
-    /// Unlike `poll`, this method blocks until at least one work completion is available or the
-    /// optional timeout expires. It is designed to wait efficiently for completions when polling
-    /// alone is insufficient, such as in low-traffic scenarios.
-    ///
-    /// The returned slice reflects completed work requests (e.g., sends, receives) from the
-    /// associated Work Queue. Not all fields in `ibv_wc` are valid unless the status is
-    /// `IBV_WC_SUCCESS`.
+    /// Unlike [`poll`](Self::poll), this arms the completion channel and blocks (up to `timeout`)
+    /// rather than returning `None` on an empty queue. It returns the same lending [`Completions`]
+    /// iterator.
     ///
     /// # Errors
-    /// - `TimedOut`: If the timeout expires before any completions are available.
-    /// - System errors: From underlying calls like `req_notify_cq`, `poll`, or `ibv_get_cq_event`.
-    pub fn wait<'c>(
-        &self,
-        completions: &'c mut [ffi::ibv_wc],
-        timeout: Option<Duration>,
-    ) -> io::Result<&'c mut [ffi::ibv_wc]> {
-        let c = completions as *mut [ffi::ibv_wc];
-
+    ///  - `TimedOut`: the timeout expired before any completion arrived.
+    ///  - System errors from `req_notify_cq`, `poll`, or `ibv_get_cq_event`.
+    pub fn wait(&self, timeout: Option<Duration>) -> io::Result<Completions<'_>> {
         loop {
-            let polled_completions = self.poll(unsafe { &mut *c })?;
-            if !polled_completions.is_empty() {
-                return Ok(polled_completions);
-            }
-
-            // SAFETY: dereferencing completion queue context, which is guaranteed to not have
-            // been destroyed yet because we don't destroy it until in Drop, and given we have
-            // self, Drop has not been called. The context is guaranteed to not have been destroyed
-            // because the `CompletionQueue` holds a reference to the `Context` and we only destroy
-            // the context in Drop implementation of the `Context`.
-            let ctx = unsafe { *self.inner.cq }.context;
-            let errno = unsafe {
-                let ops = &mut { &mut *ctx }.ops;
-                ops.req_notify_cq.as_mut().unwrap()(self.inner.cq, 0)
-            };
+            // Arm the completion channel, then poll: polling after arming closes the race where a
+            // completion arrives between an earlier poll and arming.
+            let cq = self.inner.cq();
+            let ctx = unsafe { *cq }.context;
+            let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, 0) };
             if errno != 0 {
                 return Err(io::Error::from_raw_os_error(errno));
             }
-
-            // We poll again to avoid a race when Work Completions arrive between the first `poll()` and `req_notify_cq()`.
-            let polled_completions = self.poll(unsafe { &mut *c })?;
-            if !polled_completions.is_empty() {
-                return Ok(polled_completions);
+            if let Some(completions) = self.poll()? {
+                return Ok(completions);
             }
 
             let pollfd = nix::poll::PollFd::new(
-                // SAFETY: dereferencing completion queue context, which is guaranteed to not have
-                // been destroyed yet because we don't destroy it until in Drop, and given we have
-                // self, Drop has not been called. `fd` is guaranteed to not have been destroyed
-                // because only destroy it in the Drop implementation of this `CompletionQueue` and
-                // we still hold `self` here.
+                // SAFETY: the comp channel fd lives until this `CompletionQueue`'s `Drop`, and we
+                // still hold `self`.
                 unsafe { BorrowedFd::borrow_raw({ *self.inner.cc }.fd) },
                 nix::poll::PollFlags::POLLIN,
             );
@@ -672,9 +779,8 @@ impl CompletionQueue {
 
             let mut out_cq = std::ptr::null_mut();
             let mut out_cq_context = std::ptr::null_mut();
-            // The Completion Notification must be read using ibv_get_cq_event(). The file descriptor of
-            // `cq_context` was put into non-blocking mode to make `ibv_get_cq_event()` non-blocking.
-            // SAFETY: c ffi call
+            // The completion notification must be read with ibv_get_cq_event(); the fd was set
+            // non-blocking so this does not block.
             let rc =
                 unsafe { ffi::ibv_get_cq_event(self.inner.cc, &mut out_cq, &mut out_cq_context) };
             if rc < 0 {
@@ -684,14 +790,11 @@ impl CompletionQueue {
                 }
                 return Err(e);
             }
-
-            assert_eq!(self.inner.cq, out_cq);
-            // cq_context is the opaque user defined identifier passed to `ibv_create_cq()`.
+            assert_eq!(self.inner.cq(), out_cq);
             assert!(out_cq_context.is_null());
 
-            // All completion events returned by ibv_get_cq_event() must eventually be acknowledged with ibv_ack_cq_events().
-            // SAFETY: c ffi call
-            unsafe { ffi::ibv_ack_cq_events(self.inner.cq, 1) };
+            // Every event from ibv_get_cq_event() must eventually be acknowledged.
+            unsafe { ffi::ibv_ack_cq_events(self.inner.cq(), 1) };
         }
     }
 }
@@ -1130,30 +1233,58 @@ impl QueuePairBuilder {
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
     pub fn build(&self) -> io::Result<PreparedQueuePair> {
-        let mut attr = ffi::ibv_qp_init_attr {
-            qp_context: unsafe { ptr::null::<c_void>().offset(self.ctx) } as *mut _,
-            send_cq: self.send.cq as *const _ as *mut _,
-            recv_cq: self.recv.cq as *const _ as *mut _,
-            srq: self
+        use ffi::ibv_qp_create_send_ops_flags as SendOps;
+        use ffi::ibv_qp_type::{IBV_QPT_RC, IBV_QPT_UC};
+
+        // Enable the extended send operations we drive through the doorbell post API. SEND is
+        // available on every transport; one-sided RDMA needs a connected QP (RC/UC), and RDMA read
+        // plus atomics are RC-only.
+        let mut send_ops_flags =
+            SendOps::IBV_QP_EX_WITH_SEND.0 | SendOps::IBV_QP_EX_WITH_SEND_WITH_IMM.0;
+        if matches!(self.qp_type, IBV_QPT_RC | IBV_QPT_UC) {
+            send_ops_flags |= SendOps::IBV_QP_EX_WITH_RDMA_WRITE.0
+                | SendOps::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0;
+        }
+        if self.qp_type == IBV_QPT_RC {
+            send_ops_flags |= SendOps::IBV_QP_EX_WITH_RDMA_READ.0
+                | SendOps::IBV_QP_EX_WITH_ATOMIC_CMP_AND_SWP.0
+                | SendOps::IBV_QP_EX_WITH_ATOMIC_FETCH_AND_ADD.0;
+        }
+
+        // `ibv_qp_init_attr_ex` has a `qp_type` field with no zero variant plus fields we never use
+        // (XRC, TSO, RX hashing). Zero the storage, write only the fields the driver reads, and hand
+        // the pointer to C without `assume_init`, so the untouched enum fields never become a Rust
+        // value.
+        let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr_ex>::zeroed();
+        let p = attr.as_mut_ptr();
+        unsafe {
+            (*p).qp_context = ptr::null::<c_void>().offset(self.ctx) as *mut _;
+            (*p).send_cq = self.send.cq();
+            (*p).recv_cq = self.recv.cq();
+            (*p).srq = self
                 .srq
                 .as_ref()
                 .map(|s| s.inner.srq)
-                .unwrap_or(ptr::null_mut()),
-            cap: ffi::ibv_qp_cap {
+                .unwrap_or(ptr::null_mut());
+            (*p).cap = ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
                 max_send_sge: self.max_send_sge,
                 max_recv_sge: self.max_recv_sge,
                 max_inline_data: self.max_inline_data,
-            },
-            qp_type: self.qp_type,
-            sq_sig_all: 0,
-        };
+            };
+            (*p).qp_type = self.qp_type;
+            (*p).comp_mask = ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
+                | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0;
+            (*p).pd = self.pd.pd;
+            (*p).send_ops_flags = send_ops_flags as u64;
+        }
 
-        let qp = unsafe { ffi::ibv_create_qp(self.pd.pd, &mut attr as *mut _) };
+        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, attr.as_mut_ptr()) };
         if qp.is_null() {
             Err(io::Error::last_os_error())
         } else {
+            let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
             Ok(PreparedQueuePair {
                 lid: self.port_attr.lid,
                 qp: QueuePair {
@@ -1162,6 +1293,7 @@ impl QueuePairBuilder {
                     _send_cq: self.send.clone(),
                     _recv_cq: self.recv.clone(),
                     qp,
+                    qp_ex,
                 },
                 gid_index: self.gid_index,
                 traffic_class: self.traffic_class,
@@ -2246,293 +2378,265 @@ impl SharedReceiveQueue {
     }
 }
 
-/// A single work request wrapper that binds the lifetime of the local buffer.
-#[repr(transparent)]
-pub struct WorkRequest<'local> {
-    wr: ffi::ibv_send_wr,
-    /// `ffi::ibv_send_wr` contains a raw pointer (`sg_list`) to the local memory slice.
-    /// `PhantomData` ensures the compiler knows this struct logically borrows the slice,
-    /// preventing the slice from being dropped or moved while the `WorkRequest` exists.
-    _local: std::marker::PhantomData<&'local [LocalMemorySlice]>,
+/// One operation recorded in a [`PostBatch`] until the batch is flushed to the doorbell.
+/// A batch of send work requests being built on a [`QueuePair`]'s send queue.
+///
+/// Created by [`QueuePair::start`]. Each builder method posts one work request to the open block
+/// immediately through the extended ("doorbell") interface; [`submit`](Self::submit) then rings the
+/// doorbell once for the whole batch. Dropping the batch without submitting aborts it.
+///
+/// Configure a request *before* its opcode method: `batch.signaled().to(&ah, qpn, qkey).send(id,
+/// sges)`. (The provider reads the work-request flags inside the opcode builder, so signaling and
+/// addressing must be set first.)
+#[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
+pub struct PostBatch<'qp> {
+    qpx: *mut ffi::ibv_qp_ex,
+    _qp: std::marker::PhantomData<&'qp mut QueuePair>,
 }
 
-impl<'local> WorkRequest<'local> {
-    /// Create a Send work request.
+impl<'qp> PostBatch<'qp> {
+    /// Mark the next work request as signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
     #[inline]
-    pub fn send(local: &'local [LocalMemorySlice], wr_id: u64, imm: Option<u32>) -> Self {
-        let opcode = if imm.is_some() {
-            ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM
-        } else {
-            ffi::ibv_wr_opcode::IBV_WR_SEND
-        };
-        let anon_1 = if let Some(imm_data) = imm {
-            ffi::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm_data.to_be(),
-            }
-        } else {
-            Default::default()
-        };
-
-        Self {
-            wr: ffi::ibv_send_wr {
-                wr_id,
-                next: ptr::null_mut(),
-                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-                num_sge: local.len() as i32,
-                opcode,
-                send_flags: 0,
-                wr: Default::default(),
-                qp_type: Default::default(),
-                __bindgen_anon_1: anon_1,
-                __bindgen_anon_2: Default::default(),
-            },
-            _local: std::marker::PhantomData,
+    pub fn signaled(&mut self) -> PostOp<'_, 'qp> {
+        PostOp {
+            batch: self,
+            flags: ffi::ibv_send_flags::IBV_SEND_SIGNALED.0,
+            dest: None,
         }
     }
 
-    /// Create an unreliable-datagram (UD) send work request addressed to `ah` / `remote_qpn` /
-    /// `remote_qkey`.
-    ///
-    /// Only valid on a UD queue pair (see [`PreparedQueuePair::activate_ud`]). The address handle
-    /// must outlive the operation, so it is borrowed for `'local` alongside the buffers.
+    /// Address the next work request to `ah` / `remote_qpn` / `remote_qkey` (required for sends on
+    /// UD and SRD queue pairs).
     #[inline]
-    pub fn send_ud(
-        local: &'local [LocalMemorySlice],
-        ah: &'local AddressHandle,
-        remote_qpn: u32,
-        remote_qkey: u32,
+    pub fn to(&mut self, ah: &AddressHandle, remote_qpn: u32, remote_qkey: u32) -> PostOp<'_, 'qp> {
+        PostOp {
+            batch: self,
+            flags: 0,
+            dest: Some((ah.as_ptr(), remote_qpn, remote_qkey)),
+        }
+    }
+
+    #[inline]
+    fn op(&mut self) -> PostOp<'_, 'qp> {
+        PostOp {
+            batch: self,
+            flags: 0,
+            dest: None,
+        }
+    }
+
+    /// Post a SEND.
+    #[inline]
+    pub fn send(&mut self, wr_id: u64, local: &[LocalMemorySlice]) {
+        self.op().send(wr_id, local)
+    }
+
+    /// Post a SEND carrying a 32-bit immediate (passed in host byte order).
+    #[inline]
+    pub fn send_imm(&mut self, wr_id: u64, local: &[LocalMemorySlice], imm: u32) {
+        self.op().send_imm(wr_id, local, imm)
+    }
+
+    /// Post an RDMA WRITE into the remote region `remote`.
+    #[inline]
+    pub fn write(&mut self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+        self.op().write(wr_id, local, remote)
+    }
+
+    /// Post an RDMA WRITE carrying a 32-bit immediate (host byte order).
+    #[inline]
+    pub fn write_imm(
+        &mut self,
         wr_id: u64,
-        imm: Option<u32>,
-    ) -> Self {
-        let opcode = if imm.is_some() {
-            ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM
-        } else {
-            ffi::ibv_wr_opcode::IBV_WR_SEND
-        };
-        let anon_1 = if let Some(imm_data) = imm {
-            ffi::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm_data.to_be(),
-            }
-        } else {
-            Default::default()
-        };
-
-        Self {
-            wr: ffi::ibv_send_wr {
-                wr_id,
-                next: ptr::null_mut(),
-                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-                num_sge: local.len() as i32,
-                opcode,
-                send_flags: 0,
-                wr: ffi::ibv_send_wr__bindgen_ty_2 {
-                    ud: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_3 {
-                        ah: ah.as_ptr(),
-                        remote_qpn,
-                        remote_qkey,
-                    },
-                },
-                qp_type: Default::default(),
-                __bindgen_anon_1: anon_1,
-                __bindgen_anon_2: Default::default(),
-            },
-            _local: std::marker::PhantomData,
-        }
-    }
-
-    // Helper function to build one-sided (RDMA Read/Write) work requests
-    #[inline]
-    fn _one_sided(
-        local: &'local [LocalMemorySlice],
+        local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
-        wr_id: u64,
-        opcode: ffi::ibv_wr_opcode,
-        imm: Option<u32>,
-    ) -> Self {
-        let anon_1 = if let Some(imm_data) = imm {
-            ffi::ibv_send_wr__bindgen_ty_1 {
-                imm_data: imm_data.to_be(),
-            }
-        } else {
-            Default::default()
-        };
-
-        Self {
-            wr: ffi::ibv_send_wr {
-                wr_id,
-                next: ptr::null_mut(),
-                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-                num_sge: local.len() as i32,
-                opcode,
-                send_flags: 0,
-                wr: ffi::ibv_send_wr__bindgen_ty_2 {
-                    rdma: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
-                        remote_addr: remote.addr,
-                        rkey: remote.rkey,
-                    },
-                },
-                qp_type: Default::default(),
-                __bindgen_anon_1: anon_1,
-                __bindgen_anon_2: Default::default(),
-            },
-            _local: std::marker::PhantomData,
-        }
+        imm: u32,
+    ) {
+        self.op().write_imm(wr_id, local, remote, imm)
     }
 
-    /// Create an RDMA Write work request.
+    /// Post an RDMA READ from `remote` into `local`.
     #[inline]
-    pub fn write(
-        local: &'local [LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-        imm: Option<u32>,
-    ) -> Self {
-        let opcode = if imm.is_some() {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
-        } else {
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
-        };
-        Self::_one_sided(local, remote, wr_id, opcode, imm)
+    pub fn read(&mut self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+        self.op().read(wr_id, local, remote)
     }
 
-    /// Create an RDMA Read work request.
-    #[inline]
-    pub fn read(local: &'local [LocalMemorySlice], remote: RemoteMemorySlice, wr_id: u64) -> Self {
-        Self::_one_sided(
-            local,
-            remote,
-            wr_id,
-            ffi::ibv_wr_opcode::IBV_WR_RDMA_READ,
-            None,
-        )
-    }
-
-    // Helper to build atomic (compare-and-swap / fetch-and-add) work requests.
-    #[inline]
-    fn _atomic(
-        local: &'local [LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-        opcode: ffi::ibv_wr_opcode,
-        compare_add: u64,
-        swap: u64,
-    ) -> Self {
-        Self {
-            wr: ffi::ibv_send_wr {
-                wr_id,
-                next: ptr::null_mut(),
-                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-                num_sge: local.len() as i32,
-                opcode,
-                send_flags: 0,
-                wr: ffi::ibv_send_wr__bindgen_ty_2 {
-                    atomic: ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_2 {
-                        remote_addr: remote.addr,
-                        compare_add,
-                        swap,
-                        rkey: remote.rkey,
-                    },
-                },
-                qp_type: Default::default(),
-                __bindgen_anon_1: Default::default(),
-                __bindgen_anon_2: Default::default(),
-            },
-            _local: std::marker::PhantomData,
-        }
-    }
-
-    /// Create an atomic compare-and-swap work request (`IBV_WR_ATOMIC_CMP_AND_SWP`).
-    ///
-    /// Atomically compares the 8-byte value at `remote` against `compare` and, if they are equal,
-    /// writes `swap`. The original remote value is returned into `local`, which must be 8 bytes and
-    /// 8-byte aligned. Valid only for RC queue pairs, and the remote memory region must permit
-    /// `IBV_ACCESS_REMOTE_ATOMIC`.
+    /// Post an atomic compare-and-swap on the 8-byte value at `remote`.
     #[inline]
     pub fn atomic_cmp_swap(
-        local: &'local [LocalMemorySlice],
+        &mut self,
+        wr_id: u64,
+        local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         compare: u64,
         swap: u64,
-        wr_id: u64,
-    ) -> Self {
-        Self::_atomic(
-            local,
-            remote,
-            wr_id,
-            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP,
-            compare,
-            swap,
-        )
+    ) {
+        self.op()
+            .atomic_cmp_swap(wr_id, local, remote, compare, swap)
     }
 
-    /// Create an atomic fetch-and-add work request (`IBV_WR_ATOMIC_FETCH_AND_ADD`).
-    ///
-    /// Atomically adds `add` to the 8-byte value at `remote`, returning the original remote value
-    /// into `local`, which must be 8 bytes and 8-byte aligned. Valid only for RC queue pairs, and
-    /// the remote memory region must permit `IBV_ACCESS_REMOTE_ATOMIC`.
+    /// Post an atomic fetch-and-add on the 8-byte value at `remote`.
     #[inline]
     pub fn atomic_fetch_add(
-        local: &'local [LocalMemorySlice],
+        &mut self,
+        wr_id: u64,
+        local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         add: u64,
-        wr_id: u64,
-    ) -> Self {
-        Self::_atomic(
-            local,
-            remote,
-            wr_id,
-            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD,
-            add,
-            0,
-        )
+    ) {
+        self.op().atomic_fetch_add(wr_id, local, remote, add)
     }
 
-    /// Set the `IBV_SEND_FENCE` flag.
+    /// Post the whole batch to the device, ringing the doorbell once.
     ///
-    /// Prevents this Work Request from being processed until all prior RDMA Read and Atomic
-    /// operations on this Queue Pair have completed.
-    #[inline]
-    pub fn fenced(mut self) -> Self {
-        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
-        self
+    /// # Safety
+    ///
+    /// Every memory region referenced by the batch must stay valid until a work completion has been
+    /// polled for the corresponding `wr_id`.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: invalid value in one of the work requests.
+    ///  - `ENOMEM`: the send queue is full or out of resources.
+    pub unsafe fn submit(self) -> io::Result<()> {
+        let qpx = self.qpx;
+        // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
+        // are about to `wr_complete`.
+        std::mem::forget(self);
+        let ret = unsafe { (*qpx).wr_complete.unwrap()(qpx) };
+        if ret != 0 {
+            Err(io::Error::from_raw_os_error(ret))
+        } else {
+            Ok(())
+        }
     }
+}
 
-    /// Set the `IBV_SEND_SIGNALED` flag.
-    ///
-    /// Generates a Completion Queue Entry (CQE) when this Work Request completes.
+impl Drop for PostBatch<'_> {
+    fn drop(&mut self) {
+        // Reached only when the batch was started (`wr_start`) but not submitted; `submit` forgets
+        // the batch to skip this. Abort the open work-request block.
+        unsafe { (*self.qpx).wr_abort.unwrap()(self.qpx) };
+    }
+}
+
+/// Per-request configuration (signaled / datagram address) for the next work request on a
+/// [`PostBatch`].
+///
+/// Returned by [`PostBatch::signaled`] / [`PostBatch::to`]; the chosen opcode method (`send`,
+/// `write`, ...) posts the request immediately.
+pub struct PostOp<'b, 'qp> {
+    batch: &'b mut PostBatch<'qp>,
+    flags: u32,
+    dest: Option<(*mut ffi::ibv_ah, u32, u32)>,
+}
+
+impl PostOp<'_, '_> {
+    /// Also mark this work request signaled (`IBV_SEND_SIGNALED`).
     #[inline]
     pub fn signaled(mut self) -> Self {
-        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+        self.flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
         self
     }
 
-    /// Set the `IBV_SEND_SOLICITED` flag.
-    ///
-    /// Generates a Solicited Event on the remote side, waking up the receiver if they are
-    /// waiting on a completion channel for solicited events.
+    /// Also address this datagram send to `ah` / `remote_qpn` / `remote_qkey`.
     #[inline]
-    pub fn solicited(mut self) -> Self {
-        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_SOLICITED.0;
+    pub fn to(mut self, ah: &AddressHandle, remote_qpn: u32, remote_qkey: u32) -> Self {
+        self.dest = Some((ah.as_ptr(), remote_qpn, remote_qkey));
         self
     }
 
-    /// Set the `IBV_SEND_INLINE` flag.
-    ///
-    /// The payload is copied directly into the Send Queue (WQE) rather than being DMA'd
-    /// from host memory. Useful for small messages to reduce latency.
+    /// Post one work request: set id and flags, run the opcode builder, then the optional datagram
+    /// address, then the scatter list.
     #[inline]
-    pub fn inline(mut self) -> Self {
-        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_INLINE.0;
-        self
+    fn build(self, wr_id: u64, local: &[LocalMemorySlice], op: impl FnOnce(*mut ffi::ibv_qp_ex)) {
+        let qpx = self.batch.qpx;
+        unsafe {
+            (*qpx).wr_id = wr_id;
+            (*qpx).wr_flags = self.flags;
+            op(qpx);
+            if let Some((ah, qpn, qkey)) = self.dest {
+                (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
+            }
+            (*qpx).wr_set_sge_list.unwrap()(
+                qpx,
+                local.len(),
+                local.as_ptr() as *const ffi::ibv_sge,
+            );
+        }
     }
 
-    /// Set the `IBV_SEND_IP_CSUM` flag.
-    ///
-    /// Instructs the NIC to offload IPv4 and TCP/UDP checksum calculation for Raw Ethernet Queue Pairs.
+    /// Post a SEND.
     #[inline]
-    pub fn ip_csum(mut self) -> Self {
-        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_IP_CSUM.0;
-        self
+    pub fn send(self, wr_id: u64, local: &[LocalMemorySlice]) {
+        self.build(wr_id, local, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    }
+
+    /// Post a SEND carrying a 32-bit immediate (host byte order).
+    #[inline]
+    pub fn send_imm(self, wr_id: u64, local: &[LocalMemorySlice], imm: u32) {
+        self.build(wr_id, local, move |q| unsafe {
+            (*q).wr_send_imm.unwrap()(q, imm.to_be())
+        })
+    }
+
+    /// Post an RDMA WRITE into `remote`.
+    #[inline]
+    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+        self.build(wr_id, local, move |q| unsafe {
+            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
+        })
+    }
+
+    /// Post an RDMA WRITE carrying a 32-bit immediate (host byte order).
+    #[inline]
+    pub fn write_imm(
+        self,
+        wr_id: u64,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        imm: u32,
+    ) {
+        self.build(wr_id, local, move |q| unsafe {
+            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+        })
+    }
+
+    /// Post an RDMA READ from `remote` into `local`.
+    #[inline]
+    pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+        self.build(wr_id, local, move |q| unsafe {
+            (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
+        })
+    }
+
+    /// Post an atomic compare-and-swap on the 8-byte value at `remote`.
+    #[inline]
+    pub fn atomic_cmp_swap(
+        self,
+        wr_id: u64,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        compare: u64,
+        swap: u64,
+    ) {
+        self.build(wr_id, local, move |q| unsafe {
+            (*q).wr_atomic_cmp_swp.unwrap()(q, remote.rkey, remote.addr, compare, swap)
+        })
+    }
+
+    /// Post an atomic fetch-and-add on the 8-byte value at `remote`.
+    #[inline]
+    pub fn atomic_fetch_add(
+        self,
+        wr_id: u64,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        add: u64,
+    ) {
+        self.build(wr_id, local, move |q| unsafe {
+            (*q).wr_atomic_fetch_add.unwrap()(q, remote.rkey, remote.addr, add)
+        })
     }
 }
 /// A fully initialized and ready `QueuePair`.
@@ -2551,6 +2655,9 @@ pub struct QueuePair {
     _send_cq: Arc<CompletionQueueInner>,
     _recv_cq: Arc<CompletionQueueInner>,
     qp: *mut ffi::ibv_qp,
+    // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
+    // this aliases `qp` and lives exactly as long.
+    qp_ex: *mut ffi::ibv_qp_ex,
 }
 
 unsafe impl Send for QueuePair {}
@@ -2576,7 +2683,9 @@ impl QueuePair {
     /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
     #[inline]
     pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
-        self.post([WorkRequest::send(local, wr_id, None).signaled()])
+        let mut batch = self.start();
+        batch.signaled().send(wr_id, local);
+        unsafe { batch.submit() }
     }
 
     /// Posts a single unreliable-datagram (UD) send, addressed by `ah` / `remote_qpn` /
@@ -2598,9 +2707,12 @@ impl QueuePair {
         remote_qkey: u32,
         wr_id: u64,
     ) -> io::Result<()> {
-        self.post([
-            WorkRequest::send_ud(local, ah, remote_qpn, remote_qkey, wr_id, None).signaled(),
-        ])
+        let mut batch = self.start();
+        batch
+            .signaled()
+            .to(ah, remote_qpn, remote_qkey)
+            .send(wr_id, local);
+        unsafe { batch.submit() }
     }
 
     /// Posts a single receive Work Request (WR) containing a scatter-gather list of local
@@ -2689,7 +2801,12 @@ impl QueuePair {
         wr_id: u64,
         imm_data: Option<u32>,
     ) -> io::Result<()> {
-        self.post([WorkRequest::write(local, remote, wr_id, imm_data).signaled()])
+        let mut batch = self.start();
+        match imm_data {
+            Some(imm) => batch.signaled().write_imm(wr_id, local, remote, imm),
+            None => batch.signaled().write(wr_id, local, remote),
+        };
+        unsafe { batch.submit() }
     }
 
     #[inline]
@@ -2708,129 +2825,40 @@ impl QueuePair {
         remote: RemoteMemorySlice,
         wr_id: u64,
     ) -> io::Result<()> {
-        self.post([WorkRequest::read(local, remote, wr_id).signaled()])
+        let mut batch = self.start();
+        batch.signaled().read(wr_id, local, remote);
+        unsafe { batch.submit() }
     }
 
-    /// Posts a linked list of Work Requests (WRs) to the Send Queue of this Queue Pair.
+    /// Begin a batch of send work requests on this queue pair's send queue.
     ///
-    /// This method modifies `wrs` to link the work requests together.
+    /// Each builder method on the returned [`PostBatch`] (`send`, `write`, `read`, the atomics, ...)
+    /// appends one request; chain [`signaled`](PostOp::signaled) to request a completion and
+    /// [`to`](PostOp::to) to address a datagram send. Nothing reaches the device until
+    /// [`submit`](PostBatch::submit), which rings the doorbell once for the whole batch.
     ///
-    /// Unlike the simpler helper methods (such as [`post_send`](Self::post_send)), it does *not*
-    /// automatically set the signaled flag (`IBV_SEND_SIGNALED`) on the last request. The caller
-    /// must explicitly call [`.signaled()`](WorkRequest::signaled) on the work requests for which
-    /// they want to generate a Completion Queue Entry (CQE) in the Completion Queue (CQ).
-    ///
-    /// Generates HW-specific Send Requests and adds them to the tail of the Queue Pair's Send
-    /// Queue without performing any context switch. The RDMA device will handle them (later) in an
-    /// asynchronous way. If there is a failure in one of the WRs because the Send Queue is full or
-    /// one of the attributes in the WR is bad, it stops immediately and returns an error.
-    ///
-    /// Each `WorkRequest` contains a `wr_id` (a 64-bit value). If a Work Completion is generated
-    /// when a Work Request completes, the completion will contain this value.
-    ///
-    /// See also [RDMAmojo's `ibv_post_send` documentation][1].
+    /// The scatter/gather slices passed to each op must outlive the batch (the borrow checker
+    /// enforces this), and — as with any send — the underlying memory must stay valid until a work
+    /// completion has been polled for the request.
     ///
     /// # Examples
     ///
-    /// Passing an inline array by value (ideal for a fixed number of operations):
     /// ```no_run
-    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice, WorkRequest};
-    /// fn post_write_and_send(
-    ///     qp: &mut QueuePair,
-    ///     payload: LocalMemorySlice,
-    ///     remote_dest: RemoteMemorySlice,
-    ///     notification: LocalMemorySlice,
-    /// ) -> std::io::Result<()> {
-    ///     unsafe {
-    ///         qp.post([
-    ///             WorkRequest::write(&[payload], remote_dest, 1, None),
-    ///             WorkRequest::send(&[notification], 2, None).signaled(),
-    ///         ])
-    ///     }
-    /// }
+    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice};
+    /// # unsafe fn f(qp: &mut QueuePair, payload: &[LocalMemorySlice], dest: RemoteMemorySlice, note: &[LocalMemorySlice]) -> std::io::Result<()> {
+    /// let mut batch = qp.start();
+    /// batch.write(1, payload, dest);
+    /// batch.signaled().send(2, note);
+    /// unsafe { batch.submit() }
+    /// # }
     /// ```
-    ///
-    /// Passing a dynamically allocated `Vec` by reference (ideal for reuse and zero-copy):
-    /// ```no_run
-    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice, WorkRequest};
-    /// fn post_many<'local>(
-    ///     qp: &mut QueuePair,
-    ///     local: &'local [LocalMemorySlice],
-    ///     remote: &[RemoteMemorySlice],
-    ///     wrs: &mut Vec<WorkRequest<'local>>,
-    /// ) -> std::io::Result<()> {
-    ///     wrs.clear();
-    ///     for i in 0..local.len() {
-    ///         wrs.push(WorkRequest::write(&local[i..i+1], remote[i].clone(), i as u64, None));
-    ///     }
-    ///     // Append a final signaled send request to get a completion notification for the whole chain
-    ///     wrs.push(WorkRequest::send(&[], local.len() as u64, None).signaled());
-    ///
-    ///     unsafe {
-    ///         // Passed by mutable reference, the `Vec` is not consumed and can be reused later
-    ///         qp.post(wrs)
-    ///     }
-    /// }
-    /// ```
-    ///
-    /// # Safety
-    ///
-    /// The memory regions can only be safely reused or dropped after the requests are fully executed
-    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
-    /// until `CompletionQueue::poll` returns a completion for each request).
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid value provided in a Work Request.
-    ///  - `ENOMEM`: Send Queue is full or not enough resources to complete this operation.
-    ///  - `EFAULT`: Invalid value provided in `QueuePair`.
-    ///
-    /// [1]: http://www.rdmamojo.com/2013/01/26/ibv_post_send/
     #[inline]
-    pub unsafe fn post<'local>(
-        &mut self,
-        mut wrs: impl AsMut<[WorkRequest<'local>]>,
-    ) -> io::Result<()> {
-        let wrs = wrs.as_mut();
-        if wrs.is_empty() {
-            return Ok(());
-        }
-
-        for i in 0..wrs.len() - 1 {
-            let next_ptr = &mut wrs[i + 1].wr as *mut ffi::ibv_send_wr;
-            wrs[i].wr.next = next_ptr;
-        }
-        wrs.last_mut().unwrap().wr.next = ptr::null_mut();
-
-        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
-
-        // TODO:
-        //
-        // ibv_post_send()  posts the linked list of work requests (WRs) starting with wr to the
-        // send queue of the queue pair qp.  It stops processing WRs from this list at the first
-        // failure (that can  be  detected  immediately  while  requests  are  being posted), and
-        // returns this failing WR through bad_wr.
-        //
-        // The user should not alter or destroy AHs associated with WRs until request is fully
-        // executed and  a  work  completion  has been retrieved from the corresponding completion
-        // queue (CQ) to avoid unexpected behavior.
-        //
-        // ... However, if the IBV_SEND_INLINE flag was set, the  buffer  can  be reused
-        // immediately after the call returns.
-
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_send.as_mut().unwrap()(
-                self.qp,
-                &mut wrs[0].wr as *mut _,
-                &mut bad_wr as *mut _,
-            )
-        };
-        if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
-        } else {
-            Ok(())
+    pub fn start(&mut self) -> PostBatch<'_> {
+        let qpx = self.qp_ex;
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        PostBatch {
+            qpx,
+            _qp: std::marker::PhantomData,
         }
     }
 }
