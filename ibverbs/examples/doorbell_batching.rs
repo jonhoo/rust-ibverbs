@@ -73,7 +73,7 @@ fn main() {
 
     // 7. Build and post the chain of work requests as a single doorbell batch.
     let _ = total_send_wrs;
-    let mut batch = qp.start();
+    let mut batch = qp.start_send();
     // Chain the RDMA Write operations for each word segment.
     for i in 0..num_writes {
         batch.write((i + 1) as u64, &locals[i], remotes[i].clone());
