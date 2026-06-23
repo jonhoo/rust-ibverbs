@@ -46,6 +46,12 @@ fn update_submodule() {
 fn main() {
     println!("cargo:rustc-link-lib=ibverbs");
 
+    let efa = env::var("CARGO_FEATURE_EFA").is_ok();
+    if efa {
+        // `efadv_create_qp_ex` and friends are exported from libefa.
+        println!("cargo:rustc-link-lib=efa");
+    }
+
     let rdma_core_include_dir = if let Ok(rdma_core_include_dir) = env::var("RDMA_CORE_INCLUDE_DIR")
     {
         let rdma_core_lib_dir = env::var("RDMA_CORE_LIB_DIR").expect(
@@ -73,7 +79,7 @@ fn main() {
 
     // generate the bindings
     eprintln!("run bindgen");
-    let bindings = bindgen::Builder::default()
+    let mut builder = bindgen::Builder::default()
         .header(format!("{ibverbs_header_dir}/verbs.h"))
         .clang_arg(format!("-I{rdma_core_include_dir}"))
         .allowlist_function("ibv_.*")
@@ -111,9 +117,19 @@ fn main() {
         .derive_debug(true)
         .prepend_enum_name(false)
         .blocklist_type("ibv_wc")
-        .size_t_is_usize(true)
-        .generate()
-        .expect("Unable to generate bindings");
+        .size_t_is_usize(true);
+
+    if efa {
+        // EFA SRD queue pairs are created through the provider's direct-verbs (`efadv`), reached
+        // via `<infiniband/efadv.h>` on the same include path as `verbs.h`.
+        builder = builder
+            .header_contents("efadv_wrapper.h", "#include <infiniband/efadv.h>")
+            .allowlist_function("efadv_.*")
+            .allowlist_type("efadv_.*")
+            .allowlist_var("EFADV_QP_DRIVER_TYPE_.*");
+    }
+
+    let bindings = builder.generate().expect("Unable to generate bindings");
 
     // write the bindings to the $OUT_DIR/bindings.rs file.
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());

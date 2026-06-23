@@ -29,6 +29,12 @@ features = ["derive"]
 
 [features]
 default = ["serde"]
+# AWS Elastic Fabric Adapter (EFA) SRD queue pairs. Pulls in the efadv bindings and links libefa.
+efa = ["ffi/efa"]
 
 [dev-dependencies]
 bincode = "1.3"
+
+[[example]]
+name = "efa_srd"
+required-features = ["efa"]
