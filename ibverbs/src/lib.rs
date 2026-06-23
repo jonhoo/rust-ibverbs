@@ -619,6 +619,15 @@ impl Context {
         }
         Ok(port_attr)
     }
+
+    /// Returns the underlying `ibv_context` pointer.
+    ///
+    /// This is an escape hatch for calling libibverbs verbs that this crate does not yet wrap. The
+    /// pointer is owned by this [`Context`] and stays valid only while it (or a resource derived
+    /// from it) is alive; do not close it or use it past the owner's lifetime.
+    pub fn as_raw(&self) -> *mut ffi::ibv_context {
+        self.inner.ctx
+    }
 }
 
 struct CompletionQueueInner {
@@ -896,6 +905,24 @@ impl CompletionQueue {
             // Every event from ibv_get_cq_event() must eventually be acknowledged.
             unsafe { ffi::ibv_ack_cq_events(self.inner.cq(), 1) };
         }
+    }
+
+    /// Returns the underlying `ibv_cq` pointer.
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The completion queue is built
+    /// through the extended interface; an `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this
+    /// is the same handle viewed as a plain completion queue (see [`as_raw_ex`](Self::as_raw_ex)).
+    /// The pointer stays valid only while this [`CompletionQueue`] is alive; do not destroy it.
+    pub fn as_raw(&self) -> *mut ffi::ibv_cq {
+        self.inner.cq()
+    }
+
+    /// Returns the underlying `ibv_cq_ex` pointer (the extended completion queue this is built on).
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The pointer stays valid only
+    /// while this [`CompletionQueue`] is alive; do not destroy it.
+    pub fn as_raw_ex(&self) -> *mut ffi::ibv_cq_ex {
+        self.inner.cq_ex
     }
 }
 
@@ -1904,6 +1931,14 @@ impl AddressHandle {
     fn as_ptr(&self) -> *mut ffi::ibv_ah {
         self.ah
     }
+
+    /// Returns the underlying `ibv_ah` pointer.
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
+    /// [`AddressHandle`] and stays valid only while it is alive; do not destroy it.
+    pub fn as_raw(&self) -> *mut ffi::ibv_ah {
+        self.ah
+    }
 }
 
 impl Drop for AddressHandle {
@@ -1946,6 +1981,14 @@ impl<O> MemoryRegion<O> {
         RemoteKey {
             key: unsafe { &*self.inner.mr }.rkey,
         }
+    }
+
+    /// Returns the underlying `ibv_mr` pointer.
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
+    /// [`MemoryRegion`] and stays valid only while it is alive; do not deregister it.
+    pub fn as_raw(&self) -> *mut ffi::ibv_mr {
+        self.inner.mr
     }
 
     /// Remote region.
@@ -2092,6 +2135,15 @@ pub struct ProtectionDomain {
 }
 
 impl ProtectionDomain {
+    /// Returns the underlying `ibv_pd` pointer.
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
+    /// [`ProtectionDomain`] and stays valid only while it (or a resource derived from it) is alive;
+    /// do not deallocate it.
+    pub fn as_raw(&self) -> *mut ffi::ibv_pd {
+        self.inner.pd
+    }
+
     /// Create an [`AddressHandle`] for the destination described by `attr`.
     ///
     /// Address handles are used to address unreliable-datagram (UD) sends. One handle can be reused
@@ -2423,6 +2475,14 @@ pub struct SharedReceiveQueue {
 }
 
 impl SharedReceiveQueue {
+    /// Returns the underlying `ibv_srq` pointer.
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
+    /// [`SharedReceiveQueue`] and stays valid only while it is alive; do not destroy it.
+    pub fn as_raw(&self) -> *mut ffi::ibv_srq {
+        self.inner.srq
+    }
+
     /// Posts a linked list of Work Requests (WRs) to this Shared Receive Queue (SRQ).
     ///
     /// Generates a HW-specific Receive Request out of it and adds it to the tail of the SRQ
@@ -2843,10 +2903,22 @@ impl QueuePair {
         unsafe { *self.qp }.qp_num
     }
 
-    /// The raw `ibv_qp`, for the connection-manager integration in [`crate::rdmacm`].
-    #[cfg(feature = "rdmacm")]
-    pub(crate) fn as_raw_qp(&self) -> *mut ffi::ibv_qp {
+    /// Returns the underlying `ibv_qp` pointer.
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The send path uses the
+    /// extended (doorbell) interface; see [`as_raw_ex`](Self::as_raw_ex) for that view. The pointer
+    /// is owned by this [`QueuePair`] and stays valid only while it is alive; do not destroy it.
+    pub fn as_raw(&self) -> *mut ffi::ibv_qp {
         self.qp
+    }
+
+    /// Returns the underlying `ibv_qp_ex` pointer (the extended/doorbell view of this queue pair).
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. `ibv_qp_to_qp_ex` is a cast,
+    /// so this aliases [`as_raw`](Self::as_raw) and lives exactly as long. The pointer stays valid
+    /// only while this [`QueuePair`] is alive; do not destroy it.
+    pub fn as_raw_ex(&self) -> *mut ffi::ibv_qp_ex {
+        self.qp_ex
     }
 
     /// Posts a single send Work Request (WR) containing a scatter-gather list of local
