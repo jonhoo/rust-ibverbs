@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use ibverbs::{
     ibv_access_flags, ibv_advise_mr_advice, ibv_qp_type, AddressHandleAttribute, CompletionQueue,
-    Context, ProtectionDomain, QueuePair,
+    Context, ProtectionDomain, QueuePair, RecvRequest,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -320,7 +320,7 @@ fn batched_post() {
     let note_sge = [note.slice(..2)];
     let remote = dst.remote().slice(..3);
     unsafe {
-        let mut batch = lb.qp.start();
+        let mut batch = lb.qp.start_send();
         batch.write(101, &payload_sge, remote);
         batch.signaled().send(102, &note_sge);
         batch.submit()
@@ -554,7 +554,7 @@ fn atomic_operations() {
         let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
-            let mut batch = lb.qp.start();
+            let mut batch = lb.qp.start_send();
             batch.signaled().atomic_cmp_swap(1, &sg, remote, 0, swapped);
             batch.submit()
         }
@@ -573,7 +573,7 @@ fn atomic_operations() {
         let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
-            let mut batch = lb.qp.start();
+            let mut batch = lb.qp.start_send();
             batch.signaled().atomic_cmp_swap(2, &sg, remote, 0, 0);
             batch.submit()
         }
@@ -597,7 +597,7 @@ fn atomic_operations() {
         let sg = [local.slice(..)];
         let remote = counter.remote().slice(..);
         unsafe {
-            let mut batch = lb.qp.start();
+            let mut batch = lb.qp.start_send();
             batch.signaled().atomic_fetch_add(3, &sg, remote, 5);
             batch.submit()
         }
@@ -671,4 +671,42 @@ fn register_from_raw() {
     assert!(comps.iter().any(|wc| wc.wr_id() == 1), "missing recv");
     assert!(comps.iter().any(|wc| wc.wr_id() == 2), "missing send");
     assert_eq!(&recv_buf[..6], b"extern");
+}
+
+/// Batched receive: two receives posted in one `post_recv` (caller-owned array) catch two sends, in
+/// order, on the same RC queue pair.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn batched_recv() {
+    let mut lb = loopback();
+
+    let recv_a = lb.pd.allocate(64).expect("failed to register recv MR a");
+    let recv_b = lb.pd.allocate(64).expect("failed to register recv MR b");
+    let mut send_a = lb.pd.allocate(64).expect("failed to register send MR a");
+    let mut send_b = lb.pd.allocate(64).expect("failed to register send MR b");
+    send_a.bytes_mut()[..3].copy_from_slice(b"one");
+    send_b.bytes_mut()[..3].copy_from_slice(b"two");
+
+    // Post both receives in a single `ibv_post_recv` from a stack array (no allocation).
+    let sg_a = [recv_a.slice(..3)];
+    let sg_b = [recv_b.slice(..3)];
+    unsafe {
+        lb.qp
+            .post_recv([RecvRequest::new(1, &sg_a), RecvRequest::new(2, &sg_b)])
+    }
+    .expect("post_recv failed");
+
+    // RC is in order, so the first send fills the first receive and so on.
+    unsafe { lb.qp.post_send(&[send_a.slice(..3)], 11) }.expect("post_send a failed");
+    unsafe { lb.qp.post_send(&[send_b.slice(..3)], 12) }.expect("post_send b failed");
+
+    let comps = drain(&lb.cq, 4);
+    for id in [1, 2, 11, 12] {
+        assert!(
+            comps.iter().any(|c| c.wr_id() == id),
+            "missing completion {id}"
+        );
+    }
+    assert_eq!(&recv_a.bytes()[..3], b"one");
+    assert_eq!(&recv_b.bytes()[..3], b"two");
 }

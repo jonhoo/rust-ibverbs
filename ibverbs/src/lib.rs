@@ -2379,6 +2379,32 @@ impl SharedReceiveQueue {
 }
 
 /// One operation recorded in a [`PostBatch`] until the batch is flushed to the doorbell.
+/// A receive work request, binding the lifetime of its scatter/gather buffers.
+///
+/// Build one with [`RecvRequest::new`] and post a batch of them with [`QueuePair::post_recv`]. Unlike
+/// the send doorbell, receives are posted from a caller-owned slice, so batching allocates nothing.
+#[repr(transparent)]
+pub struct RecvRequest<'a> {
+    wr: ffi::ibv_recv_wr,
+    _local: std::marker::PhantomData<&'a [LocalMemorySlice]>,
+}
+
+impl<'a> RecvRequest<'a> {
+    /// A receive that scatters an incoming message into `local`, tagged with `wr_id`.
+    #[inline]
+    pub fn new(wr_id: u64, local: &'a [LocalMemorySlice]) -> Self {
+        RecvRequest {
+            wr: ffi::ibv_recv_wr {
+                wr_id,
+                next: ptr::null_mut(),
+                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                num_sge: local.len() as i32,
+            },
+            _local: std::marker::PhantomData,
+        }
+    }
+}
+
 /// A batch of send work requests being built on a [`QueuePair`]'s send queue.
 ///
 /// Created by [`QueuePair::start`]. Each builder method posts one work request to the open block
@@ -2683,7 +2709,7 @@ impl QueuePair {
     /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
     #[inline]
     pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
-        let mut batch = self.start();
+        let mut batch = self.start_send();
         batch.signaled().send(wr_id, local);
         unsafe { batch.submit() }
     }
@@ -2707,7 +2733,7 @@ impl QueuePair {
         remote_qkey: u32,
         wr_id: u64,
     ) -> io::Result<()> {
-        let mut batch = self.start();
+        let mut batch = self.start_send();
         batch
             .signaled()
             .to(ah, remote_qpn, remote_qkey)
@@ -2751,30 +2777,54 @@ impl QueuePair {
         local: &[LocalMemorySlice],
         wr_id: u64,
     ) -> io::Result<()> {
-        let mut wr = ffi::ibv_recv_wr {
-            wr_id,
-            next: ptr::null::<ffi::ibv_send_wr>() as *mut _,
-            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: local.len() as i32,
-        };
-        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null::<ffi::ibv_recv_wr>() as *mut _;
+        unsafe { self.post_recv([RecvRequest::new(wr_id, local)]) }
+    }
 
-        // TODO:
-        //
-        // If the QP qp is associated with a shared receive queue, you must use the function
-        // ibv_post_srq_recv(), and not ibv_post_recv(), since the QP's own receive queue will not
-        // be used.
-        //
-        // If a WR is being posted to a UD QP, the Global Routing Header (GRH) of the incoming
-        // message will be placed in the first 40 bytes of the buffer(s) in the scatter list. If no
-        // GRH is present in the incoming message, then the first  bytes  will  be undefined. This
-        // means that in all cases, the actual data of the incoming message will start at an offset
-        // of 40 bytes into the buffer(s) in the scatter list.
+    /// Posts a batch of receive Work Requests to this Queue Pair's receive queue with a single
+    /// `ibv_post_recv`.
+    ///
+    /// Receives have no doorbell form, so the requests are posted as a linked list. `recvs` is the
+    /// caller's storage — a stack array or a reusable `Vec` — linked in place rather than copied, so
+    /// posting allocates nothing. Each request is consumed by the device when a matching message
+    /// arrives.
+    ///
+    /// On a UD queue pair the 40-byte GRH of an incoming message is placed at the front of the
+    /// scatter buffers, so the payload starts at offset 40. If the queue pair uses a shared receive
+    /// queue, post to the [`SharedReceiveQueue`] instead; its own receive queue is unused.
+    ///
+    /// # Safety
+    ///
+    /// Each referenced memory region must stay valid until a work completion has been polled for the
+    /// corresponding `wr_id`.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: invalid value in one of the work requests.
+    ///  - `ENOMEM`: the receive queue is full or out of resources.
+    pub unsafe fn post_recv<'a>(
+        &mut self,
+        mut recvs: impl AsMut<[RecvRequest<'a>]>,
+    ) -> io::Result<()> {
+        let recvs = recvs.as_mut();
+        if recvs.is_empty() {
+            return Ok(());
+        }
+        // Link the requests into the list `ibv_post_recv` expects.
+        for i in 0..recvs.len() - 1 {
+            let next = &mut recvs[i + 1].wr as *mut ffi::ibv_recv_wr;
+            recvs[i].wr.next = next;
+        }
+        recvs.last_mut().unwrap().wr.next = ptr::null_mut();
 
+        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
         let ctx = unsafe { *self.qp }.context;
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
-            ops.post_recv.as_mut().unwrap()(self.qp, &mut wr as *mut _, &mut bad_wr as *mut _)
+            ops.post_recv.as_mut().unwrap()(
+                self.qp,
+                &mut recvs[0].wr as *mut _,
+                &mut bad_wr as *mut _,
+            )
         };
         if errno != 0 {
             Err(io::Error::from_raw_os_error(errno))
@@ -2801,7 +2851,7 @@ impl QueuePair {
         wr_id: u64,
         imm_data: Option<u32>,
     ) -> io::Result<()> {
-        let mut batch = self.start();
+        let mut batch = self.start_send();
         match imm_data {
             Some(imm) => batch.signaled().write_imm(wr_id, local, remote, imm),
             None => batch.signaled().write(wr_id, local, remote),
@@ -2825,7 +2875,7 @@ impl QueuePair {
         remote: RemoteMemorySlice,
         wr_id: u64,
     ) -> io::Result<()> {
-        let mut batch = self.start();
+        let mut batch = self.start_send();
         batch.signaled().read(wr_id, local, remote);
         unsafe { batch.submit() }
     }
@@ -2837,8 +2887,7 @@ impl QueuePair {
     /// [`to`](PostOp::to) to address a datagram send. Nothing reaches the device until
     /// [`submit`](PostBatch::submit), which rings the doorbell once for the whole batch.
     ///
-    /// The scatter/gather slices passed to each op must outlive the batch (the borrow checker
-    /// enforces this), and — as with any send — the underlying memory must stay valid until a work
+    /// As with any send, the memory backing each scatter/gather slice must stay valid until a work
     /// completion has been polled for the request.
     ///
     /// # Examples
@@ -2846,14 +2895,14 @@ impl QueuePair {
     /// ```no_run
     /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice};
     /// # unsafe fn f(qp: &mut QueuePair, payload: &[LocalMemorySlice], dest: RemoteMemorySlice, note: &[LocalMemorySlice]) -> std::io::Result<()> {
-    /// let mut batch = qp.start();
+    /// let mut batch = qp.start_send();
     /// batch.write(1, payload, dest);
     /// batch.signaled().send(2, note);
     /// unsafe { batch.submit() }
     /// # }
     /// ```
     #[inline]
-    pub fn start(&mut self) -> PostBatch<'_> {
+    pub fn start_send(&mut self) -> PostBatch<'_> {
         let qpx = self.qp_ex;
         unsafe { (*qpx).wr_start.unwrap()(qpx) };
         PostBatch {
