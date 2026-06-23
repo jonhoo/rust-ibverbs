@@ -267,10 +267,10 @@ impl<'devlist> Device<'devlist> {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: `PORT_NUM` is invalid (from `ibv_query_port_attr`).
+    ///  - `EINVAL`: port 1 is invalid (from `ibv_query_port_attr`).
     ///  - `ENOMEM`: Out of memory (from `ibv_query_port_attr`).
     ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
-    ///  - Other: the device is not in `ACTIVE` or `ARMED` state.
+    ///  - Other: port 1 is not in `ACTIVE` or `ARMED` state.
     pub fn open(&self) -> io::Result<Context> {
         Context::with_device(*self.0)
     }
@@ -364,7 +364,7 @@ enum ContextOwnership {
 }
 
 impl ContextInner {
-    fn query_port(&self) -> io::Result<ffi::ibv_port_attr> {
+    fn query_port(&self, port_num: u8) -> io::Result<ffi::ibv_port_attr> {
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
         //
         //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
@@ -376,7 +376,7 @@ impl ContextInner {
         let errno = unsafe {
             ffi::ibv_query_port(
                 self.ctx,
-                PORT_NUM,
+                port_num,
                 &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
             )
         };
@@ -438,8 +438,8 @@ impl Context {
         });
 
         let ctx = Context { inner };
-        // checks that the port is active/armed.
-        ctx.inner.query_port()?;
+        // checks that the (default) port is active/armed.
+        ctx.inner.query_port(PORT_NUM)?;
         Ok(ctx)
     }
 
@@ -549,8 +549,11 @@ impl Context {
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
+    ///
+    /// The entries span all of the device's ports; each carries the `port_num` and `gid_index` it
+    /// belongs to (the latter is what [`QueuePairBuilder::set_gid_index`] expects).
     pub fn gid_table(&self) -> io::Result<Vec<GidEntry>> {
-        let max_entries = self.inner.query_port()?.gid_tbl_len as usize;
+        let max_entries = self.inner.query_port(PORT_NUM)?.gid_tbl_len as usize;
         let mut gid_table = vec![ffi::ibv_gid_entry::default(); max_entries];
         let num_entries = unsafe {
             ffi::_ibv_query_gid_table(
@@ -936,6 +939,8 @@ pub struct QueuePairBuilder {
     ctx: isize,
     pd: Arc<ProtectionDomainInner>,
     port_attr: ffi::ibv_port_attr,
+    /// the device port this queue pair is associated with (numbered from 1)
+    port_num: u8,
 
     send: Arc<CompletionQueueInner>,
     max_send_wr: u32,
@@ -993,6 +998,7 @@ impl QueuePairBuilder {
     fn new(
         pd: Arc<ProtectionDomainInner>,
         port_attr: ffi::ibv_port_attr,
+        port_num: u8,
         send: Arc<CompletionQueueInner>,
         max_send_wr: u32,
         recv: Arc<CompletionQueueInner>,
@@ -1006,6 +1012,7 @@ impl QueuePairBuilder {
             ctx: 0,
             pd,
             port_attr,
+            port_num,
 
             gid_index: None,
             traffic_class: 0,
@@ -1428,6 +1435,7 @@ impl QueuePairBuilder {
             let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
             Ok(PreparedQueuePair {
                 lid: self.port_attr.lid,
+                port_num: self.port_num,
                 qp: QueuePair {
                     pd: self.pd.clone(),
                     _srq: self.srq.clone(),
@@ -1481,6 +1489,8 @@ pub struct PreparedQueuePair {
     qp: QueuePair,
     /// port local identifier
     lid: u16,
+    /// the device port this queue pair is associated with (numbered from 1)
+    port_num: u8,
     // carried from builder
     gid_index: Option<u32>,
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
@@ -1655,7 +1665,12 @@ impl PreparedQueuePair {
         let gid = if let Some(gid_index) = self.gid_index {
             let mut gid = ffi::ibv_gid::default();
             let rc = unsafe {
-                ffi::ibv_query_gid(self.qp.pd.ctx.ctx, PORT_NUM, gid_index as i32, &mut gid)
+                ffi::ibv_query_gid(
+                    self.qp.pd.ctx.ctx,
+                    self.port_num,
+                    gid_index as i32,
+                    &mut gid,
+                )
             };
             if rc < 0 {
                 return Err(io::Error::last_os_error());
@@ -1683,12 +1698,13 @@ impl PreparedQueuePair {
     /// ah_attr.grh.hop_limit = 0xff;
     /// ```
     ///
-    /// The handshake also sets the following parameters, which are currently not configurable:
+    /// The queue pair is associated with the port chosen when it was created (see
+    /// [`ProtectionDomain::create_qp_on_port`]). The handshake also sets the following parameters,
+    /// which are currently not configurable:
     ///
     /// # Examples
     ///
     /// ```text,ignore
-    /// port_num = PORT_NUM;
     /// pkey_index = 0;
     /// sq_psn = 0;
     ///
@@ -1707,7 +1723,7 @@ impl PreparedQueuePair {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             pkey_index: 0,
-            port_num: PORT_NUM,
+            port_num: self.port_num,
             ..Default::default()
         };
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
@@ -1732,7 +1748,7 @@ impl PreparedQueuePair {
                 dlid: remote.lid,
                 sl: self.service_level,
                 src_path_bits: 0,
-                port_num: PORT_NUM,
+                port_num: self.port_num,
                 grh: Default::default(),
                 ..Default::default()
             },
@@ -1822,7 +1838,7 @@ impl PreparedQueuePair {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
             pkey_index: 0,
-            port_num: PORT_NUM,
+            port_num: self.port_num,
             qkey,
             ..Default::default()
         };
@@ -2232,16 +2248,35 @@ impl ProtectionDomain {
     ///
     /// Note that both this protection domain, *and* both provided completion queues, must outlive
     /// the resulting `QueuePair`.
+    ///
+    /// The queue pair is associated with the device's first port (port 1); use
+    /// [`create_qp_on_port`](Self::create_qp_on_port) to choose another port.
     pub fn create_qp(
         &self,
         send: &CompletionQueue,
         recv: &CompletionQueue,
         qp_type: ffi::ibv_qp_type,
     ) -> io::Result<QueuePairBuilder> {
-        let port_attr = self.inner.ctx.query_port()?;
+        self.create_qp_on_port(send, recv, qp_type, PORT_NUM)
+    }
+
+    /// Creates a queue pair builder associated with `port_num` on this protection domain's device.
+    ///
+    /// Like [`create_qp`](Self::create_qp), but the queue pair (and the endpoint reported by
+    /// [`PreparedQueuePair::endpoint`]) is associated with the given port instead of port 1. Ports
+    /// are numbered from 1.
+    pub fn create_qp_on_port(
+        &self,
+        send: &CompletionQueue,
+        recv: &CompletionQueue,
+        qp_type: ffi::ibv_qp_type,
+        port_num: u8,
+    ) -> io::Result<QueuePairBuilder> {
+        let port_attr = self.inner.ctx.query_port(port_num)?;
         Ok(QueuePairBuilder::new(
             self.inner.clone(),
             port_attr,
+            port_num,
             send.inner.clone(),
             1,
             recv.inner.clone(),
@@ -3413,6 +3448,7 @@ impl QueuePairBuilder {
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         Ok(PreparedQueuePair {
             lid: self.port_attr.lid,
+            port_num: self.port_num,
             qp: QueuePair {
                 pd: self.pd.clone(),
                 _srq: None,
