@@ -2486,6 +2486,30 @@ impl<'qp> PostBatch<'qp> {
         }
     }
 
+    /// Mark the next work request as fenced (`IBV_SEND_FENCE`): the device blocks it until prior
+    /// RDMA reads and atomic operations on this queue pair have completed. Used to order a send or
+    /// write after a read whose data it depends on.
+    #[inline]
+    pub fn fenced(&mut self) -> PostOp<'_, 'qp> {
+        PostOp {
+            batch: self,
+            flags: ffi::ibv_send_flags::IBV_SEND_FENCE.0,
+            dest: None,
+        }
+    }
+
+    /// Mark the next work request as solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
+    /// raises a solicited event on the remote side, waking a peer blocked in
+    /// [`CompletionQueue::wait`](crate::CompletionQueue::wait) that armed for solicited events.
+    #[inline]
+    pub fn solicited(&mut self) -> PostOp<'_, 'qp> {
+        PostOp {
+            batch: self,
+            flags: ffi::ibv_send_flags::IBV_SEND_SOLICITED.0,
+            dest: None,
+        }
+    }
+
     /// Address the next work request to `ah` / `remote_qpn` / `remote_qkey` (required for sends on
     /// UD and SRD queue pairs).
     #[inline]
@@ -2617,6 +2641,22 @@ impl PostOp<'_, '_> {
     #[inline]
     pub fn signaled(mut self) -> Self {
         self.flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+        self
+    }
+
+    /// Also mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
+    /// reads and atomic operations on this queue pair have completed.
+    #[inline]
+    pub fn fenced(mut self) -> Self {
+        self.flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
+        self
+    }
+
+    /// Also mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
+    /// raises a solicited event on the remote side.
+    #[inline]
+    pub fn solicited(mut self) -> Self {
+        self.flags |= ffi::ibv_send_flags::IBV_SEND_SOLICITED.0;
         self
     }
 
