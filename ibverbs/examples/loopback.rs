@@ -7,7 +7,7 @@ fn main() {
         .open()
         .unwrap();
 
-    let cq = ctx.create_cq(16, 0).unwrap();
+    let cq = ctx.create_cq(16).build().unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
     let qp_builder = pd

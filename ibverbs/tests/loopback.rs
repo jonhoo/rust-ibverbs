@@ -10,8 +10,8 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    ibv_access_flags, ibv_advise_mr_advice, ibv_qp_type, AddressHandleAttribute, CompletionQueue,
-    Context, ProtectionDomain, QueuePair, RecvRequest,
+    ibv_access_flags, ibv_advise_mr_advice, ibv_create_cq_wc_flags, ibv_qp_type,
+    AddressHandleAttribute, CompletionQueue, Context, ProtectionDomain, QueuePair, RecvRequest,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -45,7 +45,8 @@ fn open_test_device() -> Context {
 fn loopback_of(qp_type: ibv_qp_type) -> Loopback {
     let ctx = open_test_device();
     let cq = ctx
-        .create_cq(64, 0)
+        .create_cq(64)
+        .build()
         .expect("failed to create completion queue");
     let pd = ctx
         .alloc_pd()
@@ -441,7 +442,7 @@ fn unreliable_connection() {
 fn shared_receive_queue() {
     let ctx = open_test_device();
 
-    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
 
@@ -481,7 +482,7 @@ fn shared_receive_queue() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn unreliable_datagram() {
     let ctx = open_test_device();
-    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     const GID_INDEX: u32 = 1;
@@ -779,7 +780,7 @@ fn raw_handles() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     assert!(!pd.as_raw().is_null());
 
-    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     assert!(!cq.as_raw().is_null());
     assert!(!cq.as_raw_ex().is_null());
     // The plain and extended views are the same underlying completion queue.
@@ -818,7 +819,7 @@ fn raw_handles() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn inline_send() {
     let ctx = open_test_device();
-    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
@@ -861,7 +862,7 @@ fn inline_send() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn queue_pair_on_explicit_port() {
     let ctx = open_test_device();
-    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
@@ -887,4 +888,73 @@ fn queue_pair_on_explicit_port() {
     assert!(comps.iter().any(|c| c.wr_id() == 1), "missing recv");
     assert!(comps.iter().any(|c| c.wr_id() == 2), "missing send");
     assert_eq!(&recv.bytes()[..4], b"port");
+}
+
+/// The device clock and per-completion hardware timestamps, where the device supports them.
+///
+/// Both are optional features (Soft-RoCE, for instance, supports neither), so the test skips the
+/// parts the device does not implement rather than failing.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn completion_timestamps() {
+    // EOPNOTSUPP (95 on Linux) is how a device without these features reports them.
+    const EOPNOTSUPP: i32 = 95;
+
+    let ctx = open_test_device();
+
+    match ctx.query_rt_values_ex() {
+        Ok(_clock) => {}
+        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => {
+            eprintln!("device does not support query_rt_values_ex; skipping that check");
+        }
+        Err(e) => panic!("query_rt_values_ex failed: {e}"),
+    }
+
+    let cq = match ctx
+        .create_cq(16)
+        .set_wc_flags(ibv_create_cq_wc_flags::IBV_WC_EX_WITH_COMPLETION_TIMESTAMP)
+        .build()
+    {
+        Ok(cq) => cq,
+        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => {
+            eprintln!("device does not support completion timestamps; skipping");
+            return;
+        }
+        Err(e) => panic!("create_cq with timestamps failed: {e}"),
+    };
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut builder = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .expect("failed to create QP");
+    builder.set_gid_index(1).set_access(
+        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+    );
+    let prepared = builder.build().expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+
+    let recv = pd.allocate(64).expect("failed to register recv MR");
+    let mut send = pd.allocate(64).expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"time");
+    unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
+    unsafe { qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
+
+    // Each completion carries a hardware timestamp; reading it must succeed (not panic).
+    let mut seen = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen < 2 {
+        if let Some(mut comps) = cq.poll().expect("failed to poll CQ") {
+            while let Some(wc) = comps.next() {
+                wc.ok().expect("work request failed");
+                let _ts = wc.completion_timestamp();
+                seen += 1;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for completions"
+        );
+    }
 }

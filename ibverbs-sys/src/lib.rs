@@ -426,3 +426,27 @@ pub unsafe fn ibv_advise_mr(
         _ => 95,
     }
 }
+
+/// Query a device's real-time values, such as its free-running hardware clock
+/// (`ibv_query_rt_values_ex`).
+///
+/// Returns `EOPNOTSUPP` if the provider does not implement the verb (matching the C inline).
+///
+/// # Safety
+///
+/// `context` and `values` must be valid pointers for an `ibv_query_rt_values_ex` call.
+#[inline]
+pub unsafe fn ibv_query_rt_values_ex(
+    context: *mut ibv_context,
+    values: *mut ibv_values_ex,
+) -> ::std::os::raw::c_int {
+    let vctx = verbs_get_ctx(context);
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, query_rt_values);
+    match (*vctx).query_rt_values {
+        Some(query_rt_values) if (*vctx).sz >= need => query_rt_values(context, values),
+        // The provider does not implement query_rt_values; mirror the C inline's `return EOPNOTSUPP`
+        // (95 on Linux, the only platform rdma-core targets).
+        _ => 95,
+    }
+}

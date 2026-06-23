@@ -16,7 +16,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("no RDMA device found")?
         .open()?;
-    let cq = device.create_cq(16, 0)?;
+    let cq = device.create_cq(16).build()?;
     let pd = device.alloc_pd()?;
 
     // Two SRD queue pairs. SRD is connectionless, so each is just brought to ready with a Q_Key.
