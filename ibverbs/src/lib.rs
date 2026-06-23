@@ -77,6 +77,11 @@ use std::time::Duration;
 
 const PORT_NUM: u8 = 1;
 
+/// The RDMA connection manager (`librdmacm`): set up reliable connections without exchanging queue
+/// pair endpoints out of band.
+#[cfg(feature = "rdmacm")]
+pub mod rdmacm;
+
 /// Direct access to low-level libverbs FFI.
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
@@ -337,6 +342,20 @@ impl<'devlist> Device<'devlist> {
 
 struct ContextInner {
     ctx: *mut ffi::ibv_context,
+    ownership: ContextOwnership,
+}
+
+/// Whether a [`Context`] owns its `ibv_context` or borrows one owned elsewhere.
+enum ContextOwnership {
+    /// We opened the device and close it on drop.
+    Owned,
+    /// `ctx` is borrowed from another owner (an `rdma_cm_id`'s `verbs`). We keep that owner alive so
+    /// `ctx` stays valid for as long as this context and anything derived from it lives, and we do
+    /// not close the device ourselves. The `Arc` is held purely so its `Drop` runs last, so the
+    /// field is intentionally never read.
+    #[cfg(feature = "rdmacm")]
+    #[allow(dead_code)]
+    Borrowed(Arc<dyn Send + Sync>),
 }
 
 impl ContextInner {
@@ -378,8 +397,15 @@ impl ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        let ok = unsafe { ffi::ibv_close_device(self.ctx) };
-        assert_eq!(ok, 0);
+        match &self.ownership {
+            ContextOwnership::Owned => {
+                let ok = unsafe { ffi::ibv_close_device(self.ctx) };
+                assert_eq!(ok, 0);
+            }
+            // Borrowed: don't close the device; dropping the kept-alive owner is enough.
+            #[cfg(feature = "rdmacm")]
+            ContextOwnership::Borrowed(_) => {}
+        }
     }
 }
 
@@ -401,12 +427,33 @@ impl Context {
         if ctx.is_null() {
             return Err(io::Error::other("failed to open device"));
         }
-        let inner = Arc::new(ContextInner { ctx });
+        let inner = Arc::new(ContextInner {
+            ctx,
+            ownership: ContextOwnership::Owned,
+        });
 
         let ctx = Context { inner };
         // checks that the port is active/armed.
         ctx.inner.query_port()?;
         Ok(ctx)
+    }
+
+    /// Wraps a raw `ibv_context` owned by `owner` (the RDMA connection manager's `rdma_cm_id`).
+    ///
+    /// The returned [`Context`] does not close the device on drop, and keeps `owner` alive for as
+    /// long as the context — or any protection domain, completion queue, queue pair, or memory
+    /// region built from it — is alive, so `ctx` cannot dangle.
+    #[cfg(feature = "rdmacm")]
+    pub(crate) fn from_borrowed_context(
+        ctx: *mut ffi::ibv_context,
+        owner: Arc<dyn Send + Sync>,
+    ) -> Context {
+        Context {
+            inner: Arc::new(ContextInner {
+                ctx,
+                ownership: ContextOwnership::Borrowed(owner),
+            }),
+        }
     }
 
     /// Create a completion queue (CQ).
@@ -1498,6 +1545,14 @@ pub struct QueuePairEndpoint {
 }
 
 impl PreparedQueuePair {
+    /// Extracts the underlying, still-uninitialized `QueuePair` so the RDMA connection manager (the
+    /// [`rdmacm`](crate::rdmacm) module) can drive its state transitions. Not public: the manager
+    /// keeps the queue pair wrapped in its setup typestate until it reaches `RTS`.
+    #[cfg(feature = "rdmacm")]
+    pub(crate) fn into_queue_pair(self) -> QueuePair {
+        self.qp
+    }
+
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
@@ -2693,6 +2748,12 @@ impl QueuePair {
     /// Returns the local QP number of this QueuePair.
     pub fn qp_num(&self) -> u32 {
         unsafe { *self.qp }.qp_num
+    }
+
+    /// The raw `ibv_qp`, for the connection-manager integration in [`crate::rdmacm`].
+    #[cfg(feature = "rdmacm")]
+    pub(crate) fn as_raw_qp(&self) -> *mut ffi::ibv_qp {
+        self.qp
     }
 
     /// Posts a single send Work Request (WR) containing a scatter-gather list of local

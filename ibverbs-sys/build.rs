@@ -52,6 +52,12 @@ fn main() {
         println!("cargo:rustc-link-lib=efa");
     }
 
+    let rdmacm = env::var("CARGO_FEATURE_RDMACM").is_ok();
+    if rdmacm {
+        // The `rdma_*` connection-manager functions are exported from librdmacm.
+        println!("cargo:rustc-link-lib=rdmacm");
+    }
+
     let rdma_core_include_dir = if let Ok(rdma_core_include_dir) = env::var("RDMA_CORE_INCLUDE_DIR")
     {
         let rdma_core_lib_dir = env::var("RDMA_CORE_LIB_DIR").expect(
@@ -127,6 +133,15 @@ fn main() {
             .allowlist_function("efadv_.*")
             .allowlist_type("efadv_.*")
             .allowlist_var("EFADV_QP_DRIVER_TYPE_.*");
+    }
+
+    if rdmacm {
+        // The RDMA connection manager lives in `<rdma/rdma_cma.h>`, which itself includes `verbs.h`
+        // (guarded, so the `ibv_*` types are still emitted only once) on the same include path.
+        builder = builder
+            .header_contents("rdmacm_wrapper.h", "#include <rdma/rdma_cma.h>")
+            .allowlist_function("rdma_.*")
+            .allowlist_type("rdma_.*");
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");

@@ -4,7 +4,8 @@ set -euo pipefail
 
 echo "Install libibverbs dependencies"
 sudo apt-get update
-sudo apt-get install libibverbs1 libibverbs-dev
+# librdmacm is needed to build and link the optional `rdmacm` feature.
+sudo apt-get install libibverbs1 libibverbs-dev librdmacm1 librdmacm-dev
 
 echo "Install clang (for bindgen) and cmake (to generate the vendored rdma-core headers)"
 sudo apt-get install clang cmake
