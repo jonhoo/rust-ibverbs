@@ -812,3 +812,45 @@ fn raw_handles() {
         .expect("failed to create address handle");
     assert!(!ah.as_raw().is_null());
 }
+
+/// Inline SEND and inline RDMA WRITE deliver their payloads without a registered source region.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn inline_send() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16, 0).expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+
+    let mut builder = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .expect("failed to create RC QP");
+    builder.set_gid_index(1).set_max_inline_data(64).set_access(
+        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+    );
+    let prepared = builder.build().expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+
+    // Inline SEND: the payload lives only in this stack array, never in a registered MR.
+    let recv = pd.allocate(64).expect("failed to register recv MR");
+    unsafe { qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
+    let mut batch = qp.start_send();
+    batch.signaled().send_inline(2, b"inrun");
+    unsafe { batch.submit() }.expect("inline send submit failed");
+    let comps = drain(&cq, 2);
+    assert!(comps.iter().any(|c| c.wr_id() == 1), "missing recv");
+    assert!(comps.iter().any(|c| c.wr_id() == 2), "missing send");
+    assert_eq!(&recv.bytes()[..5], b"inrun");
+
+    // Inline RDMA WRITE into a remote region.
+    let dst = pd.allocate(64).expect("failed to register dst MR");
+    let remote = dst.remote().slice(..4);
+    let mut batch = qp.start_send();
+    batch.signaled().write_inline(3, b"wxyz", remote);
+    unsafe { batch.submit() }.expect("inline write submit failed");
+    let comps = drain(&cq, 1);
+    assert_eq!(comps[0].wr_id(), 3);
+    assert_eq!(&dst.bytes()[..4], b"wxyz");
+}

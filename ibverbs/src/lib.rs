@@ -1345,6 +1345,20 @@ impl QueuePairBuilder {
         self
     }
 
+    /// Set the maximum size, in bytes, of inline data that may be posted on the send queue.
+    ///
+    /// Inline sends (see [`PostOp::send_inline`]) copy their payload directly into the work request
+    /// rather than referencing a registered memory region, which lowers latency for small messages.
+    /// A send queue must reserve this capacity up front; the actual value granted by the device can
+    /// be larger than requested and is reported in the `max_inline_data` field returned by
+    /// `ibv_query_qp`. Posting more inline bytes than the queue pair supports fails at submit time.
+    ///
+    /// Defaults to 0 (inline sends disabled).
+    pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
+        self.max_inline_data = max_inline_data;
+        self
+    }
+
     /// Create a new `QueuePair` from this builder template.
     ///
     /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
@@ -2673,6 +2687,37 @@ impl<'qp> PostBatch<'qp> {
         self.op().write_imm(wr_id, local, remote, imm)
     }
 
+    /// Post a SEND whose payload is carried inline. See [`PostOp::send_inline`].
+    #[inline]
+    pub fn send_inline(&mut self, wr_id: u64, data: &[u8]) {
+        self.op().send_inline(wr_id, data)
+    }
+
+    /// Post a SEND with an inline payload and a 32-bit immediate. See [`PostOp::send_imm_inline`].
+    #[inline]
+    pub fn send_imm_inline(&mut self, wr_id: u64, data: &[u8], imm: u32) {
+        self.op().send_imm_inline(wr_id, data, imm)
+    }
+
+    /// Post an RDMA WRITE with an inline payload. See [`PostOp::write_inline`].
+    #[inline]
+    pub fn write_inline(&mut self, wr_id: u64, data: &[u8], remote: RemoteMemorySlice) {
+        self.op().write_inline(wr_id, data, remote)
+    }
+
+    /// Post an RDMA WRITE with an inline payload and a 32-bit immediate. See
+    /// [`PostOp::write_imm_inline`].
+    #[inline]
+    pub fn write_imm_inline(
+        &mut self,
+        wr_id: u64,
+        data: &[u8],
+        remote: RemoteMemorySlice,
+        imm: u32,
+    ) {
+        self.op().write_imm_inline(wr_id, data, remote, imm)
+    }
+
     /// Post an RDMA READ from `remote` into `local`.
     #[inline]
     pub fn read(&mut self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
@@ -2800,10 +2845,75 @@ impl PostOp<'_, '_> {
         }
     }
 
+    /// Like [`build`](Self::build), but copies `data` inline into the work request instead of
+    /// referencing a registered memory region. The bytes are copied during this call, so `data` need
+    /// not outlive the work completion.
+    #[inline]
+    fn build_inline(self, wr_id: u64, data: &[u8], op: impl FnOnce(*mut ffi::ibv_qp_ex)) {
+        let qpx = self.batch.qpx;
+        unsafe {
+            (*qpx).wr_id = wr_id;
+            // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline; it is what
+            // the legacy `ibv_post_send` ABI carries, and rdma-core's generic doorbell emulation
+            // (used by providers such as Soft-RoCE) sets it when translating `wr_set_inline_data`.
+            // Native doorbell providers key off the `wr_set_inline_data` call itself, so the flag is
+            // redundant but harmless there.
+            (*qpx).wr_flags = self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0;
+            op(qpx);
+            if let Some((ah, qpn, qkey)) = self.dest {
+                (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
+            }
+            (*qpx).wr_set_inline_data.unwrap()(qpx, data.as_ptr() as *mut c_void, data.len());
+        }
+    }
+
     /// Post a SEND.
     #[inline]
     pub fn send(self, wr_id: u64, local: &[LocalMemorySlice]) {
         self.build(wr_id, local, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    }
+
+    /// Post a SEND whose payload is carried inline in the work request.
+    ///
+    /// Inline data is copied into the work request rather than referenced through a memory region,
+    /// which lowers latency for small messages and lets `data` be reused or dropped right away. The
+    /// queue pair must have been built with enough inline capacity (see
+    /// [`QueuePairBuilder::set_max_inline_data`]) or the [`submit`](PostBatch::submit) fails with
+    /// `EINVAL`.
+    #[inline]
+    pub fn send_inline(self, wr_id: u64, data: &[u8]) {
+        self.build_inline(wr_id, data, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    }
+
+    /// Post a SEND carrying an inline payload and a 32-bit immediate (host byte order).
+    ///
+    /// See [`send_inline`](Self::send_inline) for the inline-data requirements.
+    #[inline]
+    pub fn send_imm_inline(self, wr_id: u64, data: &[u8], imm: u32) {
+        self.build_inline(wr_id, data, move |q| unsafe {
+            (*q).wr_send_imm.unwrap()(q, imm.to_be())
+        })
+    }
+
+    /// Post an RDMA WRITE into `remote` whose payload is carried inline in the work request.
+    ///
+    /// See [`send_inline`](Self::send_inline) for the inline-data requirements.
+    #[inline]
+    pub fn write_inline(self, wr_id: u64, data: &[u8], remote: RemoteMemorySlice) {
+        self.build_inline(wr_id, data, move |q| unsafe {
+            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
+        })
+    }
+
+    /// Post an RDMA WRITE into `remote` carrying an inline payload and a 32-bit immediate (host byte
+    /// order).
+    ///
+    /// See [`send_inline`](Self::send_inline) for the inline-data requirements.
+    #[inline]
+    pub fn write_imm_inline(self, wr_id: u64, data: &[u8], remote: RemoteMemorySlice, imm: u32) {
+        self.build_inline(wr_id, data, move |q| unsafe {
+            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+        })
     }
 
     /// Post a SEND carrying a 32-bit immediate (host byte order).
