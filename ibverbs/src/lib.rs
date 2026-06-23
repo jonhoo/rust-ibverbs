@@ -2407,7 +2407,7 @@ impl<'a> RecvRequest<'a> {
 
 /// A batch of send work requests being built on a [`QueuePair`]'s send queue.
 ///
-/// Created by [`QueuePair::start`]. Each builder method posts one work request to the open block
+/// Created by [`QueuePair::start_send`]. Each builder method posts one work request to the open block
 /// immediately through the extended ("doorbell") interface; [`submit`](Self::submit) then rings the
 /// doorbell once for the whole batch. Dropping the batch without submitting aborts it.
 ///
@@ -2701,12 +2701,12 @@ impl QueuePair {
     /// `wr_id` is a 64 bits value associated with this WR. If a Work Completion will be generated
     /// when this Work Request ends, it will contain this value.
     ///
-    /// Internally, this is a convenience wrapper around [`post`](Self::post). The local memory
+    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send). The local memory
     /// slices will be sent as a single `ibv_send_wr` using `IBV_WR_SEND`. The send has
     /// `IBV_SEND_SIGNALED` set, so a work completion will also be triggered as a result of this send.
     /// # Safety
     ///
-    /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
+    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
     #[inline]
     pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
         let mut batch = self.start_send();
@@ -2722,7 +2722,7 @@ impl QueuePair {
     ///
     /// # Safety
     ///
-    /// See [`post`](Self::post). The address handle and the local buffers must remain valid until a
+    /// See [`start_send`](Self::start_send). The address handle and the local buffers must remain valid until a
     /// work completion for this request has been retrieved.
     #[inline]
     pub unsafe fn post_send_ud(
@@ -2839,11 +2839,11 @@ impl QueuePair {
     /// Immediate data can be used to signal the completion of the write operation.
     /// The other side uses `post_recv` on a dummy buffer and gets the imm data from the work completion.
     ///
-    /// Internally, this is a convenience wrapper around [`post`](Self::post).
+    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send).
     ///
     /// # Safety
     ///
-    /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
+    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
     pub unsafe fn post_write(
         &mut self,
         local: &[LocalMemorySlice],
@@ -2864,11 +2864,11 @@ impl QueuePair {
     ///
     /// RDMA read does not support immediate data.
     ///
-    /// Internally, this is a convenience wrapper around [`post`](Self::post).
+    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send).
     ///
     /// # Safety
     ///
-    /// See [`post`](Self::post) for more details on the asynchronous execution, safety, and errors.
+    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
     pub unsafe fn post_read(
         &mut self,
         local: &[LocalMemorySlice],
