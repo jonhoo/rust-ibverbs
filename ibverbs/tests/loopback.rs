@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use ibverbs::{
     ibv_access_flags, ibv_advise_mr_advice, ibv_qp_type, AddressHandleAttribute, CompletionQueue,
-    Context, ProtectionDomain, QueuePair, WorkRequest,
+    Context, ProtectionDomain, QueuePair,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -87,23 +87,47 @@ fn loopback() -> Loopback {
     loopback_of(ibv_qp_type::IBV_QPT_RC)
 }
 
+/// An owned snapshot of the completion fields the tests inspect (the borrowed `WorkCompletion`
+/// cannot escape the poll, so `drain` copies out what it needs).
+struct Completed {
+    wr_id: u64,
+    len: usize,
+    imm_data: Option<u32>,
+}
+
+impl Completed {
+    fn wr_id(&self) -> u64 {
+        self.wr_id
+    }
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn imm_data(&self) -> Option<u32> {
+        self.imm_data
+    }
+}
+
 /// Poll until `n` completions arrive (asserting each succeeded) and return them. Panics after a few
 /// seconds if they don't (loopback completes in microseconds).
-fn drain(cq: &CompletionQueue, n: usize) -> Vec<ibverbs::ibv_wc> {
+fn drain(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     let mut observed = Vec::with_capacity(n);
-    let mut completions = [ibverbs::ibv_wc::default(); 16];
     let deadline = Instant::now() + Duration::from_secs(5);
 
     loop {
-        let done = cq.poll(&mut completions).expect("failed to poll CQ");
-        for wc in done.iter() {
-            if let Some((status, vendor_err)) = wc.error() {
-                panic!(
-                    "work request {} failed: status {status:?}, vendor_err {vendor_err}",
-                    wc.wr_id()
-                );
+        if let Some(mut completions) = cq.poll().expect("failed to poll CQ") {
+            while let Some(wc) = completions.next() {
+                if let Err((status, vendor_err)) = wc.ok() {
+                    panic!(
+                        "work request {} failed: status {status:?}, vendor_err {vendor_err}",
+                        wc.wr_id()
+                    );
+                }
+                observed.push(Completed {
+                    wr_id: wc.wr_id(),
+                    len: wc.len(),
+                    imm_data: wc.imm_data(),
+                });
             }
-            observed.push(*wc);
         }
         if observed.len() >= n {
             return observed;
@@ -296,10 +320,10 @@ fn batched_post() {
     let note_sge = [note.slice(..2)];
     let remote = dst.remote().slice(..3);
     unsafe {
-        lb.qp.post([
-            WorkRequest::write(&payload_sge, remote, 101, None),
-            WorkRequest::send(&note_sge, 102, None).signaled(),
-        ])
+        let mut batch = lb.qp.start();
+        batch.write(101, &payload_sge, remote);
+        batch.signaled().send(102, &note_sge);
+        batch.submit()
     }
     .expect("batched post failed");
 
@@ -367,15 +391,14 @@ fn wait_for_completion() {
     unsafe { lb.qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
 
     // Block on the completion channel instead of busy-polling.
-    let mut completions = [ibverbs::ibv_wc::default(); 8];
     let mut ids = Vec::new();
     while ids.len() < 2 {
-        let done = lb
+        let mut completions = lb
             .cq
-            .wait(&mut completions, Some(Duration::from_secs(5)))
+            .wait(Some(Duration::from_secs(5)))
             .expect("wait failed");
-        for wc in done.iter() {
-            assert!(wc.error().is_none(), "work request {} failed", wc.wr_id());
+        while let Some(wc) = completions.next() {
+            assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
             ids.push(wc.wr_id());
         }
     }
@@ -531,8 +554,9 @@ fn atomic_operations() {
         let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
-            lb.qp
-                .post([WorkRequest::atomic_cmp_swap(&sg, remote, 0, swapped, 1).signaled()])
+            let mut batch = lb.qp.start();
+            batch.signaled().atomic_cmp_swap(1, &sg, remote, 0, swapped);
+            batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
     }
@@ -549,8 +573,9 @@ fn atomic_operations() {
         let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
-            lb.qp
-                .post([WorkRequest::atomic_cmp_swap(&sg, remote, 0, 0, 2).signaled()])
+            let mut batch = lb.qp.start();
+            batch.signaled().atomic_cmp_swap(2, &sg, remote, 0, 0);
+            batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
     }
@@ -572,8 +597,9 @@ fn atomic_operations() {
         let sg = [local.slice(..)];
         let remote = counter.remote().slice(..);
         unsafe {
-            lb.qp
-                .post([WorkRequest::atomic_fetch_add(&sg, remote, 5, 3).signaled()])
+            let mut batch = lb.qp.start();
+            batch.signaled().atomic_fetch_add(3, &sg, remote, 5);
+            batch.submit()
         }
         .expect("post atomic_fetch_add failed");
     }

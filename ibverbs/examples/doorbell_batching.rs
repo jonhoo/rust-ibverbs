@@ -2,7 +2,7 @@
 //! into a single linked list and post them to the Send Queue using the `post` API,
 //! with only the final operation generating a Completion Queue Event (CQE).
 
-use ibverbs::{LocalMemorySlice, RemoteMemorySlice, WorkRequest};
+use ibverbs::{LocalMemorySlice, RemoteMemorySlice};
 
 const RECEIVE_NOTIFICATION_WR_ID: u64 = 100;
 const NOTIFY_BUF_SIZE: usize = std::mem::size_of::<u32>();
@@ -71,41 +71,38 @@ fn main() {
     notify_mr.bytes_mut()[..NOTIFY_BUF_SIZE].copy_from_slice(&(num_writes as u32).to_ne_bytes());
     let notify_slice = [notify_mr.slice(..)];
 
-    // 7. Build and post the chain of work requests
-    let mut wrs = Vec::with_capacity(total_send_wrs);
-
-    // Chain the RDMA Write operations for each word segment
+    // 7. Build and post the chain of work requests as a single doorbell batch.
+    let _ = total_send_wrs;
+    let mut batch = qp.start();
+    // Chain the RDMA Write operations for each word segment.
     for i in 0..num_writes {
-        wrs.push(WorkRequest::write(
-            &locals[i],
-            remotes[i].clone(),
-            (i + 1) as u64,
-            None,
-        ));
+        batch.write((i + 1) as u64, &locals[i], remotes[i].clone());
     }
-    // Append the final Send operation to signal completion of the chain and carry the write count
-    wrs.push(WorkRequest::send(&notify_slice, send_chain_completion_wr_id, None).signaled());
-
-    // Post the completed chain to the Queue Pair
-    unsafe { qp.post(&mut wrs) }.unwrap();
+    // Append the final Send to signal completion of the chain and carry the write count.
+    batch
+        .signaled()
+        .send(send_chain_completion_wr_id, &notify_slice);
+    // Post (ring the doorbell once) for the whole chain.
+    unsafe { batch.submit() }.unwrap();
 
     // 8. Poll completion queue until both the send chain and the receive completion are done.
     // Note that because the writes and the send are chained, only the last operation (the Send)
     // in the chain generates a completion event.
     let mut chain_completed = false;
     let mut receive_completed = false;
-    let mut completions = [ibverbs::ibv_wc::default(); CQ_CAPACITY];
 
     while !chain_completed || !receive_completed {
-        let completed = cq.poll(&mut completions[..]).unwrap();
-        for wc in completed {
+        let Some(mut completions) = cq.poll().unwrap() else {
+            continue;
+        };
+        while let Some(wc) = completions.next() {
             println!(
                 "Polled WC: wr_id={}, status={:?}, opcode={:?}",
                 wc.wr_id(),
                 wc.error(),
                 wc.opcode()
             );
-            if !wc.is_valid() {
+            if !wc.is_success() {
                 panic!(
                     "Work completion failed: {:?}, wr_id: {}, opcode: {:?}",
                     wc.error(),
