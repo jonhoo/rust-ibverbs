@@ -710,3 +710,37 @@ fn batched_recv() {
     assert_eq!(&recv_a.bytes()[..3], b"one");
     assert_eq!(&recv_b.bytes()[..3], b"two");
 }
+
+/// Sends carrying the fence and solicited send flags complete successfully.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn send_flags() {
+    let mut lb = loopback();
+
+    let recv = lb.pd.allocate(64).expect("failed to register recv MR");
+    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"flag");
+
+    let sg = [recv.slice(..4)];
+    unsafe {
+        lb.qp
+            .post_recv([RecvRequest::new(1, &sg), RecvRequest::new(2, &sg)])
+    }
+    .expect("post_recv failed");
+
+    let mut batch = lb.qp.start_send();
+    // Fenced: ordered after any prior reads/atomics on this queue pair.
+    batch.signaled().fenced().send(10, &[send.slice(..4)]);
+    // Solicited: raises a solicited event on the receiver.
+    batch.signaled().solicited().send(11, &[send.slice(..4)]);
+    unsafe { batch.submit() }.expect("submit failed");
+
+    let comps = drain(&lb.cq, 4);
+    for id in [1, 2, 10, 11] {
+        assert!(
+            comps.iter().any(|c| c.wr_id() == id),
+            "missing completion {id}"
+        );
+    }
+    assert_eq!(&recv.bytes()[..4], b"flag");
+}
