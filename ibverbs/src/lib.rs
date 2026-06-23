@@ -91,6 +91,11 @@ pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
 pub use ffi::ibv_wc_status;
 
+/// Device-wide attributes and capabilities, as returned by [`Context::query_device`].
+pub use ffi::ibv_device_attr;
+/// Per-port attributes, as returned by [`Context::query_port`].
+pub use ffi::ibv_port_attr;
+
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
 pub use ffi::ib_uverbs_advise_mr_advice as ibv_advise_mr_advice;
 /// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
@@ -565,6 +570,54 @@ impl Context {
         gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
         Ok(gid_table)
+    }
+
+    /// Query the attributes and capabilities of this context's device (`ibv_query_device`).
+    ///
+    /// The returned [`ibv_device_attr`] reports device-wide limits such as the maximum number of
+    /// queue pairs, completion queues, and memory regions, the maximum outstanding work requests and
+    /// scatter/gather entries per queue, and the atomic capability. Query these before creating
+    /// resources to stay within what the device supports.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid arguments.
+    pub fn query_device(&self) -> io::Result<ffi::ibv_device_attr> {
+        let mut device_attr = ffi::ibv_device_attr::default();
+        let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        Ok(device_attr)
+    }
+
+    /// Query the attributes of `port_num` on this context's device (`ibv_query_port`).
+    ///
+    /// Ports are numbered from 1. The returned [`ibv_port_attr`] reports the port's state, its active
+    /// and maximum MTU, its LID, its link layer, and its GID- and pkey-table lengths. Unlike the
+    /// check performed when a context is opened, this returns the attributes regardless of the port
+    /// state.
+    ///
+    /// Port attributes are not constant (the subnet manager or the hardware may change them), so
+    /// avoid caching the result for long.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid `port_num`.
+    ///  - `ENOMEM`: Out of memory.
+    pub fn query_port(&self, port_num: u8) -> io::Result<ffi::ibv_port_attr> {
+        let mut port_attr = ffi::ibv_port_attr::default();
+        let errno = unsafe {
+            ffi::ibv_query_port(
+                self.inner.ctx,
+                port_num,
+                &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
+            )
+        };
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        Ok(port_attr)
     }
 }
 

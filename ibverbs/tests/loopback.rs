@@ -744,3 +744,27 @@ fn send_flags() {
     }
     assert_eq!(&recv.bytes()[..4], b"flag");
 }
+
+/// `query_device` and `query_port` return sane device-wide and per-port attributes.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn query_device_and_port() {
+    let ctx = open_test_device();
+
+    let dev = ctx.query_device().expect("query_device failed");
+    assert!(dev.max_qp > 0, "device should support queue pairs");
+    assert!(
+        dev.max_cqe > 0,
+        "device should support completion queue entries"
+    );
+    assert!(
+        dev.phys_port_cnt >= 1,
+        "device should have at least one port"
+    );
+
+    let port = ctx.query_port(1).expect("query_port failed");
+    assert!(
+        port.gid_tbl_len > 0,
+        "a RoCE port should expose a GID table"
+    );
+}
