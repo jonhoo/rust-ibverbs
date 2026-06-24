@@ -450,3 +450,47 @@ pub unsafe fn ibv_query_rt_values_ex(
         _ => 95,
     }
 }
+
+/// Query extended device attributes (`ibv_query_device_ex`).
+///
+/// Falls back to `ibv_query_device` (filling in only `orig_attr`, with the rest zeroed) when the
+/// provider does not implement the extended verb, mirroring the C inline. Returns `EINVAL` if a
+/// non-null `input` carries an unsupported component mask.
+///
+/// # Safety
+///
+/// `context` must be a valid `ibv_context`. `input` may be null; if non-null it must point to a
+/// valid `ibv_query_device_ex_input`. `attr` must point to a writable `ibv_device_attr_ex`.
+#[inline]
+pub unsafe fn ibv_query_device_ex(
+    context: *mut ibv_context,
+    input: *const ibv_query_device_ex_input,
+    attr: *mut ibv_device_attr_ex,
+) -> ::std::os::raw::c_int {
+    // The only component mask the input may carry is reserved; reject anything set with EINVAL
+    // (22 on Linux, the only platform rdma-core targets), matching the C inline.
+    if !input.is_null() && (*input).comp_mask != 0 {
+        return 22;
+    }
+    let vctx = verbs_get_ctx(context);
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, query_device_ex);
+    if let Some(query_device_ex) = (*vctx).query_device_ex {
+        if (*vctx).sz >= need {
+            let ret = query_device_ex(
+                context,
+                input,
+                attr,
+                ::std::mem::size_of::<ibv_device_attr_ex>(),
+            );
+            // EOPNOTSUPP (95) or ENOSYS (38) means the provider does not really implement the
+            // extended verb; fall through to the legacy query like the C inline does.
+            if ret != 95 && ret != 38 {
+                return ret;
+            }
+        }
+    }
+    // Legacy fallback: zero the whole struct, then fill only the base attributes.
+    ::std::ptr::write_bytes(attr, 0, 1);
+    ibv_query_device(context, &mut (*attr).orig_attr)
+}
