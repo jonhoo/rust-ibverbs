@@ -812,6 +812,31 @@ impl Context {
         Ok(DeviceAttr(device_attr))
     }
 
+    /// Query the extended attributes and capabilities of this context's device
+    /// (`ibv_query_device_ex`).
+    ///
+    /// The returned [`DeviceAttrEx`] carries everything [`query_device`](Self::query_device) does
+    /// (its [`orig`](DeviceAttrEx::orig) holds the base [`ibv_device_attr`]) plus the extended
+    /// capabilities that the base query cannot report: the completion-timestamp mask, the HCA core
+    /// clock, the PCI atomic capabilities, the packet-pacing (rate-limit) limits, the raw-packet
+    /// capabilities, and the maximum device-memory size. Providers that do not implement the
+    /// extended verb fall back to the base attributes, and the extended fields read back as zero.
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid arguments.
+    pub fn query_device_ex(&self) -> Result<DeviceAttrEx> {
+        // `ibv_device_attr_ex` embeds unions, so it has no `Default`; all-zero is a valid start.
+        let mut device_attr: ffi::ibv_device_attr_ex = unsafe { std::mem::zeroed() };
+        let errno = unsafe {
+            ffi::ibv_query_device_ex(self.inner.ctx, std::ptr::null(), &mut device_attr as *mut _)
+        };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::QueryDevice));
+        }
+        Ok(DeviceAttrEx(device_attr))
+    }
+
     /// Query the attributes of `port_num` on this context's device (`ibv_query_port`).
     ///
     /// Ports are numbered from 1. The returned [`PortAttr`] reports the port's state, its active and
@@ -1070,6 +1095,82 @@ impl DeviceAttr {
 
 impl Deref for DeviceAttr {
     type Target = ffi::ibv_device_attr;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Extended device-wide attributes and capabilities, as returned by [`Context::query_device_ex`].
+///
+/// Dereferences to the raw [`ibv_device_attr_ex`], so every field is accessible; the inherent
+/// methods add typed accessors for the most useful extended capabilities, and [`orig`] returns the
+/// base attributes that [`Context::query_device`] reports.
+///
+/// [`orig`]: DeviceAttrEx::orig
+#[derive(Clone)]
+pub struct DeviceAttrEx(ffi::ibv_device_attr_ex);
+
+impl DeviceAttrEx {
+    /// The base device attributes, the same set [`Context::query_device`] returns.
+    pub fn orig(&self) -> DeviceAttr {
+        DeviceAttr(self.0.orig_attr)
+    }
+
+    /// The node GUID of the device.
+    pub fn node_guid(&self) -> Guid {
+        self.0.orig_attr.node_guid.into()
+    }
+
+    /// The system-image GUID, shared by the ports of the same physical device.
+    pub fn sys_image_guid(&self) -> Guid {
+        self.0.orig_attr.sys_image_guid.into()
+    }
+
+    /// The mask that bounds the device's completion timestamps: the free-running HCA clock that
+    /// [`WorkCompletion::completion_timestamp`] reports wraps at this value. Zero if the device does
+    /// not support completion timestamps.
+    pub fn completion_timestamp_mask(&self) -> u64 {
+        self.0.completion_timestamp_mask
+    }
+
+    /// The HCA core-clock frequency in kHz, or zero if the device does not report it. Together with
+    /// [`Context::query_rt_values_ex`] this relates raw completion timestamps to host time.
+    pub fn hca_core_clock_khz(&self) -> u64 {
+        self.0.hca_core_clock
+    }
+
+    /// The device's PCI atomic capabilities. Each field (`fetch_add`, `swap`, `compare_swap`) is a
+    /// bitmask of the operand sizes, in bytes, the device can operate on atomically across PCIe.
+    pub fn pci_atomic_caps(&self) -> ffi::ibv_pci_atomic_caps {
+        self.0.pci_atomic_caps
+    }
+
+    /// The packet-pacing (rate-limit) capabilities: the supported rate range in kbps and the
+    /// queue-pair types that can be rate limited. The minimum and maximum rate are zero if the
+    /// device does not support packet pacing.
+    pub fn packet_pacing_caps(&self) -> ffi::ibv_packet_pacing_caps {
+        self.0.packet_pacing_caps
+    }
+
+    /// The raw-packet capability flags (`IBV_RAW_PACKET_CAP_*`) the device supports.
+    pub fn raw_packet_caps(&self) -> u32 {
+        self.0.raw_packet_caps
+    }
+
+    /// The maximum size, in bytes, of a single device-memory allocation, or zero if the device has
+    /// no on-device memory.
+    pub fn max_device_memory(&self) -> u64 {
+        self.0.max_dm_size
+    }
+
+    /// The underlying `ibv_device_attr_ex`. Escape hatch for fields this crate does not wrap.
+    pub fn as_raw(&self) -> &ffi::ibv_device_attr_ex {
+        &self.0
+    }
+}
+
+impl Deref for DeviceAttrEx {
+    type Target = ffi::ibv_device_attr_ex;
     fn deref(&self) -> &Self::Target {
         &self.0
     }

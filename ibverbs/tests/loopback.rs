@@ -1287,3 +1287,28 @@ fn inline_send_list() {
     assert_eq!(comps[0].wr_id(), 3);
     assert_eq!(&dst.bytes()[..6], b"uvwxyz");
 }
+
+/// The extended device query returns at least the base attributes, and its typed accessors decode
+/// without failing even on a provider (such as Soft-RoCE) that lacks the extended verb.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn query_device_extended() {
+    let ctx = open_test_device();
+
+    let basic = ctx.query_device().expect("query_device failed");
+    let ex = ctx.query_device_ex().expect("query_device_ex failed");
+
+    // The base attributes carried by `orig()` match the plain query.
+    assert_eq!(ex.orig().node_guid(), basic.node_guid());
+    assert_eq!(ex.node_guid(), basic.node_guid());
+    assert_eq!(ex.orig().max_qp, basic.max_qp);
+
+    // The extended accessors decode without panicking; they read back zero on a provider that does
+    // not implement the extended verb (the C inline's legacy fallback fills only the base fields).
+    let _ = ex.completion_timestamp_mask();
+    let _ = ex.hca_core_clock_khz();
+    let _ = ex.pci_atomic_caps();
+    let _ = ex.packet_pacing_caps();
+    let _ = ex.raw_packet_caps();
+    let _ = ex.max_device_memory();
+}
