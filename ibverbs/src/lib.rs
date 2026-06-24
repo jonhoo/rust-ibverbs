@@ -85,6 +85,7 @@ pub mod rdmacm;
 /// Direct access to low-level libverbs FFI.
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
+pub use ffi::ibv_port_state;
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_send_wr;
 pub use ffi::ibv_wc;
@@ -95,9 +96,9 @@ pub use ffi::ibv_wc_status;
 /// Optional work-completion fields to request via [`CompletionQueueBuilder::set_wc_flags`].
 pub use ffi::ibv_create_cq_wc_flags;
 
-/// Device-wide attributes and capabilities, as returned by [`Context::query_device`].
+/// The raw device-wide attributes wrapped by [`DeviceAttr`] (returned by [`Context::query_device`]).
 pub use ffi::ibv_device_attr;
-/// Per-port attributes, as returned by [`Context::query_port`].
+/// The raw per-port attributes wrapped by [`PortAttr`] (returned by [`Context::query_port`]).
 pub use ffi::ibv_port_attr;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
@@ -724,29 +725,31 @@ impl Context {
 
     /// Query the attributes and capabilities of this context's device (`ibv_query_device`).
     ///
-    /// The returned [`ibv_device_attr`] reports device-wide limits such as the maximum number of
-    /// queue pairs, completion queues, and memory regions, the maximum outstanding work requests and
-    /// scatter/gather entries per queue, and the atomic capability. Query these before creating
-    /// resources to stay within what the device supports.
+    /// The returned [`DeviceAttr`] reports device-wide limits such as the maximum number of queue
+    /// pairs, completion queues, and memory regions, the maximum outstanding work requests and
+    /// scatter/gather entries per queue, and the atomic capability. It dereferences to the raw
+    /// [`ibv_device_attr`], so every field is accessible. Query these before creating resources to
+    /// stay within what the device supports.
     ///
     /// # Errors
     ///
     ///  - `EINVAL`: Invalid arguments.
-    pub fn query_device(&self) -> Result<ffi::ibv_device_attr> {
+    pub fn query_device(&self) -> Result<DeviceAttr> {
         let mut device_attr = ffi::ibv_device_attr::default();
         let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::QueryDevice));
         }
-        Ok(device_attr)
+        Ok(DeviceAttr(device_attr))
     }
 
     /// Query the attributes of `port_num` on this context's device (`ibv_query_port`).
     ///
-    /// Ports are numbered from 1. The returned [`ibv_port_attr`] reports the port's state, its active
-    /// and maximum MTU, its LID, its link layer, and its GID- and pkey-table lengths. Unlike the
-    /// check performed when a context is opened, this returns the attributes regardless of the port
-    /// state.
+    /// Ports are numbered from 1. The returned [`PortAttr`] reports the port's state, its active and
+    /// maximum MTU, its LID, its link layer, and its GID- and pkey-table lengths, with typed
+    /// accessors for the speed, width, link layer, and physical state; it dereferences to the raw
+    /// [`ibv_port_attr`] for everything else. Unlike the check performed when a context is opened,
+    /// this returns the attributes regardless of the port state.
     ///
     /// Port attributes are not constant (the subnet manager or the hardware may change them), so
     /// avoid caching the result for long.
@@ -755,7 +758,7 @@ impl Context {
     ///
     ///  - `EINVAL`: Invalid `port_num`.
     ///  - `ENOMEM`: Out of memory.
-    pub fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr> {
+    pub fn query_port(&self, port_num: u8) -> Result<PortAttr> {
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe {
             ffi::ibv_query_port(
@@ -770,7 +773,7 @@ impl Context {
                 source: e,
             }));
         }
-        Ok(port_attr)
+        Ok(PortAttr(port_attr))
     }
 
     /// Returns the underlying `ibv_context` pointer.
@@ -804,6 +807,258 @@ impl Context {
             values.raw_clock.tv_sec as u64,
             values.raw_clock.tv_nsec as u32,
         ))
+    }
+}
+
+/// The signaling rate of a port's active link, decoded from `ibv_port_attr::active_speed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PortSpeed {
+    /// Single data rate (2.5 Gb/s signaling per lane).
+    Sdr,
+    /// Double data rate (5 Gb/s signaling per lane).
+    Ddr,
+    /// Quad data rate (10 Gb/s signaling per lane).
+    Qdr,
+    /// FDR10 (10.3125 Gb/s signaling per lane).
+    Fdr10,
+    /// Fourteen data rate (14.0625 Gb/s signaling per lane).
+    Fdr,
+    /// Enhanced data rate (25.78125 Gb/s signaling per lane).
+    Edr,
+    /// High data rate (53.125 Gb/s signaling per lane).
+    Hdr,
+    /// Next data rate (106.25 Gb/s signaling per lane).
+    Ndr,
+    /// Extreme data rate (212.5 Gb/s signaling per lane).
+    Xdr,
+    /// A value this crate does not recognize.
+    Unknown(u8),
+}
+
+impl PortSpeed {
+    fn from_active_speed(speed: u8) -> Self {
+        match speed {
+            1 => PortSpeed::Sdr,
+            2 => PortSpeed::Ddr,
+            4 => PortSpeed::Qdr,
+            8 => PortSpeed::Fdr10,
+            16 => PortSpeed::Fdr,
+            32 => PortSpeed::Edr,
+            64 => PortSpeed::Hdr,
+            128 => PortSpeed::Ndr,
+            other => PortSpeed::Unknown(other),
+        }
+    }
+
+    /// The effective data rate of a single (1x) lane in gigabits per second, accounting for the
+    /// link's encoding overhead. Returns `None` for an unrecognized speed.
+    pub fn lane_gbps(self) -> Option<f64> {
+        Some(match self {
+            PortSpeed::Sdr => 2.0,
+            PortSpeed::Ddr => 4.0,
+            PortSpeed::Qdr => 8.0,
+            PortSpeed::Fdr10 => 10.0,
+            PortSpeed::Fdr => 13.64,
+            PortSpeed::Edr => 25.0,
+            PortSpeed::Hdr => 50.0,
+            PortSpeed::Ndr => 100.0,
+            PortSpeed::Xdr => 200.0,
+            PortSpeed::Unknown(_) => return None,
+        })
+    }
+}
+
+/// The width (number of lanes) of a port's active link, decoded from `ibv_port_attr::active_width`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PortWidth {
+    /// A single lane.
+    Width1x,
+    /// Four lanes.
+    Width4x,
+    /// Eight lanes.
+    Width8x,
+    /// Twelve lanes.
+    Width12x,
+    /// Two lanes.
+    Width2x,
+    /// A value this crate does not recognize.
+    Unknown(u8),
+}
+
+impl PortWidth {
+    fn from_active_width(width: u8) -> Self {
+        match width {
+            1 => PortWidth::Width1x,
+            2 => PortWidth::Width4x,
+            4 => PortWidth::Width8x,
+            8 => PortWidth::Width12x,
+            16 => PortWidth::Width2x,
+            other => PortWidth::Unknown(other),
+        }
+    }
+
+    /// The number of lanes, or `None` for an unrecognized width.
+    pub fn lanes(self) -> Option<u8> {
+        Some(match self {
+            PortWidth::Width1x => 1,
+            PortWidth::Width2x => 2,
+            PortWidth::Width4x => 4,
+            PortWidth::Width8x => 8,
+            PortWidth::Width12x => 12,
+            PortWidth::Unknown(_) => return None,
+        })
+    }
+}
+
+/// The link layer of a port, decoded from `ibv_port_attr::link_layer`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LinkLayer {
+    /// The link layer is unspecified.
+    Unspecified,
+    /// An InfiniBand link.
+    InfiniBand,
+    /// An Ethernet link (used by RoCE).
+    Ethernet,
+    /// A value this crate does not recognize.
+    Unknown(u8),
+}
+
+impl LinkLayer {
+    fn from_raw(link_layer: u8) -> Self {
+        // IBV_LINK_LAYER_UNSPECIFIED = 0, IBV_LINK_LAYER_INFINIBAND = 1, IBV_LINK_LAYER_ETHERNET = 2.
+        match link_layer {
+            0 => LinkLayer::Unspecified,
+            1 => LinkLayer::InfiniBand,
+            2 => LinkLayer::Ethernet,
+            other => LinkLayer::Unknown(other),
+        }
+    }
+}
+
+/// The physical state of a port, decoded from `ibv_port_attr::phys_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PhysicalState {
+    /// The port is sleeping.
+    Sleep,
+    /// The port is polling for a peer.
+    Polling,
+    /// The port is administratively disabled.
+    Disabled,
+    /// The port is training its configuration.
+    PortConfigurationTraining,
+    /// The physical link is up.
+    LinkUp,
+    /// The link is recovering from an error.
+    LinkErrorRecovery,
+    /// The port is running a PHY test.
+    PhyTest,
+    /// A value this crate does not recognize.
+    Unknown(u8),
+}
+
+impl PhysicalState {
+    fn from_raw(phys_state: u8) -> Self {
+        match phys_state {
+            1 => PhysicalState::Sleep,
+            2 => PhysicalState::Polling,
+            3 => PhysicalState::Disabled,
+            4 => PhysicalState::PortConfigurationTraining,
+            5 => PhysicalState::LinkUp,
+            6 => PhysicalState::LinkErrorRecovery,
+            7 => PhysicalState::PhyTest,
+            other => PhysicalState::Unknown(other),
+        }
+    }
+}
+
+/// Device-wide attributes and capabilities, as returned by [`Context::query_device`].
+///
+/// Dereferences to the raw [`ibv_device_attr`], so every field is accessible; the inherent methods
+/// add typed accessors for the device identifiers.
+#[derive(Clone)]
+pub struct DeviceAttr(ffi::ibv_device_attr);
+
+impl DeviceAttr {
+    /// The node GUID of the device.
+    pub fn node_guid(&self) -> Guid {
+        self.0.node_guid.into()
+    }
+
+    /// The system-image GUID, shared by the ports of the same physical device.
+    pub fn sys_image_guid(&self) -> Guid {
+        self.0.sys_image_guid.into()
+    }
+
+    /// The underlying `ibv_device_attr`. Escape hatch for fields this crate does not wrap.
+    pub fn as_raw(&self) -> &ffi::ibv_device_attr {
+        &self.0
+    }
+}
+
+impl Deref for DeviceAttr {
+    type Target = ffi::ibv_device_attr;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+/// Per-port attributes, as returned by [`Context::query_port`].
+///
+/// Dereferences to the raw [`ibv_port_attr`], so every field is accessible; the inherent methods
+/// add typed accessors for the state, MTU, speed, width, link layer, and physical state.
+#[derive(Clone)]
+pub struct PortAttr(ffi::ibv_port_attr);
+
+impl PortAttr {
+    /// The logical port state.
+    pub fn state(&self) -> ffi::ibv_port_state {
+        self.0.state
+    }
+
+    /// The maximum MTU supported by this port.
+    pub fn max_mtu(&self) -> ffi::ibv_mtu {
+        self.0.max_mtu
+    }
+
+    /// The currently active MTU.
+    pub fn active_mtu(&self) -> ffi::ibv_mtu {
+        self.0.active_mtu
+    }
+
+    /// The active link speed.
+    pub fn active_speed(&self) -> PortSpeed {
+        PortSpeed::from_active_speed(self.0.active_speed)
+    }
+
+    /// The active link width.
+    pub fn active_width(&self) -> PortWidth {
+        PortWidth::from_active_width(self.0.active_width)
+    }
+
+    /// The link layer of the port.
+    pub fn link_layer(&self) -> LinkLayer {
+        LinkLayer::from_raw(self.0.link_layer)
+    }
+
+    /// The physical state of the port.
+    pub fn phys_state(&self) -> PhysicalState {
+        PhysicalState::from_raw(self.0.phys_state)
+    }
+
+    /// The underlying `ibv_port_attr`. Escape hatch for fields this crate does not wrap.
+    pub fn as_raw(&self) -> &ffi::ibv_port_attr {
+        &self.0
+    }
+}
+
+impl Deref for PortAttr {
+    type Target = ffi::ibv_port_attr;
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
