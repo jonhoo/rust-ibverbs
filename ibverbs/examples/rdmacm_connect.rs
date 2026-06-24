@@ -58,7 +58,7 @@ fn server(addr: SocketAddr) {
     let incoming = acceptor.accept().unwrap();
     let ctx = incoming.context().unwrap();
     let pd = ctx.alloc_pd().unwrap();
-    let cq = ctx.create_cq(16, 0).unwrap();
+    let cq = ctx.create_cq(16).build().unwrap();
     let qp = pd.create_qp(&cq, &cq, IBV_QPT_RC).unwrap().build().unwrap();
     let mut recv = pd.allocate(64).unwrap();
 
@@ -84,7 +84,7 @@ fn client(addr: SocketAddr) {
         .unwrap();
     let ctx = resolved.context().unwrap();
     let pd = ctx.alloc_pd().unwrap();
-    let cq = ctx.create_cq(16, 0).unwrap();
+    let cq = ctx.create_cq(16).build().unwrap();
     let qp = pd.create_qp(&cq, &cq, IBV_QPT_RC).unwrap().build().unwrap();
     let mut send = pd.allocate(64).unwrap();
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);

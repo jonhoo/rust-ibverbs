@@ -22,7 +22,7 @@ fn main() {
         .unwrap();
 
     // 2. Create Completion Queue (CQ) and Protection Domain (PD)
-    let cq = ctx.create_cq(CQ_CAPACITY as i32, 0).unwrap();
+    let cq = ctx.create_cq(CQ_CAPACITY as i32).build().unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
     // 3. Create Queue Pair (QP) and connect it to itself in loopback mode

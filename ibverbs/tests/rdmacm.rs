@@ -81,7 +81,7 @@ fn connect_and_send() {
         let incoming = acceptor.accept().expect("accept");
         let ctx = incoming.context().expect("server device context");
         let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16, 0).expect("server cq");
+        let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
             .create_qp(&cq, &cq, IBV_QPT_RC)
             .expect("server qp builder")
@@ -112,7 +112,7 @@ fn connect_and_send() {
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
     let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16, 0).expect("client cq");
+    let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
         .create_qp(&cq, &cq, IBV_QPT_RC)
         .expect("client qp builder")
@@ -162,7 +162,7 @@ fn two_connections() {
             let incoming = acceptor.accept().expect("accept");
             let ctx = incoming.context().expect("server device context");
             let pd = ctx.alloc_pd().expect("server pd");
-            let cq = ctx.create_cq(16, 0).expect("server cq");
+            let cq = ctx.create_cq(16).build().expect("server cq");
             let qp = pd
                 .create_qp(&cq, &cq, IBV_QPT_RC)
                 .expect("server qp builder")
@@ -198,7 +198,7 @@ fn two_connections() {
                     .expect("resolve");
                 let ctx = resolved.context().expect("client device context");
                 let pd = ctx.alloc_pd().expect("client pd");
-                let cq = ctx.create_cq(16, 0).expect("client cq");
+                let cq = ctx.create_cq(16).build().expect("client cq");
                 let qp = pd
                     .create_qp(&cq, &cq, IBV_QPT_RC)
                     .expect("client qp builder")

@@ -26,7 +26,7 @@
 //!     .resolve("192.0.2.1:18515".parse().unwrap(), Duration::from_secs(2))?;
 //! let ctx = resolved.context()?;
 //! let pd = ctx.alloc_pd()?;
-//! let cq = ctx.create_cq(16, 0)?;
+//! let cq = ctx.create_cq(16).build()?;
 //! let qp = pd.create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)?.build()?;
 //! let mut conn = resolved.connect(qp, ConnectionParameter::default())?;
 //! // `conn.queue_pair()` is ready to post on; poll completions on `cq`.

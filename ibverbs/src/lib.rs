@@ -91,6 +91,9 @@ pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_opcode;
 pub use ffi::ibv_wc_status;
 
+/// Optional work-completion fields to request via [`CompletionQueueBuilder::set_wc_flags`].
+pub use ffi::ibv_create_cq_wc_flags;
+
 /// Device-wide attributes and capabilities, as returned by [`Context::query_device`].
 pub use ffi::ibv_device_attr;
 /// Per-port attributes, as returned by [`Context::query_port`].
@@ -461,7 +464,7 @@ impl Context {
         }
     }
 
-    /// Create a completion queue (CQ).
+    /// Begin building a completion queue (CQ) with room for at least `min_cq_entries` entries.
     ///
     /// When an outstanding Work Request, within a Send or Receive Queue, is completed, a Work
     /// Completion is being added to the CQ of that Work Queue. This Work Completion indicates that
@@ -472,58 +475,26 @@ impl Context {
     /// Completion holds the information to specify the QP number and the Queue (Send or Receive)
     /// that it came from.
     ///
-    /// `min_cq_entries` defines the minimum size of the CQ. The actual created size can be equal
-    /// or higher than this value. `id` is an opaque identifier that is echoed by
-    /// `CompletionQueue::poll`.
+    /// `min_cq_entries` is the minimum size of the CQ (the actual size can be larger) and is the only
+    /// required parameter. The optional ones — an opaque context cookie, the completion vector, and
+    /// extra work-completion fields such as a hardware timestamp — are configured on the returned
+    /// [`CompletionQueueBuilder`]; call [`build`](CompletionQueueBuilder::build) to create the queue.
     ///
-    /// # Errors
+    /// # Examples
     ///
-    ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`).
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn create_cq(&self, min_cq_entries: i32, id: isize) -> io::Result<CompletionQueue> {
-        let cc = unsafe { ffi::ibv_create_comp_channel(self.inner.ctx) };
-        if cc.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-
-        let cc_fd = unsafe { *cc }.fd;
-        let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)?;
-        // the file descriptor needs to be set to non-blocking because `ibv_get_cq_event()`
-        // would block otherwise.
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(cc_fd, arg)?;
-
-        // Request the standard work-completion fields so the lazy readers in `WorkCompletion` can
-        // serve them. Optional fields (timestamps, CVLAN, ...) are not requested, since not every
-        // provider supports them.
-        let wc_flags = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
-            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
-            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
-            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0;
-        let mut cq_attr = ffi::ibv_cq_init_attr_ex {
-            cqe: min_cq_entries as u32,
-            cq_context: unsafe { ptr::null::<c_void>().offset(id) } as *mut _,
-            channel: cc,
+    /// ```no_run
+    /// # fn f(ctx: &ibverbs::Context) -> std::io::Result<()> {
+    /// let cq = ctx.create_cq(16).build()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn create_cq(&self, min_cq_entries: i32) -> CompletionQueueBuilder {
+        CompletionQueueBuilder {
+            ctx: self.inner.clone(),
+            min_cq_entries,
+            cq_context: 0,
             comp_vector: 0,
-            wc_flags: wc_flags as u64,
-            comp_mask: 0,
-            flags: 0,
-            parent_domain: ptr::null_mut(),
-        };
-        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.inner.ctx, &mut cq_attr as *mut _) };
-
-        if cq_ex.is_null() {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(CompletionQueue {
-                inner: Arc::new(CompletionQueueInner {
-                    _ctx: self.inner.clone(),
-                    cc,
-                    cq_ex,
-                }),
-            })
+            wc_flags: 0,
         }
     }
 
@@ -630,6 +601,138 @@ impl Context {
     /// from it) is alive; do not close it or use it past the owner's lifetime.
     pub fn as_raw(&self) -> *mut ffi::ibv_context {
         self.inner.ctx
+    }
+
+    /// Read the device's current free-running hardware clock (`ibv_query_rt_values_ex`).
+    ///
+    /// The returned [`Duration`] is the device's raw clock value, the same time base that
+    /// [`WorkCompletion::completion_timestamp`] reports its (HCA-clock) timestamps in. Sampling it
+    /// lets you relate completion timestamps to host time.
+    ///
+    /// # Errors
+    ///
+    ///  - `EOPNOTSUPP`: The device does not support querying real-time values.
+    pub fn query_rt_values_ex(&self) -> io::Result<Duration> {
+        // SAFETY: `ibv_values_ex` is a plain C struct (a mask plus a `timespec`); all-zero is a valid
+        // initial value.
+        let mut values: ffi::ibv_values_ex = unsafe { std::mem::zeroed() };
+        values.comp_mask = ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK as u32;
+        let errno = unsafe { ffi::ibv_query_rt_values_ex(self.inner.ctx, &mut values as *mut _) };
+        if errno != 0 {
+            return Err(io::Error::from_raw_os_error(errno));
+        }
+        Ok(Duration::new(
+            values.raw_clock.tv_sec as u64,
+            values.raw_clock.tv_nsec as u32,
+        ))
+    }
+}
+
+/// Builds a [`CompletionQueue`]. Created by [`Context::create_cq`].
+///
+/// The queue size is fixed when the builder is created; everything else is optional and defaults to
+/// a plain interrupt-driven queue with the standard work-completion fields. Call
+/// [`build`](Self::build) to create the queue.
+#[must_use]
+pub struct CompletionQueueBuilder {
+    ctx: Arc<ContextInner>,
+    min_cq_entries: i32,
+    cq_context: isize,
+    comp_vector: u32,
+    /// extra work-completion fields requested on top of the always-present standard set
+    wc_flags: u32,
+}
+
+impl CompletionQueueBuilder {
+    /// Set an opaque context value associated with the completion queue.
+    ///
+    /// Defaults to 0.
+    pub fn set_context(&mut self, id: isize) -> &mut Self {
+        self.cq_context = id;
+        self
+    }
+
+    /// Set the completion vector (the index of the completion event channel used for notifications)
+    /// the queue is bound to. Must be in `[0, context.num_comp_vectors)`.
+    ///
+    /// Defaults to 0.
+    pub fn set_comp_vector(&mut self, comp_vector: u32) -> &mut Self {
+        self.comp_vector = comp_vector;
+        self
+    }
+
+    /// Request additional work-completion fields beyond the standard set.
+    ///
+    /// The standard fields (byte length, immediate data, QP number, and source QP) are always
+    /// requested so the [`WorkCompletion`] accessors work; the flags given here are requested *in
+    /// addition*. For example, pass [`ibv_create_cq_wc_flags::IBV_WC_EX_WITH_COMPLETION_TIMESTAMP`]
+    /// to make [`WorkCompletion::completion_timestamp`] available.
+    ///
+    /// Not every provider supports every optional field; [`build`](Self::build) then fails (typically
+    /// with `EOPNOTSUPP`).
+    ///
+    /// Defaults to none.
+    pub fn set_wc_flags(&mut self, wc_flags: ffi::ibv_create_cq_wc_flags) -> &mut Self {
+        self.wc_flags = wc_flags.0;
+        self
+    }
+
+    /// Create the completion queue.
+    ///
+    /// # Errors
+    ///
+    ///  - `EOPNOTSUPP`: The device does not support a requested work-completion field.
+    ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`) or comp vector.
+    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    pub fn build(&self) -> io::Result<CompletionQueue> {
+        let cc = unsafe { ffi::ibv_create_comp_channel(self.ctx.ctx) };
+        if cc.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+
+        let cc_fd = unsafe { *cc }.fd;
+        let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)?;
+        // the file descriptor needs to be set to non-blocking because `ibv_get_cq_event()`
+        // would block otherwise.
+        let arg = nix::fcntl::FcntlArg::F_SETFL(
+            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+        );
+        nix::fcntl::fcntl(cc_fd, arg)?;
+
+        // Always request the standard work-completion fields so the lazy readers in `WorkCompletion`
+        // can serve them, then add any caller-requested extras (such as the completion timestamp).
+        let wc_flags = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0
+            | self.wc_flags;
+        let mut cq_attr = ffi::ibv_cq_init_attr_ex {
+            cqe: self.min_cq_entries as u32,
+            cq_context: unsafe { ptr::null::<c_void>().offset(self.cq_context) } as *mut _,
+            channel: cc,
+            comp_vector: self.comp_vector,
+            wc_flags: wc_flags as u64,
+            comp_mask: 0,
+            flags: 0,
+            parent_domain: ptr::null_mut(),
+        };
+        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr as *mut _) };
+
+        if cq_ex.is_null() {
+            // Tear down the completion channel we created, so a failed build (for example, an
+            // unsupported work-completion field) does not leak it.
+            let err = io::Error::last_os_error();
+            unsafe { ffi::ibv_destroy_comp_channel(cc) };
+            Err(err)
+        } else {
+            Ok(CompletionQueue {
+                inner: Arc::new(CompletionQueueInner {
+                    _ctx: self.ctx.clone(),
+                    cc,
+                    cq_ex,
+                }),
+            })
+        }
     }
 }
 
@@ -748,6 +851,22 @@ impl WorkCompletion<'_> {
     #[inline]
     pub fn src_qp(&self) -> u32 {
         unsafe { (*self.cq).read_src_qp.unwrap()(self.cq) }
+    }
+
+    /// The hardware timestamp captured when this work request completed, in the device's free-running
+    /// clock units (the same time base as [`Context::query_rt_values_ex`]).
+    ///
+    /// Only valid on a completion queue that requested
+    /// [`IBV_WC_EX_WITH_COMPLETION_TIMESTAMP`](ibv_create_cq_wc_flags::IBV_WC_EX_WITH_COMPLETION_TIMESTAMP)
+    /// (see [`CompletionQueueBuilder::set_wc_flags`]). Calling this on a completion from any other
+    /// completion queue panics, because the provider did not install the timestamp reader.
+    #[inline]
+    pub fn completion_timestamp(&self) -> u64 {
+        unsafe {
+            (*self.cq)
+                .read_completion_ts
+                .expect("completion queue was not created with timestamps")(self.cq)
+        }
     }
 }
 
