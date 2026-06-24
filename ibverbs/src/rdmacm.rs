@@ -21,7 +21,7 @@
 //! use std::time::Duration;
 //! use ibverbs::rdmacm::{ConnectionParameter, Connector, rdma_port_space};
 //!
-//! # fn main() -> std::io::Result<()> {
+//! # fn main() -> ibverbs::Result<()> {
 //! let resolved = Connector::new(rdma_port_space::RDMA_PS_TCP)?
 //!     .resolve("192.0.2.1:18515".parse().unwrap(), Duration::from_secs(2))?;
 //! let ctx = resolved.context()?;
@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
 
-use crate::{Context, PreparedQueuePair, QueuePair};
+use crate::{Context, Error, PreparedQueuePair, QueuePair, Result};
 
 pub use ffi::rdma_port_space;
 
@@ -102,10 +102,10 @@ struct EventChannel {
 
 impl EventChannel {
     /// Opens a new event channel.
-    fn new() -> io::Result<EventChannel> {
+    fn new() -> Result<EventChannel> {
         let chan = unsafe { ffi::rdma_create_event_channel() };
         if chan.is_null() {
-            return Err(io::Error::last_os_error());
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
         Ok(EventChannel { chan })
     }
@@ -133,7 +133,7 @@ unsafe impl Sync for CmId {}
 
 impl CmId {
     /// Creates a new identifier on its own fresh event channel.
-    fn create(port_space: rdma_port_space) -> io::Result<CmId> {
+    fn create(port_space: rdma_port_space) -> Result<CmId> {
         let channel = EventChannel::new()?;
         let mut id: *mut ffi::rdma_cm_id = ptr::null_mut();
         let ret = unsafe {
@@ -141,24 +141,24 @@ impl CmId {
         };
         if ret != 0 {
             // `channel` drops here, destroying the event channel.
-            return Err(io::Error::last_os_error());
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
         Ok(CmId { channel, id })
     }
 
     /// Blocks until the next event on this id's channel is available and returns it.
-    fn get_cm_event(&self) -> io::Result<CmEvent> {
+    fn get_cm_event(&self) -> Result<CmEvent> {
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
         let ret = unsafe { ffi::rdma_get_cm_event(self.channel.chan, &mut event) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
         Ok(CmEvent { event })
     }
 
     /// Blocks until an `expected` event arrives, acknowledging and skipping any others, and
     /// returning an error on a failure event. Drives the blocking setup helpers.
-    fn wait_for(&self, expected: ffi::rdma_cm_event_type) -> io::Result<()> {
+    fn wait_for(&self, expected: ffi::rdma_cm_event_type) -> Result<()> {
         loop {
             // `get_cm_event` blocks on the channel's (blocking) fd until an event arrives — this
             // does not spin. The loop only goes around to skip a non-matching event, re-blocking on
@@ -168,52 +168,50 @@ impl CmId {
                 return Ok(());
             }
             if is_failure(kind) {
-                return Err(io::Error::other(format!(
-                    "connection manager reported {kind:?}"
-                )));
+                return Err(Error::ConnectionManager(kind));
             }
         }
     }
 
     /// Binds to a local `addr` (passive side). Bind to an unspecified address such as
     /// `0.0.0.0:port` to accept connections on any device.
-    fn bind_addr(&self, addr: SocketAddr) -> io::Result<()> {
+    fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
         let addr = OsSocketAddr::new(addr);
         let ret = unsafe { ffi::rdma_bind_addr(self.id, addr.as_ptr()) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::BindAddress(io::Error::last_os_error()));
         }
         Ok(())
     }
 
     /// Starts listening for incoming connection requests (passive side), queueing up to `backlog`.
-    fn listen(&self, backlog: i32) -> io::Result<()> {
+    fn listen(&self, backlog: i32) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.id, backlog) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
         Ok(())
     }
 
     /// Resolves the destination address to an RDMA device and local route (active side). On success
     /// a `RDMA_CM_EVENT_ADDR_RESOLVED` event is delivered.
-    fn resolve_addr(&self, dst: SocketAddr, timeout: Duration) -> io::Result<()> {
+    fn resolve_addr(&self, dst: SocketAddr, timeout: Duration) -> Result<()> {
         let dst = OsSocketAddr::new(dst);
         let ret = unsafe {
             ffi::rdma_resolve_addr(self.id, ptr::null_mut(), dst.as_ptr(), timeout_ms(timeout))
         };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::ResolveAddress(io::Error::last_os_error()));
         }
         Ok(())
     }
 
     /// Resolves the route to the destination (active side), after the address has resolved. On
     /// success a `RDMA_CM_EVENT_ROUTE_RESOLVED` event is delivered.
-    fn resolve_route(&self, timeout: Duration) -> io::Result<()> {
+    fn resolve_route(&self, timeout: Duration) -> Result<()> {
         let ret = unsafe { ffi::rdma_resolve_route(self.id, timeout_ms(timeout)) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::ResolveRoute(io::Error::last_os_error()));
         }
         Ok(())
     }
@@ -221,85 +219,85 @@ impl CmId {
     /// Initiates a connection to the remote (active side). On success a
     /// `RDMA_CM_EVENT_CONNECT_RESPONSE` (external queue pair) or `RDMA_CM_EVENT_ESTABLISHED` event
     /// is delivered. `param` carries the local queue pair number.
-    fn connect(&self, param: &ConnectionParameter) -> io::Result<()> {
+    fn connect(&self, param: &ConnectionParameter) -> Result<()> {
         let mut param = param.0;
         let ret = unsafe { ffi::rdma_connect(self.id, &mut param) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::Connect(io::Error::last_os_error()));
         }
         Ok(())
     }
 
     /// Accepts a connection request (passive side), in response to a
     /// `RDMA_CM_EVENT_CONNECT_REQUEST`. `param` carries the local queue pair number.
-    fn accept(&self, param: &ConnectionParameter) -> io::Result<()> {
+    fn accept(&self, param: &ConnectionParameter) -> Result<()> {
         let mut param = param.0;
         let ret = unsafe { ffi::rdma_accept(self.id, &mut param) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::Accept(io::Error::last_os_error()));
         }
         Ok(())
     }
 
     /// Completes connection establishment on the active side after the queue pair has reached
     /// `RTS`, in response to a `RDMA_CM_EVENT_CONNECT_RESPONSE`.
-    fn establish(&self) -> io::Result<()> {
+    fn establish(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_establish(self.id) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::Connect(io::Error::last_os_error()));
         }
         Ok(())
     }
 
     /// Disconnects an established connection, delivering `RDMA_CM_EVENT_DISCONNECTED` to both sides.
-    fn disconnect(&self) -> io::Result<()> {
+    fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.id) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
         Ok(())
     }
 
     /// The device context the connection manager bound this id to (its `verbs`). Only available once
     /// the address has resolved.
-    fn verbs(&self) -> io::Result<*mut ffi::ibv_context> {
+    fn verbs(&self) -> Result<*mut ffi::ibv_context> {
         let verbs = unsafe { (*self.id).verbs };
         if verbs.is_null() {
-            return Err(io::Error::other(
+            return Err(Error::ConnectionSetup(io::Error::other(
                 "connection manager has not bound a device yet",
-            ));
+            )));
         }
         Ok(verbs)
     }
 
     /// Builds the queue pair from `prepared` and moves it from `RESET` to `INIT`. Finish the
     /// transition after the connection is set up with [`ready`](Self::ready).
-    fn init_qp(&self, prepared: PreparedQueuePair) -> io::Result<QueuePair> {
+    fn init_qp(&self, prepared: PreparedQueuePair) -> Result<QueuePair> {
         let qp = prepared.into_queue_pair();
         self.transition(&qp, ffi::ibv_qp_state::IBV_QPS_INIT)?;
         Ok(qp)
     }
 
     /// Moves `qp` from `INIT` through `RTR` to `RTS`, completing the connection-manager transition.
-    fn ready(&self, qp: &QueuePair) -> io::Result<()> {
+    fn ready(&self, qp: &QueuePair) -> Result<()> {
         self.transition(qp, ffi::ibv_qp_state::IBV_QPS_RTR)?;
         self.transition(qp, ffi::ibv_qp_state::IBV_QPS_RTS)
     }
 
     /// Transitions `qp` to `state` using the attributes the connection manager computes from the
     /// resolved route and negotiated parameters (`rdma_init_qp_attr` + `ibv_modify_qp`).
-    fn transition(&self, qp: &QueuePair, state: ffi::ibv_qp_state) -> io::Result<()> {
+    fn transition(&self, qp: &QueuePair, state: ffi::ibv_qp_state) -> Result<()> {
         let mut attr = MaybeUninit::<ffi::ibv_qp_attr>::zeroed();
         // `rdma_init_qp_attr` reads the target state from the attribute and fills in the rest.
         unsafe { (*attr.as_mut_ptr()).qp_state = state };
         let mut mask: c_int = 0;
         let ret = unsafe { ffi::rdma_init_qp_attr(self.id, attr.as_mut_ptr(), &mut mask) };
         if ret != 0 {
-            return Err(io::Error::last_os_error());
+            return Err(Error::ModifyQueuePair(io::Error::last_os_error()));
         }
         let errno = unsafe { ffi::ibv_modify_qp(qp.as_raw(), attr.as_mut_ptr(), mask) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
         Ok(())
     }
@@ -326,14 +324,14 @@ impl CmEvent {
     /// Consumes the event, taking the new id a `RDMA_CM_EVENT_CONNECT_REQUEST` carries and migrating
     /// it onto its own fresh event channel, so its later events are isolated rather than colliding
     /// with the listener's. Only valid on that event type. The event is acknowledged on return.
-    fn migrate_request_id(self) -> io::Result<CmId> {
+    fn migrate_request_id(self) -> Result<CmId> {
         let channel = EventChannel::new()?;
         let id = unsafe { (*self.event).id };
         let ret = unsafe { ffi::rdma_migrate_id(id, channel.chan) };
         if ret != 0 {
             // The request id is ours to destroy once we abandon it; `channel` drops after.
             unsafe { ffi::rdma_destroy_id(id) };
-            return Err(io::Error::last_os_error());
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
         Ok(CmId { channel, id })
     }
@@ -407,7 +405,7 @@ pub struct Connector {
 
 impl Connector {
     /// Creates a connector with its own event channel.
-    pub fn new(port_space: rdma_port_space) -> io::Result<Self> {
+    pub fn new(port_space: rdma_port_space) -> Result<Self> {
         Ok(Connector {
             id: Arc::new(CmId::create(port_space)?),
         })
@@ -415,7 +413,7 @@ impl Connector {
 
     /// Resolves the destination address and route (blocking until both complete), then returns a
     /// handle to build the queue pair on the resolved device.
-    pub fn resolve(self, dst: SocketAddr, timeout: Duration) -> io::Result<Resolved> {
+    pub fn resolve(self, dst: SocketAddr, timeout: Duration) -> Result<Resolved> {
         self.id.resolve_addr(dst, timeout)?;
         self.id
             .wait_for(ffi::rdma_cm_event_type::RDMA_CM_EVENT_ADDR_RESOLVED)?;
@@ -434,7 +432,7 @@ pub struct Resolved {
 impl Resolved {
     /// The device the connection manager resolved to. Build the queue pair (and its protection
     /// domain and completion queue) on this context, then pass it to [`connect`](Self::connect).
-    pub fn context(&self) -> io::Result<Context> {
+    pub fn context(&self) -> Result<Context> {
         Ok(Context::from_borrowed_context(
             self.id.verbs()?,
             self.id.clone(),
@@ -447,7 +445,7 @@ impl Resolved {
         self,
         qp: PreparedQueuePair,
         mut param: ConnectionParameter,
-    ) -> io::Result<Connection> {
+    ) -> Result<Connection> {
         let qp = self.id.init_qp(qp)?;
         param.set_qp_num(qp.qp_num());
         self.id.connect(&param)?;
@@ -467,7 +465,7 @@ pub struct Acceptor {
 impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device) and starts
     /// listening, queueing up to `backlog` pending connections.
-    pub fn bind(addr: SocketAddr, port_space: rdma_port_space, backlog: i32) -> io::Result<Self> {
+    pub fn bind(addr: SocketAddr, port_space: rdma_port_space, backlog: i32) -> Result<Self> {
         let listener = CmId::create(port_space)?;
         listener.bind_addr(addr)?;
         listener.listen(backlog)?;
@@ -479,7 +477,7 @@ impl Acceptor {
     /// Blocks until the next connection request arrives and returns it, moved onto its own event
     /// channel so its events never collide with the listener's or with other connections'. Build a
     /// queue pair on its [`context`](Incoming::context), then [`accept`](Incoming::accept) it.
-    pub fn accept(&self) -> io::Result<Incoming> {
+    pub fn accept(&self) -> Result<Incoming> {
         loop {
             let event = self.listener.get_cm_event()?;
             if event.event_type() == ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
@@ -502,7 +500,7 @@ pub struct Incoming {
 impl Incoming {
     /// The device the request arrived on. Build the queue pair on this context, then pass it to
     /// [`accept`](Self::accept).
-    pub fn context(&self) -> io::Result<Context> {
+    pub fn context(&self) -> Result<Context> {
         Ok(Context::from_borrowed_context(
             self.id.verbs()?,
             self.id.clone(),
@@ -515,7 +513,7 @@ impl Incoming {
         self,
         qp: PreparedQueuePair,
         mut param: ConnectionParameter,
-    ) -> io::Result<Connection> {
+    ) -> Result<Connection> {
         let qp = self.id.init_qp(qp)?;
         self.id.ready(&qp)?;
         param.set_qp_num(qp.qp_num());
@@ -541,7 +539,7 @@ impl Connection {
     }
 
     /// Disconnects the connection. The peer is notified with a `RDMA_CM_EVENT_DISCONNECTED` event.
-    pub fn disconnect(&self) -> io::Result<()> {
+    pub fn disconnect(&self) -> Result<()> {
         self.id.disconnect()
     }
 }

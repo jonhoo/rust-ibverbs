@@ -120,6 +120,184 @@ pub const DEFAULT_ACCESS_FLAGS: ffi::ibv_access_flags = ffi::ibv_access_flags(
         | ffi::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0,
 );
 
+/// A specialized [`Result`](std::result::Result) for ibverbs operations.
+pub type Result<T> = std::result::Result<T, Error>;
+
+/// Errors that an ibverbs operation can return.
+///
+/// Most variants wrap the underlying operating-system error (an `errno` from a libibverbs or
+/// librdmacm call); the specific variant identifies which operation failed and carries any relevant
+/// context. A few variants ([`Unsupported`](Error::Unsupported), [`TimedOut`](Error::TimedOut), ...)
+/// capture conditions that callers commonly branch on.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum Error {
+    /// The device or provider does not support the requested operation or work-completion field
+    /// (`EOPNOTSUPP`).
+    #[error("operation not supported by the device")]
+    Unsupported,
+
+    /// A blocking operation timed out (a completion-queue wait, or address/route resolution).
+    #[error("the operation timed out")]
+    TimedOut,
+
+    /// The device port is not in the `ACTIVE` or `ARMED` state, so its GID table and routing are
+    /// unusable.
+    #[error("port {0} is not ACTIVE or ARMED")]
+    PortNotActive(u8),
+
+    /// A global routing identifier (GID) was set for the remote endpoint but not the local one.
+    #[error("a GID was set for the remote endpoint but not the local one")]
+    GidMismatch,
+
+    /// The device does not expose a stable kernel index.
+    #[error("the device index is not known")]
+    DeviceIndexUnavailable,
+
+    /// Listing the available RDMA devices failed (`ibv_get_device_list`).
+    #[error("failed to list RDMA devices")]
+    GetDeviceList(#[source] io::Error),
+
+    /// Opening the device failed (`ibv_open_device`).
+    #[error("failed to open the RDMA device")]
+    OpenDevice(#[source] io::Error),
+
+    /// Reading the device GUID failed (`ibv_get_device_guid`).
+    #[error("failed to read the device GUID")]
+    DeviceGuid(#[source] io::Error),
+
+    /// Querying device attributes failed (`ibv_query_device`).
+    #[error("failed to query device attributes")]
+    QueryDevice(#[source] io::Error),
+
+    /// Querying port attributes failed (`ibv_query_port`).
+    #[error("failed to query attributes of port {port_num}")]
+    QueryPort {
+        /// The port that was queried.
+        port_num: u8,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Querying a GID failed (`ibv_query_gid`).
+    #[error("failed to query GID index {gid_index} on port {port_num}")]
+    QueryGid {
+        /// The port that was queried.
+        port_num: u8,
+        /// The GID table index that was queried.
+        gid_index: u32,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
+
+    /// Querying the GID table failed (`ibv_query_gid_table`).
+    #[error("failed to query the GID table")]
+    QueryGidTable(#[source] io::Error),
+
+    /// Querying the device's real-time values failed (`ibv_query_rt_values_ex`).
+    #[error("failed to query the device real-time values")]
+    QueryRealTimeValues(#[source] io::Error),
+
+    /// Allocating a protection domain failed (`ibv_alloc_pd`).
+    #[error("failed to allocate a protection domain")]
+    AllocProtectionDomain(#[source] io::Error),
+
+    /// Registering a memory region failed (`ibv_reg_mr` / `ibv_reg_dmabuf_mr`).
+    #[error("failed to register a memory region")]
+    RegisterMemoryRegion(#[source] io::Error),
+
+    /// Giving advice about a memory region failed (`ibv_advise_mr`).
+    #[error("failed to advise on a memory region")]
+    AdviseMemoryRegion(#[source] io::Error),
+
+    /// Creating a completion queue (or its completion channel) failed.
+    #[error("failed to create a completion queue")]
+    CreateCompletionQueue(#[source] io::Error),
+
+    /// Creating a queue pair failed (`ibv_create_qp_ex` / `efadv_create_qp_ex`).
+    #[error("failed to create a queue pair")]
+    CreateQueuePair(#[source] io::Error),
+
+    /// Transitioning a queue pair to a new state failed (`ibv_modify_qp`).
+    #[error("failed to transition the queue pair state")]
+    ModifyQueuePair(#[source] io::Error),
+
+    /// Creating an address handle failed (`ibv_create_ah`).
+    #[error("failed to create an address handle")]
+    CreateAddressHandle(#[source] io::Error),
+
+    /// Creating a shared receive queue failed (`ibv_create_srq`).
+    #[error("failed to create a shared receive queue")]
+    CreateSharedReceiveQueue(#[source] io::Error),
+
+    /// Posting a send work request failed.
+    #[error("failed to post a send work request")]
+    PostSend(#[source] io::Error),
+
+    /// Posting a receive work request failed.
+    #[error("failed to post a receive work request")]
+    PostReceive(#[source] io::Error),
+
+    /// Polling a completion queue failed.
+    #[error("failed to poll the completion queue")]
+    PollCompletionQueue(#[source] io::Error),
+
+    /// The connection manager reported a failure event.
+    #[cfg(feature = "rdmacm")]
+    #[error("the connection manager reported {0:?}")]
+    ConnectionManager(ffi::rdma_cm_event_type),
+
+    /// Binding a connection-manager identifier to a local address failed (`rdma_bind_addr`).
+    #[cfg(feature = "rdmacm")]
+    #[error("failed to bind to a local address")]
+    BindAddress(#[source] io::Error),
+
+    /// Resolving the destination address failed (`rdma_resolve_addr`).
+    #[cfg(feature = "rdmacm")]
+    #[error("failed to resolve the destination address")]
+    ResolveAddress(#[source] io::Error),
+
+    /// Resolving the route to the destination failed (`rdma_resolve_route`).
+    #[cfg(feature = "rdmacm")]
+    #[error("failed to resolve the route to the destination")]
+    ResolveRoute(#[source] io::Error),
+
+    /// Establishing a connection failed (`rdma_connect` / `rdma_establish`).
+    #[cfg(feature = "rdmacm")]
+    #[error("failed to establish the connection")]
+    Connect(#[source] io::Error),
+
+    /// Accepting an incoming connection failed (`rdma_accept`).
+    #[cfg(feature = "rdmacm")]
+    #[error("failed to accept the connection")]
+    Accept(#[source] io::Error),
+
+    /// Another connection-manager setup step failed (creating the id, listening, getting an event,
+    /// disconnecting, ...).
+    #[cfg(feature = "rdmacm")]
+    #[error("connection manager setup failed")]
+    ConnectionSetup(#[source] io::Error),
+}
+
+impl Error {
+    /// Build an [`Error`] from an OS error, promoting `EOPNOTSUPP` to [`Error::Unsupported`] and
+    /// otherwise tagging it with `wrap` (the variant identifying the operation that failed).
+    fn os(err: io::Error, wrap: impl FnOnce(io::Error) -> Error) -> Error {
+        if err.raw_os_error() == Some(nix::libc::EOPNOTSUPP) {
+            Error::Unsupported
+        } else {
+            wrap(err)
+        }
+    }
+
+    /// As [`os`](Error::os), but from a raw `errno`.
+    fn errno(errno: i32, wrap: impl FnOnce(io::Error) -> Error) -> Error {
+        Error::os(io::Error::from_raw_os_error(errno), wrap)
+    }
+}
+
 /// Get list of available RDMA devices.
 ///
 /// # Errors
@@ -127,12 +305,12 @@ pub const DEFAULT_ACCESS_FLAGS: ffi::ibv_access_flags = ffi::ibv_access_flags(
 ///  - `EPERM`: Permission denied.
 ///  - `ENOMEM`: Insufficient memory to complete the operation.
 ///  - `ENOSYS`: No kernel support for RDMA.
-pub fn devices() -> io::Result<DeviceList> {
+pub fn devices() -> Result<DeviceList> {
     let mut n = 0i32;
     let devices = unsafe { ffi::ibv_get_device_list(&mut n as *mut _) };
 
     if devices.is_null() {
-        return Err(io::Error::last_os_error());
+        return Err(Error::os(io::Error::last_os_error(), Error::GetDeviceList));
     }
 
     let devices = unsafe {
@@ -275,7 +453,7 @@ impl<'devlist> Device<'devlist> {
     ///  - `ENOMEM`: Out of memory (from `ibv_query_port_attr`).
     ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
     ///  - Other: port 1 is not in `ACTIVE` or `ARMED` state.
-    pub fn open(&self) -> io::Result<Context> {
+    pub fn open(&self) -> Result<Context> {
         Context::with_device(*self.0)
     }
 
@@ -322,11 +500,11 @@ impl<'devlist> Device<'devlist> {
     /// # Errors
     ///
     ///  - `EMFILE`: Too many files are opened by this process.
-    pub fn guid(&self) -> io::Result<Guid> {
+    pub fn guid(&self) -> Result<Guid> {
         let guid_int = unsafe { ffi::ibv_get_device_guid(*self.0) };
         let guid: Guid = guid_int.into();
         if guid.is_reserved() {
-            Err(io::Error::last_os_error())
+            Err(Error::os(io::Error::last_os_error(), Error::DeviceGuid))
         } else {
             Ok(guid)
         }
@@ -336,13 +514,10 @@ impl<'devlist> Device<'devlist> {
     /// # Errors
     ///
     ///  - `ENOTSUP`: Stable index is not supported
-    pub fn index(&self) -> io::Result<i32> {
+    pub fn index(&self) -> Result<i32> {
         let idx = unsafe { ffi::ibv_get_device_index(*self.0) };
         if idx == -1 {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "device index not known",
-            ))
+            Err(Error::DeviceIndexUnavailable)
         } else {
             Ok(idx)
         }
@@ -368,7 +543,7 @@ enum ContextOwnership {
 }
 
 impl ContextInner {
-    fn query_port(&self, port_num: u8) -> io::Result<ffi::ibv_port_attr> {
+    fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr> {
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
         //
         //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
@@ -385,7 +560,10 @@ impl ContextInner {
             )
         };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, |e| Error::QueryPort {
+                port_num,
+                source: e,
+            }));
         }
 
         // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
@@ -397,7 +575,7 @@ impl ContextInner {
         match port_attr.state {
             ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
             _ => {
-                return Err(io::Error::other("port is not ACTIVE or ARMED"));
+                return Err(Error::PortNotActive(port_num));
             }
         }
         Ok(port_attr)
@@ -429,12 +607,12 @@ pub struct Context {
 
 impl Context {
     /// Opens a context for the given device, and queries its port and gid.
-    fn with_device(dev: *mut ffi::ibv_device) -> io::Result<Context> {
+    fn with_device(dev: *mut ffi::ibv_device) -> Result<Context> {
         assert!(!dev.is_null());
 
         let ctx = unsafe { ffi::ibv_open_device(dev) };
         if ctx.is_null() {
-            return Err(io::Error::other("failed to open device"));
+            return Err(Error::OpenDevice(io::Error::last_os_error()));
         }
         let inner = Arc::new(ContextInner {
             ctx,
@@ -484,7 +662,7 @@ impl Context {
     /// # Examples
     ///
     /// ```no_run
-    /// # fn f(ctx: &ibverbs::Context) -> std::io::Result<()> {
+    /// # fn f(ctx: &ibverbs::Context) -> ibverbs::Result<()> {
     /// let cq = ctx.create_cq(16).build()?;
     /// # Ok(())
     /// # }
@@ -506,10 +684,10 @@ impl Context {
     /// A protection domain is a means of protection, and helps you create a group of object that
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
-    pub fn alloc_pd(&self) -> io::Result<ProtectionDomain> {
+    pub fn alloc_pd(&self) -> Result<ProtectionDomain> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.inner.ctx) };
         if pd.is_null() {
-            Err(io::Error::other("obv_alloc_pd returned null"))
+            Err(Error::AllocProtectionDomain(io::Error::last_os_error()))
         } else {
             Ok(ProtectionDomain {
                 inner: Arc::new(ProtectionDomainInner {
@@ -524,7 +702,7 @@ impl Context {
     ///
     /// The entries span all of the device's ports; each carries the `port_num` and `gid_index` it
     /// belongs to (the latter is what [`QueuePairBuilder::set_gid_index`] expects).
-    pub fn gid_table(&self) -> io::Result<Vec<GidEntry>> {
+    pub fn gid_table(&self) -> Result<Vec<GidEntry>> {
         let max_entries = self.inner.query_port(PORT_NUM)?.gid_tbl_len as usize;
         let mut gid_table = vec![ffi::ibv_gid_entry::default(); max_entries];
         let num_entries = unsafe {
@@ -537,10 +715,7 @@ impl Context {
             )
         };
         if num_entries < 0 {
-            return Err(io::Error::other(format!(
-                "failed to query gid table, error={}",
-                -num_entries
-            )));
+            return Err(Error::errno(-num_entries as i32, Error::QueryGidTable));
         }
         gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
@@ -557,11 +732,11 @@ impl Context {
     /// # Errors
     ///
     ///  - `EINVAL`: Invalid arguments.
-    pub fn query_device(&self) -> io::Result<ffi::ibv_device_attr> {
+    pub fn query_device(&self) -> Result<ffi::ibv_device_attr> {
         let mut device_attr = ffi::ibv_device_attr::default();
         let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::QueryDevice));
         }
         Ok(device_attr)
     }
@@ -580,7 +755,7 @@ impl Context {
     ///
     ///  - `EINVAL`: Invalid `port_num`.
     ///  - `ENOMEM`: Out of memory.
-    pub fn query_port(&self, port_num: u8) -> io::Result<ffi::ibv_port_attr> {
+    pub fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr> {
         let mut port_attr = ffi::ibv_port_attr::default();
         let errno = unsafe {
             ffi::ibv_query_port(
@@ -590,7 +765,10 @@ impl Context {
             )
         };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, |e| Error::QueryPort {
+                port_num,
+                source: e,
+            }));
         }
         Ok(port_attr)
     }
@@ -613,14 +791,14 @@ impl Context {
     /// # Errors
     ///
     ///  - `EOPNOTSUPP`: The device does not support querying real-time values.
-    pub fn query_rt_values_ex(&self) -> io::Result<Duration> {
+    pub fn query_rt_values_ex(&self) -> Result<Duration> {
         // SAFETY: `ibv_values_ex` is a plain C struct (a mask plus a `timespec`); all-zero is a valid
         // initial value.
         let mut values: ffi::ibv_values_ex = unsafe { std::mem::zeroed() };
         values.comp_mask = ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK as u32;
         let errno = unsafe { ffi::ibv_query_rt_values_ex(self.inner.ctx, &mut values as *mut _) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::QueryRealTimeValues));
         }
         Ok(Duration::new(
             values.raw_clock.tv_sec as u64,
@@ -685,20 +863,21 @@ impl CompletionQueueBuilder {
     ///  - `EOPNOTSUPP`: The device does not support a requested work-completion field.
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`) or comp vector.
     ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn build(&self) -> io::Result<CompletionQueue> {
+    pub fn build(&self) -> Result<CompletionQueue> {
         let cc = unsafe { ffi::ibv_create_comp_channel(self.ctx.ctx) };
         if cc.is_null() {
-            return Err(io::Error::last_os_error());
+            return Err(Error::CreateCompletionQueue(io::Error::last_os_error()));
         }
 
         let cc_fd = unsafe { *cc }.fd;
-        let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)?;
+        let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)
+            .map_err(|e| Error::CreateCompletionQueue(e.into()))?;
         // the file descriptor needs to be set to non-blocking because `ibv_get_cq_event()`
         // would block otherwise.
         let arg = nix::fcntl::FcntlArg::F_SETFL(
             nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
         );
-        nix::fcntl::fcntl(cc_fd, arg)?;
+        nix::fcntl::fcntl(cc_fd, arg).map_err(|e| Error::CreateCompletionQueue(e.into()))?;
 
         // Always request the standard work-completion fields so the lazy readers in `WorkCompletion`
         // can serve them, then add any caller-requested extras (such as the completion timestamp).
@@ -724,7 +903,7 @@ impl CompletionQueueBuilder {
             // unsupported work-completion field) does not leak it.
             let err = io::Error::last_os_error();
             unsafe { ffi::ibv_destroy_comp_channel(cc) };
-            Err(err)
+            Err(Error::os(err, Error::CreateCompletionQueue))
         } else {
             Ok(CompletionQueue {
                 inner: Arc::new(CompletionQueueInner {
@@ -799,7 +978,7 @@ impl WorkCompletion<'_> {
 
     /// `Ok(())` if the work request completed successfully, otherwise the status and vendor error.
     #[inline]
-    pub fn ok(&self) -> Result<(), (ffi::ibv_wc_status, u32)> {
+    pub fn ok(&self) -> std::result::Result<(), (ffi::ibv_wc_status, u32)> {
         match self.error() {
             Some(e) => Err(e),
             None => Ok(()),
@@ -1007,7 +1186,7 @@ impl CompletionQueue {
     ///
     /// ```no_run
     /// # use ibverbs::CompletionQueue;
-    /// # fn drain(cq: &CompletionQueue) -> std::io::Result<()> {
+    /// # fn drain(cq: &CompletionQueue) -> ibverbs::Result<()> {
     /// if let Some(mut completions) = cq.poll()? {
     ///     while let Some(wc) = completions.next() {
     ///         if let Err((status, _)) = wc.ok() {
@@ -1019,7 +1198,7 @@ impl CompletionQueue {
     /// # }
     /// ```
     #[inline]
-    pub fn poll(&self) -> io::Result<Option<Completions<'_>>> {
+    pub fn poll(&self) -> Result<Option<Completions<'_>>> {
         let cq = self.inner.cq_ex;
         let mut attr = ffi::ibv_poll_cq_attr { comp_mask: 0 };
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
@@ -1031,7 +1210,7 @@ impl CompletionQueue {
                 _cq: std::marker::PhantomData,
             })),
             e if e == nix::libc::ENOENT => Ok(None),
-            e => Err(io::Error::from_raw_os_error(e)),
+            e => Err(Error::errno(e, Error::PollCompletionQueue)),
         }
     }
 
@@ -1044,7 +1223,7 @@ impl CompletionQueue {
     /// # Errors
     ///  - `TimedOut`: the timeout expired before any completion arrived.
     ///  - System errors from `req_notify_cq`, `poll`, or `ibv_get_cq_event`.
-    pub fn wait(&self, timeout: Option<Duration>) -> io::Result<Completions<'_>> {
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<Completions<'_>> {
         loop {
             // Arm the completion channel, then poll: polling after arming closes the race where a
             // completion arrives between an earlier poll and arming.
@@ -1052,7 +1231,7 @@ impl CompletionQueue {
             let ctx = unsafe { *cq }.context;
             let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, 0) };
             if errno != 0 {
-                return Err(io::Error::from_raw_os_error(errno));
+                return Err(Error::errno(errno, Error::PollCompletionQueue));
             }
             if let Some(completions) = self.poll()? {
                 return Ok(completions);
@@ -1069,14 +1248,16 @@ impl CompletionQueue {
                 timeout
                     .map(nix::poll::PollTimeout::try_from)
                     .transpose()
-                    .map_err(|_| io::Error::other("failed to convert timeout to PollTimeout"))?,
-            )?;
+                    .map_err(|_| {
+                        Error::PollCompletionQueue(io::Error::other(
+                            "failed to convert timeout to PollTimeout",
+                        ))
+                    })?,
+            )
+            .map_err(|e| Error::PollCompletionQueue(e.into()))?;
             match ret {
                 0 => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "Timed out during completion queue wait",
-                    ));
+                    return Err(Error::TimedOut);
                 }
                 1 => {}
                 _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
@@ -1093,7 +1274,7 @@ impl CompletionQueue {
                 if e.kind() == io::ErrorKind::WouldBlock {
                     continue;
                 }
-                return Err(e);
+                return Err(Error::PollCompletionQueue(e));
             }
             assert_eq!(self.inner.cq(), out_cq);
             assert!(out_cq_context.is_null());
@@ -1573,7 +1754,7 @@ impl QueuePairBuilder {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
-    pub fn build(&self) -> io::Result<PreparedQueuePair> {
+    pub fn build(&self) -> Result<PreparedQueuePair> {
         use ffi::ibv_qp_create_send_ops_flags as SendOps;
         use ffi::ibv_qp_type::{IBV_QPT_RC, IBV_QPT_UC};
 
@@ -1623,7 +1804,7 @@ impl QueuePairBuilder {
 
         let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, attr.as_mut_ptr()) };
         if qp.is_null() {
-            Err(io::Error::last_os_error())
+            Err(Error::CreateQueuePair(io::Error::last_os_error()))
         } else {
             let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
             Ok(PreparedQueuePair {
@@ -1853,7 +2034,7 @@ impl PreparedQueuePair {
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
-    pub fn endpoint(&self) -> io::Result<QueuePairEndpoint> {
+    pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
         let num = unsafe { &*self.qp.qp }.qp_num;
         let gid = if let Some(gid_index) = self.gid_index {
             let mut gid = ffi::ibv_gid::default();
@@ -1866,7 +2047,11 @@ impl PreparedQueuePair {
                 )
             };
             if rc < 0 {
-                return Err(io::Error::last_os_error());
+                return Err(Error::os(io::Error::last_os_error(), |e| Error::QueryGid {
+                    port_num: self.port_num,
+                    gid_index,
+                    source: e,
+                }));
             }
             Some(Gid::from(gid))
         } else {
@@ -1911,7 +2096,7 @@ impl PreparedQueuePair {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
-    pub fn handshake(self, remote: QueuePairEndpoint) -> io::Result<QueuePair> {
+    pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair> {
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
@@ -1928,7 +2113,7 @@ impl PreparedQueuePair {
         }
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
         // set ready to receive
@@ -1951,10 +2136,7 @@ impl PreparedQueuePair {
             attr.ah_attr.is_global = 1;
             attr.ah_attr.grh.dgid = gid.into();
             attr.ah_attr.grh.hop_limit = 0xff;
-            attr.ah_attr.grh.sgid_index = self
-                .gid_index
-                .ok_or_else(|| io::Error::other("gid was set for remote but not local"))?
-                as u8;
+            attr.ah_attr.grh.sgid_index = self.gid_index.ok_or(Error::GidMismatch)? as u8;
             attr.ah_attr.grh.traffic_class = self.traffic_class;
         }
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
@@ -1978,7 +2160,7 @@ impl PreparedQueuePair {
         }
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
         // set ready to send
@@ -2006,7 +2188,7 @@ impl PreparedQueuePair {
         }
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
         Ok(self.qp)
@@ -2026,7 +2208,7 @@ impl PreparedQueuePair {
     ///
     ///  - `EINVAL`: Invalid value provided in `attr` or `attr_mask`.
     ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn activate_ud(self, qkey: u32) -> io::Result<QueuePair> {
+    pub fn activate_ud(self, qkey: u32) -> Result<QueuePair> {
         // INIT: associate with the port and set the Q_Key. UD has no access flags.
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
@@ -2041,7 +2223,7 @@ impl PreparedQueuePair {
             | ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
         // RTR: a UD queue pair needs no path or destination information.
@@ -2052,7 +2234,7 @@ impl PreparedQueuePair {
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
         // RTS.
@@ -2064,7 +2246,7 @@ impl PreparedQueuePair {
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
-            return Err(io::Error::from_raw_os_error(errno));
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
         Ok(self.qp)
@@ -2376,14 +2558,11 @@ impl ProtectionDomain {
     ///
     ///  - `EINVAL`: Invalid value provided in `attr`.
     ///  - `ENOMEM`: Not enough resources to complete this operation.
-    pub fn create_address_handle(
-        &self,
-        attr: &AddressHandleAttribute,
-    ) -> io::Result<AddressHandle> {
+    pub fn create_address_handle(&self, attr: &AddressHandleAttribute) -> Result<AddressHandle> {
         let mut ah_attr = attr.attr;
         let ah = unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) };
         if ah.is_null() {
-            Err(io::Error::last_os_error())
+            Err(Error::CreateAddressHandle(io::Error::last_os_error()))
         } else {
             Ok(AddressHandle {
                 _pd: self.inner.clone(),
@@ -2411,7 +2590,7 @@ impl ProtectionDomain {
         advice: ibv_advise_mr_advice,
         flags: u32,
         sg_list: &[LocalMemorySlice],
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let ret = unsafe {
             ffi::ibv_advise_mr(
                 self.inner.pd,
@@ -2424,7 +2603,7 @@ impl ProtectionDomain {
         if ret == 0 {
             Ok(())
         } else {
-            Err(io::Error::from_raw_os_error(ret))
+            Err(Error::errno(ret, Error::AdviseMemoryRegion))
         }
     }
 
@@ -2449,7 +2628,7 @@ impl ProtectionDomain {
         send: &CompletionQueue,
         recv: &CompletionQueue,
         qp_type: ffi::ibv_qp_type,
-    ) -> io::Result<QueuePairBuilder> {
+    ) -> Result<QueuePairBuilder> {
         self.create_qp_on_port(send, recv, qp_type, PORT_NUM)
     }
 
@@ -2464,7 +2643,7 @@ impl ProtectionDomain {
         recv: &CompletionQueue,
         qp_type: ffi::ibv_qp_type,
         port_num: u8,
-    ) -> io::Result<QueuePairBuilder> {
+    ) -> Result<QueuePairBuilder> {
         let port_attr = self.inner.ctx.query_port(port_num)?;
         Ok(QueuePairBuilder::new(
             self.inner.clone(),
@@ -2491,11 +2670,11 @@ impl ProtectionDomain {
         ptr: *mut c_void,
         len: usize,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegionInner> {
+    ) -> Result<MemoryRegionInner> {
         let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
         // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
         if mr.is_null() {
-            Err(io::Error::last_os_error())
+            Err(Error::RegisterMemoryRegion(io::Error::last_os_error()))
         } else {
             Ok(MemoryRegionInner {
                 _pd: self.inner.clone(),
@@ -2535,7 +2714,7 @@ impl ProtectionDomain {
         &self,
         n: usize,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegion<Box<[u8]>>> {
+    ) -> Result<MemoryRegion<Box<[u8]>>> {
         assert!(n > 0);
         let mut data = vec![0u8; n].into_boxed_slice();
         let inner = unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags)? };
@@ -2576,7 +2755,7 @@ impl ProtectionDomain {
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
-    pub fn allocate(&self, n: usize) -> io::Result<MemoryRegion<Box<[u8]>>> {
+    pub fn allocate(&self, n: usize) -> Result<MemoryRegion<Box<[u8]>>> {
         let access_flags = DEFAULT_ACCESS_FLAGS;
         self.allocate_with_permissions(n, access_flags)
     }
@@ -2616,7 +2795,7 @@ impl ProtectionDomain {
         ptr: *mut u8,
         len: usize,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegion<()>> {
+    ) -> Result<MemoryRegion<()>> {
         assert!(len > 0);
         let inner = self.reg_mr(ptr as *mut c_void, len, access_flags)?;
         Ok(MemoryRegion { inner, owner: () })
@@ -2638,13 +2817,13 @@ impl ProtectionDomain {
         len: usize,
         iova: u64,
         access_flags: ffi::ibv_access_flags,
-    ) -> io::Result<MemoryRegion<()>> {
+    ) -> Result<MemoryRegion<()>> {
         let mr = unsafe {
             ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
         };
 
         if mr.is_null() {
-            Err(io::Error::last_os_error())
+            Err(Error::RegisterMemoryRegion(io::Error::last_os_error()))
         } else {
             let inner = MemoryRegionInner {
                 _pd: self.inner.clone(),
@@ -2669,7 +2848,7 @@ impl ProtectionDomain {
         max_wr: u32,
         max_sge: u32,
         srq_limit: u32,
-    ) -> io::Result<SharedReceiveQueue> {
+    ) -> Result<SharedReceiveQueue> {
         let mut srq_init_attr = ffi::ibv_srq_init_attr {
             srq_context: ptr::null_mut(),
             attr: ffi::ibv_srq_attr {
@@ -2680,7 +2859,7 @@ impl ProtectionDomain {
         };
         let srq = unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) };
         if srq.is_null() {
-            Err(io::Error::last_os_error())
+            Err(Error::CreateSharedReceiveQueue(io::Error::last_os_error()))
         } else {
             Ok(SharedReceiveQueue {
                 inner: Arc::new(SharedReceiveQueueInner {
@@ -2762,7 +2941,7 @@ impl SharedReceiveQueue {
     /// [1]: https://www.rdmamojo.com/2013/02/08/ibv_post_srq_recv/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_post_srq_recv.3.html
     #[inline]
-    pub unsafe fn post_receive(&self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
+    pub unsafe fn post_receive(&self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
         let mut wr = ffi::ibv_recv_wr {
             wr_id,
             next: ptr::null_mut(),
@@ -2781,7 +2960,7 @@ impl SharedReceiveQueue {
             )
         };
         if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
+            Err(Error::errno(errno, Error::PostReceive))
         } else {
             Ok(())
         }
@@ -2989,14 +3168,14 @@ impl<'qp> PostBatch<'qp> {
     ///
     ///  - `EINVAL`: invalid value in one of the work requests.
     ///  - `ENOMEM`: the send queue is full or out of resources.
-    pub unsafe fn submit(self) -> io::Result<()> {
+    pub unsafe fn submit(self) -> Result<()> {
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
         // are about to `wr_complete`.
         std::mem::forget(self);
         let ret = unsafe { (*qpx).wr_complete.unwrap()(qpx) };
         if ret != 0 {
-            Err(io::Error::from_raw_os_error(ret))
+            Err(Error::errno(ret, Error::PostSend))
         } else {
             Ok(())
         }
@@ -3272,7 +3451,7 @@ impl QueuePair {
     ///
     /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
     #[inline]
-    pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> io::Result<()> {
+    pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
         let mut batch = self.start_send();
         batch.signaled().send(wr_id, local);
         unsafe { batch.submit() }
@@ -3296,7 +3475,7 @@ impl QueuePair {
         remote_qpn: u32,
         remote_qkey: u32,
         wr_id: u64,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let mut batch = self.start_send();
         batch
             .signaled()
@@ -3336,11 +3515,7 @@ impl QueuePair {
     ///
     /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
     #[inline]
-    pub unsafe fn post_receive(
-        &mut self,
-        local: &[LocalMemorySlice],
-        wr_id: u64,
-    ) -> io::Result<()> {
+    pub unsafe fn post_receive(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
         unsafe { self.post_recv([RecvRequest::new(wr_id, local)]) }
     }
 
@@ -3365,10 +3540,7 @@ impl QueuePair {
     ///
     ///  - `EINVAL`: invalid value in one of the work requests.
     ///  - `ENOMEM`: the receive queue is full or out of resources.
-    pub unsafe fn post_recv<'a>(
-        &mut self,
-        mut recvs: impl AsMut<[RecvRequest<'a>]>,
-    ) -> io::Result<()> {
+    pub unsafe fn post_recv<'a>(&mut self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
             return Ok(());
@@ -3391,7 +3563,7 @@ impl QueuePair {
             )
         };
         if errno != 0 {
-            Err(io::Error::from_raw_os_error(errno))
+            Err(Error::errno(errno, Error::PostReceive))
         } else {
             Ok(())
         }
@@ -3414,7 +3586,7 @@ impl QueuePair {
         remote: RemoteMemorySlice,
         wr_id: u64,
         imm_data: Option<u32>,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let mut batch = self.start_send();
         match imm_data {
             Some(imm) => batch.signaled().write_imm(wr_id, local, remote, imm),
@@ -3438,7 +3610,7 @@ impl QueuePair {
         local: &[LocalMemorySlice],
         remote: RemoteMemorySlice,
         wr_id: u64,
-    ) -> io::Result<()> {
+    ) -> Result<()> {
         let mut batch = self.start_send();
         batch.signaled().read(wr_id, local, remote);
         unsafe { batch.submit() }
@@ -3458,7 +3630,7 @@ impl QueuePair {
     ///
     /// ```no_run
     /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice};
-    /// # unsafe fn f(qp: &mut QueuePair, payload: &[LocalMemorySlice], dest: RemoteMemorySlice, note: &[LocalMemorySlice]) -> std::io::Result<()> {
+    /// # unsafe fn f(qp: &mut QueuePair, payload: &[LocalMemorySlice], dest: RemoteMemorySlice, note: &[LocalMemorySlice]) -> ibverbs::Result<()> {
     /// let mut batch = qp.start_send();
     /// batch.write(1, payload, dest);
     /// batch.signaled().send(2, note);
@@ -3573,7 +3745,7 @@ impl ProtectionDomain {
         &self,
         send: &CompletionQueue,
         recv: &CompletionQueue,
-    ) -> io::Result<QueuePairBuilder> {
+    ) -> Result<QueuePairBuilder> {
         self.create_qp(send, recv, ffi::ibv_qp_type::IBV_QPT_DRIVER)
     }
 }
@@ -3589,7 +3761,7 @@ impl QueuePairBuilder {
     ///
     ///  - `EINVAL`: invalid value in the queue pair attributes.
     ///  - `ENOMEM`: not enough resources to complete this operation.
-    pub fn build_srd(&self) -> io::Result<PreparedQueuePair> {
+    pub fn build_srd(&self) -> Result<PreparedQueuePair> {
         use ffi::ibv_qp_create_send_ops_flags as SendOps;
         // SRD supports send and one-sided RDMA, including the immediate variants.
         let send_ops_flags = SendOps::IBV_QP_EX_WITH_SEND.0
@@ -3636,7 +3808,7 @@ impl QueuePairBuilder {
             )
         };
         if qp.is_null() {
-            return Err(io::Error::last_os_error());
+            return Err(Error::CreateQueuePair(io::Error::last_os_error()));
         }
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         Ok(PreparedQueuePair {
@@ -3678,7 +3850,7 @@ impl PreparedQueuePair {
     ///
     ///  - `EINVAL`: invalid value provided in `attr` or `attr_mask`.
     ///  - `ENOMEM`: not enough resources to complete this operation.
-    pub fn activate_srd(self, qkey: u32) -> io::Result<QueuePair> {
+    pub fn activate_srd(self, qkey: u32) -> Result<QueuePair> {
         self.activate_ud(qkey)
     }
 }
