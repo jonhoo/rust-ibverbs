@@ -65,8 +65,10 @@
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 #![allow(clippy::doc_markdown)]
 
+use std::borrow::Cow;
 use std::convert::TryInto;
 use std::ffi::CStr;
+use std::fmt;
 use std::io;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::os::fd::{AsFd, BorrowedFd};
@@ -431,13 +433,24 @@ impl<'d> From<&'d *mut ffi::ibv_device> for Device<'d> {
     }
 }
 
+impl fmt::Debug for Device<'_> {
+    /// Shows the device name and GUID. The GUID is read best-effort and shown as `None` if it
+    /// cannot be queried.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Device")
+            .field("name", &self.name())
+            .field("guid", &self.guid().ok())
+            .finish()
+    }
+}
+
 /// A Global unique identifier for ibv.
 ///
 /// This struct acts as a rust wrapper for GUID value represented as `__be64` in
 /// libibverbs. We introduce this struct, because u64 is stored in host
 /// endianness, whereas ibverbs stores GUID in network order (big endian).
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct Guid {
     raw: [u8; 8],
@@ -455,6 +468,25 @@ impl Guid {
     /// Returns `true` if this GUID is all zeroes, which is considered reserved.
     pub fn is_reserved(&self) -> bool {
         self.raw == [0; 8]
+    }
+}
+
+impl fmt::Display for Guid {
+    /// Formats the GUID as four colon-separated 16-bit groups, the conventional `ibv_devinfo`
+    /// rendering, for example `0002:c903:00a0:7c8e`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let r = &self.raw;
+        write!(
+            f,
+            "{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}:{:02x}{:02x}",
+            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]
+        )
+    }
+}
+
+impl fmt::Debug for Guid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Guid({self})")
     }
 }
 
@@ -963,6 +995,24 @@ impl PortSpeed {
     }
 }
 
+impl fmt::Display for PortSpeed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            PortSpeed::Sdr => "SDR",
+            PortSpeed::Ddr => "DDR",
+            PortSpeed::Qdr => "QDR",
+            PortSpeed::Fdr10 => "FDR10",
+            PortSpeed::Fdr => "FDR",
+            PortSpeed::Edr => "EDR",
+            PortSpeed::Hdr => "HDR",
+            PortSpeed::Ndr => "NDR",
+            PortSpeed::Xdr => "XDR",
+            PortSpeed::Unknown(raw) => return write!(f, "unknown ({raw})"),
+        };
+        f.write_str(name)
+    }
+}
+
 /// The width (number of lanes) of a port's active link, decoded from `ibv_port_attr::active_width`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1006,6 +1056,19 @@ impl PortWidth {
     }
 }
 
+impl fmt::Display for PortWidth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PortWidth::Unknown(raw) => write!(f, "unknown ({raw})"),
+            width => write!(
+                f,
+                "{}x",
+                width.lanes().expect("non-Unknown width has lanes")
+            ),
+        }
+    }
+}
+
 /// The link layer of a port, decoded from `ibv_port_attr::link_layer`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1029,6 +1092,18 @@ impl LinkLayer {
             2 => LinkLayer::Ethernet,
             other => LinkLayer::Unknown(other),
         }
+    }
+}
+
+impl fmt::Display for LinkLayer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            LinkLayer::Unspecified => "unspecified",
+            LinkLayer::InfiniBand => "InfiniBand",
+            LinkLayer::Ethernet => "Ethernet",
+            LinkLayer::Unknown(raw) => return write!(f, "unknown ({raw})"),
+        };
+        f.write_str(name)
     }
 }
 
@@ -1069,6 +1144,22 @@ impl PhysicalState {
     }
 }
 
+impl fmt::Display for PhysicalState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            PhysicalState::Sleep => "Sleep",
+            PhysicalState::Polling => "Polling",
+            PhysicalState::Disabled => "Disabled",
+            PhysicalState::PortConfigurationTraining => "PortConfigurationTraining",
+            PhysicalState::LinkUp => "LinkUp",
+            PhysicalState::LinkErrorRecovery => "LinkErrorRecovery",
+            PhysicalState::PhyTest => "PhyTest",
+            PhysicalState::Unknown(raw) => return write!(f, "unknown ({raw})"),
+        };
+        f.write_str(name)
+    }
+}
+
 /// Device-wide attributes and capabilities, as returned by [`Context::query_device`].
 ///
 /// Dereferences to the raw [`ibv_device_attr`], so every field is accessible; the inherent methods
@@ -1087,9 +1178,33 @@ impl DeviceAttr {
         self.0.sys_image_guid.into()
     }
 
+    /// The device's firmware version, decoded from the fixed-size `fw_ver` C string. Borrows when it
+    /// is valid UTF-8 (the usual case) and allocates only to replace invalid bytes.
+    pub fn fw_ver(&self) -> Cow<'_, str> {
+        // SAFETY: `fw_ver` is a NUL-terminated C string embedded in the attributes; the borrow is
+        // tied to `&self`, so the array outlives the returned `CStr`.
+        unsafe { CStr::from_ptr(self.0.fw_ver.as_ptr()) }.to_string_lossy()
+    }
+
     /// The underlying `ibv_device_attr`. Escape hatch for fields this crate does not wrap.
     pub fn as_raw(&self) -> &ffi::ibv_device_attr {
         &self.0
+    }
+}
+
+impl fmt::Debug for DeviceAttr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceAttr")
+            .field("node_guid", &self.node_guid())
+            .field("sys_image_guid", &self.sys_image_guid())
+            .field("fw_ver", &self.fw_ver())
+            .field("vendor_id", &format_args!("{:#06x}", self.0.vendor_id))
+            .field("vendor_part_id", &self.0.vendor_part_id)
+            .field("phys_port_cnt", &self.0.phys_port_cnt)
+            .field("max_qp", &self.0.max_qp)
+            .field("max_cq", &self.0.max_cq)
+            .field("max_mr", &self.0.max_mr)
+            .finish_non_exhaustive()
     }
 }
 
@@ -1222,6 +1337,24 @@ impl PortAttr {
     /// The underlying `ibv_port_attr`. Escape hatch for fields this crate does not wrap.
     pub fn as_raw(&self) -> &ffi::ibv_port_attr {
         &self.0
+    }
+}
+
+impl fmt::Debug for PortAttr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PortAttr")
+            .field("state", &self.state())
+            .field("phys_state", &self.phys_state())
+            .field("link_layer", &self.link_layer())
+            .field("active_mtu", &self.active_mtu())
+            .field("max_mtu", &self.max_mtu())
+            .field("active_speed", &self.active_speed())
+            .field("active_width", &self.active_width())
+            .field("lid", &self.0.lid)
+            .field("sm_lid", &self.0.sm_lid)
+            .field("gid_tbl_len", &self.0.gid_tbl_len)
+            .field("pkey_tbl_len", &self.0.pkey_tbl_len)
+            .finish_non_exhaustive()
     }
 }
 
@@ -5005,5 +5138,27 @@ mod test_qp_transitions {
             qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RESET),
             Some((state, 0))
         );
+    }
+}
+
+#[cfg(test)]
+mod test_display {
+    use super::*;
+
+    #[test]
+    fn guid_formats_as_four_groups() {
+        let guid = Guid::from(0x0002_c903_00a0_7c8e_u64);
+        assert_eq!(guid.to_string(), "0002:c903:00a0:7c8e");
+        assert_eq!(format!("{guid:?}"), "Guid(0002:c903:00a0:7c8e)");
+    }
+
+    #[test]
+    fn port_attributes_display_human_names() {
+        assert_eq!(PortSpeed::Edr.to_string(), "EDR");
+        assert_eq!(PortSpeed::Unknown(7).to_string(), "unknown (7)");
+        assert_eq!(PortWidth::Width4x.to_string(), "4x");
+        assert_eq!(PortWidth::Unknown(9).to_string(), "unknown (9)");
+        assert_eq!(LinkLayer::Ethernet.to_string(), "Ethernet");
+        assert_eq!(PhysicalState::LinkUp.to_string(), "LinkUp");
     }
 }
