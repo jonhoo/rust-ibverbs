@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use ibverbs::{
     ibv_access_flags, ibv_advise_mr_advice, ibv_create_cq_wc_flags, ibv_port_state, ibv_qp_type,
-    AddressHandleAttribute, CompletionQueue, Context, ProtectionDomain, QueuePair, RecvRequest,
+    ibv_transport_type, AddressHandleAttribute, CompletionQueue, Context, ProtectionDomain,
+    QueuePair, RecvRequest,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -1090,4 +1091,45 @@ fn event_driven_completion() {
         "missing send completion"
     );
     assert_eq!(&recv.bytes_mut()[..5], b"hello");
+}
+
+/// Device transport type, single-GID query, and GID net-device names are all reported.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn gid_and_device_introspection() {
+    // Select the same device `open_test_device` would, so we can read its transport type first.
+    let devices = ibverbs::devices().expect("failed to list RDMA devices");
+    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
+        Ok(name) if !name.is_empty() => devices
+            .iter()
+            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
+            .expect("IBVERBS_TEST_DEVICE is not among the available devices"),
+        _ => devices.iter().next().expect("no RDMA device available"),
+    };
+    // RoCE (including Soft-RoCE) presents the InfiniBand transport.
+    assert_eq!(
+        device.transport_type(),
+        ibv_transport_type::IBV_TRANSPORT_IB
+    );
+
+    let ctx = device.open().expect("failed to open the RDMA device");
+
+    // A single GID query returns the same GID as the matching full-table entry.
+    let table = ctx.gid_table().expect("failed to read GID table");
+    let entry = table.first().expect("expected at least one GID entry");
+    let gid = ctx
+        .query_gid(entry.port_num as u8, entry.gid_index)
+        .expect("query_gid failed");
+    assert_eq!(gid, entry.gid);
+
+    // Every GID bound to a net device resolves to that device's name.
+    for entry in &table {
+        if entry.ndev_ifindex != 0 {
+            assert!(
+                entry.netdev_name().is_some(),
+                "expected a net-device name for ifindex {}",
+                entry.ndev_ifindex
+            );
+        }
+    }
 }
