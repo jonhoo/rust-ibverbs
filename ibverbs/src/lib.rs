@@ -88,6 +88,7 @@ pub use ffi::ibv_mtu;
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_send_wr;
 pub use ffi::ibv_wc;
+pub use ffi::ibv_wc_flags;
 pub use ffi::ibv_wc_opcode;
 pub use ffi::ibv_wc_status;
 
@@ -866,6 +867,79 @@ impl WorkCompletion<'_> {
             (*self.cq)
                 .read_completion_ts
                 .expect("completion queue was not created with timestamps")(self.cq)
+        }
+    }
+
+    /// The wallclock hardware timestamp (in nanoseconds) captured when this work request completed.
+    ///
+    /// Only valid on a completion queue that requested
+    /// [`IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK`](ibv_create_cq_wc_flags::IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK)
+    /// (see [`CompletionQueueBuilder::set_wc_flags`]). Panics on a completion from any other
+    /// completion queue, because the provider did not install the reader.
+    #[inline]
+    pub fn completion_wallclock_ns(&self) -> u64 {
+        unsafe {
+            (*self.cq)
+                .read_completion_wallclock_ns
+                .expect("completion queue was not created with wallclock timestamps")(
+                self.cq
+            )
+        }
+    }
+
+    /// The raw work-completion flags (`IBV_WC_*`), such as whether a GRH is present or immediate
+    /// data is carried. Always available.
+    #[inline]
+    pub fn wc_flags(&self) -> ffi::ibv_wc_flags {
+        ffi::ibv_wc_flags(unsafe { (*self.cq).read_wc_flags.unwrap()(self.cq) })
+    }
+
+    /// Whether the receive completion carries a 40-byte Global Routing Header (GRH) at the front of
+    /// the scatter buffers (set for unreliable-datagram receives with a GRH). Always available.
+    #[inline]
+    pub fn has_grh(&self) -> bool {
+        (self.wc_flags() & ffi::ibv_wc_flags::IBV_WC_GRH).0 != 0
+    }
+
+    /// The source LID this message was sent from (relevant for datagram receive completions).
+    ///
+    /// Only valid on a completion queue that requested
+    /// [`IBV_WC_EX_WITH_SLID`](ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID) (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    #[inline]
+    pub fn slid(&self) -> u32 {
+        unsafe {
+            (*self.cq)
+                .read_slid
+                .expect("completion queue did not request the source LID")(self.cq)
+        }
+    }
+
+    /// The service level this message was sent with (relevant for datagram receive completions).
+    ///
+    /// Only valid on a completion queue that requested
+    /// [`IBV_WC_EX_WITH_SL`](ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL) (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    #[inline]
+    pub fn sl(&self) -> u8 {
+        unsafe {
+            (*self.cq)
+                .read_sl
+                .expect("completion queue did not request the service level")(self.cq)
+        }
+    }
+
+    /// The destination LID path bits (relevant for datagram receive completions).
+    ///
+    /// Only valid on a completion queue that requested
+    /// [`IBV_WC_EX_WITH_DLID_PATH_BITS`](ibv_create_cq_wc_flags::IBV_WC_EX_WITH_DLID_PATH_BITS) (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    #[inline]
+    pub fn dlid_path_bits(&self) -> u8 {
+        unsafe {
+            (*self.cq)
+                .read_dlid_path_bits
+                .expect("completion queue did not request the DLID path bits")(self.cq)
         }
     }
 }
