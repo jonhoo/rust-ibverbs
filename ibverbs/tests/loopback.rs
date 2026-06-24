@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    ibv_access_flags, ibv_advise_mr_advice, ibv_create_cq_wc_flags, ibv_qp_type,
+    ibv_access_flags, ibv_advise_mr_advice, ibv_create_cq_wc_flags, ibv_port_state, ibv_qp_type,
     AddressHandleAttribute, CompletionQueue, Context, ProtectionDomain, QueuePair, RecvRequest,
 };
 
@@ -762,11 +762,28 @@ fn query_device_and_port() {
         "device should have at least one port"
     );
 
+    // The device GUID is set via the typed accessor, and `Deref` still exposes the raw fields.
+    assert!(
+        !dev.node_guid().is_reserved(),
+        "device should report a GUID"
+    );
+
     let port = ctx.query_port(1).expect("query_port failed");
     assert!(
         port.gid_tbl_len > 0,
         "a RoCE port should expose a GID table"
     );
+    // `open_test_device` only succeeds on an active port, so the typed state reflects that, and the
+    // remaining typed accessors decode without panicking.
+    assert!(matches!(
+        port.state(),
+        ibv_port_state::IBV_PORT_ACTIVE | ibv_port_state::IBV_PORT_ARMED
+    ));
+    let _ = port.active_mtu();
+    let _ = port.active_speed();
+    let _ = port.active_width();
+    let _ = port.link_layer();
+    let _ = port.phys_state();
 }
 
 /// The raw-handle escape hatches return the live, non-null FFI pointers for each resource.
