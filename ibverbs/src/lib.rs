@@ -3661,6 +3661,36 @@ impl PostOp<'_, '_> {
         }
     }
 
+    /// Like [`build_inline`](Self::build_inline), but gathers several buffers into the inline payload
+    /// of a single work request (`wr_set_inline_data_list`). The bytes are copied during this call,
+    /// so none of the `bufs` need outlive the work completion.
+    #[inline]
+    fn build_inline_list(
+        self,
+        wr_id: u64,
+        bufs: &[io::IoSlice<'_>],
+        op: impl FnOnce(*mut ffi::ibv_qp_ex),
+    ) {
+        let qpx = self.batch.qpx;
+        unsafe {
+            (*qpx).wr_id = wr_id;
+            (*qpx).wr_flags = self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0;
+            op(qpx);
+            if let Some((ah, qpn, qkey)) = self.dest {
+                (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
+            }
+            // `std::io::IoSlice` is guaranteed ABI-compatible with `struct iovec` on Unix (the only
+            // platform rdma-core targets), and `ibv_data_buf` has the same layout as `iovec` (an
+            // address and a length), so the buffer list passes straight through without copying it
+            // into a temporary array.
+            (*qpx).wr_set_inline_data_list.unwrap()(
+                qpx,
+                bufs.len(),
+                bufs.as_ptr() as *const ffi::ibv_data_buf,
+            );
+        }
+    }
+
     /// Post a SEND.
     #[inline]
     pub fn send(self, wr_id: u64, local: &[LocalMemorySlice]) {
@@ -3706,6 +3736,59 @@ impl PostOp<'_, '_> {
     #[inline]
     pub fn write_imm_inline(self, wr_id: u64, data: &[u8], remote: RemoteMemorySlice, imm: u32) {
         self.build_inline(wr_id, data, move |q| unsafe {
+            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+        })
+    }
+
+    /// Post a SEND whose inline payload is gathered from several buffers.
+    ///
+    /// Like [`send_inline`](Self::send_inline), but concatenates `bufs` into one inline payload
+    /// (saving a copy into a contiguous buffer first), so the queue pair must have enough inline
+    /// capacity for their combined length. See [`send_inline`](Self::send_inline) for the
+    /// inline-data requirements.
+    #[inline]
+    pub fn send_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>]) {
+        self.build_inline_list(wr_id, bufs, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    }
+
+    /// Post a SEND carrying a gathered inline payload and a 32-bit immediate (host byte order).
+    ///
+    /// See [`send_inline_list`](Self::send_inline_list) for the gathering behavior.
+    #[inline]
+    pub fn send_imm_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>], imm: u32) {
+        self.build_inline_list(wr_id, bufs, move |q| unsafe {
+            (*q).wr_send_imm.unwrap()(q, imm.to_be())
+        })
+    }
+
+    /// Post an RDMA WRITE into `remote` whose inline payload is gathered from several buffers.
+    ///
+    /// See [`send_inline_list`](Self::send_inline_list) for the gathering behavior.
+    #[inline]
+    pub fn write_inline_list(
+        self,
+        wr_id: u64,
+        bufs: &[io::IoSlice<'_>],
+        remote: RemoteMemorySlice,
+    ) {
+        self.build_inline_list(wr_id, bufs, move |q| unsafe {
+            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
+        })
+    }
+
+    /// Post an RDMA WRITE into `remote` carrying a gathered inline payload and a 32-bit immediate
+    /// (host byte order).
+    ///
+    /// See [`send_inline_list`](Self::send_inline_list) for the gathering behavior.
+    #[inline]
+    pub fn write_imm_inline_list(
+        self,
+        wr_id: u64,
+        bufs: &[io::IoSlice<'_>],
+        remote: RemoteMemorySlice,
+        imm: u32,
+    ) {
+        self.build_inline_list(wr_id, bufs, move |q| unsafe {
             (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
         })
     }

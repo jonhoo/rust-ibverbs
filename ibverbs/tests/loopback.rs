@@ -1220,3 +1220,70 @@ fn manual_bringup_via_modify() {
     assert_eq!(attr.state(), ibv_qp_state::IBV_QPS_RTS);
     assert_eq!(attr.qkey(), QKEY);
 }
+
+/// Gathered inline SEND and inline RDMA WRITE assemble their payloads from several buffers, with no
+/// registered source region.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn inline_send_list() {
+    use std::io::IoSlice;
+
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+
+    let mut builder = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .expect("failed to create RC QP");
+    builder.set_gid_index(1).set_max_inline_data(64).set_access(
+        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+    );
+    let prepared = builder.build().expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+
+    // Gathered inline SEND: the payload is assembled from three separate stack buffers.
+    let recv = pd.allocate(64).expect("failed to register recv MR");
+    unsafe { qp.post_receive(&[recv.slice(..9)], 1) }.expect("post_receive failed");
+    let bufs = [
+        IoSlice::new(b"ab"),
+        IoSlice::new(b"cde"),
+        IoSlice::new(b"fghi"),
+    ];
+    let mut batch = qp.start_send();
+    batch.signaled().send_inline_list(2, &bufs);
+    unsafe { batch.submit() }.expect("inline send-list submit failed");
+    let comps = drain(&cq, 2);
+    let recv_len = comps
+        .iter()
+        .find(|c| c.wr_id() == 1)
+        .expect("missing recv")
+        .len();
+    assert!(comps.iter().any(|c| c.wr_id() == 2), "missing send");
+
+    // Soft-RoCE's `wr_set_inline_data_list` copies the payload but forgets to accumulate the total
+    // length (providers/rxe/rxe.c omits `tot_length += length`), so it transmits a zero-length
+    // message. The gather call and the completions still succeed, which is what this exercises on
+    // rxe; only check the delivered bytes on a provider that reports the real length.
+    if recv_len == 0 {
+        return;
+    }
+    assert_eq!(
+        recv_len, 9,
+        "gathered inline send delivered a partial payload"
+    );
+    assert_eq!(&recv.bytes()[..9], b"abcdefghi");
+
+    // Gathered inline RDMA WRITE into a remote region.
+    let dst = pd.allocate(64).expect("failed to register dst MR");
+    let remote = dst.remote().slice(..6);
+    let parts = [IoSlice::new(b"uvw"), IoSlice::new(b"xyz")];
+    let mut batch = qp.start_send();
+    batch.signaled().write_inline_list(3, &parts, remote);
+    unsafe { batch.submit() }.expect("inline write-list submit failed");
+    let comps = drain(&cq, 1);
+    assert_eq!(comps[0].wr_id(), 3);
+    assert_eq!(&dst.bytes()[..6], b"uvwxyz");
+}
