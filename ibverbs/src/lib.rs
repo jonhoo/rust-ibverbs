@@ -86,6 +86,8 @@ pub mod rdmacm;
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
 pub use ffi::ibv_port_state;
+pub use ffi::ibv_qp_attr_mask;
+pub use ffi::ibv_qp_state;
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_send_wr;
 pub use ffi::ibv_transport_type;
@@ -225,6 +227,42 @@ pub enum Error {
     /// Transitioning a queue pair to a new state failed (`ibv_modify_qp`).
     #[error("failed to transition the queue pair state")]
     ModifyQueuePair(#[source] io::Error),
+
+    /// A queue-pair state transition was rejected because it is not a legal transition for this
+    /// queue-pair type.
+    ///
+    /// Surfaced by [`QueuePair::modify`] when the device rejects the transition and the crate's
+    /// state-table check confirms that `current -> next` is not allowed.
+    #[error("invalid queue pair state transition from {current:?} to {next:?}")]
+    InvalidQueuePairTransition {
+        /// The queue pair's current state.
+        current: ffi::ibv_qp_state,
+        /// The requested next state.
+        next: ffi::ibv_qp_state,
+    },
+
+    /// A queue-pair state transition was rejected because its attribute mask was wrong.
+    ///
+    /// Surfaced by [`QueuePair::modify`]: `invalid` are bits that were set but are not allowed for
+    /// the transition, and `needed` are bits that the transition requires but that were not set.
+    #[error(
+        "invalid attribute mask for queue pair transition from {current:?} to {next:?}: \
+         disallowed bits {invalid:?}, missing required bits {needed:?}"
+    )]
+    InvalidQueuePairAttributeMask {
+        /// The queue pair's current state.
+        current: ffi::ibv_qp_state,
+        /// The requested next state.
+        next: ffi::ibv_qp_state,
+        /// Attribute bits that were set but are not allowed for this transition.
+        invalid: ffi::ibv_qp_attr_mask,
+        /// Attribute bits that the transition requires but that were not set.
+        needed: ffi::ibv_qp_attr_mask,
+    },
+
+    /// Querying queue pair attributes failed (`ibv_query_qp`).
+    #[error("failed to query queue pair attributes")]
+    QueryQueuePair(#[source] io::Error),
 
     /// Creating an address handle failed (`ibv_create_ah`).
     #[error("failed to create an address handle")]
@@ -2367,11 +2405,16 @@ pub struct QueuePairEndpoint {
 }
 
 impl PreparedQueuePair {
-    /// Extracts the underlying, still-uninitialized `QueuePair` so the RDMA connection manager (the
-    /// [`rdmacm`](crate::rdmacm) module) can drive its state transitions. Not public: the manager
-    /// keeps the queue pair wrapped in its setup typestate until it reaches `RTS`.
-    #[cfg(feature = "rdmacm")]
-    pub(crate) fn into_queue_pair(self) -> QueuePair {
+    /// Extracts the still-uninitialized (`RESET`) queue pair without transitioning it, so you can
+    /// drive the state machine yourself with [`QueuePair::modify`] instead of using
+    /// [`handshake`](Self::handshake) / [`activate_ud`](Self::activate_ud).
+    ///
+    /// This is an escape hatch for fully manual bring-up (custom partition keys, packet sequence
+    /// numbers, alternate paths, and so on). The returned queue pair is in `RESET` and cannot send
+    /// or receive until you transition it through `INIT`, `RTR`, and `RTS`; most users should prefer
+    /// `handshake`/`activate_ud`. The RDMA connection manager (the [`rdmacm`](crate::rdmacm) module)
+    /// uses this to drive the transitions itself.
+    pub fn into_queue_pair(self) -> QueuePair {
         self.qp
     }
 
@@ -3734,6 +3777,407 @@ impl PostOp<'_, '_> {
         })
     }
 }
+/// A set of queue-pair attributes together with a mask of which of them are present.
+///
+/// Used with [`QueuePair::modify`] to change a queue pair's attributes (the general escape hatch
+/// for transitions that [`PreparedQueuePair::handshake`] and friends do not cover), and returned by
+/// [`QueuePair::query`]. Each `set_*` method records its field in the mask; [`modify`] reads only
+/// the fields the mask marks as present, and after a [`query`] the getters are meaningful only for
+/// the fields that were requested.
+///
+/// [`modify`]: QueuePair::modify
+/// [`query`]: QueuePair::query
+#[derive(Clone)]
+pub struct QueuePairAttribute {
+    attr: ffi::ibv_qp_attr,
+    mask: ffi::ibv_qp_attr_mask,
+}
+
+impl Default for QueuePairAttribute {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueuePairAttribute {
+    /// Create an empty set of attributes (no fields present).
+    pub fn new() -> Self {
+        QueuePairAttribute {
+            attr: ffi::ibv_qp_attr::default(),
+            mask: ffi::ibv_qp_attr_mask(0),
+        }
+    }
+
+    /// Build attributes from a raw `ibv_qp_attr` and mask.
+    ///
+    /// This is for attributes produced elsewhere, for example the values the RDMA connection
+    /// manager fills in via `rdma_init_qp_attr`.
+    pub fn from_raw(attr: ffi::ibv_qp_attr, mask: ffi::ibv_qp_attr_mask) -> Self {
+        QueuePairAttribute { attr, mask }
+    }
+
+    /// The underlying `ibv_qp_attr`. Escape hatch for fields this crate does not wrap.
+    pub fn as_raw(&self) -> &ffi::ibv_qp_attr {
+        &self.attr
+    }
+
+    /// The mask of which attributes are present.
+    pub fn mask(&self) -> ffi::ibv_qp_attr_mask {
+        self.mask
+    }
+
+    /// Set the next queue-pair state. Not every transition is valid; see [`QueuePair::modify`].
+    pub fn set_state(&mut self, state: ffi::ibv_qp_state) -> &mut Self {
+        self.attr.qp_state = state;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_STATE;
+        self
+    }
+
+    /// Set the assumed current state, used to make a transition conditional on it.
+    pub fn set_current_state(&mut self, state: ffi::ibv_qp_state) -> &mut Self {
+        self.attr.cur_qp_state = state;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_CUR_STATE;
+        self
+    }
+
+    /// Set the primary partition-key (P_Key) index.
+    pub fn set_pkey_index(&mut self, pkey_index: u16) -> &mut Self {
+        self.attr.pkey_index = pkey_index;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX;
+        self
+    }
+
+    /// Set the primary physical port number (ports are numbered from 1).
+    pub fn set_port(&mut self, port_num: u8) -> &mut Self {
+        self.attr.port_num = port_num;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_PORT;
+        self
+    }
+
+    /// Set the remote-access flags (RC/UC only).
+    pub fn set_access_flags(&mut self, access_flags: ffi::ibv_access_flags) -> &mut Self {
+        self.attr.qp_access_flags = access_flags.0;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
+        self
+    }
+
+    /// Set the path MTU (RC/UC only).
+    pub fn set_path_mtu(&mut self, path_mtu: ffi::ibv_mtu) -> &mut Self {
+        self.attr.path_mtu = path_mtu;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU;
+        self
+    }
+
+    /// Set the destination queue-pair number (24 bits; RC/UC only).
+    pub fn set_dest_qp_num(&mut self, dest_qp_num: u32) -> &mut Self {
+        self.attr.dest_qp_num = dest_qp_num;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN;
+        self
+    }
+
+    /// Set the receive-queue packet sequence number (24 bits).
+    pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
+        self.attr.rq_psn = rq_psn;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN;
+        self
+    }
+
+    /// Set the send-queue packet sequence number (24 bits).
+    pub fn set_sq_psn(&mut self, sq_psn: u32) -> &mut Self {
+        self.attr.sq_psn = sq_psn;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
+        self
+    }
+
+    /// Set the number of outstanding RDMA reads and atomics this queue pair issues as the initiator
+    /// (RC only).
+    pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
+        self.attr.max_rd_atomic = max_rd_atomic;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
+        self
+    }
+
+    /// Set the number of outstanding RDMA reads and atomics this queue pair handles as the
+    /// destination (RC only).
+    pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
+        self.attr.max_dest_rd_atomic = max_dest_rd_atomic;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC;
+        self
+    }
+
+    /// Set the minimum RNR-NAK timer.
+    pub fn set_min_rnr_timer(&mut self, min_rnr_timer: u8) -> &mut Self {
+        self.attr.min_rnr_timer = min_rnr_timer;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
+        self
+    }
+
+    /// Set the ACK timeout (the actual time is `4.096 * 2^timeout` microseconds; 0 means infinite).
+    pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
+        self.attr.timeout = timeout;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT;
+        self
+    }
+
+    /// Set the retry count for the primary path.
+    pub fn set_retry_count(&mut self, retry_count: u8) -> &mut Self {
+        self.attr.retry_cnt = retry_count;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT;
+        self
+    }
+
+    /// Set the RNR retry count (7 means retry infinitely).
+    pub fn set_rnr_retry(&mut self, rnr_retry: u8) -> &mut Self {
+        self.attr.rnr_retry = rnr_retry;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY;
+        self
+    }
+
+    /// Set the Q_Key (UD only).
+    pub fn set_qkey(&mut self, qkey: u32) -> &mut Self {
+        self.attr.qkey = qkey;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
+        self
+    }
+
+    /// Set the primary path's address vector, describing how to reach the remote queue pair.
+    pub fn set_address_vector(&mut self, ah_attr: &AddressHandleAttribute) -> &mut Self {
+        self.attr.ah_attr = ah_attr.attr;
+        self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_AV;
+        self
+    }
+
+    /// The queue-pair state (the value set, or the one read back by [`QueuePair::query`]).
+    pub fn state(&self) -> ffi::ibv_qp_state {
+        self.attr.qp_state
+    }
+
+    /// The partition-key index.
+    pub fn pkey_index(&self) -> u16 {
+        self.attr.pkey_index
+    }
+
+    /// The physical port number.
+    pub fn port(&self) -> u8 {
+        self.attr.port_num
+    }
+
+    /// The remote-access flags.
+    pub fn access_flags(&self) -> ffi::ibv_access_flags {
+        ffi::ibv_access_flags(self.attr.qp_access_flags)
+    }
+
+    /// The path MTU. Meaningful only if it was set or queried.
+    pub fn path_mtu(&self) -> ffi::ibv_mtu {
+        self.attr.path_mtu
+    }
+
+    /// The destination queue-pair number.
+    pub fn dest_qp_num(&self) -> u32 {
+        self.attr.dest_qp_num
+    }
+
+    /// The receive-queue packet sequence number.
+    pub fn rq_psn(&self) -> u32 {
+        self.attr.rq_psn
+    }
+
+    /// The send-queue packet sequence number.
+    pub fn sq_psn(&self) -> u32 {
+        self.attr.sq_psn
+    }
+
+    /// The number of outstanding RDMA reads and atomics issued as the initiator.
+    pub fn max_rd_atomic(&self) -> u8 {
+        self.attr.max_rd_atomic
+    }
+
+    /// The number of outstanding RDMA reads and atomics handled as the destination.
+    pub fn max_dest_rd_atomic(&self) -> u8 {
+        self.attr.max_dest_rd_atomic
+    }
+
+    /// The minimum RNR-NAK timer.
+    pub fn min_rnr_timer(&self) -> u8 {
+        self.attr.min_rnr_timer
+    }
+
+    /// The ACK timeout.
+    pub fn timeout(&self) -> u8 {
+        self.attr.timeout
+    }
+
+    /// The primary-path retry count.
+    pub fn retry_count(&self) -> u8 {
+        self.attr.retry_cnt
+    }
+
+    /// The RNR retry count.
+    pub fn rnr_retry(&self) -> u8 {
+        self.attr.rnr_retry
+    }
+
+    /// The Q_Key.
+    pub fn qkey(&self) -> u32 {
+        self.attr.qkey
+    }
+}
+
+/// The configured capacities of a queue pair, as returned by [`QueuePair::query`].
+pub struct QueuePairInitAttribute {
+    init_attr: ffi::ibv_qp_init_attr,
+}
+
+impl QueuePairInitAttribute {
+    /// The maximum number of outstanding send work requests.
+    pub fn max_send_wr(&self) -> u32 {
+        self.init_attr.cap.max_send_wr
+    }
+
+    /// The maximum number of outstanding receive work requests.
+    pub fn max_recv_wr(&self) -> u32 {
+        self.init_attr.cap.max_recv_wr
+    }
+
+    /// The maximum number of scatter-gather entries per send work request.
+    pub fn max_send_sge(&self) -> u32 {
+        self.init_attr.cap.max_send_sge
+    }
+
+    /// The maximum number of scatter-gather entries per receive work request.
+    pub fn max_recv_sge(&self) -> u32 {
+        self.init_attr.cap.max_recv_sge
+    }
+
+    /// The maximum amount of inline data, in bytes.
+    pub fn max_inline_data(&self) -> u32 {
+        self.init_attr.cap.max_inline_data
+    }
+
+    /// The underlying `ibv_qp_init_attr`. Escape hatch for fields this crate does not wrap.
+    pub fn as_raw(&self) -> &ffi::ibv_qp_init_attr {
+        &self.init_attr
+    }
+}
+
+/// The required and optional attribute-mask bits for a `cur -> next` transition of a queue pair of
+/// the given type, or `None` if the transition is not valid.
+///
+/// This mirrors the kernel's `qp_state_table` (drivers/infiniband/core/verbs.c): every queue pair
+/// may move to `RESET` or `ERR` from any state with only `IBV_QP_STATE`, and each type allows a
+/// specific set of forward transitions. It is used only to turn an `EINVAL` from `ibv_modify_qp`
+/// into a more precise [`Error`].
+fn qp_transition_masks(
+    qp_type: ffi::ibv_qp_type,
+    cur: ffi::ibv_qp_state,
+    next: ffi::ibv_qp_state,
+) -> Option<(u32, u32)> {
+    use ffi::ibv_qp_state::*;
+    use ffi::ibv_qp_type::*;
+
+    let state = ffi::ibv_qp_attr_mask::IBV_QP_STATE.0;
+    let cur_state = ffi::ibv_qp_attr_mask::IBV_QP_CUR_STATE.0;
+    let pkey = ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX.0;
+    let port = ffi::ibv_qp_attr_mask::IBV_QP_PORT.0;
+    let access = ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS.0;
+    let qkey = ffi::ibv_qp_attr_mask::IBV_QP_QKEY.0;
+    let av = ffi::ibv_qp_attr_mask::IBV_QP_AV.0;
+    let path_mtu = ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU.0;
+    let timeout = ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT.0;
+    let retry = ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT.0;
+    let rnr_retry = ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY.0;
+    let rq_psn = ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN.0;
+    let max_rd = ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC.0;
+    let alt_path = ffi::ibv_qp_attr_mask::IBV_QP_ALT_PATH.0;
+    let min_rnr = ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER.0;
+    let sq_psn = ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN.0;
+    let max_dest_rd = ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC.0;
+    let mig = ffi::ibv_qp_attr_mask::IBV_QP_PATH_MIG_STATE.0;
+    let dest_qpn = ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN.0;
+    let rate = ffi::ibv_qp_attr_mask::IBV_QP_RATE_LIMIT.0;
+    let sqd_async = ffi::ibv_qp_attr_mask::IBV_QP_EN_SQD_ASYNC_NOTIFY.0;
+
+    // Any state may move to RESET or ERR with only IBV_QP_STATE.
+    if let IBV_QPS_RESET | IBV_QPS_ERR = next {
+        return Some((state, 0));
+    }
+
+    match qp_type {
+        IBV_QPT_RC | IBV_QPT_XRC_SEND | IBV_QPT_XRC_RECV => match (cur, next) {
+            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
+            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | access)),
+            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((
+                state | av | path_mtu | dest_qpn | rq_psn | max_dest_rd | min_rnr,
+                pkey | access | alt_path,
+            )),
+            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((
+                state | sq_psn | timeout | retry | rnr_retry | max_rd,
+                cur_state | access | min_rnr | alt_path | mig,
+            )),
+            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | access | min_rnr | alt_path | mig)),
+            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
+            (IBV_QPS_SQD, IBV_QPS_RTS) => {
+                Some((state, cur_state | access | min_rnr | alt_path | mig))
+            }
+            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((
+                0,
+                pkey | port
+                    | access
+                    | av
+                    | max_rd
+                    | min_rnr
+                    | alt_path
+                    | timeout
+                    | retry
+                    | rnr_retry
+                    | max_dest_rd
+                    | mig,
+            )),
+            _ => None,
+        },
+        IBV_QPT_UC => match (cur, next) {
+            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
+            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | access)),
+            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((
+                state | av | path_mtu | dest_qpn | rq_psn,
+                pkey | access | alt_path,
+            )),
+            (IBV_QPS_RTR, IBV_QPS_RTS) => {
+                Some((state | sq_psn, cur_state | access | alt_path | mig))
+            }
+            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | access | alt_path | mig)),
+            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
+            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, cur_state | access | alt_path | mig)),
+            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, pkey | port | access | av | alt_path | mig)),
+            _ => None,
+        },
+        IBV_QPT_UD => match (cur, next) {
+            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | qkey, 0)),
+            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | qkey)),
+            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((state, pkey | qkey)),
+            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((state | sq_psn, cur_state | qkey)),
+            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | qkey)),
+            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
+            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, cur_state | qkey)),
+            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, pkey | port | qkey)),
+            (IBV_QPS_SQE, IBV_QPS_RTS) => Some((state, cur_state | qkey)),
+            _ => None,
+        },
+        IBV_QPT_RAW_PACKET => match (cur, next) {
+            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | port, 0)),
+            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, port)),
+            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((state, 0)),
+            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((state, rate)),
+            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, rate)),
+            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
+            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, rate)),
+            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, port | rate)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// A fully initialized and ready `QueuePair`.
 ///
 /// A queue pair is the actual object that sends and receives data in the RDMA architecture
@@ -3780,6 +4224,105 @@ impl QueuePair {
     /// only while this [`QueuePair`] is alive; do not destroy it.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_qp_ex {
         self.qp_ex
+    }
+
+    /// Modify this queue pair's attributes (`ibv_modify_qp`).
+    ///
+    /// This is the general escape hatch for transitions and attribute changes that
+    /// [`PreparedQueuePair::handshake`], [`activate_ud`](PreparedQueuePair::activate_ud), and (with
+    /// the `efa` feature) `activate_srd` do not cover: changing access flags at runtime, draining
+    /// the send queue, moving the queue pair to `ERR` for teardown, setting a custom partition-key
+    /// index or packet sequence number, and so on. Only the attributes whose mask bits are set in
+    /// `attr` are applied.
+    ///
+    /// # Errors
+    ///
+    /// If the device rejects the transition with `EINVAL`, the crate consults its queue-pair state
+    /// table and returns [`Error::InvalidQueuePairTransition`] or
+    /// [`Error::InvalidQueuePairAttributeMask`] where it can pinpoint the problem, and
+    /// [`Error::ModifyQueuePair`] otherwise.
+    pub fn modify(&mut self, attr: &QueuePairAttribute) -> Result<()> {
+        let mut a = attr.attr;
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp, &mut a as *mut _, attr.mask.0 as i32) };
+        if errno == 0 {
+            return Ok(());
+        }
+        if errno == nix::libc::EINVAL {
+            let next = if attr.mask.0 & ffi::ibv_qp_attr_mask::IBV_QP_STATE.0 != 0 {
+                attr.attr.qp_state
+            } else {
+                unsafe { (*self.qp).state }
+            };
+            return Err(self.diagnose_modify(attr.mask, next));
+        }
+        Err(Error::errno(errno, Error::ModifyQueuePair))
+    }
+
+    /// Query this queue pair's attributes (`ibv_query_qp`).
+    ///
+    /// `mask` selects which attributes to read; the returned [`QueuePairAttribute`]'s getters are
+    /// meaningful only for the requested fields. The second return value describes the queue pair's
+    /// configured capacities.
+    pub fn query(
+        &self,
+        mask: ffi::ibv_qp_attr_mask,
+    ) -> Result<(QueuePairAttribute, QueuePairInitAttribute)> {
+        let mut attr = ffi::ibv_qp_attr::default();
+        // `ibv_qp_init_attr` has no valid all-zero representation (its `qp_type` enum has no 0
+        // variant), so zero the storage and only `assume_init` once `ibv_query_qp` has filled it in.
+        let mut init_attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr>::zeroed();
+        let errno = unsafe {
+            ffi::ibv_query_qp(
+                self.qp,
+                &mut attr as *mut _,
+                mask.0 as i32,
+                init_attr.as_mut_ptr(),
+            )
+        };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::QueryQueuePair));
+        }
+        let init_attr = unsafe { init_attr.assume_init() };
+        Ok((
+            QueuePairAttribute { attr, mask },
+            QueuePairInitAttribute { init_attr },
+        ))
+    }
+
+    /// Turn a rejected [`modify`](Self::modify) into a precise [`Error`], consulting the queue-pair
+    /// state table for the actual queue-pair type and current state.
+    fn diagnose_modify(&self, mask: ffi::ibv_qp_attr_mask, next: ffi::ibv_qp_state) -> Error {
+        let raw = || Error::ModifyQueuePair(io::Error::from_raw_os_error(nix::libc::EINVAL));
+        let cur = unsafe { (*self.qp).state };
+        let qp_type = unsafe { (*self.qp).qp_type };
+        // Only the types with a transition table can be diagnosed; others (e.g. driver/SRD) fall
+        // back to the raw error.
+        match qp_type {
+            ffi::ibv_qp_type::IBV_QPT_RC
+            | ffi::ibv_qp_type::IBV_QPT_UC
+            | ffi::ibv_qp_type::IBV_QPT_UD
+            | ffi::ibv_qp_type::IBV_QPT_RAW_PACKET
+            | ffi::ibv_qp_type::IBV_QPT_XRC_SEND
+            | ffi::ibv_qp_type::IBV_QPT_XRC_RECV => {}
+            _ => return raw(),
+        }
+        match qp_transition_masks(qp_type, cur, next) {
+            None => Error::InvalidQueuePairTransition { current: cur, next },
+            Some((required, optional)) => {
+                let invalid = mask.0 & !(required | optional);
+                let needed = required & !mask.0;
+                if invalid == 0 && needed == 0 {
+                    raw()
+                } else {
+                    Error::InvalidQueuePairAttributeMask {
+                        current: cur,
+                        next,
+                        invalid: ffi::ibv_qp_attr_mask(invalid),
+                        needed: ffi::ibv_qp_attr_mask(needed),
+                    }
+                }
+            }
+        }
     }
 
     /// Posts a single send Work Request (WR) containing a scatter-gather list of local
@@ -4211,5 +4754,45 @@ mod test {
         ];
         let arr2: [u8; 16] = Gid::from(arr).into();
         assert_eq!(arr, arr2);
+    }
+}
+
+#[cfg(test)]
+mod test_qp_transitions {
+    use super::*;
+    use ffi::ibv_qp_state::*;
+    use ffi::ibv_qp_type::IBV_QPT_RC;
+
+    fn bit(m: ffi::ibv_qp_attr_mask) -> u32 {
+        m.0
+    }
+
+    #[test]
+    fn reset_to_init_requires_pkey_port_access() {
+        let (required, _optional) =
+            qp_transition_masks(IBV_QPT_RC, IBV_QPS_RESET, IBV_QPS_INIT).unwrap();
+        let expected = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE)
+            | bit(ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX)
+            | bit(ffi::ibv_qp_attr_mask::IBV_QP_PORT)
+            | bit(ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS);
+        assert_eq!(required, expected);
+    }
+
+    #[test]
+    fn init_to_rts_is_not_a_valid_transition() {
+        assert!(qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RTS).is_none());
+    }
+
+    #[test]
+    fn any_state_to_reset_or_err_needs_only_state() {
+        let state = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE);
+        assert_eq!(
+            qp_transition_masks(IBV_QPT_RC, IBV_QPS_RTS, IBV_QPS_ERR),
+            Some((state, 0))
+        );
+        assert_eq!(
+            qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RESET),
+            Some((state, 0))
+        );
     }
 }

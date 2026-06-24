@@ -10,9 +10,9 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    ibv_access_flags, ibv_advise_mr_advice, ibv_create_cq_wc_flags, ibv_port_state, ibv_qp_type,
-    ibv_transport_type, AddressHandleAttribute, CompletionQueue, Context, ProtectionDomain,
-    QueuePair, RecvRequest,
+    ibv_access_flags, ibv_advise_mr_advice, ibv_create_cq_wc_flags, ibv_port_state,
+    ibv_qp_attr_mask, ibv_qp_state, ibv_qp_type, ibv_transport_type, AddressHandleAttribute,
+    CompletionQueue, Context, Error, ProtectionDomain, QueuePair, QueuePairAttribute, RecvRequest,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -1132,4 +1132,91 @@ fn gid_and_device_introspection() {
             );
         }
     }
+}
+
+#[test]
+#[ignore]
+fn modify_and_query_queue_pair() {
+    // `loopback()` builds an RC queue pair and drives it to RTS via `handshake`. The general
+    // `query`/`modify` API then lets us inspect and change it afterwards.
+    let mut lb = loopback();
+
+    // Query the attributes the handshake negotiated. Because the queue pair is connected to its own
+    // endpoint, its destination QP number is its own.
+    let mask = ibv_qp_attr_mask::IBV_QP_STATE
+        | ibv_qp_attr_mask::IBV_QP_CUR_STATE
+        | ibv_qp_attr_mask::IBV_QP_DEST_QPN
+        | ibv_qp_attr_mask::IBV_QP_SQ_PSN;
+    let (attr, init) = lb.qp.query(mask).expect("failed to query the queue pair");
+    assert_eq!(attr.state(), ibv_qp_state::IBV_QPS_RTS);
+    assert_eq!(attr.dest_qp_num(), lb.qp.qp_num());
+    assert!(init.max_send_wr() >= 16);
+
+    // An illegal transition (RTS -> INIT) is reported precisely.
+    let mut to_init = QueuePairAttribute::new();
+    to_init.set_state(ibv_qp_state::IBV_QPS_INIT);
+    match lb.qp.modify(&to_init) {
+        Err(Error::InvalidQueuePairTransition { current, next }) => {
+            assert_eq!(current, ibv_qp_state::IBV_QPS_RTS);
+            assert_eq!(next, ibv_qp_state::IBV_QPS_INIT);
+        }
+        other => panic!("expected InvalidQueuePairTransition, got {other:?}"),
+    }
+
+    // A legal transition (any state -> ERR) succeeds, and the change is visible to a later query.
+    let mut to_err = QueuePairAttribute::new();
+    to_err.set_state(ibv_qp_state::IBV_QPS_ERR);
+    lb.qp
+        .modify(&to_err)
+        .expect("failed to move the queue pair to ERR");
+    let (attr, _) = lb
+        .qp
+        .query(ibv_qp_attr_mask::IBV_QP_STATE)
+        .expect("failed to re-query the queue pair");
+    assert_eq!(attr.state(), ibv_qp_state::IBV_QPS_ERR);
+}
+
+/// `into_queue_pair` plus `modify` lets you drive a queue pair through its states by hand, the raw
+/// path that `activate_ud` wraps.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn manual_bringup_via_modify() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+
+    // Build a UD queue pair but do not activate it; take the still-RESET queue pair to drive by hand.
+    let prepared = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_UD)
+        .expect("failed to create QP")
+        .build()
+        .expect("failed to build QP");
+    let mut qp = prepared.into_queue_pair();
+
+    const QKEY: u32 = 0x1111_1111;
+
+    // RESET -> INIT: associate the port, partition key, and Q_Key.
+    let mut init = QueuePairAttribute::new();
+    init.set_state(ibv_qp_state::IBV_QPS_INIT)
+        .set_pkey_index(0)
+        .set_port(1)
+        .set_qkey(QKEY);
+    qp.modify(&init).expect("RESET -> INIT failed");
+
+    // INIT -> RTR.
+    let mut rtr = QueuePairAttribute::new();
+    rtr.set_state(ibv_qp_state::IBV_QPS_RTR);
+    qp.modify(&rtr).expect("INIT -> RTR failed");
+
+    // RTR -> RTS.
+    let mut rts = QueuePairAttribute::new();
+    rts.set_state(ibv_qp_state::IBV_QPS_RTS).set_sq_psn(0);
+    qp.modify(&rts).expect("RTR -> RTS failed");
+
+    // The hand-driven queue pair reached RTS with the Q_Key we set.
+    let (attr, _) = qp
+        .query(ibv_qp_attr_mask::IBV_QP_STATE | ibv_qp_attr_mask::IBV_QP_QKEY)
+        .expect("query failed");
+    assert_eq!(attr.state(), ibv_qp_state::IBV_QPS_RTS);
+    assert_eq!(attr.qkey(), QKEY);
 }
