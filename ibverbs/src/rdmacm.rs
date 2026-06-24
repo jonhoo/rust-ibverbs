@@ -51,7 +51,7 @@ use std::time::Duration;
 
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
 
-use crate::{Context, Error, PreparedQueuePair, QueuePair, Result};
+use crate::{Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Result};
 
 pub use ffi::rdma_port_space;
 
@@ -273,20 +273,21 @@ impl CmId {
     /// Builds the queue pair from `prepared` and moves it from `RESET` to `INIT`. Finish the
     /// transition after the connection is set up with [`ready`](Self::ready).
     fn init_qp(&self, prepared: PreparedQueuePair) -> Result<QueuePair> {
-        let qp = prepared.into_queue_pair();
-        self.transition(&qp, ffi::ibv_qp_state::IBV_QPS_INIT)?;
+        let mut qp = prepared.into_queue_pair();
+        self.transition(&mut qp, ffi::ibv_qp_state::IBV_QPS_INIT)?;
         Ok(qp)
     }
 
     /// Moves `qp` from `INIT` through `RTR` to `RTS`, completing the connection-manager transition.
-    fn ready(&self, qp: &QueuePair) -> Result<()> {
+    fn ready(&self, qp: &mut QueuePair) -> Result<()> {
         self.transition(qp, ffi::ibv_qp_state::IBV_QPS_RTR)?;
         self.transition(qp, ffi::ibv_qp_state::IBV_QPS_RTS)
     }
 
     /// Transitions `qp` to `state` using the attributes the connection manager computes from the
-    /// resolved route and negotiated parameters (`rdma_init_qp_attr` + `ibv_modify_qp`).
-    fn transition(&self, qp: &QueuePair, state: ffi::ibv_qp_state) -> Result<()> {
+    /// resolved route and negotiated parameters (`rdma_init_qp_attr`), applied with
+    /// [`QueuePair::modify`].
+    fn transition(&self, qp: &mut QueuePair, state: ffi::ibv_qp_state) -> Result<()> {
         let mut attr = MaybeUninit::<ffi::ibv_qp_attr>::zeroed();
         // `rdma_init_qp_attr` reads the target state from the attribute and fills in the rest.
         unsafe { (*attr.as_mut_ptr()).qp_state = state };
@@ -295,11 +296,12 @@ impl CmId {
         if ret != 0 {
             return Err(Error::ModifyQueuePair(io::Error::last_os_error()));
         }
-        let errno = unsafe { ffi::ibv_modify_qp(qp.as_raw(), attr.as_mut_ptr(), mask) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-        Ok(())
+        // SAFETY: `rdma_init_qp_attr` succeeded, so it initialized `attr`.
+        let attr = QueuePairAttribute::from_raw(
+            unsafe { attr.assume_init() },
+            ffi::ibv_qp_attr_mask(mask as u32),
+        );
+        qp.modify(&attr)
     }
 }
 
@@ -446,12 +448,12 @@ impl Resolved {
         qp: PreparedQueuePair,
         mut param: ConnectionParameter,
     ) -> Result<Connection> {
-        let qp = self.id.init_qp(qp)?;
+        let mut qp = self.id.init_qp(qp)?;
         param.set_qp_num(qp.qp_num());
         self.id.connect(&param)?;
         self.id
             .wait_for(ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_RESPONSE)?;
-        self.id.ready(&qp)?;
+        self.id.ready(&mut qp)?;
         self.id.establish()?;
         Ok(Connection { id: self.id, qp })
     }
@@ -514,8 +516,8 @@ impl Incoming {
         qp: PreparedQueuePair,
         mut param: ConnectionParameter,
     ) -> Result<Connection> {
-        let qp = self.id.init_qp(qp)?;
-        self.id.ready(&qp)?;
+        let mut qp = self.id.init_qp(qp)?;
+        self.id.ready(&mut qp)?;
         param.set_qp_num(qp.qp_num());
         self.id.accept(&param)?;
         self.id
