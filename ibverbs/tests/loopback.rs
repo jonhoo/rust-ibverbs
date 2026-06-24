@@ -1021,3 +1021,56 @@ fn extended_wc_fields() {
         );
     }
 }
+
+/// The completion channel exposes a descriptor and arm/consume hooks for event-driven polling.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn event_driven_completion() {
+    use std::os::fd::AsRawFd;
+
+    let mut lb = loopback();
+    // The completion channel is backed by a real (non-blocking) descriptor an event loop can wait on.
+    assert!(
+        lb.cq.as_raw_fd() >= 0,
+        "completion channel should expose an fd"
+    );
+
+    let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
+    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
+    send.bytes_mut()[..5].copy_from_slice(b"hello");
+
+    // Arm the channel before posting so the completions raise a notification on the descriptor.
+    lb.cq
+        .req_notify(false)
+        .expect("failed to arm the completion channel");
+    unsafe { lb.qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
+    unsafe { lb.qp.post_send(&[send.slice(..5)], 2) }.expect("post_send failed");
+
+    // A real event loop would await readability of the descriptor; here we consume the notification
+    // as soon as it arrives. `get_event` reads the (non-blocking) channel and acknowledges for us.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut notified = false;
+    while Instant::now() < deadline {
+        if lb.cq.get_event().expect("get_event failed") {
+            notified = true;
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert!(
+        notified,
+        "expected a completion notification on the channel"
+    );
+
+    // The completions themselves are drained through the normal poll path.
+    let comps = drain(&lb.cq, 2);
+    assert!(
+        comps.iter().any(|wc| wc.wr_id() == 1),
+        "missing recv completion"
+    );
+    assert!(
+        comps.iter().any(|wc| wc.wr_id() == 2),
+        "missing send completion"
+    );
+    assert_eq!(&recv.bytes_mut()[..5], b"hello");
+}

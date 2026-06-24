@@ -69,7 +69,7 @@ use std::convert::TryInto;
 use std::ffi::CStr;
 use std::io;
 use std::ops::{Deref, DerefMut, RangeBounds};
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -1227,22 +1227,12 @@ impl CompletionQueue {
         loop {
             // Arm the completion channel, then poll: polling after arming closes the race where a
             // completion arrives between an earlier poll and arming.
-            let cq = self.inner.cq();
-            let ctx = unsafe { *cq }.context;
-            let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, 0) };
-            if errno != 0 {
-                return Err(Error::errno(errno, Error::PollCompletionQueue));
-            }
+            self.req_notify(false)?;
             if let Some(completions) = self.poll()? {
                 return Ok(completions);
             }
 
-            let pollfd = nix::poll::PollFd::new(
-                // SAFETY: the comp channel fd lives until this `CompletionQueue`'s `Drop`, and we
-                // still hold `self`.
-                unsafe { BorrowedFd::borrow_raw({ *self.inner.cc }.fd) },
-                nix::poll::PollFlags::POLLIN,
-            );
+            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
             let ret = nix::poll::poll(
                 &mut [pollfd],
                 timeout
@@ -1263,25 +1253,55 @@ impl CompletionQueue {
                 _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
             }
 
-            let mut out_cq = std::ptr::null_mut();
-            let mut out_cq_context = std::ptr::null_mut();
-            // The completion notification must be read with ibv_get_cq_event(); the fd was set
-            // non-blocking so this does not block.
-            let rc =
-                unsafe { ffi::ibv_get_cq_event(self.inner.cc, &mut out_cq, &mut out_cq_context) };
-            if rc < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() == io::ErrorKind::WouldBlock {
-                    continue;
-                }
-                return Err(Error::PollCompletionQueue(e));
-            }
-            assert_eq!(self.inner.cq(), out_cq);
-            assert!(out_cq_context.is_null());
-
-            // Every event from ibv_get_cq_event() must eventually be acknowledged.
-            unsafe { ffi::ibv_ack_cq_events(self.inner.cq(), 1) };
+            // Drain the notification the poll reported; re-arm and re-poll on the next iteration.
+            self.get_event()?;
         }
+    }
+
+    /// Arm the completion channel so the next work completion generates a notification on the
+    /// channel's file descriptor (`ibv_req_notify_cq`).
+    ///
+    /// This is the building block for event-driven and asynchronous completion handling: arm the
+    /// channel, drain everything already pending with [`poll`](Self::poll), then wait for the
+    /// descriptor returned by [`AsFd`](std::os::fd::AsFd)/[`AsRawFd`](std::os::fd::AsRawFd) to become
+    /// readable (for example with `epoll`, or a `tokio` `AsyncFd`). When it is, call
+    /// [`get_event`](Self::get_event) to consume the notification, drain with [`poll`](Self::poll),
+    /// and arm again. [`wait`](Self::wait) is the blocking version of this loop.
+    ///
+    /// If `solicited_only` is set, only completions of work requests that asked for a solicited
+    /// event generate a notification.
+    pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
+        let cq = self.inner.cq();
+        let ctx = unsafe { *cq }.context;
+        let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, solicited_only as i32) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::PollCompletionQueue));
+        }
+        Ok(())
+    }
+
+    /// Consume one pending completion notification from the channel (`ibv_get_cq_event`), and
+    /// acknowledge it.
+    ///
+    /// Returns `true` if a notification was consumed and `false` if none was pending (the channel's
+    /// descriptor is non-blocking). Call this after the descriptor becomes readable, then re-arm
+    /// with [`req_notify`](Self::req_notify); see [`req_notify`](Self::req_notify) for the full loop.
+    /// Acknowledgement is handled for you, so there is no separate ack step.
+    pub fn get_event(&self) -> Result<bool> {
+        let mut out_cq = std::ptr::null_mut();
+        let mut out_cq_context = std::ptr::null_mut();
+        let rc = unsafe { ffi::ibv_get_cq_event(self.inner.cc, &mut out_cq, &mut out_cq_context) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::WouldBlock {
+                return Ok(false);
+            }
+            return Err(Error::PollCompletionQueue(e));
+        }
+        debug_assert_eq!(self.inner.cq(), out_cq);
+        // Every event from ibv_get_cq_event() must eventually be acknowledged.
+        unsafe { ffi::ibv_ack_cq_events(self.inner.cq(), 1) };
+        Ok(true)
     }
 
     /// Returns the underlying `ibv_cq` pointer.
@@ -1300,6 +1320,23 @@ impl CompletionQueue {
     /// while this [`CompletionQueue`] is alive; do not destroy it.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_cq_ex {
         self.inner.cq_ex
+    }
+}
+
+impl std::os::fd::AsRawFd for CompletionQueue {
+    /// The raw file descriptor of this completion queue's completion channel. It is non-blocking and
+    /// becomes readable when a notification arrives after [`req_notify`](CompletionQueue::req_notify);
+    /// see that method for the event-driven loop.
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        unsafe { *self.inner.cc }.fd
+    }
+}
+
+impl std::os::fd::AsFd for CompletionQueue {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the comp channel fd lives until this `CompletionQueue`'s `Drop`, and the borrow is
+        // tied to `&self`.
+        unsafe { BorrowedFd::borrow_raw((*self.inner.cc).fd) }
     }
 }
 
