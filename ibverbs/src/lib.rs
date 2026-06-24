@@ -3390,6 +3390,33 @@ impl<'a> RecvRequest<'a> {
 /// Configure a request *before* its opcode method: `batch.signaled().to(&ah, qpn, qkey).send(id,
 /// sges)`. (The provider reads the work-request flags inside the opcode builder, so signaling and
 /// addressing must be set first.)
+///
+/// # Borrow-checked guarantees
+///
+/// The batch borrows the queue pair for as long as it is open, so the type system enforces the
+/// doorbell interface's rule that a queue pair has at most one block being built at a time. A
+/// second [`start_send`](QueuePair::start_send) (or any other use of the queue pair) while a batch
+/// is open is rejected at compile time:
+///
+/// ```compile_fail
+/// # fn two_batches(qp: &mut ibverbs::QueuePair) {
+/// let first = qp.start_send();
+/// let second = qp.start_send(); // error: `*qp` is already mutably borrowed by `first`
+/// let _ = (first, second);
+/// # }
+/// ```
+///
+/// Likewise, only one request at a time is configured on a batch: each builder method borrows the
+/// batch until that work request is posted, so two half-built requests cannot overlap:
+///
+/// ```compile_fail
+/// # fn two_requests(qp: &mut ibverbs::QueuePair) {
+/// let mut batch = qp.start_send();
+/// let first = batch.signaled();
+/// let second = batch.signaled(); // error: `batch` is already mutably borrowed by `first`
+/// let _ = (first, second);
+/// # }
+/// ```
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct PostBatch<'qp> {
     qpx: *mut ffi::ibv_qp_ex,
