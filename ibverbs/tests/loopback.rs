@@ -958,3 +958,71 @@ fn completion_timestamps() {
         );
     }
 }
+
+/// The extended work-completion accessors: the always-available GRH flag, plus the optional
+/// SL / source-LID / DLID-path-bits fields requested through the completion-queue builder. The
+/// addressing fields are optional, so the test skips them on a device that cannot request them.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn extended_wc_fields() {
+    const EOPNOTSUPP: i32 = 95;
+    let ctx = open_test_device();
+
+    let cq = match ctx
+        .create_cq(16)
+        .set_wc_flags(
+            ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID
+                | ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL
+                | ibv_create_cq_wc_flags::IBV_WC_EX_WITH_DLID_PATH_BITS,
+        )
+        .build()
+    {
+        Ok(cq) => cq,
+        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => {
+            eprintln!("device does not support these completion fields; skipping");
+            return;
+        }
+        Err(e) => panic!("create_cq failed: {e}"),
+    };
+
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut builder = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .expect("failed to create QP");
+    builder.set_gid_index(1).set_access(
+        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
+            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+    );
+    let prepared = builder.build().expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+
+    let recv = pd.allocate(64).expect("failed to register recv MR");
+    let mut send = pd.allocate(64).expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"wcfl");
+    unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
+    unsafe { qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
+
+    // Exercise the accessors on each completion. The addressing values are device-defined (and zero
+    // on RoCE), so just ensure the reads succeed; an RC completion never carries a GRH.
+    let mut seen = 0;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while seen < 2 {
+        if let Some(mut comps) = cq.poll().expect("failed to poll CQ") {
+            while let Some(wc) = comps.next() {
+                wc.ok().expect("work request failed");
+                let _ = wc.wc_flags();
+                let _ = wc.has_grh();
+                let _ = wc.slid();
+                let _ = wc.sl();
+                let _ = wc.dlid_path_bits();
+                seen += 1;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for completions"
+        );
+    }
+}
