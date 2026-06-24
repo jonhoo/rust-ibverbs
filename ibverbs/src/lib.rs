@@ -88,6 +88,7 @@ pub use ffi::ibv_mtu;
 pub use ffi::ibv_port_state;
 pub use ffi::ibv_qp_type;
 pub use ffi::ibv_send_wr;
+pub use ffi::ibv_transport_type;
 pub use ffi::ibv_wc;
 pub use ffi::ibv_wc_flags;
 pub use ffi::ibv_wc_opcode;
@@ -523,6 +524,14 @@ impl<'devlist> Device<'devlist> {
             Ok(idx)
         }
     }
+
+    /// Returns the transport type of this device (for example InfiniBand or iWARP).
+    ///
+    /// RoCE devices report [`IBV_TRANSPORT_IB`](ffi::ibv_transport_type::IBV_TRANSPORT_IB), since
+    /// RoCE is InfiniBand transport over Ethernet.
+    pub fn transport_type(&self) -> ffi::ibv_transport_type {
+        unsafe { (**self.0).transport_type }
+    }
 }
 
 struct ContextInner {
@@ -721,6 +730,28 @@ impl Context {
         gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
         Ok(gid_table)
+    }
+
+    /// Query a single entry of a port's GID table (`ibv_query_gid`).
+    ///
+    /// Ports are numbered from 1. For the full table at once (with the GID type and associated net
+    /// device of each entry), use [`gid_table`](Self::gid_table).
+    ///
+    /// # Errors
+    ///
+    ///  - `EINVAL`: Invalid `port_num` or `gid_index`.
+    pub fn query_gid(&self, port_num: u8, gid_index: u32) -> Result<Gid> {
+        let mut gid = ffi::ibv_gid::default();
+        let rc =
+            unsafe { ffi::ibv_query_gid(self.inner.ctx, port_num, gid_index as i32, &mut gid) };
+        if rc != 0 {
+            return Err(Error::os(io::Error::last_os_error(), |e| Error::QueryGid {
+                port_num,
+                gid_index,
+                source: e,
+            }));
+        }
+        Ok(gid.into())
     }
 
     /// Query the attributes and capabilities of this context's device (`ibv_query_device`).
@@ -2297,6 +2328,27 @@ impl From<ffi::ibv_gid_entry> for GidEntry {
             },
             ndev_ifindex: gid_entry.ndev_ifindex,
         }
+    }
+}
+
+impl GidEntry {
+    /// The name of the network device associated with this GID, if any.
+    ///
+    /// Resolves [`ndev_ifindex`](Self::ndev_ifindex) with `if_indextoname`. Returns `None` when
+    /// there is no associated net device (the index is 0) or the name cannot be resolved.
+    pub fn netdev_name(&self) -> Option<String> {
+        if self.ndev_ifindex == 0 {
+            return None;
+        }
+        let mut buf = [0 as std::os::raw::c_char; nix::libc::IF_NAMESIZE];
+        // SAFETY: `buf` is `IF_NAMESIZE` bytes, the size `if_indextoname` requires.
+        let ret = unsafe { nix::libc::if_indextoname(self.ndev_ifindex, buf.as_mut_ptr()) };
+        if ret.is_null() {
+            return None;
+        }
+        // SAFETY: on success `if_indextoname` wrote a NUL-terminated name into `buf`.
+        let name = unsafe { CStr::from_ptr(buf.as_ptr()) };
+        name.to_str().ok().map(String::from)
     }
 }
 
