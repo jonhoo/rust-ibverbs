@@ -1312,3 +1312,31 @@ fn query_device_extended() {
     let _ = ex.raw_packet_caps();
     let _ = ex.max_device_memory();
 }
+
+/// The `Debug` impls on `Device`, `DeviceAttr`, and `PortAttr` render the device's real attributes,
+/// and `fw_ver` decodes the firmware string without the caller touching raw pointers.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn debug_formatting() {
+    let devices = ibverbs::devices().expect("failed to list RDMA devices");
+    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
+        Ok(name) if !name.is_empty() => devices
+            .iter()
+            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
+            .expect("IBVERBS_TEST_DEVICE is not among the available devices"),
+        _ => devices.iter().next().expect("no RDMA device available"),
+    };
+    assert!(format!("{device:?}").contains("Device"), "{device:?}");
+
+    let ctx = device.open().expect("failed to open the RDMA device");
+    let attr = ctx.query_device().expect("query_device failed");
+    let attr_dbg = format!("{attr:?}");
+    assert!(
+        attr_dbg.contains("DeviceAttr") && attr_dbg.contains("fw_ver"),
+        "{attr_dbg}"
+    );
+    let _ = attr.fw_ver();
+
+    let port = ctx.query_port(1).expect("query_port failed");
+    assert!(format!("{port:?}").contains("PortAttr"), "{port:?}");
+}
