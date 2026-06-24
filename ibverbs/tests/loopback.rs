@@ -632,10 +632,9 @@ fn advise_mr() {
         0,
         &sg,
     ) {
-        // Either the device prefetched, or it does not implement advise_mr / on-demand paging
-        // (EOPNOTSUPP is 95 on Linux).
+        // Either the device prefetched, or it does not implement advise_mr / on-demand paging.
         Ok(()) => {}
-        Err(e) if e.raw_os_error() == Some(95) => {}
+        Err(ibverbs::Error::Unsupported) => {}
         Err(e) => panic!("advise_mr returned an unexpected error: {e}"),
     }
 }
@@ -897,14 +896,11 @@ fn queue_pair_on_explicit_port() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn completion_timestamps() {
-    // EOPNOTSUPP (95 on Linux) is how a device without these features reports them.
-    const EOPNOTSUPP: i32 = 95;
-
     let ctx = open_test_device();
 
     match ctx.query_rt_values_ex() {
         Ok(_clock) => {}
-        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => {
+        Err(ibverbs::Error::Unsupported) => {
             eprintln!("device does not support query_rt_values_ex; skipping that check");
         }
         Err(e) => panic!("query_rt_values_ex failed: {e}"),
@@ -916,7 +912,7 @@ fn completion_timestamps() {
         .build()
     {
         Ok(cq) => cq,
-        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => {
+        Err(ibverbs::Error::Unsupported) => {
             eprintln!("device does not support completion timestamps; skipping");
             return;
         }
@@ -965,7 +961,6 @@ fn completion_timestamps() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn extended_wc_fields() {
-    const EOPNOTSUPP: i32 = 95;
     let ctx = open_test_device();
 
     let cq = match ctx
@@ -978,7 +973,7 @@ fn extended_wc_fields() {
         .build()
     {
         Ok(cq) => cq,
-        Err(e) if e.raw_os_error() == Some(EOPNOTSUPP) => {
+        Err(ibverbs::Error::Unsupported) => {
             eprintln!("device does not support these completion fields; skipping");
             return;
         }
