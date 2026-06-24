@@ -7,12 +7,15 @@
 #![cfg(feature = "rdmacm")]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::os::fd::AsRawFd;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use ibverbs::ibv_qp_type::IBV_QPT_RC;
-use ibverbs::rdmacm::{rdma_port_space, Acceptor, ConnectionParameter, Connector};
-use ibverbs::{CompletionQueue, Context};
+use ibverbs::rdmacm::{
+    rdma_cm_event_type, rdma_port_space, Acceptor, CmId, ConnectionParameter, Connector,
+};
+use ibverbs::{ibv_qp_state, CompletionQueue, Context};
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
 fn open_test_device() -> Context {
@@ -230,4 +233,141 @@ fn two_connections() {
         vec![vec![b'A'; MESSAGE.len()], vec![b'B'; MESSAGE.len()]],
         "both connections should deliver their distinct message"
     );
+}
+
+/// Pump events on `id` in non-blocking mode until the wanted one arrives, ignoring (acknowledging)
+/// others. Mirrors how a reactor would drive the connection manager: poll, and only sleep when the
+/// channel is empty. Exercises [`CmId::poll_cm_event`] and [`CmId::set_nonblocking`].
+fn pump_until(id: &CmId, want: rdma_cm_event_type) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match id.poll_cm_event().expect("poll cm event") {
+            Some(event) => {
+                if event.event_type() == want {
+                    assert_eq!(
+                        event.status(),
+                        0,
+                        "event {want:?} reported a failure status"
+                    );
+                    return;
+                }
+                // A non-matching event is acknowledged when `event` drops here.
+            }
+            None => {
+                assert!(Instant::now() < deadline, "timed out waiting for {want:?}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn low_level_connect_and_send() {
+    // Drive the connection-manager state machine directly with `CmId`, instead of the blocking
+    // `Connector`/`Acceptor` helpers: the passive side blocks on `get_cm_event`, while the active
+    // side runs its channel non-blocking and pumps events off the file descriptor the way an event
+    // loop would. Proves the low-level escape hatch can set up a working connection.
+    let addr = SocketAddr::new(IpAddr::V4(device_ipv4(&open_test_device())), 18603);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    // Passive side: bind, listen, take the request id, build and ready the queue pair, accept.
+    let server = std::thread::spawn(move || {
+        let listener = CmId::create(rdma_port_space::RDMA_PS_TCP).expect("listener");
+        listener.bind_addr(addr).expect("bind");
+        listener.listen(1).expect("listen");
+        ready_tx.send(()).expect("signal ready");
+
+        let request = loop {
+            let event = listener.get_cm_event().expect("listener event");
+            if event.event_type() == rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
+                break event.connection_request().expect("connection request");
+            }
+        };
+        let ctx = request.context().expect("server device context");
+        let pd = ctx.alloc_pd().expect("server pd");
+        let cq = ctx.create_cq(16).build().expect("server cq");
+        let mut qp = pd
+            .create_qp(&cq, &cq, IBV_QPT_RC)
+            .expect("server qp builder")
+            .build()
+            .expect("server prepared qp")
+            .into_queue_pair();
+        for state in [
+            ibv_qp_state::IBV_QPS_INIT,
+            ibv_qp_state::IBV_QPS_RTR,
+            ibv_qp_state::IBV_QPS_RTS,
+        ] {
+            let attr = request.init_qp_attr(state).expect("server init_qp_attr");
+            qp.modify(&attr).expect("server modify");
+        }
+        let mut recv = pd.allocate(64).expect("server recv mr");
+        unsafe { qp.post_receive(&[recv.slice(..MESSAGE.len())], 1) }.expect("post_receive");
+
+        let mut param = ConnectionParameter::default();
+        param.set_qp_num(qp.qp_num());
+        request.accept(&param).expect("accept");
+        loop {
+            let event = request.get_cm_event().expect("server event");
+            if event.event_type() == rdma_cm_event_type::RDMA_CM_EVENT_ESTABLISHED {
+                break;
+            }
+        }
+
+        wait_for(&cq, 1);
+        assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
+        done_tx.send(()).expect("signal done");
+    });
+
+    // Active side: drive resolution and connection non-blocking, off the channel's file descriptor.
+    ready_rx.recv().expect("server ready");
+    let id = CmId::create(rdma_port_space::RDMA_PS_TCP).expect("client id");
+    assert!(
+        id.as_raw_fd() >= 0,
+        "the event channel exposes a file descriptor"
+    );
+    id.set_nonblocking(true).expect("set_nonblocking");
+
+    id.resolve_addr(addr, Duration::from_secs(5))
+        .expect("resolve_addr");
+    pump_until(&id, rdma_cm_event_type::RDMA_CM_EVENT_ADDR_RESOLVED);
+    id.resolve_route(Duration::from_secs(5))
+        .expect("resolve_route");
+    pump_until(&id, rdma_cm_event_type::RDMA_CM_EVENT_ROUTE_RESOLVED);
+
+    let ctx = id.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let mut qp = pd
+        .create_qp(&cq, &cq, IBV_QPT_RC)
+        .expect("client qp builder")
+        .build()
+        .expect("client prepared qp")
+        .into_queue_pair();
+    let init = id
+        .init_qp_attr(ibv_qp_state::IBV_QPS_INIT)
+        .expect("client init attr");
+    qp.modify(&init).expect("client init");
+
+    let mut param = ConnectionParameter::default();
+    param.set_qp_num(qp.qp_num());
+    id.connect(&param).expect("connect");
+    pump_until(&id, rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_RESPONSE);
+    for state in [ibv_qp_state::IBV_QPS_RTR, ibv_qp_state::IBV_QPS_RTS] {
+        let attr = id.init_qp_attr(state).expect("client init_qp_attr");
+        qp.modify(&attr).expect("client modify");
+    }
+    id.establish().expect("establish");
+
+    let mut send = pd.allocate(64).expect("client send mr");
+    send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
+    unsafe { qp.post_send(&[send.slice(..MESSAGE.len())], 2) }.expect("post_send");
+    wait_for(&cq, 2);
+
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("server received the message");
+    id.disconnect().ok();
+    server.join().expect("server thread");
 }
