@@ -1311,6 +1311,13 @@ fn query_device_extended() {
     let _ = ex.packet_pacing_caps();
     let _ = ex.raw_packet_caps();
     let _ = ex.max_device_memory();
+
+    // The Debug impl renders the wrapper and its nested base attributes.
+    let dbg = format!("{ex:?}");
+    assert!(
+        dbg.contains("DeviceAttrEx") && dbg.contains("DeviceAttr {"),
+        "{dbg}"
+    );
 }
 
 /// The `Debug` impls on `Device`, `DeviceAttr`, and `PortAttr` render the device's real attributes,

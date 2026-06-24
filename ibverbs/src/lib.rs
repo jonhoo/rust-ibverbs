@@ -1284,6 +1284,26 @@ impl DeviceAttrEx {
     }
 }
 
+impl fmt::Debug for DeviceAttrEx {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceAttrEx")
+            .field("orig", &self.orig())
+            .field(
+                "completion_timestamp_mask",
+                &format_args!("{:#x}", self.completion_timestamp_mask()),
+            )
+            .field("hca_core_clock_khz", &self.hca_core_clock_khz())
+            .field("pci_atomic_caps", &self.pci_atomic_caps())
+            .field("packet_pacing_caps", &self.packet_pacing_caps())
+            .field(
+                "raw_packet_caps",
+                &format_args!("{:#x}", self.raw_packet_caps()),
+            )
+            .field("max_device_memory", &self.max_device_memory())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Deref for DeviceAttrEx {
     type Target = ffi::ibv_device_attr_ex;
     fn deref(&self) -> &Self::Target {
@@ -5160,5 +5180,16 @@ mod test_display {
         assert_eq!(PortWidth::Unknown(9).to_string(), "unknown (9)");
         assert_eq!(LinkLayer::Ethernet.to_string(), "Ethernet");
         assert_eq!(PhysicalState::LinkUp.to_string(), "LinkUp");
+    }
+
+    #[test]
+    fn device_attr_ex_debug_labels() {
+        // A zeroed value is valid (`query_device_ex` starts from one); check the Debug impl renders
+        // the wrapper's labels and the nested base attributes.
+        let attr = DeviceAttrEx(unsafe { std::mem::zeroed() });
+        let s = format!("{attr:?}");
+        assert!(s.contains("DeviceAttrEx"), "{s}");
+        assert!(s.contains("completion_timestamp_mask"), "{s}");
+        assert!(s.contains("DeviceAttr {"), "{s}");
     }
 }
