@@ -98,14 +98,15 @@ jobs:
         env:
           IBVERBS_TEST_DEVICE: rxe0
         # Run serially: the tests share one rxe device, and Soft-RoCE drops completions when many
-        # queue pairs drive it concurrently. The three skipped tests cover RC atomics and the UC/UD
-        # transports, which this rxe build does not handle correctly (they pass on real hardware and
-        # a current 7.x kernel); everything else gates the full RC data path.
+        # queue pairs drive it concurrently. The skipped tests cover RC atomics, the UC/UD transports,
+        # and inline data, which this rxe build does not handle correctly (they pass on real hardware
+        # and a current 7.x kernel); everything else gates the full RC data path.
         run: |
           cargo test --locked --test loopback -- --ignored --test-threads=1 \
             --skip atomic_operations \
             --skip unreliable_connection \
-            --skip unreliable_datagram
+            --skip unreliable_datagram \
+            --skip inline_send
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
     # that this crate is compatible with the minimal version that this crate and its dependencies
