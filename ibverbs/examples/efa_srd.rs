@@ -1,6 +1,6 @@
 //! Minimal EFA SRD example: two SRD queue pairs on one device, one sends a datagram to the other.
 //!
-//! The only EFA-specific calls are `create_srd_qp` / `build_srd` / `activate_srd`; everything else
+//! The only EFA-specific calls are `create_srd_qp` / `build` / `activate`; everything else
 //! (`start_send`, `post_recv`, `poll`) is the same API every other transport uses.
 //!
 //! Requires an AWS Elastic Fabric Adapter (EFA) device and the `efa` feature
@@ -23,15 +23,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut sender = pd
         .create_srd_qp(&cq, &cq, 1)?
         .set_gid_index(GID_INDEX)
-        .build_srd()?
-        .activate_srd(QKEY)?;
+        .build()?
+        .activate(QKEY)?;
 
     let receiver_prepared = pd
         .create_srd_qp(&cq, &cq, 1)?
         .set_gid_index(GID_INDEX)
-        .build_srd()?;
+        .build()?;
     let receiver_endpoint = receiver_prepared.endpoint()?;
-    let mut receiver = receiver_prepared.activate_srd(QKEY)?;
+    let mut receiver = receiver_prepared.activate(QKEY)?;
 
     // Address the receiver by its GID.
     let receiver_gid = receiver_endpoint.gid.ok_or("EFA requires a GID")?;
@@ -47,9 +47,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     unsafe { receiver.post_recv([ibverbs::RecvRequest::new(1, &[recv_buf.slice(..)])]) }?;
     let mut batch = sender.start_send();
     batch
-        .op()
-        .signaled()
         .to(&ah, receiver_endpoint.qp_num, QKEY)
+        .signaled()
         .send(2, &[send_buf.slice(..5)]);
     unsafe { batch.submit() }?;
 

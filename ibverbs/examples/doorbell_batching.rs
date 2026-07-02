@@ -40,7 +40,7 @@ fn main() {
         .expect("no GID available")
         .gid_index;
     let prepared_qp = pd
-        .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)
+        .create_qp::<ibverbs::Rc>(&cq, &cq, 1)
         .unwrap()
         .set_gid_index(gid_index)
         .set_max_send_wr(MAX_SEND_WR)

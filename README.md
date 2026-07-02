@@ -22,7 +22,7 @@ fn main() -> ibverbs::Result<()> {
 
     // On RoCE, routing needs a GID; pick the index of a routable entry from `ctx.gid_table()?`.
     let prepared = pd
-        .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)?
+        .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
         .set_gid_index(1)
         .build()?;
 
@@ -62,9 +62,10 @@ manager, and EFA SRD queue pairs.
 
 - Device listing and typed device, port, and GID-table queries (including extended device
   attributes and GID-to-netdev resolution).
-- RC, UC, and UD queue pairs, with a builder for their many knobs, one-call bring-up
-  (`handshake`, `activate_ud`), and validated manual state transitions (`modify`/`query`) when
-  you want to drive `INIT`/`RTR`/`RTS` yourself.
+- RC, UC, and UD queue pairs, typed by their transport so transport-specific operations are
+  compile-time checked, with a builder for their many knobs, one-call bring-up (`handshake`,
+  `activate`), and validated manual state transitions (`modify`/`query`) when you want to drive
+  `INIT`/`RTR`/`RTS` yourself.
 - Memory regions that own their buffer, plus registration of caller-managed memory
   (`register_from_raw` for mmap/hugepages, `register_dmabuf` for device memory such as GPU
   buffers) and `ibv_advise_mr`.

@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use ibverbs::rdmacm::{Acceptor, ConnectionParameter, Connector, PortSpace};
-use ibverbs::{AccessFlags, CompletionQueue, QueuePairType, RecvRequest};
+use ibverbs::{AccessFlags, CompletionQueue, Rc, RecvRequest};
 
 const MESSAGE: &[u8] = b"hello over rdmacm";
 
@@ -59,11 +59,7 @@ fn server(addr: SocketAddr) {
     let ctx = incoming.context().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
-        .unwrap()
-        .build()
-        .unwrap();
+    let qp = pd.create_qp::<Rc>(&cq, &cq, 1).unwrap().build().unwrap();
     let mut recv = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
 
     let mut conn = incoming
@@ -96,11 +92,7 @@ fn client(addr: SocketAddr) {
     let ctx = resolved.context().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
-        .unwrap()
-        .build()
-        .unwrap();
+    let qp = pd.create_qp::<Rc>(&cq, &cq, 1).unwrap().build().unwrap();
     let mut send = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
 

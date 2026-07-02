@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
-use ibverbs::{AccessFlags, CompletionQueue, Context, QueuePairState, QueuePairType, RecvRequest};
+use ibverbs::{AccessFlags, CompletionQueue, Context, QueuePairState, Rc, RecvRequest};
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
 fn open_test_device() -> Context {
@@ -88,7 +88,7 @@ fn connect_and_send() {
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
-            .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+            .create_qp::<Rc>(&cq, &cq, 1)
             .expect("server qp builder")
             .build()
             .expect("server qp");
@@ -126,7 +126,7 @@ fn connect_and_send() {
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -198,7 +198,7 @@ fn two_connections() {
             let pd = ctx.alloc_pd().expect("server pd");
             let cq = ctx.create_cq(16).build().expect("server cq");
             let qp = pd
-                .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+                .create_qp::<Rc>(&cq, &cq, 1)
                 .expect("server qp builder")
                 .build()
                 .expect("server qp");
@@ -236,7 +236,7 @@ fn two_connections() {
                 let pd = ctx.alloc_pd().expect("client pd");
                 let cq = ctx.create_cq(16).build().expect("client cq");
                 let qp = pd
-                    .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+                    .create_qp::<Rc>(&cq, &cq, 1)
                     .expect("client qp builder")
                     .build()
                     .expect("client qp");
@@ -342,7 +342,7 @@ fn low_level_connect_and_send() {
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let mut qp = pd
-            .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+            .create_qp::<Rc>(&cq, &cq, 1)
             .expect("server qp builder")
             .build()
             .expect("server prepared qp")
@@ -402,7 +402,7 @@ fn low_level_connect_and_send() {
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let mut qp = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("client qp builder")
         .build()
         .expect("client prepared qp")

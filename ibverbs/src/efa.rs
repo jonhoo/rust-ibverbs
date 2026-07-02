@@ -14,42 +14,58 @@ use std::ptr;
 
 use crate::completion::CompletionQueue;
 use crate::error::{Error, Result};
+use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
-use crate::qp::{PreparedQueuePair, QueuePair, QueuePairBuilder, QueuePairType};
+use crate::qp::{
+    sealed, AddressedSendOp, Datagram, PreparedQueuePair, QueuePair, QueuePairBuilder,
+    QueuePairType, Transport,
+};
 
 #[cfg(doc)]
 use crate::AddressHandle;
+
+/// The EFA SRD (Scalable Reliable Datagram) transport: reliable like RC but connectionless and
+/// addressed like UD ([`QueuePairType::Driver`], created through
+/// [`ProtectionDomain::create_srd_qp`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Srd;
+
+impl sealed::Sealed for Srd {
+    const TYPE: QueuePairType = QueuePairType::Driver;
+}
+impl Transport for Srd {}
+impl Datagram for Srd {}
 
 impl ProtectionDomain {
     /// Begin building an EFA SRD queue pair associated with `port_num` (numbered from 1) on this
     /// protection domain's device.
     ///
     /// Configure it like any other queue pair (GID index, queue/SGE limits), then create it with
-    /// [`build_srd`](QueuePairBuilder::build_srd) and bring it to ready with
-    /// [`activate_srd`](PreparedQueuePair::activate_srd). Send with
-    /// [`start_send`](QueuePair::start_send) and [`op().to(..)`](crate::SendOp::to), receive with
+    /// [`build`](QueuePairBuilder::build) and bring it to ready with
+    /// [`activate`](PreparedQueuePair::activate). Send with
+    /// [`start_send`](QueuePair::start_send) and [`to(..)`](crate::SendBatch::to), receive with
     /// [`post_recv`](QueuePair::post_recv).
     pub fn create_srd_qp(
         &self,
         send: &CompletionQueue,
         recv: &CompletionQueue,
         port_num: u8,
-    ) -> Result<QueuePairBuilder> {
-        self.create_qp(send, recv, QueuePairType::Driver, port_num)
+    ) -> Result<QueuePairBuilder<Srd>> {
+        self.create_qp::<Srd>(send, recv, port_num)
     }
 }
 
-impl QueuePairBuilder {
+impl QueuePairBuilder<Srd> {
     /// Create the EFA SRD queue pair described by this builder (`efadv_create_qp_ex`).
     ///
-    /// Like [`build`](Self::build) but for SRD: it enables the send and one-sided RDMA doorbell
-    /// operations, then activate it with [`activate_srd`](PreparedQueuePair::activate_srd).
+    /// It enables the send and one-sided RDMA doorbell operations; activate the result with
+    /// [`activate`](PreparedQueuePair::activate).
     ///
     /// # Errors
     ///
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): `efadv_create_qp_ex` failed (`EINVAL` for
     ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
-    pub fn build_srd(&self) -> Result<PreparedQueuePair> {
+    pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
         use ffi::ibv_qp_create_send_ops_flags as SendOps;
         // SRD supports send and one-sided RDMA, including the immediate variants.
         let send_ops_flags = SendOps::IBV_QP_EX_WITH_SEND.0
@@ -109,6 +125,7 @@ impl QueuePairBuilder {
                 _recv_cq: self.recv.clone(),
                 qp,
                 qp_ex,
+                _transport: std::marker::PhantomData,
             },
             gid_index: self.gid_index,
             traffic_class: self.traffic_class,
@@ -126,18 +143,50 @@ impl QueuePairBuilder {
     }
 }
 
-impl PreparedQueuePair {
-    /// Transition an EFA SRD queue pair to ready with the given Q_Key.
+impl PreparedQueuePair<Srd> {
+    /// Transition this EFA SRD queue pair to ready with the given Q_Key.
     ///
     /// SRD is connectionless, so this needs no remote endpoint; the transitions are the same as a UD
     /// queue pair's. Address each send with an [`AddressHandle`] (see
-    /// [`SendOp::to`](crate::SendOp::to)).
+    /// [`SendBatch::to`](crate::SendBatch::to)).
     ///
     /// # Errors
     ///
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
     ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources).
-    pub fn activate_srd(self, qkey: u32) -> Result<QueuePair> {
-        self.activate_ud(qkey)
+    pub fn activate(self, qkey: u32) -> Result<QueuePair<Srd>> {
+        self.activate_impl(qkey)
+    }
+}
+
+impl AddressedSendOp<'_, '_, Srd> {
+    /// Post an RDMA WRITE into `remote`.
+    #[inline]
+    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+        self.op.build(wr_id, local, move |q| unsafe {
+            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
+        })
+    }
+
+    /// Post an RDMA WRITE into `remote` carrying a 32-bit immediate (host byte order).
+    #[inline]
+    pub fn write_imm(
+        self,
+        wr_id: u64,
+        local: &[LocalMemorySlice],
+        remote: RemoteMemorySlice,
+        imm: u32,
+    ) {
+        self.op.build(wr_id, local, move |q| unsafe {
+            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+        })
+    }
+
+    /// Post an RDMA READ from `remote` into `local`.
+    #[inline]
+    pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+        self.op.build(wr_id, local, move |q| unsafe {
+            (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
+        })
     }
 }

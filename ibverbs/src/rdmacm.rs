@@ -28,7 +28,7 @@
 //! let pd = ctx.alloc_pd()?;
 //! let cq = ctx.create_cq(16).build()?;
 //! let qp = pd
-//!     .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)?
+//!     .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
 //!     .build()?;
 //! let mut conn = resolved.connect(qp, ConnectionParameter::default(), None)?;
 //! // `conn.queue_pair()` is ready to post on; poll completions on `cq`.
@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
 
 use crate::qp::QueuePairState;
-use crate::{Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Result};
+use crate::{Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Rc, Result};
 
 /// The port space a connection-manager identifier lives in: which namespace its port numbers are
 /// allocated from, and which transport its connections use. Passed to [`Connector::new`],
@@ -702,14 +702,14 @@ impl CmId {
 
     /// Builds the queue pair from `prepared` and moves it from `RESET` to `INIT`. Finish the
     /// transition after the connection is set up with [`ready`](Self::ready).
-    fn init_qp(&self, prepared: PreparedQueuePair) -> Result<QueuePair> {
+    fn init_qp(&self, prepared: PreparedQueuePair<Rc>) -> Result<QueuePair<Rc>> {
         let mut qp = prepared.into_queue_pair();
         self.transition(&mut qp, QueuePairState::Init)?;
         Ok(qp)
     }
 
     /// Moves `qp` from `INIT` through `RTR` to `RTS`, completing the connection-manager transition.
-    fn ready(&self, qp: &mut QueuePair) -> Result<()> {
+    fn ready(&self, qp: &mut QueuePair<Rc>) -> Result<()> {
         self.transition(qp, QueuePairState::ReadyToReceive)?;
         self.transition(qp, QueuePairState::ReadyToSend)
     }
@@ -717,7 +717,7 @@ impl CmId {
     /// Transitions `qp` to `state` using the attributes the connection manager computes from the
     /// resolved route and negotiated parameters ([`init_qp_attr`](Self::init_qp_attr)), applied with
     /// [`QueuePair::modify`].
-    fn transition(&self, qp: &mut QueuePair, state: QueuePairState) -> Result<()> {
+    fn transition(&self, qp: &mut QueuePair<Rc>, state: QueuePairState) -> Result<()> {
         qp.modify(&self.init_qp_attr(state)?)
     }
 }
@@ -972,7 +972,7 @@ impl Resolved {
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
     pub fn connect(
         self,
-        qp: PreparedQueuePair,
+        qp: PreparedQueuePair<Rc>,
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
@@ -1047,7 +1047,7 @@ impl Incoming {
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
     pub fn accept(
         self,
-        qp: PreparedQueuePair,
+        qp: PreparedQueuePair<Rc>,
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
@@ -1066,13 +1066,13 @@ impl Incoming {
 /// dropping it tears the connection down.
 pub struct Connection {
     id: CmId,
-    qp: QueuePair,
+    qp: QueuePair<Rc>,
 }
 
 impl Connection {
     /// The connected queue pair, for posting work requests. Poll completions on the completion queue
     /// you built it with.
-    pub fn queue_pair(&mut self) -> &mut QueuePair {
+    pub fn queue_pair(&mut self) -> &mut QueuePair<Rc> {
         &mut self.qp
     }
 

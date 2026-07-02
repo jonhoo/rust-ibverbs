@@ -30,7 +30,7 @@ fn main() {
         .gid_index;
 
     let qp_builder = pd
-        .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)
+        .create_qp::<ibverbs::Rc>(&cq, &cq, 1)
         .unwrap()
         .set_gid_index(gid_index)
         .build()
