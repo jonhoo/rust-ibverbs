@@ -85,7 +85,8 @@ impl CompletionChannel {
 
     /// Set this channel's file descriptor to non-blocking.
     fn set_nonblocking(&self) -> Result<()> {
-        let fd = unsafe { *self.inner.cc }.fd;
+        // SAFETY: the channel owns this fd, and the borrow ends within this call.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.cc).fd) };
         let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
             .map_err(|e| Error::CreateCompletionChannel(e.into()))?;
         let arg = nix::fcntl::FcntlArg::F_SETFL(

@@ -468,7 +468,7 @@ impl CmId {
     /// the [`AsRawFd`]/[`AsFd`] descriptor to integrate
     /// connection setup with an event loop.
     pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
-        let fd = self.as_raw_fd();
+        let fd = self.as_fd();
         let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
             .map_err(|e| Error::ConnectionSetup(e.into()))?;
         let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);

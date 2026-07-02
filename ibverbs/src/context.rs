@@ -157,7 +157,8 @@ impl Context {
     /// [`poll_async_event`](Self::poll_async_event) reports an empty event queue instead of
     /// blocking.
     fn set_async_fd_nonblocking(&self) -> Result<()> {
-        let fd = unsafe { (*self.inner.ctx).async_fd };
+        // SAFETY: the context owns this fd, and the borrow ends within this call.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.ctx).async_fd) };
         let flags =
             nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(|e| Error::OpenDevice(e.into()))?;
         let arg = nix::fcntl::FcntlArg::F_SETFL(
