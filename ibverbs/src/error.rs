@@ -1,5 +1,10 @@
 use std::io;
 
+use crate::qp::{QueuePairAttributeMask, QueuePairState};
+
+#[cfg(feature = "rdmacm")]
+use crate::rdmacm::CmEventType;
+
 #[cfg(doc)]
 use crate::QueuePair;
 
@@ -112,12 +117,12 @@ pub enum Error {
     ///
     /// Surfaced by [`QueuePair::modify`] when the device rejects the transition and the crate's
     /// state-table check confirms that `current -> next` is not allowed.
-    #[error("invalid queue pair state transition from {current:?} to {next:?}")]
+    #[error("invalid queue pair state transition from {current} to {next}")]
     InvalidQueuePairTransition {
         /// The queue pair's current state.
-        current: ffi::ibv_qp_state,
+        current: QueuePairState,
         /// The requested next state.
-        next: ffi::ibv_qp_state,
+        next: QueuePairState,
     },
 
     /// A queue-pair state transition was rejected because its attribute mask was wrong.
@@ -125,18 +130,18 @@ pub enum Error {
     /// Surfaced by [`QueuePair::modify`]: `invalid` are bits that were set but are not allowed for
     /// the transition, and `needed` are bits that the transition requires but that were not set.
     #[error(
-        "invalid attribute mask for queue pair transition from {current:?} to {next:?}: \
+        "invalid attribute mask for queue pair transition from {current} to {next}: \
          disallowed bits {invalid:?}, missing required bits {needed:?}"
     )]
     InvalidQueuePairAttributeMask {
         /// The queue pair's current state.
-        current: ffi::ibv_qp_state,
+        current: QueuePairState,
         /// The requested next state.
-        next: ffi::ibv_qp_state,
+        next: QueuePairState,
         /// Attribute bits that were set but are not allowed for this transition.
-        invalid: ffi::ibv_qp_attr_mask,
+        invalid: QueuePairAttributeMask,
         /// Attribute bits that the transition requires but that were not set.
-        needed: ffi::ibv_qp_attr_mask,
+        needed: QueuePairAttributeMask,
     },
 
     /// Querying queue pair attributes failed (`ibv_query_qp`).
@@ -166,7 +171,7 @@ pub enum Error {
     /// The connection manager reported a failure event.
     #[cfg(feature = "rdmacm")]
     #[error("the connection manager reported {0:?}")]
-    ConnectionManager(ffi::rdma_cm_event_type),
+    ConnectionManager(CmEventType),
 
     /// Binding a connection-manager identifier to a local address failed (`rdma_bind_addr`).
     #[cfg(feature = "rdmacm")]

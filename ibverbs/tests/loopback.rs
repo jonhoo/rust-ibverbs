@@ -10,9 +10,9 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    ibv_access_flags, ibv_advise_mr_advice, ibv_create_cq_wc_flags, ibv_port_state,
-    ibv_qp_attr_mask, ibv_qp_state, ibv_qp_type, ibv_transport_type, AddressHandleAttribute,
-    CompletionQueue, Context, Error, ProtectionDomain, QueuePair, QueuePairAttribute, RecvRequest,
+    AccessFlags, AddressHandleAttribute, CompletionQueue, Context, Error, MrAdvice, MrAdviseFlags,
+    PortState, ProtectionDomain, QueuePair, QueuePairAttribute, QueuePairAttributeMask,
+    QueuePairState, QueuePairType, RecvRequest, TransportType, WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -43,7 +43,7 @@ fn open_test_device() -> Context {
 
 /// Build a self-connected queue pair of the given type, with generous queue/SGE limits and remote
 /// access so the tests can post batches, multi-SGE lists, and one-sided operations.
-fn loopback_of(qp_type: ibv_qp_type) -> Loopback {
+fn loopback_of(qp_type: QueuePairType) -> Loopback {
     let ctx = open_test_device();
     let cq = ctx
         .create_cq(64)
@@ -54,7 +54,7 @@ fn loopback_of(qp_type: ibv_qp_type) -> Loopback {
         .expect("failed to allocate protection domain");
 
     let mut builder = pd
-        .create_qp(&cq, &cq, qp_type)
+        .create_qp(&cq, &cq, qp_type, 1)
         .expect("failed to create queue pair");
     builder
         .set_gid_index(1)
@@ -64,12 +64,12 @@ fn loopback_of(qp_type: ibv_qp_type) -> Loopback {
         .set_max_recv_sge(4);
     // One-sided ops loop back to this same QP, so it must grant remote access (RC/UC only). RC also
     // serves the atomic loopback, which additionally requires remote-atomic access.
-    if qp_type == ibv_qp_type::IBV_QPT_RC {
+    if qp_type == QueuePairType::ReliableConnection {
         builder.set_access(
-            ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-                | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-                | ibv_access_flags::IBV_ACCESS_REMOTE_READ
-                | ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC,
+            AccessFlags::LOCAL_WRITE
+                | AccessFlags::REMOTE_WRITE
+                | AccessFlags::REMOTE_READ
+                | AccessFlags::REMOTE_ATOMIC,
         );
     } else {
         builder.allow_remote_rw();
@@ -86,7 +86,7 @@ fn loopback_of(qp_type: ibv_qp_type) -> Loopback {
 
 /// A reliable-connected self-loopback queue pair (the common case).
 fn loopback() -> Loopback {
-    loopback_of(ibv_qp_type::IBV_QPT_RC)
+    loopback_of(QueuePairType::ReliableConnection)
 }
 
 /// Build a reliable-connected self-loopback queue pair on a caller-provided protection domain and
@@ -94,7 +94,7 @@ fn loopback() -> Loopback {
 /// test a completion channel shared across queues.
 fn loopback_on(pd: &ProtectionDomain, cq: &CompletionQueue) -> QueuePair {
     let mut builder = pd
-        .create_qp(cq, cq, ibv_qp_type::IBV_QPT_RC)
+        .create_qp(cq, cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create queue pair");
     builder
         .set_gid_index(1)
@@ -183,8 +183,14 @@ fn gid_table() {
 fn send_recv() {
     let mut lb = loopback();
 
-    let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
-    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
+    let mut recv = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..5].copy_from_slice(b"hello");
 
     unsafe { lb.qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
@@ -209,8 +215,14 @@ fn send_recv_large() {
     let mut lb = loopback();
 
     const LEN: usize = 4096;
-    let recv = lb.pd.allocate(LEN).expect("failed to register recv MR");
-    let mut send = lb.pd.allocate(LEN).expect("failed to register send MR");
+    let recv = lb
+        .pd
+        .allocate(LEN, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = lb
+        .pd
+        .allocate(LEN, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     for (i, b) in send.bytes_mut().iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
@@ -234,8 +246,14 @@ fn send_recv_large() {
 fn scatter_gather() {
     let mut lb = loopback();
 
-    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
-    let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
+    let mut send = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    let mut recv = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
     send.bytes_mut()[0..4].copy_from_slice(b"AAAA");
     send.bytes_mut()[16..20].copy_from_slice(b"BBBB");
 
@@ -264,8 +282,14 @@ fn scatter_gather() {
 fn rdma_write() {
     let mut lb = loopback();
 
-    let mut src = lb.pd.allocate(64).expect("failed to register src MR");
-    let mut dst = lb.pd.allocate(64).expect("failed to register dst MR");
+    let mut src = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register src MR");
+    let mut dst = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register dst MR");
     src.bytes_mut()[..6].copy_from_slice(b"verbs!");
 
     let remote = dst.remote().slice(..6);
@@ -283,9 +307,18 @@ fn rdma_write() {
 fn rdma_write_with_imm() {
     let mut lb = loopback();
 
-    let mut src = lb.pd.allocate(64).expect("failed to register src MR");
-    let mut dst = lb.pd.allocate(64).expect("failed to register dst MR");
-    let dummy = lb.pd.allocate(64).expect("failed to register dummy MR");
+    let mut src = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register src MR");
+    let mut dst = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register dst MR");
+    let dummy = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register dummy MR");
     src.bytes_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
 
     // A write-with-immediate consumes a receive work request on the target queue pair.
@@ -311,8 +344,14 @@ fn rdma_write_with_imm() {
 fn rdma_read() {
     let mut lb = loopback();
 
-    let mut remote_mr = lb.pd.allocate(64).expect("failed to register remote MR");
-    let mut local = lb.pd.allocate(64).expect("failed to register local MR");
+    let mut remote_mr = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register remote MR");
+    let mut local = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register local MR");
     remote_mr.bytes_mut()[..8].copy_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
 
     let remote = remote_mr.remote().slice(..8);
@@ -330,10 +369,22 @@ fn rdma_read() {
 fn batched_post() {
     let mut lb = loopback();
 
-    let mut payload = lb.pd.allocate(64).expect("failed to register payload MR");
-    let mut dst = lb.pd.allocate(64).expect("failed to register dst MR");
-    let mut note = lb.pd.allocate(64).expect("failed to register note MR");
-    let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
+    let mut payload = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register payload MR");
+    let mut dst = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register dst MR");
+    let mut note = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register note MR");
+    let mut recv = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
     payload.bytes_mut()[..3].copy_from_slice(&[42, 43, 44]);
     note.bytes_mut()[..2].copy_from_slice(&[1, 2]);
 
@@ -344,8 +395,8 @@ fn batched_post() {
     let remote = dst.remote().slice(..3);
     unsafe {
         let mut batch = lb.qp.start_send();
-        batch.write(101, &payload_sge, remote);
-        batch.signaled().send(102, &note_sge);
+        batch.op().write(101, &payload_sge, remote);
+        batch.op().signaled().send(102, &note_sge);
         batch.submit()
     }
     .expect("batched post failed");
@@ -375,13 +426,19 @@ fn multiple_outstanding() {
     // Keep the memory regions alive until their work requests complete.
     let mut recv_mrs = Vec::new();
     for i in 0..N {
-        let mr = lb.pd.allocate(8).expect("failed to register recv MR");
+        let mr = lb
+            .pd
+            .allocate(8, AccessFlags::PERMISSIVE)
+            .expect("failed to register recv MR");
         unsafe { lb.qp.post_receive(&[mr.slice(..8)], 1000 + i) }.expect("post_receive failed");
         recv_mrs.push(mr);
     }
     let mut send_mrs = Vec::new();
     for i in 0..N {
-        let mut mr = lb.pd.allocate(8).expect("failed to register send MR");
+        let mut mr = lb
+            .pd
+            .allocate(8, AccessFlags::PERMISSIVE)
+            .expect("failed to register send MR");
         mr.bytes_mut()[0] = i as u8;
         unsafe { lb.qp.post_send(&[mr.slice(..8)], i) }.expect("post_send failed");
         send_mrs.push(mr);
@@ -422,8 +479,12 @@ fn wait_for_completion() {
         .expect("failed to allocate protection domain");
     let mut qp = loopback_on(&pd, &cq);
 
-    let mut recv = pd.allocate(16).expect("failed to register recv MR");
-    let mut send = pd.allocate(16).expect("failed to register send MR");
+    let mut recv = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..4].copy_from_slice(b"wait");
 
     unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
@@ -460,10 +521,16 @@ fn wait_for_completion() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn unreliable_connection() {
-    let mut lb = loopback_of(ibv_qp_type::IBV_QPT_UC);
+    let mut lb = loopback_of(QueuePairType::UnreliableConnection);
 
-    let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
-    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
+    let mut recv = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..3].copy_from_slice(b"ucq");
 
     unsafe { lb.qp.post_receive(&[recv.slice(..3)], 1) }.expect("post_receive failed");
@@ -493,7 +560,7 @@ fn shared_receive_queue() {
     let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
 
     let prepared = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create QP")
         .set_gid_index(1)
         .set_srq(&srq)
@@ -502,8 +569,12 @@ fn shared_receive_queue() {
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to connect QP");
 
-    let mut recv = pd.allocate(64).expect("failed to register recv MR");
-    let mut send = pd.allocate(64).expect("failed to register send MR");
+    let mut recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..4].copy_from_slice(b"srq!");
 
     // Receives go to the SRQ, not the queue pair's own receive queue.
@@ -535,7 +606,7 @@ fn unreliable_datagram() {
     const QKEY: u32 = 0x1234_5678;
 
     let prepared = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_UD)
+        .create_qp(&cq, &cq, QueuePairType::UnreliableDatagram, 1)
         .expect("failed to create UD QP")
         .set_gid_index(GID_INDEX)
         .build()
@@ -555,8 +626,12 @@ fn unreliable_datagram() {
 
     let payload = b"datagram";
     // UD receives prepend a 40-byte GRH, so the receive buffer must allow for it.
-    let mut recv = pd.allocate(40 + 64).expect("failed to register recv MR");
-    let mut send = pd.allocate(64).expect("failed to register send MR");
+    let mut recv = pd
+        .allocate(40 + 64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..payload.len()].copy_from_slice(payload);
 
     unsafe { qp.post_receive(&[recv.slice(..40 + payload.len())], 1) }
@@ -591,8 +666,14 @@ fn unreliable_datagram() {
 fn atomic_operations() {
     let mut lb = loopback();
 
-    let mut target = lb.pd.allocate(8).expect("failed to register target MR");
-    let mut local = lb.pd.allocate(8).expect("failed to register local MR");
+    let mut target = lb
+        .pd
+        .allocate(8, AccessFlags::PERMISSIVE)
+        .expect("failed to register target MR");
+    let mut local = lb
+        .pd
+        .allocate(8, AccessFlags::PERMISSIVE)
+        .expect("failed to register local MR");
 
     // The compare matches the zeroed target, so the swap takes effect and the original value (0) is
     // returned into `local`.
@@ -602,7 +683,10 @@ fn atomic_operations() {
         let remote = target.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
-            batch.signaled().atomic_cmp_swap(1, &sg, remote, 0, swapped);
+            batch
+                .op()
+                .signaled()
+                .atomic_cmp_swap(1, &sg, remote, 0, swapped);
             batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
@@ -621,7 +705,7 @@ fn atomic_operations() {
         let remote = target.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
-            batch.signaled().atomic_cmp_swap(2, &sg, remote, 0, 0);
+            batch.op().signaled().atomic_cmp_swap(2, &sg, remote, 0, 0);
             batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
@@ -639,13 +723,16 @@ fn atomic_operations() {
     );
 
     // Fetch-and-add on a fresh zeroed counter returns the old value and adds in place.
-    let mut counter = lb.pd.allocate(8).expect("failed to register counter MR");
+    let mut counter = lb
+        .pd
+        .allocate(8, AccessFlags::PERMISSIVE)
+        .expect("failed to register counter MR");
     {
         let sg = [local.slice(..)];
         let remote = counter.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
-            batch.signaled().atomic_fetch_add(3, &sg, remote, 5);
+            batch.op().signaled().atomic_fetch_add(3, &sg, remote, 5);
             batch.submit()
         }
         .expect("post atomic_fetch_add failed");
@@ -670,14 +757,16 @@ fn atomic_operations() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn advise_mr() {
     let lb = loopback();
-    let mr = lb.pd.allocate(4096).expect("failed to register MR");
+    let mr = lb
+        .pd
+        .allocate(4096, AccessFlags::PERMISSIVE)
+        .expect("failed to register MR");
     let sg = [mr.slice(..)];
 
-    match lb.pd.advise_mr(
-        ibv_advise_mr_advice::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
-        0,
-        &sg,
-    ) {
+    match lb
+        .pd
+        .advise_mr(MrAdvice::Prefetch, MrAdviseFlags::empty(), &sg)
+    {
         // Either the device prefetched, or it does not implement advise_mr / on-demand paging.
         Ok(()) => {}
         Err(ibverbs::Error::Unsupported) => {}
@@ -698,7 +787,7 @@ fn register_from_raw() {
 
     // SAFETY: both buffers outlive their regions (they are declared first, so dropped last) and are
     // never moved or resized while registered.
-    let access = ibverbs::DEFAULT_ACCESS_FLAGS;
+    let access = AccessFlags::PERMISSIVE;
     let send_mr = unsafe {
         lb.pd
             .register_from_raw(send_buf.as_mut_ptr(), send_buf.len(), access)
@@ -726,10 +815,22 @@ fn register_from_raw() {
 fn batched_recv() {
     let mut lb = loopback();
 
-    let recv_a = lb.pd.allocate(64).expect("failed to register recv MR a");
-    let recv_b = lb.pd.allocate(64).expect("failed to register recv MR b");
-    let mut send_a = lb.pd.allocate(64).expect("failed to register send MR a");
-    let mut send_b = lb.pd.allocate(64).expect("failed to register send MR b");
+    let recv_a = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR a");
+    let recv_b = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR b");
+    let mut send_a = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR a");
+    let mut send_b = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR b");
     send_a.bytes_mut()[..3].copy_from_slice(b"one");
     send_b.bytes_mut()[..3].copy_from_slice(b"two");
 
@@ -763,8 +864,14 @@ fn batched_recv() {
 fn send_flags() {
     let mut lb = loopback();
 
-    let recv = lb.pd.allocate(64).expect("failed to register recv MR");
-    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
+    let recv = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..4].copy_from_slice(b"flag");
 
     let sg = [recv.slice(..4)];
@@ -776,9 +883,13 @@ fn send_flags() {
 
     let mut batch = lb.qp.start_send();
     // Fenced: ordered after any prior reads/atomics on this queue pair.
-    batch.signaled().fenced().send(10, &[send.slice(..4)]);
+    batch.op().signaled().fenced().send(10, &[send.slice(..4)]);
     // Solicited: raises a solicited event on the receiver.
-    batch.signaled().solicited().send(11, &[send.slice(..4)]);
+    batch
+        .op()
+        .signaled()
+        .solicited()
+        .send(11, &[send.slice(..4)]);
     unsafe { batch.submit() }.expect("submit failed");
 
     let comps = drain(&lb.cq, 4);
@@ -821,10 +932,7 @@ fn query_device_and_port() {
     );
     // `open_test_device` only succeeds on an active port, so the typed state reflects that, and the
     // remaining typed accessors decode without panicking.
-    assert!(matches!(
-        port.state(),
-        ibv_port_state::IBV_PORT_ACTIVE | ibv_port_state::IBV_PORT_ARMED
-    ));
+    assert!(matches!(port.state(), PortState::Active | PortState::Armed));
     let _ = port.active_mtu();
     let _ = port.active_speed();
     let _ = port.active_width();
@@ -859,7 +967,9 @@ fn raw_handles() {
     // The plain and extended views are the same underlying completion queue.
     assert_eq!(cq.as_raw() as *const (), cq.as_raw_ex() as *const ());
 
-    let mr = pd.allocate(64).expect("failed to register MR");
+    let mr = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register MR");
     assert!(!mr.as_raw().is_null());
     assert_eq!(mr.lkey(), mr.slice(..).lkey());
 
@@ -868,7 +978,7 @@ fn raw_handles() {
 
     // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
     let prepared = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_UD)
+        .create_qp(&cq, &cq, QueuePairType::UnreliableDatagram, 1)
         .expect("failed to create UD QP")
         .set_gid_index(1)
         .build()
@@ -897,22 +1007,22 @@ fn inline_send() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create RC QP");
     builder.set_gid_index(1).set_max_inline_data(64).set_access(
-        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
 
     // Inline SEND: the payload lives only in this stack array, never in a registered MR.
-    let recv = pd.allocate(64).expect("failed to register recv MR");
+    let recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
     unsafe { qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
     let mut batch = qp.start_send();
-    batch.signaled().send_inline(2, b"inrun");
+    batch.op().signaled().send_inline(2, b"inrun");
     unsafe { batch.submit() }.expect("inline send submit failed");
     let comps = drain(&cq, 2);
     assert!(comps.iter().any(|c| c.wr_id() == 1), "missing recv");
@@ -920,10 +1030,12 @@ fn inline_send() {
     assert_eq!(&recv.bytes()[..5], b"inrun");
 
     // Inline RDMA WRITE into a remote region.
-    let dst = pd.allocate(64).expect("failed to register dst MR");
+    let dst = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register dst MR");
     let remote = dst.remote().slice(..4);
     let mut batch = qp.start_send();
-    batch.signaled().write_inline(3, b"wxyz", remote);
+    batch.op().signaled().write_inline(3, b"wxyz", remote);
     unsafe { batch.submit() }.expect("inline write submit failed");
     let comps = drain(&cq, 1);
     assert_eq!(comps[0].wr_id(), 3);
@@ -940,19 +1052,21 @@ fn queue_pair_on_explicit_port() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
-        .create_qp_on_port(&cq, &cq, ibv_qp_type::IBV_QPT_RC, 1)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create QP on port 1");
     builder.set_gid_index(1).set_access(
-        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
 
-    let recv = pd.allocate(64).expect("failed to register recv MR");
-    let mut send = pd.allocate(64).expect("failed to register send MR");
+    let recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..4].copy_from_slice(b"port");
 
     unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
@@ -983,7 +1097,7 @@ fn completion_timestamps() {
 
     let cq = match ctx
         .create_cq(16)
-        .set_wc_flags(ibv_create_cq_wc_flags::IBV_WC_EX_WITH_COMPLETION_TIMESTAMP)
+        .set_wc_flags(WcFields::COMPLETION_TIMESTAMP)
         .build()
     {
         Ok(cq) => cq,
@@ -995,19 +1109,21 @@ fn completion_timestamps() {
     };
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut builder = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create QP");
     builder.set_gid_index(1).set_access(
-        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
 
-    let recv = pd.allocate(64).expect("failed to register recv MR");
-    let mut send = pd.allocate(64).expect("failed to register send MR");
+    let recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..4].copy_from_slice(b"time");
     unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
     unsafe { qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
@@ -1040,11 +1156,7 @@ fn extended_wc_fields() {
 
     let cq = match ctx
         .create_cq(16)
-        .set_wc_flags(
-            ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID
-                | ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL
-                | ibv_create_cq_wc_flags::IBV_WC_EX_WITH_DLID_PATH_BITS,
-        )
+        .set_wc_flags(WcFields::SLID | WcFields::SL | WcFields::DLID_PATH_BITS)
         .build()
     {
         Ok(cq) => cq,
@@ -1057,19 +1169,21 @@ fn extended_wc_fields() {
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut builder = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create QP");
     builder.set_gid_index(1).set_access(
-        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
 
-    let recv = pd.allocate(64).expect("failed to register recv MR");
-    let mut send = pd.allocate(64).expect("failed to register send MR");
+    let recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..4].copy_from_slice(b"wcfl");
     unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
     unsafe { qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
@@ -1127,8 +1241,12 @@ fn event_driven_completion() {
         .expect("failed to allocate protection domain");
     let mut qp = loopback_on(&pd, &cq);
 
-    let mut recv = pd.allocate(64).expect("failed to register recv MR");
-    let mut send = pd.allocate(64).expect("failed to register send MR");
+    let mut recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
     send.bytes_mut()[..5].copy_from_slice(b"hello");
 
     // Arm the queue before posting so the completions raise a notification on the descriptor.
@@ -1180,10 +1298,7 @@ fn gid_and_device_introspection() {
         _ => devices.iter().next().expect("no RDMA device available"),
     };
     // RoCE (including Soft-RoCE) presents the InfiniBand transport.
-    assert_eq!(
-        device.transport_type(),
-        ibv_transport_type::IBV_TRANSPORT_IB
-    );
+    assert_eq!(device.transport_type(), TransportType::Ib);
 
     let ctx = device.open().expect("failed to open the RDMA device");
 
@@ -1216,37 +1331,37 @@ fn modify_and_query_queue_pair() {
 
     // Query the attributes the handshake negotiated. Because the queue pair is connected to its own
     // endpoint, its destination QP number is its own.
-    let mask = ibv_qp_attr_mask::IBV_QP_STATE
-        | ibv_qp_attr_mask::IBV_QP_CUR_STATE
-        | ibv_qp_attr_mask::IBV_QP_DEST_QPN
-        | ibv_qp_attr_mask::IBV_QP_SQ_PSN;
+    let mask = QueuePairAttributeMask::STATE
+        | QueuePairAttributeMask::CUR_STATE
+        | QueuePairAttributeMask::DEST_QPN
+        | QueuePairAttributeMask::SQ_PSN;
     let (attr, init) = lb.qp.query(mask).expect("failed to query the queue pair");
-    assert_eq!(attr.state(), ibv_qp_state::IBV_QPS_RTS);
+    assert_eq!(attr.state(), QueuePairState::ReadyToSend);
     assert_eq!(attr.dest_qp_num(), lb.qp.qp_num());
     assert!(init.max_send_wr() >= 16);
 
     // An illegal transition (RTS -> INIT) is reported precisely.
     let mut to_init = QueuePairAttribute::new();
-    to_init.set_state(ibv_qp_state::IBV_QPS_INIT);
+    to_init.set_state(QueuePairState::Init);
     match lb.qp.modify(&to_init) {
         Err(Error::InvalidQueuePairTransition { current, next }) => {
-            assert_eq!(current, ibv_qp_state::IBV_QPS_RTS);
-            assert_eq!(next, ibv_qp_state::IBV_QPS_INIT);
+            assert_eq!(current, QueuePairState::ReadyToSend);
+            assert_eq!(next, QueuePairState::Init);
         }
         other => panic!("expected InvalidQueuePairTransition, got {other:?}"),
     }
 
     // A legal transition (any state -> ERR) succeeds, and the change is visible to a later query.
     let mut to_err = QueuePairAttribute::new();
-    to_err.set_state(ibv_qp_state::IBV_QPS_ERR);
+    to_err.set_state(QueuePairState::Error);
     lb.qp
         .modify(&to_err)
         .expect("failed to move the queue pair to ERR");
     let (attr, _) = lb
         .qp
-        .query(ibv_qp_attr_mask::IBV_QP_STATE)
+        .query(QueuePairAttributeMask::STATE)
         .expect("failed to re-query the queue pair");
-    assert_eq!(attr.state(), ibv_qp_state::IBV_QPS_ERR);
+    assert_eq!(attr.state(), QueuePairState::Error);
 }
 
 /// `into_queue_pair` plus `modify` lets you drive a queue pair through its states by hand, the raw
@@ -1260,7 +1375,7 @@ fn manual_bringup_via_modify() {
 
     // Build a UD queue pair but do not activate it; take the still-RESET queue pair to drive by hand.
     let prepared = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_UD)
+        .create_qp(&cq, &cq, QueuePairType::UnreliableDatagram, 1)
         .expect("failed to create QP")
         .build()
         .expect("failed to build QP");
@@ -1270,7 +1385,7 @@ fn manual_bringup_via_modify() {
 
     // RESET -> INIT: associate the port, partition key, and Q_Key.
     let mut init = QueuePairAttribute::new();
-    init.set_state(ibv_qp_state::IBV_QPS_INIT)
+    init.set_state(QueuePairState::Init)
         .set_pkey_index(0)
         .set_port(1)
         .set_qkey(QKEY);
@@ -1278,19 +1393,19 @@ fn manual_bringup_via_modify() {
 
     // INIT -> RTR.
     let mut rtr = QueuePairAttribute::new();
-    rtr.set_state(ibv_qp_state::IBV_QPS_RTR);
+    rtr.set_state(QueuePairState::ReadyToReceive);
     qp.modify(&rtr).expect("INIT -> RTR failed");
 
     // RTR -> RTS.
     let mut rts = QueuePairAttribute::new();
-    rts.set_state(ibv_qp_state::IBV_QPS_RTS).set_sq_psn(0);
+    rts.set_state(QueuePairState::ReadyToSend).set_sq_psn(0);
     qp.modify(&rts).expect("RTR -> RTS failed");
 
     // The hand-driven queue pair reached RTS with the Q_Key we set.
     let (attr, _) = qp
-        .query(ibv_qp_attr_mask::IBV_QP_STATE | ibv_qp_attr_mask::IBV_QP_QKEY)
+        .query(QueuePairAttributeMask::STATE | QueuePairAttributeMask::QKEY)
         .expect("query failed");
-    assert_eq!(attr.state(), ibv_qp_state::IBV_QPS_RTS);
+    assert_eq!(attr.state(), QueuePairState::ReadyToSend);
     assert_eq!(attr.qkey(), QKEY);
 }
 
@@ -1306,19 +1421,19 @@ fn inline_send_list() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create RC QP");
     builder.set_gid_index(1).set_max_inline_data(64).set_access(
-        ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-            | ibv_access_flags::IBV_ACCESS_REMOTE_READ,
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
 
     // Gathered inline SEND: the payload is assembled from three separate stack buffers.
-    let recv = pd.allocate(64).expect("failed to register recv MR");
+    let recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
     unsafe { qp.post_receive(&[recv.slice(..9)], 1) }.expect("post_receive failed");
     let bufs = [
         IoSlice::new(b"ab"),
@@ -1326,7 +1441,7 @@ fn inline_send_list() {
         IoSlice::new(b"fghi"),
     ];
     let mut batch = qp.start_send();
-    batch.signaled().send_inline_list(2, &bufs);
+    batch.op().signaled().send_inline_list(2, &bufs);
     unsafe { batch.submit() }.expect("inline send-list submit failed");
     let comps = drain(&cq, 2);
     let recv_len = comps
@@ -1350,11 +1465,13 @@ fn inline_send_list() {
     assert_eq!(&recv.bytes()[..9], b"abcdefghi");
 
     // Gathered inline RDMA WRITE into a remote region.
-    let dst = pd.allocate(64).expect("failed to register dst MR");
+    let dst = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register dst MR");
     let remote = dst.remote().slice(..6);
     let parts = [IoSlice::new(b"uvw"), IoSlice::new(b"xyz")];
     let mut batch = qp.start_send();
-    batch.signaled().write_inline_list(3, &parts, remote);
+    batch.op().signaled().write_inline_list(3, &parts, remote);
     unsafe { batch.submit() }.expect("inline write-list submit failed");
     let comps = drain(&cq, 1);
     assert_eq!(comps[0].wr_id(), 3);
@@ -1466,10 +1583,10 @@ fn shared_completion_channel() {
     let mut qp_a = loopback_on(&pd, &cq_a);
     let mut qp_b = loopback_on(&pd, &cq_b);
 
-    let mut recv_a = pd.allocate(16).expect("recv a");
-    let mut recv_b = pd.allocate(16).expect("recv b");
-    let mut send_a = pd.allocate(16).expect("send a");
-    let mut send_b = pd.allocate(16).expect("send b");
+    let mut recv_a = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv a");
+    let mut recv_b = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv b");
+    let mut send_a = pd.allocate(16, AccessFlags::PERMISSIVE).expect("send a");
+    let mut send_b = pd.allocate(16, AccessFlags::PERMISSIVE).expect("send b");
     send_a.bytes_mut()[..4].copy_from_slice(b"aaaa");
     send_b.bytes_mut()[..4].copy_from_slice(b"bbbb");
 
@@ -1544,7 +1661,7 @@ fn roce_route_failure_diagnostic() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let prepared = pd
-        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("failed to create QP")
         .set_gid_index(1)
         .build()

@@ -29,7 +29,7 @@
 //!
 //! // On RoCE, routing needs a GID; pick the index of a suitable entry in `ctx.gid_table()?`.
 //! let prepared = pd
-//!     .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)?
+//!     .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)?
 //!     .set_gid_index(1)
 //!     .build()?;
 //!
@@ -41,8 +41,8 @@
 //!
 //! // Register memory with the device and post work requests: a receive, and a send that loops
 //! // back into it.
-//! let mut recv = pd.allocate(4096)?;
-//! let mut send = pd.allocate(4096)?;
+//! let mut recv = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
+//! let mut send = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
 //! send.bytes_mut()[..5].copy_from_slice(b"hello");
 //! unsafe { qp.post_receive(&[recv.slice(..)], /* wr_id */ 1) }?;
 //! unsafe { qp.post_send(&[send.slice(..5)], /* wr_id */ 2) }?;
@@ -94,7 +94,7 @@
 //! `Sync` where that holds. Handles like [`Context`], [`ProtectionDomain`], and
 //! [`CompletionQueue`] can be shared freely across threads. Operations whose verbs contracts are
 //! per-caller are encoded in the types instead: posting work requests takes `&mut QueuePair`
-//! (wrap the queue pair in a lock to post from several threads), a [`PostBatch`] borrows its
+//! (wrap the queue pair in a lock to post from several threads), a [`SendBatch`] borrows its
 //! queue pair until submitted, and the views handed out during a poll ([`Completions`],
 //! [`WorkCompletion`]) borrow the queue and cannot outlive or escape it.
 //!
@@ -140,6 +140,102 @@
 // avoid warnings about RDMAmojo, iWARP, InfiniBand, etc. not being in backticks
 #![allow(clippy::doc_markdown)]
 
+/// Implements the shared surface of the crate's flag newtypes: associated constants for each
+/// known flag, `empty`/`contains`, the bit operators, a `Debug` that lists the names of the set
+/// flags, and lossless conversions to and from the corresponding raw ffi bitfield type.
+macro_rules! flags_newtype {
+    (
+        $(#[$meta:meta])*
+        $vis:vis struct $name:ident($ffi:ty) {
+            $( $(#[$cmeta:meta])* $cname:ident = $fconst:ident; )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+        $vis struct $name(pub(crate) u32);
+
+        impl $name {
+            $(
+                $(#[$cmeta])*
+                pub const $cname: $name = $name(<$ffi>::$fconst.0);
+            )+
+
+            /// No flags set.
+            #[must_use]
+            pub const fn empty() -> Self {
+                $name(0)
+            }
+
+            /// Whether every flag set in `other` is also set in `self`.
+            #[must_use]
+            pub const fn contains(self, other: Self) -> bool {
+                self.0 & other.0 == other.0
+            }
+        }
+
+        impl ::std::ops::BitOr for $name {
+            type Output = Self;
+            fn bitor(self, rhs: Self) -> Self {
+                $name(self.0 | rhs.0)
+            }
+        }
+
+        impl ::std::ops::BitOrAssign for $name {
+            fn bitor_assign(&mut self, rhs: Self) {
+                self.0 |= rhs.0;
+            }
+        }
+
+        impl ::std::ops::BitAnd for $name {
+            type Output = Self;
+            fn bitand(self, rhs: Self) -> Self {
+                $name(self.0 & rhs.0)
+            }
+        }
+
+        impl ::std::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.write_str(concat!(stringify!($name), "("))?;
+                let mut rest = self.0;
+                let mut first = true;
+                $(
+                    if $name::$cname.0 != 0 && rest & $name::$cname.0 == $name::$cname.0 {
+                        if !first {
+                            f.write_str(" | ")?;
+                        }
+                        f.write_str(stringify!($cname))?;
+                        first = false;
+                        rest &= !$name::$cname.0;
+                    }
+                )+
+                if rest != 0 {
+                    if !first {
+                        f.write_str(" | ")?;
+                    }
+                    write!(f, "{rest:#x}")?;
+                    first = false;
+                }
+                if first {
+                    f.write_str("0")?;
+                }
+                f.write_str(")")
+            }
+        }
+
+        impl From<$ffi> for $name {
+            fn from(raw: $ffi) -> Self {
+                $name(raw.0)
+            }
+        }
+
+        impl From<$name> for $ffi {
+            fn from(flags: $name) -> Self {
+                Self(flags.0)
+            }
+        }
+    };
+}
+
 mod address;
 mod completion;
 mod context;
@@ -175,41 +271,3 @@ pub mod rdmacm;
 /// not cover — without adding a separate dependency on `ibverbs-sys` and keeping its version in
 /// sync.
 pub use ffi;
-
-pub use ffi::ibv_gid_type;
-pub use ffi::ibv_mtu;
-pub use ffi::ibv_port_state;
-pub use ffi::ibv_qp_attr_mask;
-pub use ffi::ibv_qp_state;
-pub use ffi::ibv_qp_type;
-pub use ffi::ibv_send_wr;
-pub use ffi::ibv_transport_type;
-pub use ffi::ibv_wc;
-pub use ffi::ibv_wc_flags;
-pub use ffi::ibv_wc_opcode;
-pub use ffi::ibv_wc_status;
-
-/// Optional work-completion fields to request via [`CompletionQueueBuilder::set_wc_flags`].
-pub use ffi::ibv_create_cq_wc_flags;
-
-/// The raw device-wide attributes wrapped by [`DeviceAttr`] (returned by [`Context::query_device`]).
-pub use ffi::ibv_device_attr;
-/// The raw per-port attributes wrapped by [`PortAttr`] (returned by [`Context::query_port`]).
-pub use ffi::ibv_port_attr;
-
-/// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
-pub use ffi::ib_uverbs_advise_mr_advice as ibv_advise_mr_advice;
-/// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
-pub use ffi::ib_uverbs_advise_mr_flag as ibv_advise_mr_flags;
-
-/// Access flags for use with `QueuePair` and `MemoryRegion`.
-pub use ffi::ibv_access_flags;
-
-/// Default access flags.
-pub const DEFAULT_ACCESS_FLAGS: ffi::ibv_access_flags = ffi::ibv_access_flags(
-    ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE.0
-        | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE.0
-        | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ.0
-        | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_ATOMIC.0
-        | ffi::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING.0,
-);

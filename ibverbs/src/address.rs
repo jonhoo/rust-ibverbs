@@ -7,13 +7,11 @@ use std::sync::Arc;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-use ffi::ibv_gid_type;
-
 use crate::pd::ProtectionDomainInner;
 use crate::PORT_NUM;
 
 #[cfg(doc)]
-use crate::{ProtectionDomain, QueuePair, QueuePairBuilder};
+use crate::{Context, ProtectionDomain, QueuePair, QueuePairBuilder};
 
 /// A Global identifier (GID) for an RDMA device port.
 ///
@@ -133,7 +131,45 @@ impl AsMut<ffi::ibv_gid> for Gid {
     }
 }
 
-/// A Global identifier entry for ibv.
+/// The type of a GID table entry, deciding how packets sent from it are framed and routed.
+/// Carried by [`GidEntry::gid_type`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GidType {
+    /// An InfiniBand GID.
+    Ib,
+    /// A RoCE v1 GID (Ethernet framing, not routable across IP subnets).
+    RoceV1,
+    /// A RoCE v2 GID (UDP/IP framing, routable; mirrors an IP address of the interface).
+    RoceV2,
+    /// A value this crate does not recognize.
+    Unknown(u32),
+}
+
+impl GidType {
+    /// Decode the raw `ibv_gid_entry.gid_type` value.
+    fn from_raw(gid_type: u32) -> Self {
+        match gid_type {
+            0 => GidType::Ib,
+            1 => GidType::RoceV1,
+            2 => GidType::RoceV2,
+            other => GidType::Unknown(other),
+        }
+    }
+}
+
+impl fmt::Display for GidType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            GidType::Ib => f.write_str("IB"),
+            GidType::RoceV1 => f.write_str("RoCE v1"),
+            GidType::RoceV2 => f.write_str("RoCE v2"),
+            GidType::Unknown(raw) => write!(f, "unknown ({raw})"),
+        }
+    }
+}
+
+/// A GID table entry. Returned by [`Context::gid_table`].
 ///
 /// This struct acts as a rust wrapper for `ffi::ibv_gid_entry`. We use it instead of
 /// `ffi::ibv_gid_entry` because `ffi::ibv_gid` is wrapped by `Gid`.
@@ -145,8 +181,8 @@ pub struct GidEntry {
     pub gid_index: u32,
     /// The port number that this GID belongs to.
     pub port_num: u32,
-    /// enum ibv_gid_type, can be one of IBV_GID_TYPE_IB, IBV_GID_TYPE_ROCE_V1 or IBV_GID_TYPE_ROCE_V2.
-    pub gid_type: ibv_gid_type,
+    /// The type of the GID (InfiniBand, RoCE v1, or RoCE v2).
+    pub gid_type: GidType,
     /// The interface index of the net device associated with this GID.
     ///
     /// It is 0 if there is no net device associated with it.
@@ -159,12 +195,7 @@ impl From<ffi::ibv_gid_entry> for GidEntry {
             gid: gid_entry.gid.into(),
             gid_index: gid_entry.gid_index,
             port_num: gid_entry.port_num,
-            gid_type: match gid_entry.gid_type {
-                0 => ibv_gid_type::IBV_GID_TYPE_IB,
-                1 => ibv_gid_type::IBV_GID_TYPE_ROCE_V1,
-                2 => ibv_gid_type::IBV_GID_TYPE_ROCE_V2,
-                x => panic!("unknown ibv_gid_type: {x}"),
-            },
+            gid_type: GidType::from_raw(gid_entry.gid_type),
             ndev_ifindex: gid_entry.ndev_ifindex,
         }
     }
@@ -246,6 +277,17 @@ mod test {
         assert_eq!(gid.to_string(), "::ffff:192.0.2.1");
         assert_eq!(gid.subnet_prefix(), 0);
         assert_eq!(gid.interface_id() >> 32, 0xffff);
+    }
+
+    #[test]
+    fn gid_type_decodes_raw_values() {
+        assert_eq!(GidType::from_raw(0), GidType::Ib);
+        assert_eq!(GidType::from_raw(1), GidType::RoceV1);
+        assert_eq!(GidType::from_raw(2), GidType::RoceV2);
+        // An unrecognized value is preserved rather than panicking.
+        assert_eq!(GidType::from_raw(7), GidType::Unknown(7));
+        assert_eq!(GidType::RoceV2.to_string(), "RoCE v2");
+        assert_eq!(GidType::Unknown(7).to_string(), "unknown (7)");
     }
 }
 

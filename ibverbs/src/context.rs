@@ -14,7 +14,7 @@ use crate::pd::{ProtectionDomain, ProtectionDomainInner};
 use crate::PORT_NUM;
 
 #[cfg(doc)]
-use crate::{ibv_device_attr, ibv_port_attr, QueuePairBuilder, WorkCompletion};
+use crate::{Device, QueuePairBuilder, WorkCompletion};
 
 pub(crate) struct ContextInner {
     pub(crate) ctx: *mut ffi::ibv_context,
@@ -87,7 +87,7 @@ impl Drop for ContextInner {
 unsafe impl Sync for ContextInner {}
 unsafe impl Send for ContextInner {}
 
-/// An RDMA context bound to a device.
+/// An RDMA context bound to a device. Created by [`Device::open`].
 ///
 /// Cloning is cheap (reference counted) and hands the same device context to another thread or
 /// owner; the context is closed once the last clone, and everything built from it, is dropped.
@@ -283,8 +283,8 @@ impl Context {
     /// The returned [`DeviceAttr`] reports device-wide limits such as the maximum number of queue
     /// pairs, completion queues, and memory regions, the maximum outstanding work requests and
     /// scatter/gather entries per queue, and the atomic capability. It dereferences to the raw
-    /// [`ibv_device_attr`], so every field is accessible. Query these before creating resources to
-    /// stay within what the device supports.
+    /// [`ffi::ibv_device_attr`], so every field is accessible. Query these before creating
+    /// resources to stay within what the device supports.
     ///
     /// # Errors
     ///
@@ -302,7 +302,7 @@ impl Context {
     /// (`ibv_query_device_ex`).
     ///
     /// The returned [`DeviceAttrEx`] carries everything [`query_device`](Self::query_device) does
-    /// (its [`orig`](DeviceAttrEx::orig) holds the base [`ibv_device_attr`]) plus the extended
+    /// (its [`orig`](DeviceAttrEx::orig) holds the base [`ffi::ibv_device_attr`]) plus the extended
     /// capabilities that the base query cannot report: the completion-timestamp mask, the HCA core
     /// clock, the PCI atomic capabilities, the packet-pacing (rate-limit) limits, the raw-packet
     /// capabilities, and the maximum device-memory size. Providers that do not implement the
@@ -327,9 +327,9 @@ impl Context {
     ///
     /// Ports are numbered from 1. The returned [`PortAttr`] reports the port's state, its active and
     /// maximum MTU, its LID, its link layer, and its GID- and pkey-table lengths, with typed
-    /// accessors for the speed, width, link layer, and physical state; it dereferences to the raw
-    /// [`ibv_port_attr`] for everything else. Unlike the check performed when a context is opened,
-    /// this returns the attributes regardless of the port state.
+    /// accessors for the state, MTU, speed, width, link layer, and physical state; it dereferences
+    /// to the raw [`ffi::ibv_port_attr`] for everything else. Unlike the check performed when a
+    /// context is opened, this returns the attributes regardless of the port state.
     ///
     /// Port attributes are not constant (the subnet manager or the hardware may change them), so
     /// avoid caching the result for long.
@@ -383,6 +383,126 @@ impl Context {
             values.raw_clock.tv_sec as u64,
             values.raw_clock.tv_nsec as u32,
         ))
+    }
+}
+
+/// A path or port MTU (maximum transfer unit), the message fragment size on the wire.
+///
+/// Returned by [`PortAttr::active_mtu`] / [`PortAttr::max_mtu`], and set on a queue pair with
+/// [`QueuePairBuilder::set_path_mtu`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Mtu {
+    /// 256 bytes.
+    Mtu256,
+    /// 512 bytes.
+    Mtu512,
+    /// 1024 bytes.
+    Mtu1024,
+    /// 2048 bytes.
+    Mtu2048,
+    /// 4096 bytes.
+    Mtu4096,
+}
+
+impl Mtu {
+    /// The MTU in bytes.
+    pub fn bytes(self) -> usize {
+        match self {
+            Mtu::Mtu256 => 256,
+            Mtu::Mtu512 => 512,
+            Mtu::Mtu1024 => 1024,
+            Mtu::Mtu2048 => 2048,
+            Mtu::Mtu4096 => 4096,
+        }
+    }
+}
+
+impl From<ffi::ibv_mtu> for Mtu {
+    fn from(mtu: ffi::ibv_mtu) -> Self {
+        match mtu {
+            ffi::ibv_mtu::IBV_MTU_256 => Mtu::Mtu256,
+            ffi::ibv_mtu::IBV_MTU_512 => Mtu::Mtu512,
+            ffi::ibv_mtu::IBV_MTU_1024 => Mtu::Mtu1024,
+            ffi::ibv_mtu::IBV_MTU_2048 => Mtu::Mtu2048,
+            ffi::ibv_mtu::IBV_MTU_4096 => Mtu::Mtu4096,
+        }
+    }
+}
+
+impl From<Mtu> for ffi::ibv_mtu {
+    fn from(mtu: Mtu) -> Self {
+        match mtu {
+            Mtu::Mtu256 => ffi::ibv_mtu::IBV_MTU_256,
+            Mtu::Mtu512 => ffi::ibv_mtu::IBV_MTU_512,
+            Mtu::Mtu1024 => ffi::ibv_mtu::IBV_MTU_1024,
+            Mtu::Mtu2048 => ffi::ibv_mtu::IBV_MTU_2048,
+            Mtu::Mtu4096 => ffi::ibv_mtu::IBV_MTU_4096,
+        }
+    }
+}
+
+impl fmt::Display for Mtu {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.bytes())
+    }
+}
+
+/// The logical state of a port. Returned by [`PortAttr::state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PortState {
+    /// Reserved value (no state change).
+    Nop,
+    /// The port is down.
+    Down,
+    /// The port is initializing: the link is up, but the subnet manager has not configured it yet.
+    Init,
+    /// The port is armed: it may receive, but not yet transmit, data packets.
+    Armed,
+    /// The port is active and may send and receive packets.
+    Active,
+    /// The port is active, but temporarily deferring packet transmission.
+    ActiveDefer,
+}
+
+impl From<ffi::ibv_port_state> for PortState {
+    fn from(state: ffi::ibv_port_state) -> Self {
+        match state {
+            ffi::ibv_port_state::IBV_PORT_NOP => PortState::Nop,
+            ffi::ibv_port_state::IBV_PORT_DOWN => PortState::Down,
+            ffi::ibv_port_state::IBV_PORT_INIT => PortState::Init,
+            ffi::ibv_port_state::IBV_PORT_ARMED => PortState::Armed,
+            ffi::ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
+            ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
+        }
+    }
+}
+
+impl From<PortState> for ffi::ibv_port_state {
+    fn from(state: PortState) -> Self {
+        match state {
+            PortState::Nop => ffi::ibv_port_state::IBV_PORT_NOP,
+            PortState::Down => ffi::ibv_port_state::IBV_PORT_DOWN,
+            PortState::Init => ffi::ibv_port_state::IBV_PORT_INIT,
+            PortState::Armed => ffi::ibv_port_state::IBV_PORT_ARMED,
+            PortState::Active => ffi::ibv_port_state::IBV_PORT_ACTIVE,
+            PortState::ActiveDefer => ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER,
+        }
+    }
+}
+
+impl fmt::Display for PortState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            PortState::Nop => "Nop",
+            PortState::Down => "Down",
+            PortState::Init => "Init",
+            PortState::Armed => "Armed",
+            PortState::Active => "Active",
+            PortState::ActiveDefer => "ActiveDefer",
+        };
+        f.write_str(name)
     }
 }
 
@@ -615,8 +735,8 @@ impl fmt::Display for PhysicalState {
 
 /// Device-wide attributes and capabilities, as returned by [`Context::query_device`].
 ///
-/// Dereferences to the raw [`ibv_device_attr`], so every field is accessible; the inherent methods
-/// add typed accessors for the device identifiers.
+/// Dereferences to the raw [`ffi::ibv_device_attr`], so every field is accessible; the inherent
+/// methods add typed accessors for the device identifiers.
 #[derive(Clone)]
 pub struct DeviceAttr(ffi::ibv_device_attr);
 
@@ -766,25 +886,25 @@ impl Deref for DeviceAttrEx {
 
 /// Per-port attributes, as returned by [`Context::query_port`].
 ///
-/// Dereferences to the raw [`ibv_port_attr`], so every field is accessible; the inherent methods
-/// add typed accessors for the state, MTU, speed, width, link layer, and physical state.
+/// Dereferences to the raw [`ffi::ibv_port_attr`], so every field is accessible; the inherent
+/// methods add typed accessors for the state, MTU, speed, width, link layer, and physical state.
 #[derive(Clone)]
 pub struct PortAttr(ffi::ibv_port_attr);
 
 impl PortAttr {
     /// The logical port state.
-    pub fn state(&self) -> ffi::ibv_port_state {
-        self.0.state
+    pub fn state(&self) -> PortState {
+        self.0.state.into()
     }
 
     /// The maximum MTU supported by this port.
-    pub fn max_mtu(&self) -> ffi::ibv_mtu {
-        self.0.max_mtu
+    pub fn max_mtu(&self) -> Mtu {
+        self.0.max_mtu.into()
     }
 
     /// The currently active MTU.
-    pub fn active_mtu(&self) -> ffi::ibv_mtu {
-        self.0.active_mtu
+    pub fn active_mtu(&self) -> Mtu {
+        self.0.active_mtu.into()
     }
 
     /// The active link speed.
@@ -857,6 +977,36 @@ mod test_display {
         assert_eq!(PortWidth::Unknown(9).to_string(), "unknown (9)");
         assert_eq!(LinkLayer::Ethernet.to_string(), "Ethernet");
         assert_eq!(PhysicalState::LinkUp.to_string(), "LinkUp");
+    }
+
+    #[test]
+    fn mtu_roundtrip_and_bytes() {
+        for (wrapper, raw, bytes) in [
+            (Mtu::Mtu256, ffi::ibv_mtu::IBV_MTU_256, 256),
+            (Mtu::Mtu1024, ffi::ibv_mtu::IBV_MTU_1024, 1024),
+            (Mtu::Mtu4096, ffi::ibv_mtu::IBV_MTU_4096, 4096),
+        ] {
+            assert_eq!(Mtu::from(raw), wrapper);
+            assert_eq!(ffi::ibv_mtu::from(wrapper), raw);
+            assert_eq!(wrapper.bytes(), bytes);
+            assert_eq!(wrapper.to_string(), bytes.to_string());
+        }
+    }
+
+    #[test]
+    fn port_state_roundtrip() {
+        for (wrapper, raw) in [
+            (PortState::Down, ffi::ibv_port_state::IBV_PORT_DOWN),
+            (PortState::Active, ffi::ibv_port_state::IBV_PORT_ACTIVE),
+            (
+                PortState::ActiveDefer,
+                ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER,
+            ),
+        ] {
+            assert_eq!(PortState::from(raw), wrapper);
+            assert_eq!(ffi::ibv_port_state::from(wrapper), raw);
+        }
+        assert_eq!(PortState::Active.to_string(), "Active");
     }
 
     #[test]

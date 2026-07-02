@@ -7,13 +7,126 @@ use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
 use crate::context::ContextInner;
 use crate::error::{Error, Result};
-use crate::mr::{LocalMemorySlice, MemoryRegion, MemoryRegionInner};
-use crate::qp::QueuePairBuilder;
+use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
+use crate::qp::{QueuePairBuilder, QueuePairType};
+
 use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
-use crate::{ibv_advise_mr_advice, DEFAULT_ACCESS_FLAGS, PORT_NUM};
 
 #[cfg(doc)]
-use crate::{ibv_advise_mr_flags, PreparedQueuePair};
+use crate::Context;
+
+/// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MrAdvice {
+    /// Prefetch the pages for read access (a best-effort hint; the ranges must allow local read).
+    Prefetch,
+    /// Prefetch the pages for write access (a best-effort hint; the ranges must allow local
+    /// write).
+    PrefetchWrite,
+    /// Prefetch without faulting: pre-load what is already resident, never a page fault.
+    PrefetchNoFault,
+}
+
+impl From<ffi::ib_uverbs_advise_mr_advice> for MrAdvice {
+    fn from(advice: ffi::ib_uverbs_advise_mr_advice) -> Self {
+        use ffi::ib_uverbs_advise_mr_advice::*;
+        match advice {
+            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH => MrAdvice::Prefetch,
+            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE => MrAdvice::PrefetchWrite,
+            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT => MrAdvice::PrefetchNoFault,
+        }
+    }
+}
+
+impl From<MrAdvice> for ffi::ib_uverbs_advise_mr_advice {
+    fn from(advice: MrAdvice) -> Self {
+        use ffi::ib_uverbs_advise_mr_advice::*;
+        match advice {
+            MrAdvice::Prefetch => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
+            MrAdvice::PrefetchWrite => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE,
+            MrAdvice::PrefetchNoFault => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT,
+        }
+    }
+}
+
+/// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct MrAdviseFlags(pub(crate) u32);
+
+impl MrAdviseFlags {
+    /// The advice may be flushed by other verbs (rather than being sticky).
+    pub const FLUSHABLE: MrAdviseFlags =
+        MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH as u32);
+
+    /// No flags set.
+    #[must_use]
+    pub const fn empty() -> Self {
+        MrAdviseFlags(0)
+    }
+
+    /// Whether every flag set in `other` is also set in `self`.
+    #[must_use]
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
+impl std::ops::BitOr for MrAdviseFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        MrAdviseFlags(self.0 | rhs.0)
+    }
+}
+
+impl std::ops::BitOrAssign for MrAdviseFlags {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
+
+impl std::ops::BitAnd for MrAdviseFlags {
+    type Output = Self;
+    fn bitand(self, rhs: Self) -> Self {
+        MrAdviseFlags(self.0 & rhs.0)
+    }
+}
+
+impl std::fmt::Debug for MrAdviseFlags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MrAdviseFlags(")?;
+        let mut rest = self.0;
+        let mut first = true;
+        if rest & MrAdviseFlags::FLUSHABLE.0 == MrAdviseFlags::FLUSHABLE.0 {
+            f.write_str("FLUSHABLE")?;
+            first = false;
+            rest &= !MrAdviseFlags::FLUSHABLE.0;
+        }
+        if rest != 0 {
+            if !first {
+                f.write_str(" | ")?;
+            }
+            write!(f, "{rest:#x}")?;
+            first = false;
+        }
+        if first {
+            f.write_str("0")?;
+        }
+        f.write_str(")")
+    }
+}
+
+impl From<ffi::ib_uverbs_advise_mr_flag> for MrAdviseFlags {
+    fn from(flag: ffi::ib_uverbs_advise_mr_flag) -> Self {
+        MrAdviseFlags(flag as u32)
+    }
+}
+
+impl From<MrAdviseFlags> for u32 {
+    fn from(flags: MrAdviseFlags) -> Self {
+        flags.0
+    }
+}
 
 pub(crate) struct ProtectionDomainInner {
     pub(crate) ctx: Arc<ContextInner>,
@@ -33,7 +146,7 @@ impl Drop for ProtectionDomainInner {
 unsafe impl Sync for ProtectionDomainInner {}
 unsafe impl Send for ProtectionDomainInner {}
 
-/// A protection domain for a device's context.
+/// A protection domain for a device's context. Created by [`Context::alloc_pd`].
 #[must_use]
 #[derive(Clone)]
 pub struct ProtectionDomain {
@@ -76,10 +189,10 @@ impl ProtectionDomain {
     /// protection domain (`ibv_advise_mr`).
     ///
     /// This is mainly useful with on-demand-paging (ODP) memory regions: for example, prefetching
-    /// pages with `IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH` so that a later access does not take a page
-    /// fault. `flags` is a bitmask of [`ibv_advise_mr_flags`] (`0` for none), and `sg_list`
-    /// describes the ranges to act on; every entry must lie within a memory region registered under
-    /// this protection domain.
+    /// pages with [`MrAdvice::Prefetch`] so that a later access does not take a page fault.
+    /// `flags` is a bitmask of [`MrAdviseFlags`] ([`MrAdviseFlags::empty()`] for none), and
+    /// `sg_list` describes the ranges to act on; every entry must lie within a memory region
+    /// registered under this protection domain.
     ///
     /// # Errors
     ///
@@ -88,15 +201,15 @@ impl ProtectionDomain {
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     pub fn advise_mr(
         &self,
-        advice: ibv_advise_mr_advice,
-        flags: u32,
+        advice: MrAdvice,
+        flags: MrAdviseFlags,
         sg_list: &[LocalMemorySlice],
     ) -> Result<()> {
         let ret = unsafe {
             ffi::ibv_advise_mr(
                 self.inner.pd,
-                advice,
-                flags,
+                advice.into(),
+                flags.into(),
                 sg_list.as_ptr() as *mut ffi::ibv_sge,
                 sg_list.len() as u32,
             )
@@ -108,41 +221,23 @@ impl ProtectionDomain {
         }
     }
 
-    /// Creates a queue pair builder associated with this protection domain.
+    /// Creates a queue pair builder associated with `port_num` on this protection domain's device.
     ///
     /// `send` and `recv` are the [`CompletionQueue`]s that completions for the send and receive
     /// queues are delivered to, respectively. They may refer to the same queue.
     ///
-    /// `qp_type` indicates the requested Transport Service Type of this QP:
+    /// `qp_type` is the requested transport service type of this QP (for example
+    /// [`QueuePairType::ReliableConnection`]).
     ///
-    ///  - `IBV_QPT_RC`: Reliable Connection
-    ///  - `IBV_QPT_UC`: Unreliable Connection
-    ///  - `IBV_QPT_UD`: Unreliable Datagram
+    /// `port_num` is the device port this queue pair uses; ports are numbered from 1.
     ///
     /// Note that both this protection domain, *and* both provided completion queues, must outlive
     /// the resulting `QueuePair`.
-    ///
-    /// The queue pair is associated with the device's first port (port 1); use
-    /// [`create_qp_on_port`](Self::create_qp_on_port) to choose another port.
     pub fn create_qp(
         &self,
         send: &CompletionQueue,
         recv: &CompletionQueue,
-        qp_type: ffi::ibv_qp_type,
-    ) -> Result<QueuePairBuilder> {
-        self.create_qp_on_port(send, recv, qp_type, PORT_NUM)
-    }
-
-    /// Creates a queue pair builder associated with `port_num` on this protection domain's device.
-    ///
-    /// Like [`create_qp`](Self::create_qp), but the queue pair (and the endpoint reported by
-    /// [`PreparedQueuePair::endpoint`]) is associated with the given port instead of port 1. Ports
-    /// are numbered from 1.
-    pub fn create_qp_on_port(
-        &self,
-        send: &CompletionQueue,
-        recv: &CompletionQueue,
-        qp_type: ffi::ibv_qp_type,
+        qp_type: QueuePairType,
         port_num: u8,
     ) -> Result<QueuePairBuilder> {
         let port_attr = self.inner.ctx.query_port(port_num)?;
@@ -154,7 +249,7 @@ impl ProtectionDomain {
             1,
             recv.inner.clone(),
             1,
-            qp_type,
+            qp_type.into(),
             1,
             1,
         ))
@@ -170,7 +265,7 @@ impl ProtectionDomain {
         &self,
         ptr: *mut c_void,
         len: usize,
-        access_flags: ffi::ibv_access_flags,
+        access_flags: AccessFlags,
     ) -> Result<MemoryRegionInner> {
         let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
         // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
@@ -192,33 +287,6 @@ impl ProtectionDomain {
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`, with
     /// the given access permissions.
     ///
-    /// This is [`allocate`](Self::allocate) with the permission flags under your control instead
-    /// of [`DEFAULT_ACCESS_FLAGS`]; see there for the details of allocation and registration.
-    /// Local read access is always enabled for the region.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `n` is 0.
-    ///
-    /// # Errors
-    ///
-    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags.
-    ///  - `EINVAL`: Invalid access value.
-    ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
-    ///    complete this operation.
-    pub fn allocate_with_permissions(
-        &self,
-        n: usize,
-        access_flags: ffi::ibv_access_flags,
-    ) -> Result<MemoryRegion<Box<[u8]>>> {
-        assert!(n > 0);
-        let mut data = vec![0u8; n].into_boxed_slice();
-        let inner = unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags)? };
-        Ok(MemoryRegion { inner, owner: data })
-    }
-
-    /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
-    ///
     /// This process allows the RDMA device to read and write data to the allocated memory. Only
     /// registered memory can be sent from and received to by `QueuePair`s. Performing this
     /// registration takes some time, so performing memory registration isn't recommended in the
@@ -237,10 +305,9 @@ impl ProtectionDomain {
     /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
     /// that can be registered for a specific device.
     ///
-    /// `allocate` registers the region with [`DEFAULT_ACCESS_FLAGS`]: local write, remote write,
-    /// remote read, remote atomics, and relaxed ordering (local read access is always enabled).
-    /// For control over the permissions, see
-    /// [`allocate_with_permissions`](Self::allocate_with_permissions).
+    /// `access_flags` are the permissions the region is registered with; local read access is
+    /// always enabled. [`AccessFlags::PERMISSIVE`] is the everything-enabled set: local write, remote
+    /// write, remote read, remote atomics, and relaxed ordering.
     ///
     /// # Panics
     ///
@@ -252,9 +319,11 @@ impl ProtectionDomain {
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
-    pub fn allocate(&self, n: usize) -> Result<MemoryRegion<Box<[u8]>>> {
-        let access_flags = DEFAULT_ACCESS_FLAGS;
-        self.allocate_with_permissions(n, access_flags)
+    pub fn allocate(&self, n: usize, access_flags: AccessFlags) -> Result<MemoryRegion<Box<[u8]>>> {
+        assert!(n > 0);
+        let mut data = vec![0u8; n].into_boxed_slice();
+        let inner = unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags)? };
+        Ok(MemoryRegion { inner, owner: data })
     }
 
     /// Registers externally managed memory as a Memory Region (MR), with the given access
@@ -266,9 +335,8 @@ impl ProtectionDomain {
     /// region's [`slice`](MemoryRegion::slice) / [`remote`](MemoryRegion::remote) handles for RDMA;
     /// access the bytes through your own pointer.
     ///
-    /// `access_flags` is always required here: registering memory directly is a low-level operation,
-    /// so the permissions are spelled out rather than defaulted (see [`DEFAULT_ACCESS_FLAGS`] for the
-    /// set [`allocate`](Self::allocate) uses).
+    /// `access_flags` are the permissions the region is registered with; local read access is
+    /// always enabled ([`AccessFlags::PERMISSIVE`] is the everything-enabled set).
     ///
     /// # Safety
     ///
@@ -292,7 +360,7 @@ impl ProtectionDomain {
         &self,
         ptr: *mut u8,
         len: usize,
-        access_flags: ffi::ibv_access_flags,
+        access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
         assert!(len > 0);
         let inner = self.reg_mr(ptr as *mut c_void, len, access_flags)?;
@@ -327,7 +395,7 @@ impl ProtectionDomain {
         offset: u64,
         len: usize,
         iova: u64,
-        access_flags: ffi::ibv_access_flags,
+        access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
         let mr = unsafe {
             ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
@@ -394,5 +462,46 @@ impl ProtectionDomain {
                 }),
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod test_conversions {
+    use super::*;
+
+    #[test]
+    fn mr_advice_roundtrip() {
+        for (wrapper, raw) in [
+            (
+                MrAdvice::Prefetch,
+                ffi::ib_uverbs_advise_mr_advice::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
+            ),
+            (
+                MrAdvice::PrefetchWrite,
+                ffi::ib_uverbs_advise_mr_advice::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE,
+            ),
+            (
+                MrAdvice::PrefetchNoFault,
+                ffi::ib_uverbs_advise_mr_advice::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT,
+            ),
+        ] {
+            assert_eq!(MrAdvice::from(raw), wrapper);
+            assert_eq!(ffi::ib_uverbs_advise_mr_advice::from(wrapper), raw);
+        }
+    }
+
+    #[test]
+    fn mr_advise_flags_bits_and_debug() {
+        assert!(!MrAdviseFlags::empty().contains(MrAdviseFlags::FLUSHABLE));
+        let mut flags = MrAdviseFlags::empty();
+        flags |= MrAdviseFlags::FLUSHABLE;
+        assert!(flags.contains(MrAdviseFlags::FLUSHABLE));
+        assert_eq!(u32::from(flags), 1);
+        assert_eq!(
+            MrAdviseFlags::from(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH),
+            MrAdviseFlags::FLUSHABLE
+        );
+        assert_eq!(format!("{flags:?}"), "MrAdviseFlags(FLUSHABLE)");
+        assert_eq!(format!("{:?}", MrAdviseFlags::empty()), "MrAdviseFlags(0)");
     }
 }
