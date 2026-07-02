@@ -2,9 +2,6 @@ use std::ffi::CStr;
 use std::fmt;
 use std::io;
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use crate::context::Context;
 use crate::error::{Error, Result};
 
@@ -116,7 +113,6 @@ impl fmt::Debug for Device<'_> {
 /// This struct acts as a rust wrapper for GUID value represented as `__be64` in
 /// libibverbs. We introduce this struct, because u64 is stored in host
 /// endianness, whereas ibverbs stores GUID in network order (big endian).
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct Guid {
@@ -339,8 +335,8 @@ impl fmt::Display for TransportType {
     }
 }
 
-#[cfg(all(test, feature = "serde"))]
-mod test_serde {
+#[cfg(test)]
+mod test_guid {
     use super::*;
     #[test]
     fn encode_decode_guid() {

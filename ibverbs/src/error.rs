@@ -177,6 +177,12 @@ pub enum Error {
     #[error("the connection-manager operation timed out")]
     TimedOut,
 
+    /// Decoding a wire-format value ([`QueuePairEndpoint::from_bytes`](crate::QueuePairEndpoint::from_bytes)
+    /// or [`RemoteMemorySlice::from_bytes`](crate::RemoteMemorySlice::from_bytes)) failed: the
+    /// bytes carry a flag or value this version does not understand.
+    #[error("malformed wire-format encoding")]
+    MalformedWireFormat,
+
     /// The connection manager reported a failure event.
     #[cfg(feature = "rdmacm")]
     #[error("the connection manager reported {0:?}")]

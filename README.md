@@ -31,8 +31,8 @@ fn main() -> ibverbs::Result<()> {
         .set_gid_index(1)
         .build()?;
 
-    // Exchange endpoints with the peer out of band (they serialize with the `serde`
-    // feature), or use the `rdmacm` feature to negotiate connections over IP instead.
+    // Exchange endpoints with the peer out of band (`endpoint.to_bytes()` is the wire
+    // format), or use the `rdmacm` feature to negotiate connections over IP instead.
     // Here we self-connect for brevity.
     let endpoint = prepared.endpoint()?;
     let mut qp = prepared.handshake(endpoint)?;
@@ -113,8 +113,6 @@ re-exported as `ibverbs::ffi`, and escape-hatch constructors let you mix safe an
 
 None are enabled by default.
 
-- `serde`: `QueuePairEndpoint` and `RemoteMemorySlice` implement `Serialize`/`Deserialize`, for
-  sending to the peer during connection setup.
 - `rdmacm`: the RDMA connection manager. Links `librdmacm`.
 - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter. Links `libefa`.
 

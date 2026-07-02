@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
-use ibverbs::{AccessFlags, CompletionQueue, Context, QueuePairState, Rc, RecvRequest};
+use ibverbs::{
+    AccessFlags, CompletionQueue, Context, QueuePairEndpoint, QueuePairState, Rc, RecvRequest,
+};
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
 fn open_test_device() -> Context {
@@ -300,7 +302,6 @@ fn pump_until(id: &CmId, want: CmEventType) -> CmEvent {
 
 /// The private data each side attaches to its connection request or reply. The transport pads the
 /// payload on the wire, so the receiver asserts on the prefix it knows, within the reported length.
-const CLIENT_PDATA: &[u8] = b"client says hi";
 const SERVER_PDATA: &[u8] = b"server says welcome";
 
 #[test]
@@ -325,16 +326,22 @@ fn low_level_connect_and_send() {
         let request = loop {
             let event = listener.get_cm_event().expect("listener event");
             if event.event_type() == CmEventType::ConnectRequest {
-                // The client's private data rides in the connection-request event. The transport
-                // pads it, so check the prefix within the reported length.
+                // The client sent its queue-pair endpoint's wire encoding as private data (the
+                // in-band bootstrap the fixed format enables). The transport pads the payload, so
+                // decode the known-length prefix.
                 let pdata = event
                     .private_data()
                     .expect("connect request carries private data");
                 assert!(
-                    pdata.len() >= CLIENT_PDATA.len(),
-                    "reported private data is shorter than what the client wrote"
+                    pdata.len() >= QueuePairEndpoint::WIRE_LEN,
+                    "reported private data is shorter than an endpoint encoding"
                 );
-                assert_eq!(&pdata[..CLIENT_PDATA.len()], CLIENT_PDATA);
+                let bytes: [u8; QueuePairEndpoint::WIRE_LEN] =
+                    pdata[..QueuePairEndpoint::WIRE_LEN].try_into().unwrap();
+                let client_endpoint =
+                    QueuePairEndpoint::from_bytes(&bytes).expect("well-formed endpoint bytes");
+                assert!(client_endpoint.qp_num > 0, "{client_endpoint:?}");
+                assert!(client_endpoint.gid.is_none(), "{client_endpoint:?}");
                 break event.connection_request().expect("connection request");
             }
         };
@@ -401,12 +408,13 @@ fn low_level_connect_and_send() {
     let ctx = id.context().expect("client device context");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
-    let mut qp = pd
+    let qp = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("client qp builder")
         .build()
-        .expect("client prepared qp")
-        .into_queue_pair();
+        .expect("client prepared qp");
+    let client_endpoint = qp.endpoint().expect("client endpoint");
+    let mut qp = qp.into_queue_pair();
     let init = id
         .init_qp_attr(QueuePairState::Init)
         .expect("client init attr");
@@ -414,7 +422,7 @@ fn low_level_connect_and_send() {
 
     let param = ConnectionParameter::default()
         .set_qp_num(qp.qp_num())
-        .set_private_data(CLIENT_PDATA);
+        .set_private_data(&client_endpoint.to_bytes());
     id.connect(&param).expect("connect");
     // The server's private data rides back in the connect-response event; check the prefix
     // within the reported (transport-padded) length, then acknowledge the event by dropping it.
