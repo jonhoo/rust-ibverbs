@@ -54,7 +54,8 @@ fn server(addr: SocketAddr) {
     let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 1).unwrap();
     println!("listening on {addr}");
 
-    let incoming = acceptor.accept().unwrap();
+    // Wait for a client indefinitely, but bound the establishment of an arrived request.
+    let incoming = acceptor.accept(None).unwrap();
     let ctx = incoming.context().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
@@ -65,7 +66,14 @@ fn server(addr: SocketAddr) {
         .unwrap();
     let mut recv = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
 
-    let mut conn = incoming.accept(qp, ConnectionParameter::default()).unwrap();
+    let mut conn = incoming
+        .accept(
+            qp,
+            ConnectionParameter::default(),
+            Some(Duration::from_secs(10)),
+        )
+        .unwrap();
+    println!("connected to {:?}", conn.peer_addr());
     unsafe {
         conn.queue_pair()
             .post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
@@ -97,7 +105,11 @@ fn client(addr: SocketAddr) {
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
 
     let mut conn = resolved
-        .connect(qp, ConnectionParameter::default())
+        .connect(
+            qp,
+            ConnectionParameter::default(),
+            Some(Duration::from_secs(10)),
+        )
         .unwrap();
     let mut batch = conn.queue_pair().start_send();
     batch

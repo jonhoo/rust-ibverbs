@@ -117,6 +117,17 @@ rdma-core headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
 
 The minimum supported Rust version is 1.82.
 
+## Provider requirements
+
+The crate drives completion queues and queue pairs exclusively through rdma-core's extended
+verbs — `ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API — so it needs a
+provider (the userspace driver for your device) that implements them. Of the providers in the
+rdma-core tree this workspace vendors (v63), `mlx5`, `hns`, `efa`, and `rxe` (SoftRoCE) implement
+both. A provider that lacks them fails cleanly at completion-queue or queue-pair creation
+(typically with `Error::Unsupported`) rather than degrading to the legacy verbs: `bnxt_re`
+implements the send API but not extended CQ creation, `mlx4`, `irdma`, and `ionic` the reverse,
+and the remaining providers neither.
+
 ## Testing without RDMA hardware
 
 Any modern Linux kernel can attach a software RDMA device

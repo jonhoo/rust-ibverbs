@@ -2,8 +2,11 @@ use std::borrow::Cow;
 use std::ffi::CStr;
 use std::fmt;
 use std::io;
+use std::marker::PhantomData;
 use std::ops::Deref;
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::address::{Gid, GidEntry};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
@@ -117,12 +120,15 @@ impl Context {
         if ctx.is_null() {
             return Err(Error::OpenDevice(io::Error::last_os_error()));
         }
-        let inner = Arc::new(ContextInner {
-            ctx,
-            ownership: ContextOwnership::Owned,
-        });
-
-        Ok(Context { inner })
+        let context = Context {
+            inner: Arc::new(ContextInner {
+                ctx,
+                ownership: ContextOwnership::Owned,
+            }),
+        };
+        // If this fails, `context` drops here and closes the half-opened device again.
+        context.set_async_fd_nonblocking()?;
+        Ok(context)
     }
 
     /// Wraps a raw `ibv_context` owned by `owner` (the RDMA connection manager's `rdma_cm_id`).
@@ -134,13 +140,31 @@ impl Context {
     pub(crate) fn from_borrowed_context(
         ctx: *mut ffi::ibv_context,
         owner: Arc<dyn Send + Sync>,
-    ) -> Context {
-        Context {
+    ) -> Result<Context> {
+        let context = Context {
             inner: Arc::new(ContextInner {
                 ctx,
                 ownership: ContextOwnership::Borrowed(owner),
             }),
-        }
+        };
+        // The async-event descriptor is shared with every other borrow of this device context;
+        // setting it non-blocking is idempotent, so doing it once per borrow is harmless.
+        context.set_async_fd_nonblocking()?;
+        Ok(context)
+    }
+
+    /// Set this context's asynchronous-event file descriptor to non-blocking, so
+    /// [`poll_async_event`](Self::poll_async_event) reports an empty event queue instead of
+    /// blocking.
+    fn set_async_fd_nonblocking(&self) -> Result<()> {
+        let fd = unsafe { (*self.inner.ctx).async_fd };
+        let flags =
+            nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(|e| Error::OpenDevice(e.into()))?;
+        let arg = nix::fcntl::FcntlArg::F_SETFL(
+            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+        );
+        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::OpenDevice(e.into()))?;
+        Ok(())
     }
 
     /// Begin building a completion queue (CQ) with room for at least `min_cq_entries` entries.
@@ -188,6 +212,91 @@ impl Context {
     /// queue pairs from one `epoll`/reactor. See [`CompletionChannel`] for the notification loop.
     pub fn create_comp_channel(&self) -> Result<CompletionChannel> {
         CompletionChannel::new(&self.inner)
+    }
+
+    /// The file descriptor that delivers the device's asynchronous events, for handing to an
+    /// event loop: it becomes readable when an event is pending, to be consumed with
+    /// [`poll_async_event`](Self::poll_async_event). The descriptor is non-blocking.
+    pub fn async_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the descriptor lives until the device context is closed, which the borrow of
+        // `self` prevents.
+        unsafe { BorrowedFd::borrow_raw((*self.inner.ctx).async_fd) }
+    }
+
+    /// Consume one pending asynchronous event from the device, or `None` if none is pending.
+    ///
+    /// Asynchronous events are the device's out-of-band reports: affiliated errors on a
+    /// completion queue, queue pair, or shared receive queue, port state changes, and
+    /// device-wide failures — see [`AsyncEventType`] for the full list. This never blocks; to
+    /// wait for an event, use [`wait_async_event`](Self::wait_async_event), or watch
+    /// [`async_fd`](Self::async_fd) from your own reactor and drain pending events here when it
+    /// becomes readable.
+    ///
+    /// The returned event is acknowledged when it drops; see [`AsyncEvent`] for why that should
+    /// happen promptly.
+    ///
+    /// # Errors
+    ///
+    ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
+    pub fn poll_async_event(&self) -> Result<Option<AsyncEvent<'_>>> {
+        // `ibv_async_event` embeds an enum with no zero variant inside a union, so let
+        // `ibv_get_async_event` initialize the storage before a Rust value is formed.
+        let mut event = std::mem::MaybeUninit::<ffi::ibv_async_event>::uninit();
+        let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, event.as_mut_ptr()) };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(Error::AsyncEvent(e));
+        }
+        Ok(Some(AsyncEvent {
+            // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
+            event: unsafe { event.assume_init() },
+            _ctx: PhantomData,
+        }))
+    }
+
+    /// Block until an asynchronous event is available (up to `timeout`), then consume it.
+    /// Returns `None` only if `timeout` elapses first; with no timeout it waits indefinitely,
+    /// even if other threads race it for events.
+    ///
+    /// This is the blocking form of [`poll_async_event`](Self::poll_async_event): it waits on
+    /// [`async_fd`](Self::async_fd) for you rather than requiring an external reactor.
+    ///
+    /// # Errors
+    ///
+    ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
+    pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let pollfd = nix::poll::PollFd::new(self.async_fd(), nix::poll::PollFlags::POLLIN);
+            let ret = nix::poll::poll(
+                &mut [pollfd],
+                remaining
+                    .map(nix::poll::PollTimeout::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        Error::AsyncEvent(io::Error::other(
+                            "failed to convert timeout to PollTimeout",
+                        ))
+                    })?,
+            )
+            .map_err(|e| Error::AsyncEvent(e.into()))?;
+            match ret {
+                0 => return Ok(None),
+                1 => {
+                    // The descriptor was readable, but another thread may have consumed the
+                    // event first; if so, go back to waiting for the next one.
+                    if let Some(event) = self.poll_async_event()? {
+                        return Ok(Some(event));
+                    }
+                }
+                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            }
+        }
     }
 
     /// Allocate a protection domain (PD) for the device's context.
@@ -387,6 +496,191 @@ impl Context {
                 .wrapping_mul(1_000_000_000)
                 .wrapping_add(values.raw_clock.tv_nsec as u64),
         ))
+    }
+}
+
+/// An asynchronous event reported by the device, consumed with [`Context::poll_async_event`] /
+/// [`Context::wait_async_event`] and acknowledged automatically when dropped.
+///
+/// Drop events promptly: libibverbs blocks the destruction of the object an event refers to
+/// until the event is acknowledged, so holding an `AsyncEvent` while dropping the completion
+/// queue, queue pair, or shared receive queue it refers to deadlocks.
+pub struct AsyncEvent<'ctx> {
+    event: ffi::ibv_async_event,
+    /// The event must be acknowledged before the device context closes, so it borrows the
+    /// [`Context`] it was read from.
+    _ctx: PhantomData<&'ctx Context>,
+}
+
+impl AsyncEvent<'_> {
+    /// The kind of event.
+    pub fn event_type(&self) -> AsyncEventType {
+        self.event.event_type.into()
+    }
+
+    /// The port the event refers to, for the port-scoped events
+    /// ([`PortActive`](AsyncEventType::PortActive), [`PortError`](AsyncEventType::PortError),
+    /// [`LidChange`](AsyncEventType::LidChange), [`PkeyChange`](AsyncEventType::PkeyChange),
+    /// [`SmChange`](AsyncEventType::SmChange),
+    /// [`ClientReregister`](AsyncEventType::ClientReregister), and
+    /// [`GidChange`](AsyncEventType::GidChange)); `None` for every other kind.
+    pub fn port_num(&self) -> Option<u8> {
+        match self.event_type() {
+            AsyncEventType::PortActive
+            | AsyncEventType::PortError
+            | AsyncEventType::LidChange
+            | AsyncEventType::PkeyChange
+            | AsyncEventType::SmChange
+            | AsyncEventType::ClientReregister
+            | AsyncEventType::GidChange => {
+                // SAFETY: for the port-scoped events, the element union holds the port number.
+                Some(unsafe { self.event.element.port_num } as u8)
+            }
+            _ => None,
+        }
+    }
+
+    /// The underlying `ibv_async_event`.
+    ///
+    /// This is the escape hatch for the `element` union: for CQ-, QP-, and SRQ-scoped events it
+    /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to. Those pointers
+    /// cannot be mapped back to this crate's safe wrappers; compare them against the `as_raw`
+    /// handles of the wrappers you own to identify the object.
+    pub fn as_raw(&self) -> &ffi::ibv_async_event {
+        &self.event
+    }
+}
+
+impl Drop for AsyncEvent<'_> {
+    fn drop(&mut self) {
+        // Every event from `ibv_get_async_event` must be acknowledged exactly once; the object
+        // it refers to cannot be destroyed until then.
+        unsafe { ffi::ibv_ack_async_event(&mut self.event) };
+    }
+}
+
+impl fmt::Debug for AsyncEvent<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut f = f.debug_struct("AsyncEvent");
+        f.field("event_type", &self.event_type());
+        if let Some(port_num) = self.port_num() {
+            f.field("port_num", &port_num);
+        }
+        f.finish_non_exhaustive()
+    }
+}
+
+/// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
+///
+/// The events fall into four scopes: affiliated errors and state changes on a completion queue,
+/// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which),
+/// port-level changes (with [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AsyncEventType {
+    /// An error occurred on a completion queue (overrun or protection fault); the queue and the
+    /// queue pairs attached to it are unusable.
+    CqError,
+    /// An error occurred on a queue pair that its completion queues could not report; the queue
+    /// pair moved to the error state.
+    QpFatal,
+    /// The transport detected an invalid request on the queue pair while it was the responder.
+    QpRequestError,
+    /// The transport detected an access violation on the queue pair while it was the responder.
+    QpAccessError,
+    /// The first message arrived on a queue pair still in `RTR` (communication is established).
+    CommEstablished,
+    /// The send queue finished draining after a transition to `SQD`.
+    SqDrained,
+    /// The connection migrated to its alternate path.
+    PathMigrated,
+    /// The connection failed to migrate to its alternate path.
+    PathMigrationError,
+    /// The device is in a fatal state; all of its resources are unusable.
+    DeviceFatal,
+    /// The port's logical state became active.
+    PortActive,
+    /// The port's logical state left active.
+    PortError,
+    /// The subnet manager changed the port's LID.
+    LidChange,
+    /// The port's partition-key (P_Key) table changed.
+    PkeyChange,
+    /// A new subnet manager took over the port.
+    SmChange,
+    /// An error occurred on a shared receive queue.
+    SrqError,
+    /// The number of receives posted to a shared receive queue dropped below its low watermark
+    /// (the `srq_limit` of [`ProtectionDomain::create_srq`]).
+    SrqLimitReached,
+    /// The last work request reached a queue pair, attached to a shared receive queue, that is in
+    /// the error state: no more receives will be consumed from the SRQ by this queue pair.
+    QpLastWqeReached,
+    /// The subnet manager asked the port's clients to reregister their subscriptions.
+    ClientReregister,
+    /// The port's GID table changed.
+    GidChange,
+    /// An error occurred on a work queue.
+    WqFatal,
+    /// The device's link speed changed.
+    DeviceSpeedChange,
+}
+
+impl From<ffi::ibv_event_type> for AsyncEventType {
+    fn from(event: ffi::ibv_event_type) -> Self {
+        use ffi::ibv_event_type::*;
+        match event {
+            IBV_EVENT_CQ_ERR => AsyncEventType::CqError,
+            IBV_EVENT_QP_FATAL => AsyncEventType::QpFatal,
+            IBV_EVENT_QP_REQ_ERR => AsyncEventType::QpRequestError,
+            IBV_EVENT_QP_ACCESS_ERR => AsyncEventType::QpAccessError,
+            IBV_EVENT_COMM_EST => AsyncEventType::CommEstablished,
+            IBV_EVENT_SQ_DRAINED => AsyncEventType::SqDrained,
+            IBV_EVENT_PATH_MIG => AsyncEventType::PathMigrated,
+            IBV_EVENT_PATH_MIG_ERR => AsyncEventType::PathMigrationError,
+            IBV_EVENT_DEVICE_FATAL => AsyncEventType::DeviceFatal,
+            IBV_EVENT_PORT_ACTIVE => AsyncEventType::PortActive,
+            IBV_EVENT_PORT_ERR => AsyncEventType::PortError,
+            IBV_EVENT_LID_CHANGE => AsyncEventType::LidChange,
+            IBV_EVENT_PKEY_CHANGE => AsyncEventType::PkeyChange,
+            IBV_EVENT_SM_CHANGE => AsyncEventType::SmChange,
+            IBV_EVENT_SRQ_ERR => AsyncEventType::SrqError,
+            IBV_EVENT_SRQ_LIMIT_REACHED => AsyncEventType::SrqLimitReached,
+            IBV_EVENT_QP_LAST_WQE_REACHED => AsyncEventType::QpLastWqeReached,
+            IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
+            IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
+            IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
+            IBV_EVENT_DEVICE_SPEED_CHANGE => AsyncEventType::DeviceSpeedChange,
+        }
+    }
+}
+
+impl From<AsyncEventType> for ffi::ibv_event_type {
+    fn from(event: AsyncEventType) -> Self {
+        use ffi::ibv_event_type::*;
+        match event {
+            AsyncEventType::CqError => IBV_EVENT_CQ_ERR,
+            AsyncEventType::QpFatal => IBV_EVENT_QP_FATAL,
+            AsyncEventType::QpRequestError => IBV_EVENT_QP_REQ_ERR,
+            AsyncEventType::QpAccessError => IBV_EVENT_QP_ACCESS_ERR,
+            AsyncEventType::CommEstablished => IBV_EVENT_COMM_EST,
+            AsyncEventType::SqDrained => IBV_EVENT_SQ_DRAINED,
+            AsyncEventType::PathMigrated => IBV_EVENT_PATH_MIG,
+            AsyncEventType::PathMigrationError => IBV_EVENT_PATH_MIG_ERR,
+            AsyncEventType::DeviceFatal => IBV_EVENT_DEVICE_FATAL,
+            AsyncEventType::PortActive => IBV_EVENT_PORT_ACTIVE,
+            AsyncEventType::PortError => IBV_EVENT_PORT_ERR,
+            AsyncEventType::LidChange => IBV_EVENT_LID_CHANGE,
+            AsyncEventType::PkeyChange => IBV_EVENT_PKEY_CHANGE,
+            AsyncEventType::SmChange => IBV_EVENT_SM_CHANGE,
+            AsyncEventType::SrqError => IBV_EVENT_SRQ_ERR,
+            AsyncEventType::SrqLimitReached => IBV_EVENT_SRQ_LIMIT_REACHED,
+            AsyncEventType::QpLastWqeReached => IBV_EVENT_QP_LAST_WQE_REACHED,
+            AsyncEventType::ClientReregister => IBV_EVENT_CLIENT_REREGISTER,
+            AsyncEventType::GidChange => IBV_EVENT_GID_CHANGE,
+            AsyncEventType::WqFatal => IBV_EVENT_WQ_FATAL,
+            AsyncEventType::DeviceSpeedChange => IBV_EVENT_DEVICE_SPEED_CHANGE,
+        }
     }
 }
 
@@ -1039,6 +1333,35 @@ mod test_display {
             assert_eq!(ffi::ibv_port_state::from(wrapper), raw);
         }
         assert_eq!(PortState::Active.to_string(), "Active");
+    }
+
+    #[test]
+    fn async_event_type_roundtrip() {
+        for (wrapper, raw) in [
+            (
+                AsyncEventType::CqError,
+                ffi::ibv_event_type::IBV_EVENT_CQ_ERR,
+            ),
+            (
+                AsyncEventType::CommEstablished,
+                ffi::ibv_event_type::IBV_EVENT_COMM_EST,
+            ),
+            (
+                AsyncEventType::SrqLimitReached,
+                ffi::ibv_event_type::IBV_EVENT_SRQ_LIMIT_REACHED,
+            ),
+            (
+                AsyncEventType::PortActive,
+                ffi::ibv_event_type::IBV_EVENT_PORT_ACTIVE,
+            ),
+            (
+                AsyncEventType::DeviceSpeedChange,
+                ffi::ibv_event_type::IBV_EVENT_DEVICE_SPEED_CHANGE,
+            ),
+        ] {
+            assert_eq!(AsyncEventType::from(raw), wrapper);
+            assert_eq!(ffi::ibv_event_type::from(wrapper), raw);
+        }
     }
 
     #[test]

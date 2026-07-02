@@ -627,6 +627,101 @@ fn shared_receive_queue() {
     assert_eq!(&recv.bytes_mut()[..4], b"srq!");
 }
 
+/// Asynchronous device events on a quiet context: the descriptor is exposed, the non-blocking
+/// poll reports nothing pending, and the bounded wait times out instead of hanging.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn async_events_quiet_context() {
+    use std::os::fd::AsRawFd;
+
+    let ctx = open_test_device();
+    assert!(
+        ctx.async_fd().as_raw_fd() >= 0,
+        "the context exposes its asynchronous-event descriptor"
+    );
+    assert!(
+        ctx.poll_async_event()
+            .expect("failed to poll for an async event")
+            .is_none(),
+        "a quiet context has no pending async event"
+    );
+    let before = Instant::now();
+    assert!(
+        ctx.wait_async_event(Some(Duration::from_millis(50)))
+            .expect("failed to wait for an async event")
+            .is_none(),
+        "waiting on a quiet context times out with None"
+    );
+    // poll(2) has millisecond granularity, so allow it to undershoot the timeout slightly.
+    assert!(before.elapsed() >= Duration::from_millis(45));
+}
+
+/// The SRQ low-watermark event arrives as an asynchronous event: an SRQ armed with a limit raises
+/// `SrqLimitReached` once sends consume its posted receives down below the limit.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn srq_limit_reached_async_event() {
+    let ctx = open_test_device();
+
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    // Arm the low watermark at creation: dropping below 2 posted receives raises the event.
+    let srq = pd.create_srq(16, 1, 2).expect("failed to create SRQ");
+
+    let prepared = pd
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .expect("failed to create QP")
+        .set_gid_index(1)
+        .set_srq(&srq)
+        .set_max_send_wr(8)
+        .build()
+        .expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.handshake(endpoint).expect("failed to connect QP");
+
+    let recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"srq!");
+
+    // Post three receives, then consume all of them: the count crosses below the limit of 2.
+    unsafe {
+        srq.post_recv([
+            RecvRequest::new(1, &[recv.slice(..4)]),
+            RecvRequest::new(2, &[recv.slice(..4)]),
+            RecvRequest::new(3, &[recv.slice(..4)]),
+        ])
+    }
+    .expect("SRQ post_recv failed");
+    let mut batch = qp.start_send();
+    batch.op().signaled().send(4, &[send.slice(..4)]);
+    batch.op().signaled().send(5, &[send.slice(..4)]);
+    batch.op().signaled().send(6, &[send.slice(..4)]);
+    unsafe { batch.submit() }.expect("send failed");
+    drain(&cq, 6);
+
+    // The event may share the queue with unrelated ones (port changes and the like); wait until
+    // the SRQ limit event shows up, dropping (acknowledging) everything else.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match ctx
+            .wait_async_event(Some(remaining))
+            .expect("failed to wait for an async event")
+        {
+            Some(event) if event.event_type() == ibverbs::AsyncEventType::SrqLimitReached => {
+                assert_eq!(event.port_num(), None, "an SRQ event is not port-scoped");
+                break;
+            }
+            Some(_other) => continue,
+            None => panic!("no SrqLimitReached event within the deadline"),
+        }
+    }
+}
+
 /// Unreliable datagram (UD): a connectionless queue pair sends a datagram to itself via an address
 /// handle pointing at its own GID. UD prepends a 40-byte GRH to received messages.
 #[test]

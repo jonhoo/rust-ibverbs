@@ -69,6 +69,13 @@
 //! SRD queue pairs. You can run all of them (and this crate's test suite) without RDMA hardware on
 //! any modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`.
 //!
+//! You do not have to poll: completion channels ([`Context::create_comp_channel`]) deliver
+//! completion notifications on a file descriptor to block on ([`CompletionChannel::wait`]) or hand
+//! to an `epoll`/`tokio` reactor, and the device's out-of-band reports — port state changes,
+//! queue-pair errors, SRQ low-watermark warnings — arrive the same two ways through the
+//! asynchronous-event API ([`Context::wait_async_event`], or [`Context::async_fd`] plus
+//! [`Context::poll_async_event`] from a reactor).
+//!
 //! # Cargo features
 //!
 //! - `serde` *(default)*: [`QueuePairEndpoint`] and [`RemoteMemorySlice`] implement
@@ -89,6 +96,13 @@
 //! `ibverbs-sys` builds automatically (this requires `cmake` and a C toolchain, but nothing
 //! RDMA-specific to be installed). To generate bindings from pre-built rdma-core headers instead,
 //! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
+//!
+//! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
+//! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
+//! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`, and
+//! `rxe` (SoftRoCE) implement both. A provider that lacks them fails cleanly at completion-queue
+//! or queue-pair creation (typically with [`Error::Unsupported`]) rather than degrading to the
+//! legacy verbs.
 //!
 //! # Thread safety
 //!

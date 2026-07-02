@@ -530,3 +530,31 @@ pub unsafe fn ibv_query_device_ex(
     ::std::ptr::write_bytes(attr, 0, 1);
     ibv_query_device(context, &mut (*attr).orig_attr)
 }
+
+// `rdma_get_local_addr` and `rdma_get_peer_addr` are `static inline` in rdma_cma.h: they return
+// pointers into the id's own `route.addr` storage, so there is no exported symbol for bindgen to
+// bind. The functions below reimplement them.
+
+/// The local address a connection-manager id is bound to (rdma_cma.h's inline
+/// `rdma_get_local_addr`).
+///
+/// # Safety
+///
+/// `id` must be a valid `rdma_cm_id`. The returned pointer aliases `id`'s own storage and is
+/// valid only as long as the id.
+#[inline]
+pub unsafe fn rdma_get_local_addr(id: *mut rdma_cm_id) -> *mut sockaddr {
+    &raw mut (*id).route.addr.__bindgen_anon_1.src_addr
+}
+
+/// The remote address a connection-manager id is connected to (rdma_cma.h's inline
+/// `rdma_get_peer_addr`).
+///
+/// # Safety
+///
+/// `id` must be a valid `rdma_cm_id`. The returned pointer aliases `id`'s own storage and is
+/// valid only as long as the id.
+#[inline]
+pub unsafe fn rdma_get_peer_addr(id: *mut rdma_cm_id) -> *mut sockaddr {
+    &raw mut (*id).route.addr.__bindgen_anon_2.dst_addr
+}

@@ -434,8 +434,9 @@ impl ProtectionDomain {
     /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
     /// `max_sge` is the maximum number of scatter/gather elements per work request.
     /// `srq_limit` arms the SRQ's low-watermark event: when the number of posted receives drops
-    /// below it, the device raises an `IBV_EVENT_SRQ_LIMIT_REACHED` asynchronous event (pass 0 to
-    /// disable).
+    /// below it, the device raises an [`SrqLimitReached`](crate::AsyncEventType::SrqLimitReached)
+    /// asynchronous event — receive it with [`Context::poll_async_event`] /
+    /// [`Context::wait_async_event`] and top the SRQ back up (pass 0 to disable).
     ///
     /// # Errors
     ///

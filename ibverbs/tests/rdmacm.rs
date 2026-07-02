@@ -11,7 +11,9 @@ use std::os::fd::AsRawFd;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use ibverbs::rdmacm::{Acceptor, CmEventType, CmId, ConnectionParameter, Connector, PortSpace};
+use ibverbs::rdmacm::{
+    Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
+};
 use ibverbs::{AccessFlags, CompletionQueue, Context, QueuePairState, QueuePairType, RecvRequest};
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
@@ -65,6 +67,10 @@ fn wait_for(cq: &CompletionQueue, wr_id: u64) {
 
 const MESSAGE: &[u8] = b"hello over rdmacm";
 
+/// A generous bound for the blocking helpers: far above what loopback setup needs, so it only
+/// trips if something hangs outright.
+const SETUP_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
+
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn connect_and_send() {
@@ -77,7 +83,7 @@ fn connect_and_send() {
         let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 1).expect("bind");
         ready_tx.send(()).expect("signal ready");
 
-        let incoming = acceptor.accept().expect("accept");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
@@ -91,8 +97,13 @@ fn connect_and_send() {
             .expect("server recv mr");
 
         let mut conn = incoming
-            .accept(qp, ConnectionParameter::default())
+            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
+        // The accepted connection keeps the listener's address, and its peer is the client on
+        // the same device (the port is the client's ephemeral one).
+        assert_eq!(conn.local_addr(), Some(addr));
+        let peer = conn.peer_addr().expect("server peer address");
+        assert_eq!(peer.ip(), addr.ip());
         // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
         unsafe {
             conn.queue_pair()
@@ -125,8 +136,12 @@ fn connect_and_send() {
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
 
     let mut conn = resolved
-        .connect(qp, ConnectionParameter::default())
+        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
+    // The client's peer is the server's listen address; its own address is on the same device.
+    assert_eq!(conn.peer_addr(), Some(addr));
+    let local = conn.local_addr().expect("client local address");
+    assert_eq!(local.ip(), addr.ip());
     let mut batch = conn.queue_pair().start_send();
     batch
         .op()
@@ -140,6 +155,21 @@ fn connect_and_send() {
         .expect("server received the message");
     conn.disconnect().ok();
     server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn accept_times_out() {
+    // An acceptor with a timeout and no client reports TimedOut instead of blocking forever.
+    let addr = SocketAddr::new(IpAddr::V4(device_ipv4(&open_test_device())), 18605);
+    let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 1).expect("bind");
+    let before = Instant::now();
+    match acceptor.accept(Some(Duration::from_millis(50))) {
+        Err(ibverbs::Error::TimedOut) => {}
+        Err(e) => panic!("expected TimedOut, got error {e:?}"),
+        Ok(_) => panic!("expected TimedOut, got a connection"),
+    }
+    assert!(before.elapsed() >= Duration::from_millis(50));
 }
 
 #[test]
@@ -163,7 +193,7 @@ fn two_connections() {
         let mut received = Vec::new();
         let mut conns = Vec::new();
         for _ in 0..2 {
-            let incoming = acceptor.accept().expect("accept");
+            let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
             let ctx = incoming.context().expect("server device context");
             let pd = ctx.alloc_pd().expect("server pd");
             let cq = ctx.create_cq(16).build().expect("server cq");
@@ -176,7 +206,7 @@ fn two_connections() {
                 .allocate(64, AccessFlags::PERMISSIVE)
                 .expect("server recv mr");
             let mut conn = incoming
-                .accept(qp, ConnectionParameter::default())
+                .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
                 .expect("accept");
             unsafe {
                 conn.queue_pair()
@@ -215,7 +245,7 @@ fn two_connections() {
                     .expect("client send mr");
                 send.bytes_mut()[..MESSAGE.len()].fill(tag);
                 let mut conn = resolved
-                    .connect(qp, ConnectionParameter::default())
+                    .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
                     .expect("connect");
                 let mut batch = conn.queue_pair().start_send();
                 batch
@@ -241,10 +271,11 @@ fn two_connections() {
     );
 }
 
-/// Pump events on `id` in non-blocking mode until the wanted one arrives, ignoring (acknowledging)
-/// others. Mirrors how a reactor would drive the connection manager: poll, and only sleep when the
-/// channel is empty. Exercises [`CmId::poll_cm_event`] and [`CmId::set_nonblocking`].
-fn pump_until(id: &CmId, want: CmEventType) {
+/// Pump events on `id` in non-blocking mode until the wanted one arrives (returning it, still
+/// unacknowledged), ignoring (acknowledging) others. Mirrors how a reactor would drive the
+/// connection manager: poll, and only sleep when the channel is empty. Exercises
+/// [`CmId::poll_cm_event`] and [`CmId::set_nonblocking`].
+fn pump_until(id: &CmId, want: CmEventType) -> CmEvent {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match id.poll_cm_event().expect("poll cm event") {
@@ -255,7 +286,7 @@ fn pump_until(id: &CmId, want: CmEventType) {
                         0,
                         "event {want:?} reported a failure status"
                     );
-                    return;
+                    return event;
                 }
                 // A non-matching event is acknowledged when `event` drops here.
             }
@@ -267,13 +298,19 @@ fn pump_until(id: &CmId, want: CmEventType) {
     }
 }
 
+/// The private data each side attaches to its connection request or reply. The transport pads the
+/// payload on the wire, so the receiver asserts on the prefix it knows, within the reported length.
+const CLIENT_PDATA: &[u8] = b"client says hi";
+const SERVER_PDATA: &[u8] = b"server says welcome";
+
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn low_level_connect_and_send() {
     // Drive the connection-manager state machine directly with `CmId`, instead of the blocking
     // `Connector`/`Acceptor` helpers: the passive side blocks on `get_cm_event`, while the active
     // side runs its channel non-blocking and pumps events off the file descriptor the way an event
-    // loop would. Proves the low-level escape hatch can set up a working connection.
+    // loop would. Proves the low-level escape hatch can set up a working connection, and that
+    // private data crosses it in both directions.
     let addr = SocketAddr::new(IpAddr::V4(device_ipv4(&open_test_device())), 18603);
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
@@ -288,6 +325,16 @@ fn low_level_connect_and_send() {
         let request = loop {
             let event = listener.get_cm_event().expect("listener event");
             if event.event_type() == CmEventType::ConnectRequest {
+                // The client's private data rides in the connection-request event. The transport
+                // pads it, so check the prefix within the reported length.
+                let pdata = event
+                    .private_data()
+                    .expect("connect request carries private data");
+                assert!(
+                    pdata.len() >= CLIENT_PDATA.len(),
+                    "reported private data is shorter than what the client wrote"
+                );
+                assert_eq!(&pdata[..CLIENT_PDATA.len()], CLIENT_PDATA);
                 break event.connection_request().expect("connection request");
             }
         };
@@ -314,8 +361,9 @@ fn low_level_connect_and_send() {
         unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) }
             .expect("post_recv");
 
-        let mut param = ConnectionParameter::default();
-        param.set_qp_num(qp.qp_num());
+        let param = ConnectionParameter::default()
+            .set_qp_num(qp.qp_num())
+            .set_private_data(SERVER_PDATA);
         request.accept(&param).expect("accept");
         loop {
             let event = request.get_cm_event().expect("server event");
@@ -345,6 +393,11 @@ fn low_level_connect_and_send() {
         .expect("resolve_route");
     pump_until(&id, CmEventType::RouteResolved);
 
+    // Once the destination has resolved, both endpoint addresses are readable off the id.
+    assert_eq!(id.peer_addr(), Some(addr));
+    let local = id.local_addr().expect("local address after resolution");
+    assert_eq!(local.ip(), addr.ip());
+
     let ctx = id.context().expect("client device context");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
@@ -359,10 +412,22 @@ fn low_level_connect_and_send() {
         .expect("client init attr");
     qp.modify(&init).expect("client init");
 
-    let mut param = ConnectionParameter::default();
-    param.set_qp_num(qp.qp_num());
+    let param = ConnectionParameter::default()
+        .set_qp_num(qp.qp_num())
+        .set_private_data(CLIENT_PDATA);
     id.connect(&param).expect("connect");
-    pump_until(&id, CmEventType::ConnectResponse);
+    // The server's private data rides back in the connect-response event; check the prefix
+    // within the reported (transport-padded) length, then acknowledge the event by dropping it.
+    let response = pump_until(&id, CmEventType::ConnectResponse);
+    let pdata = response
+        .private_data()
+        .expect("connect response carries private data");
+    assert!(
+        pdata.len() >= SERVER_PDATA.len(),
+        "reported private data is shorter than what the server wrote"
+    );
+    assert_eq!(&pdata[..SERVER_PDATA.len()], SERVER_PDATA);
+    drop(response);
     for state in [QueuePairState::ReadyToReceive, QueuePairState::ReadyToSend] {
         let attr = id.init_qp_attr(state).expect("client init_qp_attr");
         qp.modify(&attr).expect("client modify");
