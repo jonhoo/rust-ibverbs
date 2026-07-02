@@ -15,6 +15,7 @@ cc_library(
 
 # Generate FFI bindings directly from rdma-core verbs.h
 # Named "bindings" so output is bindings.rs (matching Cargo's OUT_DIR/bindings.rs)
+# The flags mirror the bindgen invocation in build.rs (base features: no efa, no rdmacm).
 rust_bindgen(
     name = "bindings",
     bindgen_flags = [
@@ -23,6 +24,12 @@ rust_bindgen(
         "--allowlist-function=ibv_.*",
         "--allowlist-function=_ibv_.*",
         "--allowlist-type=ibv_.*",
+        # needed to reach the static-inline `ibv_create_cq_ex` / `ibv_create_qp_ex`, which dispatch
+        # through the provider op table embedded in `verbs_context`
+        "--allowlist-type=verbs_context",
+        # the `ibv_advise_mr_advice` / `ibv_advise_mr_flags` the public API spells are macro
+        # aliases for these kernel enums, which `ibv_advise_mr` takes
+        "--allowlist-type=ib_uverbs_advise_mr_.*",
         "--allowlist-var=IBV_LINK_LAYER_.*",
         "--bitfield-enum=ibv_access_flags",
         "--bitfield-enum=ibv_create_cq_wc_flags",
@@ -43,6 +50,7 @@ rust_bindgen(
         "--bitfield-enum=ibv_wq_flags",
         "--bitfield-enum=ibv_xrcd_init_attr_mask",
         "--default-enum-style=rust",
+        "--no-prepend-enum-name",
         "--blocklist-type=ibv_wc",
     ],
     cc_lib = ":ibverbs_c",

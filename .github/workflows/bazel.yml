@@ -1,0 +1,29 @@
+# This workflow checks that the Bazel build definitions (MODULE.bazel and the BUILD.bazel files)
+# keep working as the crate evolves. It builds the library and the loopback example with Bazel.
+# Bazel fetches its own rdma-core headers and Rust toolchain (see MODULE.bazel), so the checkout
+# does not need submodules; only the system libibverbs is needed, to link the example.
+# See check.yml for information about how the concurrency cancellation and workflow triggering works
+permissions:
+  contents: read
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+name: bazel
+jobs:
+  bazel:
+    runs-on: ubuntu-latest
+    name: ubuntu / bazel
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libibverbs
+        # the loopback example links against the host libibverbs
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libibverbs-dev
+      # bazelisk is preinstalled on the GitHub Ubuntu runners
+      - name: bazelisk build //ibverbs:ibverbs
+        run: bazelisk build //ibverbs:ibverbs
+      - name: bazelisk build //ibverbs:loopback
+        run: bazelisk build //ibverbs:loopback
