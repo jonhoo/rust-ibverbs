@@ -4,8 +4,8 @@
 // EFA's transport is SRD (Scalable Reliable Datagram): reliable like RC but connectionless and
 // addressed like UD. Only queue-pair *creation* is EFA-specific (`efadv_create_qp_ex`); the resulting
 // queue pair is created with the same extended send operations as every other, so sends go through
-// the normal doorbell path ([`QueuePair::post_send_ud`] / [`QueuePair::start_send`] with a `.to(..)`),
-// receives through [`QueuePair::post_receive`], and completions through [`CompletionQueue::poll`].
+// the normal doorbell path ([`QueuePair::start_send`] with a `.to(..)`), receives through
+// [`QueuePair::post_recv`], and completions through [`CompletionQueue::poll`].
 // ---------------------------------------------------------------------------
 
 use std::io;
@@ -27,9 +27,8 @@ impl ProtectionDomain {
     /// Configure it like any other queue pair (GID index, queue/SGE limits), then create it with
     /// [`build_srd`](QueuePairBuilder::build_srd) and bring it to ready with
     /// [`activate_srd`](PreparedQueuePair::activate_srd). Send with
-    /// [`post_send_ud`](QueuePair::post_send_ud) (or `start_send()` and
-    /// [`op().to(..)`](crate::SendOp::to)), receive with
-    /// [`post_receive`](QueuePair::post_receive).
+    /// [`start_send`](QueuePair::start_send) and [`op().to(..)`](crate::SendOp::to), receive with
+    /// [`post_recv`](QueuePair::post_recv).
     pub fn create_srd_qp(
         &self,
         send: &CompletionQueue,
@@ -48,8 +47,8 @@ impl QueuePairBuilder {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: invalid value in the queue pair attributes.
-    ///  - `ENOMEM`: not enough resources to complete this operation.
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `efadv_create_qp_ex` failed (`EINVAL` for
+    ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
     pub fn build_srd(&self) -> Result<PreparedQueuePair> {
         use ffi::ibv_qp_create_send_ops_flags as SendOps;
         // SRD supports send and one-sided RDMA, including the immediate variants.
@@ -132,12 +131,12 @@ impl PreparedQueuePair {
     ///
     /// SRD is connectionless, so this needs no remote endpoint; the transitions are the same as a UD
     /// queue pair's. Address each send with an [`AddressHandle`] (see
-    /// [`post_send_ud`](QueuePair::post_send_ud)).
+    /// [`SendOp::to`](crate::SendOp::to)).
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: invalid value provided in `attr` or `attr_mask`.
-    ///  - `ENOMEM`: not enough resources to complete this operation.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
+    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources).
     pub fn activate_srd(self, qkey: u32) -> Result<QueuePair> {
         self.activate_ud(qkey)
     }

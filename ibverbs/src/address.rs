@@ -8,10 +8,9 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::pd::ProtectionDomainInner;
-use crate::PORT_NUM;
 
 #[cfg(doc)]
-use crate::{Context, ProtectionDomain, QueuePair, QueuePairBuilder};
+use crate::{Context, ProtectionDomain, QueuePairBuilder};
 
 /// A Global identifier (GID) for an RDMA device port.
 ///
@@ -293,28 +292,23 @@ mod test {
 
 /// Attributes describing how to reach a destination, used to build an [`AddressHandle`].
 ///
-/// Defaults to a non-global (LID-only) route on the crate's port. For RoCE and routed InfiniBand,
-/// set a global route with [`set_grh`](Self::set_grh).
+/// Describes a non-global (LID-only) route until a global route is set with
+/// [`set_grh`](Self::set_grh), which RoCE and routed InfiniBand require.
 #[derive(Clone)]
 pub struct AddressHandleAttribute {
     pub(crate) attr: ffi::ibv_ah_attr,
 }
 
-impl Default for AddressHandleAttribute {
-    fn default() -> Self {
+impl AddressHandleAttribute {
+    /// A new address-handle attribute routing from `port_num`, the local physical port through
+    /// which the destination is reached (the port this handle routes from; numbered from 1).
+    pub fn new(port_num: u8) -> Self {
         AddressHandleAttribute {
             attr: ffi::ibv_ah_attr {
-                port_num: PORT_NUM,
+                port_num,
                 ..Default::default()
             },
         }
-    }
-}
-
-impl AddressHandleAttribute {
-    /// A new address-handle attribute on the default port.
-    pub fn new() -> Self {
-        Self::default()
     }
 
     /// Set the destination LID (InfiniBand). Not used for RoCE / Ethernet link layers.
@@ -326,12 +320,6 @@ impl AddressHandleAttribute {
     /// Set the service level.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
         self.attr.sl = service_level;
-        self
-    }
-
-    /// Set the local physical port through which the destination is reached.
-    pub fn set_port(&mut self, port_num: u8) -> &mut Self {
-        self.attr.port_num = port_num;
         self
     }
 
@@ -359,7 +347,7 @@ impl AddressHandleAttribute {
 ///
 /// Created with [`ProtectionDomain::create_address_handle`] and passed by reference to each UD send;
 /// a single UD queue pair can address many destinations with different handles (see
-/// [`QueuePair::post_send_ud`]).
+/// [`SendOp::to`](crate::SendOp::to)).
 pub struct AddressHandle {
     // Keeps the protection domain (and so its context) alive until the handle is destroyed.
     pub(crate) _pd: Arc<ProtectionDomainInner>,

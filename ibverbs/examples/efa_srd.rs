@@ -1,7 +1,7 @@
 //! Minimal EFA SRD example: two SRD queue pairs on one device, one sends a datagram to the other.
 //!
 //! The only EFA-specific calls are `create_srd_qp` / `build_srd` / `activate_srd`; everything else
-//! (`post_send_ud`, `post_recv`, `poll`) is the same API every other transport uses.
+//! (`start_send`, `post_recv`, `poll`) is the same API every other transport uses.
 //!
 //! Requires an AWS Elastic Fabric Adapter (EFA) device and the `efa` feature
 //! (`cargo run --features efa --example efa_srd`). It is illustrative: the data path should be
@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Address the receiver by its GID.
     let receiver_gid = receiver_endpoint.gid.ok_or("EFA requires a GID")?;
-    let mut ah_attr = ibverbs::AddressHandleAttribute::new();
+    let mut ah_attr = ibverbs::AddressHandleAttribute::new(1);
     ah_attr.set_grh(receiver_gid, GID_INDEX as u8, 64, 0);
     let ah = pd.create_address_handle(&ah_attr)?;
 
@@ -44,8 +44,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     send_buf.bytes_mut()[..5].copy_from_slice(b"hello");
 
     // Post the receive, then the send. Both go through the normal, non-EFA-specific API.
-    unsafe { receiver.post_receive(&[recv_buf.slice(..)], 1) }?;
-    unsafe { sender.post_send_ud(&[send_buf.slice(..5)], &ah, receiver_endpoint.num, QKEY, 2) }?;
+    unsafe { receiver.post_recv([ibverbs::RecvRequest::new(1, &[recv_buf.slice(..)])]) }?;
+    let mut batch = sender.start_send();
+    batch
+        .op()
+        .signaled()
+        .to(&ah, receiver_endpoint.num, QKEY)
+        .send(2, &[send_buf.slice(..5)]);
+    unsafe { batch.submit() }?;
 
     // Wait for the receive and send completions.
     let mut recv_len = None;
@@ -55,8 +61,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         };
         while let Some(wc) = completions.next() {
-            if let Err((status, _)) = wc.ok() {
-                return Err(format!("work request {} failed: {status:?}", wc.wr_id()).into());
+            if let Err(e) = wc.ok() {
+                return Err(format!("work request {} failed: {e}", wc.wr_id()).into());
             }
             match wc.wr_id() {
                 1 => recv_len = Some(wc.len()),

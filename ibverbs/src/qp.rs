@@ -2,6 +2,7 @@ use std::io;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
@@ -224,6 +225,161 @@ flags_newtype! {
     }
 }
 
+/// The ACK timeout of a reliable-connection queue pair: how long the sender waits for an ACK/NACK
+/// from the remote queue pair before retransmitting. Set with [`QueuePairBuilder::set_timeout`].
+///
+/// The wire encoding is a 5-bit exponent: the device supports exactly the timeouts
+/// `4.096 µs × 2^n` for `n` in `1..=31` — from 8.192 µs up to about 2.4 hours — plus
+/// [`INFINITE`](Self::INFINITE) (never time out). Construct a timeout from a [`Duration`] with
+/// [`at_least`](Self::at_least), which rounds up to the next representable step, or from a raw
+/// encoding with [`from_exponent`](Self::from_exponent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckTimeout(u8);
+
+impl AckTimeout {
+    /// Wait forever for the ACK/NACK (the encoding `0`).
+    ///
+    /// Useful for debugging: if a packet is lost and no ACK or NACK arrives, no retry ever
+    /// occurs and the queue pair just stops sending data.
+    pub const INFINITE: AckTimeout = AckTimeout(0);
+
+    /// The smallest exponent of a finite timeout (`4.096 µs × 2^1`).
+    const MIN_EXPONENT: u8 = 1;
+    /// The largest representable exponent (`4.096 µs × 2^31`).
+    const MAX_EXPONENT: u8 = 31;
+
+    /// The effective timeout of exponent `n`: `4.096 µs × 2^n`.
+    fn step(n: u8) -> Duration {
+        // 4.096 µs = 4096 ns; shifted by at most 31, this stays far below u64::MAX nanoseconds.
+        Duration::from_nanos(4096u64 << n)
+    }
+
+    /// The smallest representable timeout that is at least `d`.
+    ///
+    /// Rounds `d` up to the next step `4.096 µs × 2^n` (`n` in `1..=31`): a duration below the
+    /// smallest step becomes the smallest step (8.192 µs), and one beyond the largest step clamps
+    /// to it (`n = 31`, about 2.4 hours). This never returns [`INFINITE`](Self::INFINITE).
+    pub fn at_least(d: Duration) -> AckTimeout {
+        for n in Self::MIN_EXPONENT..=Self::MAX_EXPONENT {
+            if Self::step(n) >= d {
+                return AckTimeout(n);
+            }
+        }
+        AckTimeout(Self::MAX_EXPONENT)
+    }
+
+    /// The timeout with the raw 5-bit wire encoding `n` (the exponent in `4.096 µs × 2^n`), for
+    /// code ported from C. The encoding `0` is [`INFINITE`](Self::INFINITE).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `n > 31` (the encoding is 5 bits).
+    pub fn from_exponent(n: u8) -> AckTimeout {
+        assert!(
+            n <= Self::MAX_EXPONENT,
+            "an ACK timeout encoding is 5 bits (0..=31), got {n}"
+        );
+        AckTimeout(n)
+    }
+
+    /// The effective timeout, or `None` for [`INFINITE`](Self::INFINITE).
+    pub fn duration(&self) -> Option<Duration> {
+        (self.0 != 0).then(|| Self::step(self.0))
+    }
+
+    /// The raw 5-bit wire encoding (the exponent in `4.096 µs × 2^n`; `0` is infinite).
+    pub fn exponent(&self) -> u8 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AckTimeout {
+    /// Formats the effective timeout (for example `65.536µs`), or `infinite`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.duration() {
+            None => f.write_str("infinite"),
+            Some(d) => write!(f, "{d:?}"),
+        }
+    }
+}
+
+/// The minimum RNR NAK delay of a reliable-connection queue pair: the wait the queue pair demands
+/// of its peer, in each receiver-not-ready NAK it sends, before the peer retries a send that found
+/// no receive posted. Set with [`QueuePairBuilder::set_min_rnr_timer`].
+///
+/// The wire encoding is 5 bits naming one of 32 discrete delays from 0.01 ms to 655.36 ms, and it
+/// is *not* monotonic: the encoding `0` names the largest delay (655.36 ms), while `1..=31` run in
+/// increasing order from 0.01 ms to 491.52 ms. Construct a delay from a [`Duration`] with
+/// [`at_least`](Self::at_least), which rounds up to the next representable delay, or from a raw
+/// encoding with [`from_encoding`](Self::from_encoding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RnrTimer(u8);
+
+impl RnrTimer {
+    /// The discrete delays the wire encoding can express, in microseconds, sorted ascending, each
+    /// with its encoding. The encoding is non-monotonic: `0` names the *largest* delay.
+    #[rustfmt::skip]
+    const DELAYS: [(u64, u8); 32] = [
+        (10, 1), (20, 2), (30, 3), (40, 4),
+        (60, 5), (80, 6), (120, 7), (160, 8),
+        (240, 9), (320, 10), (480, 11), (640, 12),
+        (960, 13), (1_280, 14), (1_920, 15), (2_560, 16),
+        (3_840, 17), (5_120, 18), (7_680, 19), (10_240, 20),
+        (15_360, 21), (20_480, 22), (30_720, 23), (40_960, 24),
+        (61_440, 25), (81_920, 26), (122_880, 27), (163_840, 28),
+        (245_760, 29), (327_680, 30), (491_520, 31), (655_360, 0),
+    ];
+
+    /// The smallest representable delay that is at least `d`.
+    ///
+    /// Rounds `d` up to the next of the discrete delays: a duration below the smallest becomes
+    /// the smallest (0.01 ms), and one beyond the largest clamps to it (655.36 ms).
+    pub fn at_least(d: Duration) -> RnrTimer {
+        for (micros, encoding) in Self::DELAYS {
+            if Duration::from_micros(micros) >= d {
+                return RnrTimer(encoding);
+            }
+        }
+        // Beyond the largest delay: clamp to it (655.36 ms, the encoding 0).
+        RnrTimer(0)
+    }
+
+    /// The delay with the raw 5-bit wire encoding `v`, for code ported from C. Note that the
+    /// encoding `0` names the *largest* delay (655.36 ms), not the smallest.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `v > 31` (the encoding is 5 bits).
+    pub fn from_encoding(v: u8) -> RnrTimer {
+        assert!(
+            v <= 31,
+            "an RNR NAK timer encoding is 5 bits (0..=31), got {v}"
+        );
+        RnrTimer(v)
+    }
+
+    /// The effective delay.
+    pub fn duration(&self) -> Duration {
+        let (micros, _) = Self::DELAYS
+            .iter()
+            .find(|&&(_, encoding)| encoding == self.0)
+            .expect("every 5-bit encoding names a delay");
+        Duration::from_micros(*micros)
+    }
+
+    /// The raw 5-bit wire encoding.
+    pub fn encoding(&self) -> u8 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for RnrTimer {
+    /// Formats the effective delay (for example `2.56ms`).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self.duration())
+    }
+}
+
 /// An unconfigured `QueuePair`. Created by [`ProtectionDomain::create_qp`].
 ///
 /// A `QueuePairBuilder` is used to configure a `QueuePair` before it is allocated and initialized.
@@ -344,30 +500,14 @@ impl QueuePairBuilder {
 
     /// Set the access flags for the new `QueuePair`.
     ///
-    /// Valid only for RC and UC QPs.
-    ///
     /// Defaults to [`AccessFlags::LOCAL_WRITE`].
+    ///
+    /// Ignored (silently) unless this is an RC or UC queue pair.
     pub fn set_access(&mut self, access: AccessFlags) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
             self.access = Some(access.into());
-        }
-        self
-    }
-
-    /// Set the access flags of the new `QueuePair` such that it allows remote reads and writes.
-    ///
-    /// Valid only for RC and UC QPs.
-    pub fn allow_remote_rw(&mut self) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
-        {
-            self.access = Some(
-                self.access.expect("always set to Some in new")
-                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ,
-            );
         }
         self
     }
@@ -401,102 +541,37 @@ impl QueuePairBuilder {
         self
     }
 
-    /// Sets the minimum RNR NAK Timer Field Value for the new `QueuePair`.
+    /// Sets the minimum RNR NAK timer for the new `QueuePair`: the wait it demands of its peer,
+    /// in each receiver-not-ready NAK, before the peer retries a send that arrived while no
+    /// receive was posted. It does not affect RNR NAKs sent for other reasons.
     ///
-    /// Defaults to 16 (2.56 ms delay).
-    /// Valid only for RC QPs.
+    /// The device supports 32 discrete delays between 0.01 ms and 655.36 ms;
+    /// [`RnrTimer::at_least`] rounds a [`Duration`] up to the next one.
     ///
-    /// When an incoming message to this QP should consume a Work Request from the Receive Queue,
-    /// but no Work Request is outstanding on that Queue, the QP will send an RNR NAK packet to
-    /// the initiator. It does not affect RNR NAKs sent for other reasons. The value must be one of
-    /// the following values:
+    /// Defaults to a 2.56 ms delay.
     ///
-    ///  - 0 - 655.36 ms delay
-    ///  - 1 - 0.01 ms delay
-    ///  - 2 - 0.02 ms delay
-    ///  - 3 - 0.03 ms delay
-    ///  - 4 - 0.04 ms delay
-    ///  - 5 - 0.06 ms delay
-    ///  - 6 - 0.08 ms delay
-    ///  - 7 - 0.12 ms delay
-    ///  - 8 - 0.16 ms delay
-    ///  - 9 - 0.24 ms delay
-    ///  - 10 - 0.32 ms delay
-    ///  - 11 - 0.48 ms delay
-    ///  - 12 - 0.64 ms delay
-    ///  - 13 - 0.96 ms delay
-    ///  - 14 - 1.28 ms delay
-    ///  - 15 - 1.92 ms delay
-    ///  - 16 - 2.56 ms delay
-    ///  - 17 - 3.84 ms delay
-    ///  - 18 - 5.12 ms delay
-    ///  - 19 - 7.68 ms delay
-    ///  - 20 - 10.24 ms delay
-    ///  - 21 - 15.36 ms delay
-    ///  - 22 - 20.48 ms delay
-    ///  - 23 - 30.72 ms delay
-    ///  - 24 - 40.96 ms delay
-    ///  - 25 - 61.44 ms delay
-    ///  - 26 - 81.92 ms delay
-    ///  - 27 - 122.88 ms delay
-    ///  - 28 - 163.84 ms delay
-    ///  - 29 - 245.76 ms delay
-    ///  - 30 - 327.68 ms delay
-    ///  - 31 - 491.52 ms delay
-    pub fn set_min_rnr_timer(&mut self, timer: u8) -> &mut Self {
+    /// Ignored (silently) unless this is an RC queue pair.
+    pub fn set_min_rnr_timer(&mut self, timer: RnrTimer) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            self.min_rnr_timer = Some(timer);
+            self.min_rnr_timer = Some(timer.encoding());
         }
         self
     }
 
-    /// Sets the minimum timeout that the new `QueuePair` waits for ACK/NACK from remote QP before
+    /// Sets the minimum time the new `QueuePair` waits for an ACK/NACK from the remote QP before
     /// retransmitting the packet.
     ///
-    /// Defaults to 4 (65.536µs).
-    /// Valid only for RC QPs.
+    /// The device supports exactly the timeouts `4.096 µs × 2^n` for `n` in `1..=31` (8.192 µs up
+    /// to about 2.4 hours); [`AckTimeout::at_least`] rounds a [`Duration`] up to the next one.
+    /// [`AckTimeout::INFINITE`] waits forever (useful for debugging): if a packet is lost and no
+    /// ACK or NACK arrives, no retry ever occurs and the QP just stops sending data.
     ///
-    /// The value zero is special value that waits an infinite time for the ACK/NACK (useful
-    /// for debugging). This means that if any packet in a message is being lost and no ACK or NACK
-    /// is being sent, no retry will ever occur and the QP will just stop sending data.
+    /// Defaults to 65.536 µs.
     ///
-    /// For any other value of timeout, the time calculation is `4.096*2^timeout`µs, giving:
-    ///
-    ///  - 0 - infinite
-    ///  - 1 - 8.192 µs
-    ///  - 2 - 16.384 µs
-    ///  - 3 - 32.768 µs
-    ///  - 4 - 65.536 µs
-    ///  - 5 - 131.072 µs
-    ///  - 6 - 262.144 µs
-    ///  - 7 - 524.288 µs
-    ///  - 8 - 1.048 ms
-    ///  - 9 - 2.097 ms
-    ///  - 10 - 4.194 ms
-    ///  - 11 - 8.388 ms
-    ///  - 12 - 16.777 ms
-    ///  - 13 - 33.554 ms
-    ///  - 14 - 67.108 ms
-    ///  - 15 - 134.217 ms
-    ///  - 16 - 268.435 ms
-    ///  - 17 - 536.870 ms
-    ///  - 18 - 1.07 s
-    ///  - 19 - 2.14 s
-    ///  - 20 - 4.29 s
-    ///  - 21 - 8.58 s
-    ///  - 22 - 17.1 s
-    ///  - 23 - 34.3 s
-    ///  - 24 - 68.7 s
-    ///  - 25 - 137 s
-    ///  - 26 - 275 s
-    ///  - 27 - 550 s
-    ///  - 28 - 1100 s
-    ///  - 29 - 2200 s
-    ///  - 30 - 4400 s
-    ///  - 31 - 8800 s
-    pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
+    /// Ignored (silently) unless this is an RC queue pair.
+    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            self.timeout = Some(timeout);
+            self.timeout = Some(timeout.exponent());
         }
         self
     }
@@ -505,7 +580,8 @@ impl QueuePairBuilder {
     /// before reporting an error because the remote side doesn't answer in the primary path.
     ///
     /// This 3 bit value defaults to 6.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     ///
     /// # Panics
     ///
@@ -523,7 +599,8 @@ impl QueuePairBuilder {
     ///
     /// This 3 bit value defaults to 6. The value 7 is special and specify to retry sending the
     /// message indefinitely when a RNR Nack is being sent by remote side.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     ///
     /// # Panics
     ///
@@ -545,7 +622,8 @@ impl QueuePairBuilder {
     /// Set the number of outstanding RDMA reads & atomic operations on the destination Queue Pair.
     ///
     /// This defaults to 1.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
             self.max_rd_atomic = Some(max_rd_atomic);
@@ -556,7 +634,8 @@ impl QueuePairBuilder {
     /// Set the number of responder resources for handling incoming RDMA reads & atomic operations.
     ///
     /// This defaults to 1.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
             self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
@@ -567,7 +646,8 @@ impl QueuePairBuilder {
     /// Set the path MTU.
     ///
     /// Defaults to the port's active MTU.
-    /// Valid only for RC and UC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC or UC queue pair.
     pub fn set_path_mtu(&mut self, path_mtu: Mtu) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
@@ -580,7 +660,8 @@ impl QueuePairBuilder {
     /// Set the PSN for the receive queue.
     ///
     /// Defaults to 0.
-    /// Valid only for RC and UC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC or UC queue pair.
     pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
@@ -665,11 +746,11 @@ impl QueuePairBuilder {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid `ProtectionDomain` or `CompletionQueue`, or invalid value provided in
-    ///    `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
-    ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
-    ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `ibv_create_qp_ex` failed (`EINVAL` for an
+    ///    invalid `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
+    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
+    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
+    ///    to create a QP with this Transport Service Type).
     pub fn build(&self) -> Result<PreparedQueuePair> {
         use ffi::ibv_qp_create_send_ops_flags as SendOps;
         use ffi::ibv_qp_type::{IBV_QPT_RC, IBV_QPT_UC};
@@ -1033,12 +1114,12 @@ impl PreparedQueuePair {
     /// has its most significant bit set, meaning "use the QP's Q_Key").
     ///
     /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
-    /// [`QueuePair::post_send_ud`].
+    /// [`SendOp::to`].
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid value provided in `attr` or `attr_mask`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
+    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources).
     pub fn activate_ud(self, qkey: u32) -> Result<QueuePair> {
         // INIT: associate with the port and set the Q_Key. UD has no access flags.
         let mut attr = ffi::ibv_qp_attr {
@@ -1086,11 +1167,12 @@ impl PreparedQueuePair {
 
 /// A receive work request, binding the lifetime of its scatter/gather buffers.
 ///
-/// Build one with [`RecvRequest::new`] and post a batch of them with [`QueuePair::post_recv`]. Unlike
-/// the send doorbell, receives are posted from a caller-owned slice, so batching allocates nothing.
+/// Build one with [`RecvRequest::new`] and post a batch of them with [`QueuePair::post_recv`] or
+/// [`SharedReceiveQueue::post_recv`]. Unlike the send doorbell, receives are posted from a
+/// caller-owned slice, so batching allocates nothing.
 #[repr(transparent)]
 pub struct RecvRequest<'a> {
-    wr: ffi::ibv_recv_wr,
+    pub(crate) wr: ffi::ibv_recv_wr,
     _local: std::marker::PhantomData<&'a [LocalMemorySlice]>,
 }
 
@@ -1175,8 +1257,9 @@ impl<'qp> SendBatch<'qp> {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: invalid value in one of the work requests.
-    ///  - `ENOMEM`: the send queue is full or out of resources.
+    ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
+    ///    value in one of the work requests, `ENOMEM` when the send queue is full or out of
+    ///    resources).
     pub unsafe fn submit(self) -> Result<()> {
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
@@ -2040,88 +2123,6 @@ impl QueuePair {
         }
     }
 
-    /// Posts a single send Work Request (WR) containing a scatter-gather list of local
-    /// memory slices to the Send Queue of this Queue Pair.
-    ///
-    /// `wr_id` is a 64 bits value associated with this WR. If a Work Completion will be generated
-    /// when this Work Request ends, it will contain this value.
-    ///
-    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send). The local memory
-    /// slices will be sent as a single `ibv_send_wr` using `IBV_WR_SEND`. The send has
-    /// `IBV_SEND_SIGNALED` set, so a work completion will also be triggered as a result of this send.
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
-    #[inline]
-    pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
-        let mut batch = self.start_send();
-        batch.op().signaled().send(wr_id, local);
-        unsafe { batch.submit() }
-    }
-
-    /// Posts a single unreliable-datagram (UD) send, addressed by `ah` / `remote_qpn` /
-    /// `remote_qkey`. The request is signaled, so it generates a work completion.
-    ///
-    /// Only valid on a UD queue pair (see [`PreparedQueuePair::activate_ud`]). A single UD queue
-    /// pair can address many destinations by passing a different [`AddressHandle`] per call.
-    ///
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send). The address handle and the local buffers must remain valid until a
-    /// work completion for this request has been retrieved.
-    #[inline]
-    pub unsafe fn post_send_ud(
-        &mut self,
-        local: &[LocalMemorySlice],
-        ah: &AddressHandle,
-        remote_qpn: u32,
-        remote_qkey: u32,
-        wr_id: u64,
-    ) -> Result<()> {
-        let mut batch = self.start_send();
-        batch
-            .op()
-            .signaled()
-            .to(ah, remote_qpn, remote_qkey)
-            .send(wr_id, local);
-        unsafe { batch.submit() }
-    }
-
-    /// Posts a single receive Work Request (WR) containing a scatter-gather list of local
-    /// memory slices to the Receive Queue of this Queue Pair.
-    ///
-    /// Generates a HW-specific Receive Request out of it and add it to the tail of the Queue
-    /// Pair's Receive Queue without performing any context switch. The RDMA device will take one
-    /// of those Work Requests as soon as an incoming opcode to that QP will consume a Receive
-    /// Request (RR). If there is a failure in one of the WRs because the Receive Queue is full or
-    /// one of the attributes in the WR is bad, it stops immediately and return the pointer to that
-    /// WR.
-    ///
-    /// `wr_id` is a 64 bits value associated with this WR. When a Work Completion is generated
-    /// when this Work Request ends, it will contain this value.
-    ///
-    /// Internally, the local memory slices will be received into as a single `ibv_recv_wr`.
-    ///
-    /// See also [RDMAmojo's `ibv_post_recv` documentation][1].
-    ///
-    /// # Safety
-    ///
-    /// The memory region can only be safely reused or dropped after the request is fully executed
-    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
-    /// until `CompletionQueue::poll` returns a completion for this receive).
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid value provided in the Work Request.
-    ///  - `ENOMEM`: Receive Queue is full or not enough resources to complete this operation.
-    ///  - `EFAULT`: Invalid value provided in `QueuePair`.
-    ///
-    /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
-    #[inline]
-    pub unsafe fn post_receive(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
-        unsafe { self.post_recv([RecvRequest::new(wr_id, local)]) }
-    }
-
     /// Posts a batch of receive Work Requests to this Queue Pair's receive queue with a single
     /// `ibv_post_recv`.
     ///
@@ -2141,8 +2142,9 @@ impl QueuePair {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: invalid value in one of the work requests.
-    ///  - `ENOMEM`: the receive queue is full or out of resources.
+    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
+    ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
+    ///    resources).
     pub unsafe fn post_recv<'a>(&mut self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
@@ -2170,53 +2172,6 @@ impl QueuePair {
         } else {
             Ok(())
         }
-    }
-
-    #[inline]
-    /// Remote RDMA write.
-    ///
-    /// Immediate data can be used to signal the completion of the write operation.
-    /// The other side uses `post_recv` on a dummy buffer and gets the imm data from the work completion.
-    ///
-    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send).
-    ///
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
-    pub unsafe fn post_write(
-        &mut self,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-        imm_data: Option<u32>,
-    ) -> Result<()> {
-        let mut batch = self.start_send();
-        match imm_data {
-            Some(imm) => batch.op().signaled().write_imm(wr_id, local, remote, imm),
-            None => batch.op().signaled().write(wr_id, local, remote),
-        };
-        unsafe { batch.submit() }
-    }
-
-    #[inline]
-    /// Remote RDMA read.
-    ///
-    /// RDMA read does not support immediate data.
-    ///
-    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send).
-    ///
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
-    pub unsafe fn post_read(
-        &mut self,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-    ) -> Result<()> {
-        let mut batch = self.start_send();
-        batch.op().signaled().read(wr_id, local, remote);
-        unsafe { batch.submit() }
     }
 
     /// Begin a batch of send work requests on this queue pair's send queue.
@@ -2344,6 +2299,149 @@ mod test_conversions {
         ));
         assert_eq!(attr.state(), QueuePairState::Init);
         assert_eq!(attr.access_flags(), AccessFlags::LOCAL_WRITE);
+    }
+}
+
+#[cfg(test)]
+mod test_timers {
+    use super::*;
+
+    #[test]
+    fn ack_timeout_exact_step_is_itself() {
+        // 4.096 µs × 2^4 = 65.536 µs, the default.
+        let d = Duration::from_nanos(4096 << 4);
+        assert_eq!(AckTimeout::at_least(d), AckTimeout::from_exponent(4));
+        assert_eq!(AckTimeout::at_least(d).duration(), Some(d));
+    }
+
+    #[test]
+    fn ack_timeout_rounds_up_between_steps() {
+        // One nanosecond above a step lands on the next one.
+        let step4 = Duration::from_nanos(4096 << 4);
+        assert_eq!(
+            AckTimeout::at_least(step4 + Duration::from_nanos(1)),
+            AckTimeout::from_exponent(5)
+        );
+        // 9 µs is between 8.192 µs (n=1) and 16.384 µs (n=2).
+        assert_eq!(
+            AckTimeout::at_least(Duration::from_micros(9)),
+            AckTimeout::from_exponent(2)
+        );
+    }
+
+    #[test]
+    fn ack_timeout_clamps_both_ends() {
+        // Below the smallest step: rounds up to it, never to INFINITE.
+        assert_eq!(
+            AckTimeout::at_least(Duration::ZERO),
+            AckTimeout::from_exponent(1)
+        );
+        assert_eq!(
+            AckTimeout::at_least(Duration::from_nanos(1)),
+            AckTimeout::from_exponent(1)
+        );
+        // Beyond the largest step (4.096 µs × 2^31 ≈ 8796 s): clamps to it.
+        assert_eq!(
+            AckTimeout::at_least(Duration::from_secs(100_000)),
+            AckTimeout::from_exponent(31)
+        );
+    }
+
+    #[test]
+    fn ack_timeout_infinite_roundtrip() {
+        assert_eq!(AckTimeout::INFINITE, AckTimeout::from_exponent(0));
+        assert_eq!(AckTimeout::INFINITE.exponent(), 0);
+        assert_eq!(AckTimeout::INFINITE.duration(), None);
+        assert_eq!(AckTimeout::INFINITE.to_string(), "infinite");
+    }
+
+    #[test]
+    fn ack_timeout_exponent_roundtrip() {
+        for n in 0..=31 {
+            assert_eq!(AckTimeout::from_exponent(n).exponent(), n);
+        }
+        // Every finite timeout maps back to itself through its duration.
+        for n in 1..=31 {
+            let timeout = AckTimeout::from_exponent(n);
+            assert_eq!(AckTimeout::at_least(timeout.duration().unwrap()), timeout);
+        }
+        assert_eq!(AckTimeout::from_exponent(4).to_string(), "65.536µs");
+    }
+
+    #[test]
+    #[should_panic(expected = "5 bits")]
+    fn ack_timeout_exponent_out_of_range_panics() {
+        let _ = AckTimeout::from_exponent(32);
+    }
+
+    #[test]
+    fn rnr_timer_exact_delay_is_itself() {
+        // 2.56 ms, the default.
+        let d = Duration::from_micros(2_560);
+        assert_eq!(RnrTimer::at_least(d), RnrTimer::from_encoding(16));
+        assert_eq!(RnrTimer::at_least(d).duration(), d);
+    }
+
+    #[test]
+    fn rnr_timer_rounds_up_between_delays() {
+        // Between 2.56 ms (16) and 3.84 ms (17).
+        assert_eq!(
+            RnrTimer::at_least(Duration::from_micros(2_561)),
+            RnrTimer::from_encoding(17)
+        );
+        // Between 0.04 ms (4) and 0.06 ms (5).
+        assert_eq!(
+            RnrTimer::at_least(Duration::from_micros(41)),
+            RnrTimer::from_encoding(5)
+        );
+    }
+
+    #[test]
+    fn rnr_timer_clamps_both_ends() {
+        assert_eq!(
+            RnrTimer::at_least(Duration::ZERO),
+            RnrTimer::from_encoding(1)
+        );
+        assert_eq!(
+            RnrTimer::at_least(Duration::from_secs(10)),
+            RnrTimer::from_encoding(0)
+        );
+    }
+
+    #[test]
+    fn rnr_timer_encoding_zero_is_the_largest_delay() {
+        // The non-monotonic oddity: 0 encodes 655.36 ms, above 491.52 ms at encoding 31.
+        assert_eq!(
+            RnrTimer::from_encoding(0).duration(),
+            Duration::from_micros(655_360)
+        );
+        assert_eq!(
+            RnrTimer::from_encoding(31).duration(),
+            Duration::from_micros(491_520)
+        );
+        // A duration just above encoding 31's delay resolves to the encoding 0.
+        assert_eq!(
+            RnrTimer::at_least(Duration::from_micros(491_521)),
+            RnrTimer::from_encoding(0)
+        );
+        assert_eq!(RnrTimer::from_encoding(0).to_string(), "655.36ms");
+    }
+
+    #[test]
+    fn rnr_timer_encoding_roundtrip() {
+        for v in 0..=31 {
+            let timer = RnrTimer::from_encoding(v);
+            assert_eq!(timer.encoding(), v);
+            // Every delay maps back to its own encoding through its duration.
+            assert_eq!(RnrTimer::at_least(timer.duration()), timer);
+        }
+        assert_eq!(RnrTimer::from_encoding(16).to_string(), "2.56ms");
+    }
+
+    #[test]
+    #[should_panic(expected = "5 bits")]
+    fn rnr_timer_encoding_out_of_range_panics() {
+        let _ = RnrTimer::from_encoding(32);
     }
 }
 

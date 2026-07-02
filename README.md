@@ -35,8 +35,10 @@ fn main() -> ibverbs::Result<()> {
     let mut recv = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
     let mut send = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
     send.bytes_mut()[..5].copy_from_slice(b"hello");
-    unsafe { qp.post_receive(&[recv.slice(..)], 1) }?;
-    unsafe { qp.post_send(&[send.slice(..5)], 2) }?;
+    unsafe { qp.post_recv([ibverbs::RecvRequest::new(1, &[recv.slice(..)])]) }?;
+    let mut batch = qp.start_send();
+    batch.op().signaled().send(2, &[send.slice(..5)]);
+    unsafe { batch.submit() }?;
 
     let mut pending = 2;
     while pending > 0 {
@@ -114,6 +116,17 @@ by `ibverbs-sys` (this needs `cmake` and a C toolchain, but no RDMA packages). T
 rdma-core headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
 
 The minimum supported Rust version is 1.82.
+
+## Provider requirements
+
+The crate drives completion queues and queue pairs exclusively through rdma-core's extended
+verbs — `ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API — so it needs a
+provider (the userspace driver for your device) that implements them. Of the providers in the
+rdma-core tree this workspace vendors (v63), `mlx5`, `hns`, `efa`, and `rxe` (SoftRoCE) implement
+both. A provider that lacks them fails cleanly at completion-queue or queue-pair creation
+(with `Error::Unsupported`) rather than degrading to the legacy verbs: `bnxt_re`
+implements the send API but not extended CQ creation, `mlx4`, `irdma`, and `ionic` the reverse,
+and the remaining providers neither.
 
 ## Testing without RDMA hardware
 

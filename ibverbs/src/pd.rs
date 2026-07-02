@@ -170,8 +170,8 @@ impl ProtectionDomain {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid value provided in `attr`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): `ibv_create_ah` failed (`EINVAL`
+    ///    for an invalid value in `attr`, `ENOMEM` when out of resources).
     pub fn create_address_handle(&self, attr: &AddressHandleAttribute) -> Result<AddressHandle> {
         let mut ah_attr = attr.attr;
         let ah = unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) };
@@ -196,9 +196,10 @@ impl ProtectionDomain {
     ///
     /// # Errors
     ///
-    ///  - `EOPNOTSUPP`: The device does not support `ibv_advise_mr`.
-    ///  - `EINVAL`: Invalid value provided in the arguments.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - [`Unsupported`](Error::Unsupported): the device does not support `ibv_advise_mr`
+    ///    (`EOPNOTSUPP`).
+    ///  - [`AdviseMemoryRegion`](Error::AdviseMemoryRegion): `ibv_advise_mr` failed (`EINVAL` for
+    ///    an invalid value in the arguments, `ENOMEM` when out of resources).
     pub fn advise_mr(
         &self,
         advice: MrAdvice,
@@ -233,6 +234,12 @@ impl ProtectionDomain {
     ///
     /// Note that both this protection domain, *and* both provided completion queues, must outlive
     /// the resulting `QueuePair`.
+    ///
+    /// # Errors
+    ///
+    ///  - [`QueryPort`](Error::QueryPort): querying `port_num` failed (`ibv_query_port`).
+    ///  - [`PortNotActive`](Error::PortNotActive): `port_num` is not in the `ACTIVE` or `ARMED`
+    ///    state, so its GID table and routing are unusable.
     pub fn create_qp(
         &self,
         send: &CompletionQueue,
@@ -315,10 +322,11 @@ impl ProtectionDomain {
     ///
     /// # Errors
     ///
-    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags.
-    ///  - `EINVAL`: Invalid access value.
-    ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
-    ///    complete this operation.
+    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags
+    ///    (`EOPNOTSUPP`).
+    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): `ibv_reg_mr` failed (`EINVAL`
+    ///    for an invalid access value, `ENOMEM` when out of resources — either in the operating
+    ///    system or in the RDMA device).
     pub fn allocate(&self, n: usize, access_flags: AccessFlags) -> Result<MemoryRegion<Box<[u8]>>> {
         assert!(n > 0);
         let mut data = vec![0u8; n].into_boxed_slice();
@@ -352,10 +360,11 @@ impl ProtectionDomain {
     ///
     /// # Errors
     ///
-    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags.
-    ///  - `EINVAL`: Invalid access value.
-    ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
-    ///    complete this operation.
+    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags
+    ///    (`EOPNOTSUPP`).
+    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): `ibv_reg_mr` failed (`EINVAL`
+    ///    for an invalid access value, `ENOMEM` when out of resources — either in the operating
+    ///    system or in the RDMA device).
     pub unsafe fn register_from_raw(
         &self,
         ptr: *mut u8,
@@ -425,8 +434,9 @@ impl ProtectionDomain {
     /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
     /// `max_sge` is the maximum number of scatter/gather elements per work request.
     /// `srq_limit` arms the SRQ's low-watermark event: when the number of posted receives drops
-    /// below it, the device raises an `IBV_EVENT_SRQ_LIMIT_REACHED` asynchronous event (pass 0 to
-    /// disable).
+    /// below it, the device raises an [`SrqLimitReached`](crate::AsyncEventType::SrqLimitReached)
+    /// asynchronous event — receive it with [`Context::poll_async_event`] /
+    /// [`Context::wait_async_event`] and top the SRQ back up (pass 0 to disable).
     ///
     /// # Errors
     ///

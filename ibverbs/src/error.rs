@@ -168,6 +168,15 @@ pub enum Error {
     #[error("failed to poll the completion queue")]
     PollCompletionQueue(#[source] io::Error),
 
+    /// Reading a device asynchronous event failed (`ibv_get_async_event`).
+    #[error("failed to read a device asynchronous event")]
+    AsyncEvent(#[source] io::Error),
+
+    /// A blocking connection-manager helper reached its timeout before the awaited event arrived.
+    #[cfg(feature = "rdmacm")]
+    #[error("the connection-manager operation timed out")]
+    TimedOut,
+
     /// The connection manager reported a failure event.
     #[cfg(feature = "rdmacm")]
     #[error("the connection manager reported {0:?}")]

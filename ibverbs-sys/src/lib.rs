@@ -394,9 +394,21 @@ pub unsafe fn ___ibv_query_port(
     }
 }
 
+/// Set `errno`, so the shims below can report failures the way the C inlines do (they set
+/// `errno = EOPNOTSUPP` before returning null).
+///
+/// rdma-core targets only Linux, where both glibc and musl expose `__errno_location`.
+unsafe fn set_errno(err: ::std::os::raw::c_int) {
+    extern "C" {
+        fn __errno_location() -> *mut ::std::os::raw::c_int;
+    }
+    *__errno_location() = err;
+}
+
 /// Create an extended completion queue (`ibv_create_cq_ex`).
 ///
-/// Returns null if the provider does not implement the extended verb (matching the C inline).
+/// Returns null with `errno` set to `EOPNOTSUPP` if the provider does not implement the extended
+/// verb (matching the C inline).
 ///
 /// # Safety
 ///
@@ -411,13 +423,18 @@ pub unsafe fn ibv_create_cq_ex(
         - ::std::mem::offset_of!(verbs_context, create_cq_ex);
     match (*vctx).create_cq_ex {
         Some(create_cq_ex) if (*vctx).sz >= need => create_cq_ex(context, cq_attr),
-        _ => ::std::ptr::null_mut(),
+        _ => {
+            // EOPNOTSUPP, 95 on Linux, the only platform rdma-core targets.
+            set_errno(95);
+            ::std::ptr::null_mut()
+        }
     }
 }
 
 /// Create an extended queue pair (`ibv_create_qp_ex`).
 ///
-/// Returns null if the provider does not implement the extended verb (matching the C inline).
+/// Returns null with `errno` set to `EOPNOTSUPP` if the provider does not implement the extended
+/// verb (matching the C inline).
 ///
 /// # Safety
 ///
@@ -432,7 +449,11 @@ pub unsafe fn ibv_create_qp_ex(
         - ::std::mem::offset_of!(verbs_context, create_qp_ex);
     match (*vctx).create_qp_ex {
         Some(create_qp_ex) if (*vctx).sz >= need => create_qp_ex(context, qp_attr),
-        _ => ::std::ptr::null_mut(),
+        _ => {
+            // EOPNOTSUPP, 95 on Linux, the only platform rdma-core targets.
+            set_errno(95);
+            ::std::ptr::null_mut()
+        }
     }
 }
 
@@ -529,4 +550,32 @@ pub unsafe fn ibv_query_device_ex(
     // Legacy fallback: zero the whole struct, then fill only the base attributes.
     ::std::ptr::write_bytes(attr, 0, 1);
     ibv_query_device(context, &mut (*attr).orig_attr)
+}
+
+// `rdma_get_local_addr` and `rdma_get_peer_addr` are `static inline` in rdma_cma.h: they return
+// pointers into the id's own `route.addr` storage, so there is no exported symbol for bindgen to
+// bind. The functions below reimplement them.
+
+/// The local address a connection-manager id is bound to (rdma_cma.h's inline
+/// `rdma_get_local_addr`).
+///
+/// # Safety
+///
+/// `id` must be a valid `rdma_cm_id`. The returned pointer aliases `id`'s own storage and is
+/// valid only as long as the id.
+#[inline]
+pub unsafe fn rdma_get_local_addr(id: *mut rdma_cm_id) -> *mut sockaddr {
+    &raw mut (*id).route.addr.__bindgen_anon_1.src_addr
+}
+
+/// The remote address a connection-manager id is connected to (rdma_cma.h's inline
+/// `rdma_get_peer_addr`).
+///
+/// # Safety
+///
+/// `id` must be a valid `rdma_cm_id`. The returned pointer aliases `id`'s own storage and is
+/// valid only as long as the id.
+#[inline]
+pub unsafe fn rdma_get_peer_addr(id: *mut rdma_cm_id) -> *mut sockaddr {
+    &raw mut (*id).route.addr.__bindgen_anon_2.dst_addr
 }
