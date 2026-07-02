@@ -563,6 +563,7 @@ pub unsafe fn ibv_query_device_ex(
 ///
 /// `id` must be a valid `rdma_cm_id`. The returned pointer aliases `id`'s own storage and is
 /// valid only as long as the id.
+#[cfg(feature = "rdmacm")]
 #[inline]
 pub unsafe fn rdma_get_local_addr(id: *mut rdma_cm_id) -> *mut sockaddr {
     &raw mut (*id).route.addr.__bindgen_anon_1.src_addr
@@ -575,6 +576,7 @@ pub unsafe fn rdma_get_local_addr(id: *mut rdma_cm_id) -> *mut sockaddr {
 ///
 /// `id` must be a valid `rdma_cm_id`. The returned pointer aliases `id`'s own storage and is
 /// valid only as long as the id.
+#[cfg(feature = "rdmacm")]
 #[inline]
 pub unsafe fn rdma_get_peer_addr(id: *mut rdma_cm_id) -> *mut sockaddr {
     &raw mut (*id).route.addr.__bindgen_anon_2.dst_addr

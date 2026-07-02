@@ -225,6 +225,50 @@ impl From<CmEventType> for ffi::rdma_cm_event_type {
     }
 }
 
+impl std::fmt::Display for PortSpace {
+    /// Formats the port space under its name in the C headers, for example `TCP` for
+    /// [`Tcp`](Self::Tcp).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            PortSpace::Ipoib => "IPOIB",
+            PortSpace::Tcp => "TCP",
+            PortSpace::Udp => "UDP",
+            PortSpace::Ib => "IB",
+        };
+        f.write_str(name)
+    }
+}
+
+impl std::fmt::Display for CmEventType {
+    /// Formats the event under its name in the C headers, for example `CONNECT_REQUEST` for
+    /// [`ConnectRequest`](Self::ConnectRequest).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            CmEventType::AddressResolved => "ADDR_RESOLVED",
+            CmEventType::AddressError => "ADDR_ERROR",
+            CmEventType::RouteResolved => "ROUTE_RESOLVED",
+            CmEventType::RouteError => "ROUTE_ERROR",
+            CmEventType::ConnectRequest => "CONNECT_REQUEST",
+            CmEventType::ConnectResponse => "CONNECT_RESPONSE",
+            CmEventType::ConnectError => "CONNECT_ERROR",
+            CmEventType::Unreachable => "UNREACHABLE",
+            CmEventType::Rejected => "REJECTED",
+            CmEventType::Established => "ESTABLISHED",
+            CmEventType::Disconnected => "DISCONNECTED",
+            CmEventType::DeviceRemoval => "DEVICE_REMOVAL",
+            CmEventType::MulticastJoin => "MULTICAST_JOIN",
+            CmEventType::MulticastError => "MULTICAST_ERROR",
+            CmEventType::AddressChange => "ADDR_CHANGE",
+            CmEventType::TimewaitExit => "TIMEWAIT_EXIT",
+            CmEventType::AddressInfoResolved => "ADDR_INFO_RESOLVED",
+            CmEventType::AddressInfoError => "ADDR_INFO_ERROR",
+            CmEventType::User => "USER",
+            CmEventType::Internal => "INTERNAL",
+        };
+        f.write_str(name)
+    }
+}
+
 /// Holds a `sockaddr` of the right family so its pointer stays valid for a single C call.
 enum OsSocketAddr {
     V4(SockaddrIn),
@@ -531,8 +575,8 @@ impl CmId {
     /// Starts listening for incoming connection requests (passive side), queueing up to `backlog`.
     /// A [`CmEventType::ConnectRequest`] is then delivered for each incoming connection; take its
     /// new id with [`CmEvent::connection_request`].
-    pub fn listen(&self, backlog: i32) -> Result<()> {
-        let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog) };
+    pub fn listen(&self, backlog: u32) -> Result<()> {
+        let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog.min(i32::MAX as u32) as i32) };
         if ret != 0 {
             return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
@@ -952,7 +996,7 @@ pub struct Acceptor {
 impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device) and starts
     /// listening, queueing up to `backlog` pending connections.
-    pub fn bind(addr: SocketAddr, port_space: PortSpace, backlog: i32) -> Result<Self> {
+    pub fn bind(addr: SocketAddr, port_space: PortSpace, backlog: u32) -> Result<Self> {
         let listener = CmId::create(port_space)?;
         listener.bind_addr(addr)?;
         listener.listen(backlog)?;

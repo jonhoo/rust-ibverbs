@@ -769,7 +769,7 @@ fn unreliable_datagram() {
     batch
         .op()
         .signaled()
-        .to(&ah, endpoint.num, QKEY)
+        .to(&ah, endpoint.qp_num, QKEY)
         .send(2, &[send.slice(..payload.len())]);
     unsafe { batch.submit() }.expect("UD send failed");
 

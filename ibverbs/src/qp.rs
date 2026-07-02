@@ -901,7 +901,7 @@ pub struct PreparedQueuePair {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num`
-    pub num: u32,
+    pub qp_num: u32,
     /// the context's `lid`
     pub lid: u16,
     /// the context's `gid`, used for global routing
@@ -926,7 +926,7 @@ impl PreparedQueuePair {
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
-        let num = unsafe { &*self.qp.qp }.qp_num;
+        let qp_num = unsafe { &*self.qp.qp }.qp_num;
         let gid = if let Some(gid_index) = self.gid_index {
             let mut gid = ffi::ibv_gid::default();
             let rc = unsafe {
@@ -949,7 +949,7 @@ impl PreparedQueuePair {
             None
         };
         Ok(QueuePairEndpoint {
-            num,
+            qp_num,
             lid: self.lid,
             gid,
         })
@@ -1014,7 +1014,7 @@ impl PreparedQueuePair {
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
             // TODO: this is only valid for RC and UC
-            dest_qp_num: remote.num,
+            dest_qp_num: remote.qp_num,
             // TODO: this is only valid for RC and UC
             ah_attr: ffi::ibv_ah_attr {
                 dlid: remote.lid,

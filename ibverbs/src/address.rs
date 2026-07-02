@@ -227,7 +227,7 @@ mod test_serde {
     #[test]
     fn encode_decode() {
         let qpe_default = QueuePairEndpoint {
-            num: 72,
+            qp_num: 72,
             lid: 9,
             gid: Some(Default::default()),
         };
