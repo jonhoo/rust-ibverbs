@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     batch
         .op()
         .signaled()
-        .to(&ah, receiver_endpoint.num, QKEY)
+        .to(&ah, receiver_endpoint.qp_num, QKEY)
         .send(2, &[send_buf.slice(..5)]);
     unsafe { batch.submit() }?;
 

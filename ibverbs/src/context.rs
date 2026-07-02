@@ -687,6 +687,37 @@ impl From<AsyncEventType> for ffi::ibv_event_type {
     }
 }
 
+impl std::fmt::Display for AsyncEventType {
+    /// Formats the event under its name in the C headers, for example `SRQ_LIMIT_REACHED` for
+    /// [`SrqLimitReached`](Self::SrqLimitReached).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            AsyncEventType::CqError => "CQ_ERR",
+            AsyncEventType::QpFatal => "QP_FATAL",
+            AsyncEventType::QpRequestError => "QP_REQ_ERR",
+            AsyncEventType::QpAccessError => "QP_ACCESS_ERR",
+            AsyncEventType::CommEstablished => "COMM_EST",
+            AsyncEventType::SqDrained => "SQ_DRAINED",
+            AsyncEventType::PathMigrated => "PATH_MIG",
+            AsyncEventType::PathMigrationError => "PATH_MIG_ERR",
+            AsyncEventType::DeviceFatal => "DEVICE_FATAL",
+            AsyncEventType::PortActive => "PORT_ACTIVE",
+            AsyncEventType::PortError => "PORT_ERR",
+            AsyncEventType::LidChange => "LID_CHANGE",
+            AsyncEventType::PkeyChange => "PKEY_CHANGE",
+            AsyncEventType::SmChange => "SM_CHANGE",
+            AsyncEventType::SrqError => "SRQ_ERR",
+            AsyncEventType::SrqLimitReached => "SRQ_LIMIT_REACHED",
+            AsyncEventType::QpLastWqeReached => "QP_LAST_WQE_REACHED",
+            AsyncEventType::ClientReregister => "CLIENT_REREGISTER",
+            AsyncEventType::GidChange => "GID_CHANGE",
+            AsyncEventType::WqFatal => "WQ_FATAL",
+            AsyncEventType::DeviceSpeedChange => "DEVICE_SPEED_CHANGE",
+        };
+        f.write_str(name)
+    }
+}
+
 /// A reading of the device's free-running hardware clock (the "HCA core clock"), in raw ticks.
 ///
 /// Returned by [`Context::query_rt_values_ex`] and

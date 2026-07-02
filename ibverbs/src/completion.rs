@@ -681,6 +681,36 @@ impl From<WcOpcode> for ffi::ibv_wc_opcode {
     }
 }
 
+impl std::fmt::Display for WcOpcode {
+    /// Formats the opcode under its name in the C headers, for example `RDMA_WRITE` for
+    /// [`RdmaWrite`](Self::RdmaWrite).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            WcOpcode::Send => "SEND",
+            WcOpcode::RdmaWrite => "RDMA_WRITE",
+            WcOpcode::RdmaRead => "RDMA_READ",
+            WcOpcode::CompSwap => "COMP_SWAP",
+            WcOpcode::FetchAdd => "FETCH_ADD",
+            WcOpcode::BindMw => "BIND_MW",
+            WcOpcode::LocalInv => "LOCAL_INV",
+            WcOpcode::Tso => "TSO",
+            WcOpcode::Flush => "FLUSH",
+            WcOpcode::AtomicWrite => "ATOMIC_WRITE",
+            WcOpcode::Recv => "RECV",
+            WcOpcode::RecvRdmaWithImm => "RECV_RDMA_WITH_IMM",
+            WcOpcode::TmAdd => "TM_ADD",
+            WcOpcode::TmDel => "TM_DEL",
+            WcOpcode::TmSync => "TM_SYNC",
+            WcOpcode::TmRecv => "TM_RECV",
+            WcOpcode::TmNoTag => "TM_NO_TAG",
+            WcOpcode::Driver1 => "DRIVER1",
+            WcOpcode::Driver2 => "DRIVER2",
+            WcOpcode::Driver3 => "DRIVER3",
+        };
+        f.write_str(name)
+    }
+}
+
 /// A single work completion, borrowed from the completion queue being polled.
 ///
 /// Returned by [`Completions::next`]. Fields are read lazily through the extended completion-queue
