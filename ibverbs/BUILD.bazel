@@ -17,6 +17,7 @@ rust_library(
         # These deps should be provided by the consuming workspace's crates repository
         "@crates//:nix",
         "@crates//:serde",
+        "@crates//:thiserror",
     ],
 )
 
