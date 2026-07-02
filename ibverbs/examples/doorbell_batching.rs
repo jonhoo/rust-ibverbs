@@ -76,7 +76,7 @@ fn main() {
     let mut batch = qp.start_send();
     // Chain the RDMA Write operations for each word segment.
     for i in 0..num_writes {
-        batch.write((i + 1) as u64, &locals[i], remotes[i].clone());
+        batch.write((i + 1) as u64, &locals[i], remotes[i]);
     }
     // Append the final Send to signal completion of the chain and carry the write count.
     batch

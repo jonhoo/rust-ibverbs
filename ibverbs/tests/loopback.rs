@@ -836,8 +836,19 @@ fn query_device_and_port() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn raw_handles() {
+    let devices = ibverbs::devices().expect("failed to list RDMA devices");
+    let device = devices.iter().next().expect("no RDMA device available");
+    assert!(!device.as_raw().is_null());
+
     let ctx = open_test_device();
     assert!(!ctx.as_raw().is_null());
+
+    // The context handle is cheaply cloneable and debug-printable.
+    let ctx2 = ctx.clone();
+    assert_eq!(ctx.as_raw(), ctx2.as_raw());
+    assert!(format!("{ctx:?}").starts_with("Context("), "{ctx:?}");
+
+    assert!(ctx.num_comp_vectors() > 0, "device has completion vectors");
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     assert!(!pd.as_raw().is_null());
@@ -850,6 +861,7 @@ fn raw_handles() {
 
     let mr = pd.allocate(64).expect("failed to register MR");
     assert!(!mr.as_raw().is_null());
+    assert_eq!(mr.lkey(), mr.slice(..).lkey());
 
     let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
     assert!(!srq.as_raw().is_null());
