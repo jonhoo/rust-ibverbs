@@ -632,13 +632,9 @@ impl ContextInner {
         //   (re)configures the subnet.
         //
         let mut port_attr = ffi::ibv_port_attr::default();
-        let errno = unsafe {
-            ffi::ibv_query_port(
-                self.ctx,
-                port_num,
-                &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
-            )
-        };
+        // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
+        // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
+        let errno = unsafe { ffi::___ibv_query_port(self.ctx, port_num, &mut port_attr) };
         if errno != 0 {
             return Err(Error::errno(errno, |e| Error::QueryPort {
                 port_num,
@@ -796,7 +792,13 @@ impl Context {
     /// The entries span all of the device's ports; each carries the `port_num` and `gid_index` it
     /// belongs to (the latter is what [`QueuePairBuilder::set_gid_index`] expects).
     pub fn gid_table(&self) -> Result<Vec<GidEntry>> {
-        let max_entries = self.inner.query_port(PORT_NUM)?.gid_tbl_len as usize;
+        // The table spans every port, so size the buffer for all of them: each port contributes
+        // up to its own `gid_tbl_len` entries.
+        let num_ports = self.query_device()?.phys_port_cnt;
+        let mut max_entries = 0usize;
+        for port_num in 1..=num_ports {
+            max_entries += self.query_port(port_num)?.gid_tbl_len.max(0) as usize;
+        }
         let mut gid_table = vec![ffi::ibv_gid_entry::default(); max_entries];
         let num_entries = unsafe {
             ffi::_ibv_query_gid_table(
@@ -899,13 +901,9 @@ impl Context {
     ///  - `ENOMEM`: Out of memory.
     pub fn query_port(&self, port_num: u8) -> Result<PortAttr> {
         let mut port_attr = ffi::ibv_port_attr::default();
-        let errno = unsafe {
-            ffi::ibv_query_port(
-                self.inner.ctx,
-                port_num,
-                &mut port_attr as *mut ffi::ibv_port_attr as *mut _,
-            )
-        };
+        // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
+        // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
+        let errno = unsafe { ffi::___ibv_query_port(self.inner.ctx, port_num, &mut port_attr) };
         if errno != 0 {
             return Err(Error::errno(errno, |e| Error::QueryPort {
                 port_num,
@@ -949,7 +947,9 @@ impl Context {
     }
 }
 
-/// The signaling rate of a port's active link, decoded from `ibv_port_attr::active_speed`.
+/// The signaling rate of a port's active link, decoded from `ibv_port_attr::active_speed` (or
+/// `active_speed_ex`, where the provider reports the speeds the legacy 8-bit field cannot, such
+/// as XDR).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PortSpeed {
@@ -972,11 +972,11 @@ pub enum PortSpeed {
     /// Extreme data rate (212.5 Gb/s signaling per lane).
     Xdr,
     /// A value this crate does not recognize.
-    Unknown(u8),
+    Unknown(u32),
 }
 
 impl PortSpeed {
-    fn from_active_speed(speed: u8) -> Self {
+    fn from_active_speed(speed: u32) -> Self {
         match speed {
             1 => PortSpeed::Sdr,
             2 => PortSpeed::Ddr,
@@ -986,6 +986,7 @@ impl PortSpeed {
             32 => PortSpeed::Edr,
             64 => PortSpeed::Hdr,
             128 => PortSpeed::Ndr,
+            256 => PortSpeed::Xdr,
             other => PortSpeed::Unknown(other),
         }
     }
@@ -1348,8 +1349,15 @@ impl PortAttr {
     }
 
     /// The active link speed.
+    ///
+    /// Read from the extended `active_speed_ex` field when the provider fills it (necessary for
+    /// speeds beyond NDR, which overflow the legacy 8-bit field), falling back to the legacy
+    /// `active_speed` otherwise.
     pub fn active_speed(&self) -> PortSpeed {
-        PortSpeed::from_active_speed(self.0.active_speed)
+        match self.0.active_speed_ex {
+            0 => PortSpeed::from_active_speed(self.0.active_speed as u32),
+            ex => PortSpeed::from_active_speed(ex),
+        }
     }
 
     /// The active link width.
@@ -2916,6 +2924,24 @@ impl PreparedQueuePair {
         }
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
+            // On RoCE, the provider resolves the route to the remote GID during this transition,
+            // and reports a GID that does not answer as a timeout or unreachable network. Spell
+            // that out: it is the most common RoCE bring-up failure, and "connection timed out"
+            // alone sends people looking at the wrong layer.
+            if remote.gid.is_some()
+                && (errno == nix::libc::ETIMEDOUT || errno == nix::libc::ENETUNREACH)
+            {
+                let source = io::Error::from_raw_os_error(errno);
+                return Err(Error::ModifyQueuePair(io::Error::new(
+                    source.kind(),
+                    format!(
+                        "resolving the route to the remote GID failed ({source}); on RoCE this \
+                         usually means the remote GID does not answer on the network of the \
+                         local GID at index {}, or a firewall drops RoCE (UDP 4791) traffic",
+                        attr.ah_attr.grh.sgid_index,
+                    ),
+                )));
+            }
             return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 

@@ -107,6 +107,13 @@ jobs:
             --skip unreliable_connection \
             --skip unreliable_datagram \
             --skip inline_send
+      - name: cargo test --features rdmacm -- --ignored
+        env:
+          IBVERBS_TEST_DEVICE: rxe0
+        # The connection manager binds the runner's own IPv4 address, which resolves onto the same
+        # rxe device (librdmacm-dev was installed by configure-ci.sh above). Serial for the same
+        # reason as the loopback tests.
+        run: cargo test --locked --features rdmacm --test rdmacm -- --ignored --test-threads=1
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
     # that this crate is compatible with the minimal version that this crate and its dependencies
