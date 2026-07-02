@@ -34,7 +34,7 @@ optional = true
 features = ["derive"]
 
 [features]
-default = ["serde"]
+default = []
 # AWS Elastic Fabric Adapter (EFA) SRD queue pairs. Pulls in the efadv bindings and links libefa.
 efa = ["ffi/efa"]
 # RDMA connection manager (`librdmacm`): connection setup without an out-of-band endpoint exchange.

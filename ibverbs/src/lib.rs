@@ -65,8 +65,8 @@
 //! ```
 //!
 //! Runnable programs live in the [`examples/` directory][examples] — a loopback transfer, an
-//! `ibv_devinfo`-style device dump, doorbell batching, the `rdmacm` connection manager, and EFA
-//! SRD queue pairs. You can run all of them (and this crate's test suite) without RDMA hardware on
+//! event-driven loop over a shared completion channel, an `ibv_devinfo`-style device dump,
+//! doorbell batching, the `rdmacm` connection manager, and EFA SRD queue pairs. You can run all of them (and this crate's test suite) without RDMA hardware on
 //! any modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`.
 //!
 //! You do not have to poll: completion channels ([`Context::create_comp_channel`]) deliver
@@ -78,7 +78,7 @@
 //!
 //! # Cargo features
 //!
-//! - `serde` *(default)*: [`QueuePairEndpoint`] and [`RemoteMemorySlice`] implement
+//! - `serde`: [`QueuePairEndpoint`] and [`RemoteMemorySlice`] implement
 //!   `Serialize`/`Deserialize`, for sending to the peer during connection setup.
 //! - `rdmacm`: the `rdmacm` module, wrapping the `librdmacm` connection manager: connection setup
 //!   over IP addresses, blocking or event-loop driven, instead of an out-of-band endpoint
