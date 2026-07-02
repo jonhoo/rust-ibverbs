@@ -602,6 +602,15 @@ impl<'devlist> Device<'devlist> {
     pub fn transport_type(&self) -> ffi::ibv_transport_type {
         unsafe { (**self.0).transport_type }
     }
+
+    /// Returns the underlying `ibv_device` pointer.
+    ///
+    /// This is an escape hatch for calling libibverbs functions this crate does not yet wrap. The
+    /// pointer is owned by the [`DeviceList`] this device came from and stays valid only while
+    /// that list is alive.
+    pub fn as_raw(&self) -> *mut ffi::ibv_device {
+        *self.0
+    }
 }
 
 struct ContextInner {
@@ -680,9 +689,26 @@ unsafe impl Sync for ContextInner {}
 unsafe impl Send for ContextInner {}
 
 /// An RDMA context bound to a device.
+///
+/// Cloning is cheap (reference counted) and hands the same device context to another thread or
+/// owner; the context is closed once the last clone, and everything built from it, is dropped.
 #[must_use]
+#[derive(Clone)]
 pub struct Context {
     inner: Arc<ContextInner>,
+}
+
+impl fmt::Debug for Context {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = unsafe { ffi::ibv_get_device_name((*self.inner.ctx).device) };
+        let mut f = f.debug_tuple("Context");
+        if name.is_null() {
+            f.field(&"?");
+        } else {
+            f.field(&unsafe { CStr::from_ptr(name) });
+        }
+        f.finish()
+    }
 }
 
 impl Context {
@@ -835,6 +861,16 @@ impl Context {
             }));
         }
         Ok(gid.into())
+    }
+
+    /// The number of completion vectors the device supports: the exclusive upper bound for
+    /// [`CompletionQueueBuilder::set_comp_vector`].
+    ///
+    /// Completion vectors map to the device's interrupt vectors, so spreading busy completion
+    /// queues across vectors spreads their notification handling across CPUs.
+    pub fn num_comp_vectors(&self) -> u32 {
+        let n = unsafe { (*self.inner.ctx).num_comp_vectors };
+        u32::try_from(n).unwrap_or(0)
     }
 
     /// Query the attributes and capabilities of this context's device (`ibv_query_device`).
@@ -2641,7 +2677,7 @@ pub struct PreparedQueuePair {
 /// These methods read the array as big endian, regardless of native cpu
 /// endianness.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-#[derive(Default, Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct Gid {
     raw: [u8; 16],
@@ -2660,6 +2696,44 @@ impl Gid {
     /// `ffi::ibv_gid` union.
     pub fn interface_id(&self) -> u64 {
         u64::from_be_bytes(self.raw[8..].try_into().unwrap())
+    }
+
+    /// Whether this GID holds an IPv4-mapped address (`::ffff:a.b.c.d`).
+    ///
+    /// On RoCE, the GIDs of a port mirror the IP addresses of its network interface, so the entry
+    /// holding the interface's IPv4 address is IPv4-mapped. That entry is typically the routable
+    /// one to pick (by its index, via [`QueuePairBuilder::set_gid_index`]) on plain-Ethernet IPv4
+    /// networks.
+    pub fn is_ipv4_mapped(&self) -> bool {
+        std::net::Ipv6Addr::from(*self).to_ipv4_mapped().is_some()
+    }
+}
+
+/// A GID is an IPv6 address by construction (RoCE GIDs literally mirror the interface's IP
+/// addresses); this conversion makes it printable and comparable as one.
+impl From<Gid> for std::net::Ipv6Addr {
+    fn from(gid: Gid) -> Self {
+        std::net::Ipv6Addr::from(gid.raw)
+    }
+}
+
+impl From<std::net::Ipv6Addr> for Gid {
+    fn from(addr: std::net::Ipv6Addr) -> Self {
+        Self { raw: addr.octets() }
+    }
+}
+
+impl fmt::Display for Gid {
+    /// Formats the GID the way `ibv_devinfo -v` and `show_gids` do: as an IPv6 address, for
+    /// example `fe80::5054:ff:fe12:3456` or `::ffff:192.0.2.1`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        std::net::Ipv6Addr::from(*self).fmt(f)
+    }
+}
+
+impl fmt::Debug for Gid {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Gid({self})")
     }
 }
 
@@ -3144,6 +3218,12 @@ impl<O> MemoryRegion<O> {
         }
     }
 
+    /// Get the local key of this memory region (the one [`slice`](Self::slice) stamps on every
+    /// scatter/gather entry).
+    pub fn lkey(&self) -> u32 {
+        unsafe { &*self.inner.mr }.lkey
+    }
+
     /// Returns the underlying `ibv_mr` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
@@ -3205,6 +3285,22 @@ pub struct LocalMemorySlice {
     _sge: ffi::ibv_sge,
 }
 
+/// An escape hatch for posting memory registered outside this crate (for example through
+/// [`ffi::ibv_reg_mr`] with flags the safe API does not cover): a scatter/gather entry converts
+/// straight into a postable slice. The post methods' safety contracts (valid registration,
+/// no concurrent device access) then cover the converted slice.
+impl From<ffi::ibv_sge> for LocalMemorySlice {
+    fn from(sge: ffi::ibv_sge) -> Self {
+        LocalMemorySlice { _sge: sge }
+    }
+}
+
+impl From<LocalMemorySlice> for ffi::ibv_sge {
+    fn from(slice: LocalMemorySlice) -> Self {
+        slice._sge
+    }
+}
+
 impl LocalMemorySlice {
     /// Get the address of the local memory slice.
     pub fn addr(&self) -> u64 {
@@ -3240,7 +3336,8 @@ impl LocalMemorySlice {
 }
 
 /// Remote memory region.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize, Debug, Clone))]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct RemoteMemorySlice {
     /// Memory address of the registered region (might have been offset by slicing).
     pub addr: u64,
@@ -3579,7 +3676,11 @@ impl ProtectionDomain {
         };
 
         if mr.is_null() {
-            Err(Error::RegisterMemoryRegion(io::Error::last_os_error()))
+            // Promotes the EOPNOTSUPP of devices/kernels without DMA-BUF support to Unsupported.
+            Err(Error::os(
+                io::Error::last_os_error(),
+                Error::RegisterMemoryRegion,
+            ))
         } else {
             let inner = MemoryRegionInner {
                 _pd: self.inner.clone(),
@@ -5233,6 +5334,42 @@ mod test {
         ];
         let arr2: [u8; 16] = Gid::from(arr).into();
         assert_eq!(arr, arr2);
+    }
+
+    #[test]
+    fn gid_ipv6_conversion_and_display() {
+        let addr: std::net::Ipv6Addr = "fe80::5054:ff:fe12:3456".parse().unwrap();
+        let gid = Gid::from(addr);
+        assert_eq!(std::net::Ipv6Addr::from(gid), addr);
+        assert_eq!(gid.to_string(), "fe80::5054:ff:fe12:3456");
+        assert_eq!(format!("{gid:?}"), "Gid(fe80::5054:ff:fe12:3456)");
+        assert!(!gid.is_ipv4_mapped());
+    }
+
+    #[test]
+    fn gid_ipv4_mapped() {
+        let gid = Gid::from("::ffff:192.0.2.1".parse::<std::net::Ipv6Addr>().unwrap());
+        assert!(gid.is_ipv4_mapped());
+        assert_eq!(gid.to_string(), "::ffff:192.0.2.1");
+        assert_eq!(gid.subnet_prefix(), 0);
+        assert_eq!(gid.interface_id() >> 32, 0xffff);
+    }
+
+    #[test]
+    fn local_memory_slice_sge_roundtrip() {
+        let sge = ffi::ibv_sge {
+            addr: 0xdead_beef,
+            length: 64,
+            lkey: 42,
+        };
+        let slice = LocalMemorySlice::from(sge);
+        assert_eq!(slice.addr(), 0xdead_beef);
+        assert_eq!(slice.len(), 64);
+        assert_eq!(slice.lkey(), 42);
+        let back = ffi::ibv_sge::from(slice);
+        assert_eq!(back.addr, sge.addr);
+        assert_eq!(back.length, sge.length);
+        assert_eq!(back.lkey, sge.lkey);
     }
 }
 
