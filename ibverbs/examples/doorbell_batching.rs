@@ -1,6 +1,10 @@
-//! An example showcasing how to chain multiple Work Requests (WRs) together
-//! into a single linked list and post them to the Send Queue using the `post` API,
-//! with only the final operation generating a Completion Queue Event (CQE).
+//! An example showcasing how to batch multiple work requests into a single doorbell using
+//! `QueuePair::start_send`, with only the final operation generating a completion. It RDMA-writes
+//! the pieces of a string into a destination buffer and finishes with a send that notifies the
+//! (self-looped) receiver.
+//!
+//! This runs against the first RDMA device; on a machine without one, create a SoftRoCE device
+//! with `rdma link add rxe0 type rxe netdev <netdev>`.
 
 use ibverbs::{LocalMemorySlice, RemoteMemorySlice};
 
@@ -25,11 +29,24 @@ fn main() {
     let cq = ctx.create_cq(CQ_CAPACITY as i32).build().unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
-    // 3. Create Queue Pair (QP) and connect it to itself in loopback mode
+    // 3. Create Queue Pair (QP) and connect it to itself in loopback mode. See the loopback
+    // example for how the routable GID is picked.
+    let gids = ctx.gid_table().unwrap();
+    let gid_index = gids
+        .iter()
+        .filter(|e| e.port_num == 1)
+        .find(|e| {
+            e.gid_type == ibverbs::ibv_gid_type::IBV_GID_TYPE_ROCE_V2
+                && e.gid.subnet_prefix() == 0
+                && e.gid.interface_id() >> 32 == 0xffff
+        })
+        .or_else(|| gids.iter().find(|e| e.port_num == 1))
+        .expect("no GID available")
+        .gid_index;
     let prepared_qp = pd
         .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
         .unwrap()
-        .set_gid_index(1)
+        .set_gid_index(gid_index)
         .set_max_send_wr(MAX_SEND_WR)
         .allow_remote_rw()
         .build()
@@ -65,14 +82,12 @@ fn main() {
 
     let num_writes = locals.len();
     let send_chain_completion_wr_id = (num_writes + 1) as u64;
-    let total_send_wrs = num_writes + 1;
 
     // Write the count of write operations to the notification buffer as payload
     notify_mr.bytes_mut()[..NOTIFY_BUF_SIZE].copy_from_slice(&(num_writes as u32).to_ne_bytes());
     let notify_slice = [notify_mr.slice(..)];
 
     // 7. Build and post the chain of work requests as a single doorbell batch.
-    let _ = total_send_wrs;
     let mut batch = qp.start_send();
     // Chain the RDMA Write operations for each word segment.
     for i in 0..num_writes {

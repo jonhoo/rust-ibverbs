@@ -2,8 +2,9 @@
 name = "ibverbs"
 version = "0.9.2"
 edition = "2021"
+rust-version = "1.82" # inherited from ibverbs-sys
 
-description = "Bindings for RDMA ibverbs through rdma-core"
+description = "Safe Rust API for RDMA verbs (libibverbs), with rdmacm and EFA support"
 readme = "../README.md"
 authors = [
     "Jon Gjengset <jon@thesquareplanet.com>",
@@ -13,10 +14,14 @@ authors = [
 homepage = "https://github.com/jonhoo/rust-ibverbs"
 repository = "https://github.com/jonhoo/rust-ibverbs.git"
 
-keywords = ["rdma", "ibverbs", "networking"]
+keywords = ["rdma", "ibverbs", "infiniband", "roce", "networking"]
 categories = ["network-programming", "api-bindings"]
 
 license = "MIT OR Apache-2.0"
+
+[package.metadata.docs.rs]
+# so docs.rs shows the `rdmacm` module and the `efa` queue pairs
+all-features = true
 
 [dependencies]
 ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.3.0" }
