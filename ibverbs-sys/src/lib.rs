@@ -358,6 +358,42 @@ unsafe fn verbs_get_ctx(context: *mut ibv_context) -> *mut verbs_context {
     (context as *mut u8).sub(::std::mem::offset_of!(verbs_context, context)) as *mut verbs_context
 }
 
+/// Query a port's attributes, including the extended fields (rdma-core's `___ibv_query_port`,
+/// which the `ibv_query_port` macro resolves to in C).
+///
+/// The exported `ibv_query_port` symbol that bindgen binds is the *compat* entry point: it fills
+/// only the legacy prefix of `ibv_port_attr`, leaving `port_cap_flags2` and `active_speed_ex`
+/// zeroed. This shim queries through the provider op with the full struct size, so those fields
+/// are filled when the provider supports them, and falls back to the compat symbol (zeroing the
+/// full struct first) when it does not — matching the C inline.
+///
+/// # Safety
+///
+/// `context` must be a valid device context and `port_attr` a valid pointer for an
+/// `ibv_query_port` call.
+#[inline]
+pub unsafe fn ___ibv_query_port(
+    context: *mut ibv_context,
+    port_num: u8,
+    port_attr: *mut ibv_port_attr,
+) -> ::std::os::raw::c_int {
+    let vctx = verbs_get_ctx(context);
+    let need =
+        ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, query_port);
+    match (*vctx).query_port {
+        Some(query_port) if (*vctx).sz >= need => query_port(
+            context,
+            port_num,
+            port_attr,
+            ::std::mem::size_of::<ibv_port_attr>(),
+        ),
+        _ => {
+            ::std::ptr::write_bytes(port_attr, 0, 1);
+            ibv_query_port(context, port_num, port_attr.cast())
+        }
+    }
+}
+
 /// Create an extended completion queue (`ibv_create_cq_ex`).
 ///
 /// Returns null if the provider does not implement the extended verb (matching the C inline).

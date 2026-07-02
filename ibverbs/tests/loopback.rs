@@ -1533,3 +1533,42 @@ fn shared_completion_channel() {
         "a queue without set_comp_channel has no channel"
     );
 }
+
+/// Handshaking toward a remote GID that nobody answers fails with the RoCE routing diagnostic
+/// (the provider resolves the route during the RTR transition, and a bare "connection timed out"
+/// points debugging at the wrong layer).
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn roce_route_failure_diagnostic() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let prepared = pd
+        .create_qp(&cq, &cq, ibv_qp_type::IBV_QPT_RC)
+        .expect("failed to create QP")
+        .set_gid_index(1)
+        .build()
+        .expect("failed to build QP");
+
+    // A link-local address derived from nothing on this network: neighbor discovery cannot
+    // resolve it, so the RTR transition fails.
+    let mut endpoint = prepared.endpoint().expect("failed to read endpoint");
+    endpoint.gid = Some(ibverbs::Gid::from([
+        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xde, 0xad, 0xbe, 0xef,
+    ]));
+
+    match prepared.handshake(endpoint) {
+        Err(Error::ModifyQueuePair(e)) if e.raw_os_error().is_none() => {
+            // The wrapped diagnostic: points at RoCE routing and names the local GID index.
+            assert!(e.to_string().contains("RoCE"), "{e}");
+            assert!(e.to_string().contains("index 1"), "{e}");
+        }
+        Err(Error::ModifyQueuePair(e)) => {
+            // Some providers report a different errno for an unresolvable neighbor; the
+            // diagnostic only wraps timeouts and unreachable-network errors.
+            eprintln!("provider reported {e} instead of a route timeout");
+        }
+        Err(other) => panic!("unexpected error kind: {other:?}"),
+        Ok(_) => panic!("handshake to an unanswerable GID unexpectedly succeeded"),
+    }
+}
