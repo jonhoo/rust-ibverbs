@@ -29,7 +29,7 @@
 //!
 //! // On RoCE, routing needs a GID; pick the index of a suitable entry in `ctx.gid_table()?`.
 //! let prepared = pd
-//!     .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)?
+//!     .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
 //!     .set_gid_index(1)
 //!     .build()?;
 //!
@@ -103,6 +103,16 @@
 //! `rxe` (SoftRoCE) implement both. A provider that lacks them fails cleanly at completion-queue
 //! or queue-pair creation (with [`Error::Unsupported`]) rather than degrading to the
 //! legacy verbs.
+//!
+//! # Typed transports
+//!
+//! The queue-pair family is typed by its transport (see [`Transport`]): [`Rc`] supports sends,
+//! RDMA read/write, and atomics; [`Uc`] sends and RDMA writes; [`Ud`] (and, behind the `efa`
+//! feature, `Srd`) datagram sends addressed through an [`AddressHandle`]. Transport-specific
+//! operations only exist on the matching types, so using one on the wrong transport is a compile
+//! error. The queue-pair types without a marker (raw packet, XRC, non-EFA driver) are not usable
+//! through the portable wrapper anyway; when they become so, they will get their own typed
+//! markers.
 //!
 //! # Thread safety
 //!
@@ -264,6 +274,9 @@ mod srq;
 
 #[cfg(feature = "efa")]
 mod efa;
+
+#[cfg(feature = "efa")]
+pub use efa::Srd;
 
 pub use address::*;
 pub use completion::*;

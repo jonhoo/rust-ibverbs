@@ -10,14 +10,14 @@
 use std::time::Duration;
 
 use ibverbs::{
-    AccessFlags, CompletionQueue, GidType, ProtectionDomain, QueuePair, QueuePairType, RecvRequest,
+    AccessFlags, CompletionQueue, GidType, ProtectionDomain, QueuePair, Rc, RecvRequest,
 };
 
 /// Build a reliable-connected queue pair on `cq` and connect it to itself (see the loopback
 /// example for the GID selection).
 fn self_connected(pd: &ProtectionDomain, cq: &CompletionQueue, gid_index: u32) -> QueuePair {
     let prepared = pd
-        .create_qp(cq, cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(cq, cq, 1)
         .unwrap()
         .set_gid_index(gid_index)
         .build()

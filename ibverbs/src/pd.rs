@@ -8,7 +8,7 @@ use crate::completion::CompletionQueue;
 use crate::context::ContextInner;
 use crate::error::{Error, Result};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
-use crate::qp::{QueuePairBuilder, QueuePairType};
+use crate::qp::{QueuePairBuilder, Transport};
 
 use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
 
@@ -224,11 +224,14 @@ impl ProtectionDomain {
 
     /// Creates a queue pair builder associated with `port_num` on this protection domain's device.
     ///
+    /// The transport is chosen at compile time by the marker `T` (for example
+    /// `pd.create_qp::<Rc>(&send, &recv, 1)` for a reliable connection); the resulting queue-pair
+    /// family only offers the operations that transport supports. The types without a marker
+    /// (raw packet, XRC, non-EFA driver) are not usable through the portable wrapper anyway; when
+    /// they become so, they will get their own typed markers.
+    ///
     /// `send` and `recv` are the [`CompletionQueue`]s that completions for the send and receive
     /// queues are delivered to, respectively. They may refer to the same queue.
-    ///
-    /// `qp_type` is the requested transport service type of this QP (for example
-    /// [`QueuePairType::ReliableConnection`]).
     ///
     /// `port_num` is the device port this queue pair uses; ports are numbered from 1.
     ///
@@ -240,13 +243,12 @@ impl ProtectionDomain {
     ///  - [`QueryPort`](Error::QueryPort): querying `port_num` failed (`ibv_query_port`).
     ///  - [`PortNotActive`](Error::PortNotActive): `port_num` is not in the `ACTIVE` or `ARMED`
     ///    state, so its GID table and routing are unusable.
-    pub fn create_qp(
+    pub fn create_qp<T: Transport>(
         &self,
         send: &CompletionQueue,
         recv: &CompletionQueue,
-        qp_type: QueuePairType,
         port_num: u8,
-    ) -> Result<QueuePairBuilder> {
+    ) -> Result<QueuePairBuilder<T>> {
         let port_attr = self.inner.ctx.query_port(port_num)?;
         Ok(QueuePairBuilder::new(
             self.inner.clone(),
@@ -256,7 +258,7 @@ impl ProtectionDomain {
             1,
             recv.inner.clone(),
             1,
-            qp_type.into(),
+            T::TYPE.into(),
             1,
             1,
         ))

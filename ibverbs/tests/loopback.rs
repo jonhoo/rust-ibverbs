@@ -10,14 +10,14 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    AccessFlags, AddressHandleAttribute, CompletionQueue, Context, Error, MrAdvice, MrAdviseFlags,
-    PortState, ProtectionDomain, QueuePair, QueuePairAttribute, QueuePairAttributeMask,
-    QueuePairState, QueuePairType, RecvRequest, TransportType, WcFields,
+    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, MrAdvice,
+    MrAdviseFlags, PortState, ProtectionDomain, QueuePair, QueuePairAttribute,
+    QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, TransportType, Uc, Ud, WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
-struct Loopback {
-    qp: QueuePair,
+struct Loopback<T: Connected> {
+    qp: QueuePair<T>,
     cq: CompletionQueue,
     pd: ProtectionDomain,
 }
@@ -41,9 +41,10 @@ fn open_test_device() -> Context {
     device.open().expect("failed to open the RDMA device")
 }
 
-/// Build a self-connected queue pair of the given type, with generous queue/SGE limits and remote
-/// access so the tests can post batches, multi-SGE lists, and one-sided operations.
-fn loopback_of(qp_type: QueuePairType) -> Loopback {
+/// Build a self-connected queue pair of the given connected transport, with generous queue/SGE
+/// limits and the given remote-access grants so the tests can post batches, multi-SGE lists, and
+/// one-sided operations (which loop back to this same QP).
+fn loopback_of<T: Connected>(access: AccessFlags) -> Loopback<T> {
     let ctx = open_test_device();
     let cq = ctx
         .create_cq(64)
@@ -54,28 +55,15 @@ fn loopback_of(qp_type: QueuePairType) -> Loopback {
         .expect("failed to allocate protection domain");
 
     let mut builder = pd
-        .create_qp(&cq, &cq, qp_type, 1)
+        .create_qp::<T>(&cq, &cq, 1)
         .expect("failed to create queue pair");
     builder
         .set_gid_index(1)
         .set_max_send_wr(16)
         .set_max_recv_wr(16)
         .set_max_send_sge(4)
-        .set_max_recv_sge(4);
-    // One-sided ops loop back to this same QP, so it must grant remote access (RC/UC only). RC also
-    // serves the atomic loopback, which additionally requires remote-atomic access.
-    if qp_type == QueuePairType::ReliableConnection {
-        builder.set_access(
-            AccessFlags::LOCAL_WRITE
-                | AccessFlags::REMOTE_WRITE
-                | AccessFlags::REMOTE_READ
-                | AccessFlags::REMOTE_ATOMIC,
-        );
-    } else {
-        builder.set_access(
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-        );
-    }
+        .set_max_recv_sge(4)
+        .set_access(access);
 
     let prepared = builder.build().expect("failed to build queue pair");
     let endpoint = prepared.endpoint().expect("failed to read local endpoint");
@@ -86,9 +74,15 @@ fn loopback_of(qp_type: QueuePairType) -> Loopback {
     Loopback { qp, cq, pd }
 }
 
-/// A reliable-connected self-loopback queue pair (the common case).
-fn loopback() -> Loopback {
-    loopback_of(QueuePairType::ReliableConnection)
+/// A reliable-connected self-loopback queue pair (the common case). Besides remote read/write, it
+/// grants remote-atomic access, which the atomic loopback additionally requires (RC only).
+fn loopback() -> Loopback<Rc> {
+    loopback_of::<Rc>(
+        AccessFlags::LOCAL_WRITE
+            | AccessFlags::REMOTE_WRITE
+            | AccessFlags::REMOTE_READ
+            | AccessFlags::REMOTE_ATOMIC,
+    )
 }
 
 /// Build a reliable-connected self-loopback queue pair on a caller-provided protection domain and
@@ -96,7 +90,7 @@ fn loopback() -> Loopback {
 /// test a completion channel shared across queues.
 fn loopback_on(pd: &ProtectionDomain, cq: &CompletionQueue) -> QueuePair {
     let mut builder = pd
-        .create_qp(cq, cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(cq, cq, 1)
         .expect("failed to create queue pair");
     builder
         .set_gid_index(1)
@@ -549,7 +543,9 @@ fn wait_for_completion() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn unreliable_connection() {
-    let mut lb = loopback_of(QueuePairType::UnreliableConnection);
+    let mut lb = loopback_of::<Uc>(
+        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
+    );
 
     let mut recv = lb
         .pd
@@ -591,7 +587,7 @@ fn shared_receive_queue() {
     let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
 
     let prepared = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP")
         .set_gid_index(1)
         .set_srq(&srq)
@@ -669,7 +665,7 @@ fn srq_limit_reached_async_event() {
     let srq = pd.create_srq(16, 1, 2).expect("failed to create SRQ");
 
     let prepared = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP")
         .set_gid_index(1)
         .set_srq(&srq)
@@ -735,15 +731,13 @@ fn unreliable_datagram() {
     const QKEY: u32 = 0x1234_5678;
 
     let prepared = pd
-        .create_qp(&cq, &cq, QueuePairType::UnreliableDatagram, 1)
+        .create_qp::<Ud>(&cq, &cq, 1)
         .expect("failed to create UD QP")
         .set_gid_index(GID_INDEX)
         .build()
         .expect("failed to build UD QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared
-        .activate_ud(QKEY)
-        .expect("failed to activate UD QP");
+    let mut qp = prepared.activate(QKEY).expect("failed to activate UD QP");
 
     // Address handle pointing at our own GID, so the datagram loops back to us.
     let my_gid = endpoint.gid.expect("RoCE requires a GID");
@@ -767,9 +761,8 @@ fn unreliable_datagram() {
         .expect("post_recv failed");
     let mut batch = qp.start_send();
     batch
-        .op()
-        .signaled()
         .to(&ah, endpoint.qp_num, QKEY)
+        .signaled()
         .send(2, &[send.slice(..payload.len())]);
     unsafe { batch.submit() }.expect("UD send failed");
 
@@ -1122,14 +1115,14 @@ fn raw_handles() {
 
     // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
     let prepared = pd
-        .create_qp(&cq, &cq, QueuePairType::UnreliableDatagram, 1)
+        .create_qp::<Ud>(&cq, &cq, 1)
         .expect("failed to create UD QP")
         .set_gid_index(1)
         .build()
         .expect("failed to build UD QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let qp = prepared
-        .activate_ud(0x1234_5678)
+        .activate(0x1234_5678)
         .expect("failed to activate UD QP");
     assert!(!qp.as_raw().is_null());
     assert!(!qp.as_raw_ex().is_null());
@@ -1151,7 +1144,7 @@ fn inline_send() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create RC QP");
     builder.set_gid_index(1).set_max_inline_data(64).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
@@ -1196,7 +1189,7 @@ fn queue_pair_on_explicit_port() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP on port 1");
     builder.set_gid_index(1).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
@@ -1257,7 +1250,7 @@ fn completion_timestamps() {
     };
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut builder = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP");
     builder.set_gid_index(1).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
@@ -1322,7 +1315,7 @@ fn extended_wc_fields() {
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut builder = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP");
     builder.set_gid_index(1).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
@@ -1521,8 +1514,8 @@ fn modify_and_query_queue_pair() {
     assert_eq!(attr.state(), QueuePairState::Error);
 }
 
-/// `into_queue_pair` plus `modify` lets you drive a queue pair through its states by hand, the raw
-/// path that `activate_ud` wraps.
+/// `into_queue_pair` plus `modify` lets you drive a queue pair through its states by hand, the
+/// raw path that the datagram transports' `activate` wraps.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn manual_bringup_via_modify() {
@@ -1532,7 +1525,7 @@ fn manual_bringup_via_modify() {
 
     // Build a UD queue pair but do not activate it; take the still-RESET queue pair to drive by hand.
     let prepared = pd
-        .create_qp(&cq, &cq, QueuePairType::UnreliableDatagram, 1)
+        .create_qp::<Ud>(&cq, &cq, 1)
         .expect("failed to create QP")
         .build()
         .expect("failed to build QP");
@@ -1578,7 +1571,7 @@ fn inline_send_list() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut builder = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create RC QP");
     builder.set_gid_index(1).set_max_inline_data(64).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
@@ -1822,7 +1815,7 @@ fn roce_route_failure_diagnostic() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let prepared = pd
-        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP")
         .set_gid_index(1)
         .build()

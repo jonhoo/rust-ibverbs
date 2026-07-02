@@ -21,8 +21,13 @@ use crate::srq::SharedReceiveQueue;
 #[cfg(doc)]
 use crate::{CompletionQueue, ProtectionDomain};
 
-/// The transport service type of a queue pair, chosen at creation
-/// ([`ProtectionDomain::create_qp`]).
+/// The transport service type of a queue pair.
+///
+/// At creation the type is derived from the transport marker (see [`Transport`] and
+/// [`ProtectionDomain::create_qp`]); this enum names the types on the wire and in queries. The
+/// types without a marker ([`RawPacket`](Self::RawPacket), the XRC pair, and
+/// [`Driver`](Self::Driver) other than EFA's SRD) are not usable through the portable wrapper;
+/// when they become so, they will get their own markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum QueuePairType {
@@ -89,6 +94,109 @@ impl std::fmt::Display for QueuePairType {
         f.write_str(name)
     }
 }
+
+/// Seals the transport traits: only the markers defined by this crate implement them.
+pub(crate) mod sealed {
+    use super::QueuePairType;
+
+    /// Implemented by every transport marker.
+    pub trait Sealed {
+        /// The [`QueuePairType`] the marker stands for.
+        const TYPE: QueuePairType;
+    }
+}
+
+/// A queue-pair transport marker: types the queue-pair family ([`QueuePairBuilder`],
+/// [`PreparedQueuePair`], [`QueuePair`], [`SendOp`]) so that transport-specific operations only
+/// exist on the transports that support them. Sealed; implemented by [`Rc`], [`Uc`], [`Ud`], and
+/// `Srd` (behind the `efa` feature).
+///
+/// # Compile-time enforcement
+///
+/// Using a transport-specific operation on the wrong transport is a compile error, not a silent
+/// no-op or a runtime provider error:
+///
+/// ```compile_fail,E0599
+/// // An unreliable datagram has no ACK timeout: `set_timeout` requires `T: Reliable`.
+/// fn f(builder: &mut ibverbs::QueuePairBuilder<ibverbs::Ud>) {
+///     builder.set_timeout(ibverbs::AckTimeout::INFINITE);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// // A connected transport addresses no individual sends: `to` requires `T: Datagram`.
+/// fn f(qp: &mut ibverbs::QueuePair, ah: &ibverbs::AddressHandle) {
+///     let mut batch = qp.start_send();
+///     batch.to(ah, 1, 2);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// // A datagram work request is always addressed: its batch starts at `to`, and `op` requires
+/// // `T: Connected`.
+/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Ud>) {
+///     let mut batch = qp.start_send();
+///     batch.op();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// // A datagram queue pair has no remote endpoint to handshake with: use `activate`.
+/// fn f(pqp: ibverbs::PreparedQueuePair<ibverbs::Ud>, remote: ibverbs::QueuePairEndpoint) {
+///     let _ = pqp.handshake(remote);
+/// }
+/// ```
+pub trait Transport: sealed::Sealed {}
+
+/// Implemented by the connected transports RC and UC, which are brought up against a single
+/// remote endpoint with [`PreparedQueuePair::handshake`].
+pub trait Connected: Transport {}
+
+/// Implemented by the reliable connected transport RC, the only transport with acknowledgements
+/// and retries, RDMA reads, and atomics.
+pub trait Reliable: Connected {}
+
+/// Implemented by the datagram transports UD and SRD, which address each send individually with
+/// an [`AddressHandle`] ([`SendBatch::to`]).
+pub trait Datagram: Transport {}
+
+/// The reliable-connection (RC) transport: connected to exactly one peer, in-order and reliable;
+/// supports sends, RDMA read/write, and atomics ([`QueuePairType::ReliableConnection`]).
+///
+/// Note that this marker shadows [`std::rc::Rc`] when glob-imported (`use ibverbs::*`).
+#[derive(Debug, Clone, Copy)]
+pub struct Rc;
+
+/// The unreliable-connection (UC) transport: connected to exactly one peer, in order but without
+/// delivery guarantees; supports sends and RDMA writes
+/// ([`QueuePairType::UnreliableConnection`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Uc;
+
+/// The unreliable-datagram (UD) transport: connectionless, each message fits in one MTU, and each
+/// send is addressed individually with an [`AddressHandle`]
+/// ([`QueuePairType::UnreliableDatagram`]).
+#[derive(Debug, Clone, Copy)]
+pub struct Ud;
+
+impl sealed::Sealed for Rc {
+    const TYPE: QueuePairType = QueuePairType::ReliableConnection;
+}
+impl Transport for Rc {}
+impl Connected for Rc {}
+impl Reliable for Rc {}
+
+impl sealed::Sealed for Uc {
+    const TYPE: QueuePairType = QueuePairType::UnreliableConnection;
+}
+impl Transport for Uc {}
+impl Connected for Uc {}
+
+impl sealed::Sealed for Ud {
+    const TYPE: QueuePairType = QueuePairType::UnreliableDatagram;
+}
+impl Transport for Ud {}
+impl Datagram for Ud {}
 
 /// The state of a queue pair's state machine.
 ///
@@ -383,10 +491,11 @@ impl std::fmt::Display for RnrTimer {
 /// An unconfigured `QueuePair`. Created by [`ProtectionDomain::create_qp`].
 ///
 /// A `QueuePairBuilder` is used to configure a `QueuePair` before it is allocated and initialized.
-/// See also [RDMAmojo] for many more details.
+/// The setters that only make sense on some transports only exist for those transports (see
+/// [`Transport`]). See also [RDMAmojo] for many more details.
 ///
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
-pub struct QueuePairBuilder {
+pub struct QueuePairBuilder<T: Transport> {
     pub(crate) ctx: isize,
     pub(crate) pd: Arc<ProtectionDomainInner>,
     pub(crate) port_attr: ffi::ibv_port_attr,
@@ -430,9 +539,10 @@ pub struct QueuePairBuilder {
     pub(crate) service_level: u8,
     /// shared receive queue
     srq: Option<SharedReceiveQueue>,
+    _transport: std::marker::PhantomData<T>,
 }
 
-impl QueuePairBuilder {
+impl<T: Transport> QueuePairBuilder<T> {
     /// Prepare a new `QueuePair` builder.
     ///
     /// `max_send_wr` is the maximum number of outstanding Work Requests that can be posted to the
@@ -457,7 +567,7 @@ impl QueuePairBuilder {
         qp_type: ffi::ibv_qp_type,
         max_send_sge: u32,
         max_recv_sge: u32,
-    ) -> QueuePairBuilder {
+    ) -> QueuePairBuilder<T> {
         let port_active_mtu = port_attr.active_mtu;
         QueuePairBuilder {
             ctx: 0,
@@ -495,21 +605,8 @@ impl QueuePairBuilder {
                 .then_some(0),
             service_level: 0,
             srq: None,
+            _transport: std::marker::PhantomData,
         }
-    }
-
-    /// Set the access flags for the new `QueuePair`.
-    ///
-    /// Defaults to [`AccessFlags::LOCAL_WRITE`].
-    ///
-    /// Ignored (silently) unless this is an RC or UC queue pair.
-    pub fn set_access(&mut self, access: AccessFlags) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
-        {
-            self.access = Some(access.into());
-        }
-        self
     }
 
     /// Set the service level of the new `QueuePair`.
@@ -541,133 +638,9 @@ impl QueuePairBuilder {
         self
     }
 
-    /// Sets the minimum RNR NAK timer for the new `QueuePair`: the wait it demands of its peer,
-    /// in each receiver-not-ready NAK, before the peer retries a send that arrived while no
-    /// receive was posted. It does not affect RNR NAKs sent for other reasons.
-    ///
-    /// The device supports 32 discrete delays between 0.01 ms and 655.36 ms;
-    /// [`RnrTimer::at_least`] rounds a [`Duration`] up to the next one.
-    ///
-    /// Defaults to a 2.56 ms delay.
-    ///
-    /// Ignored (silently) unless this is an RC queue pair.
-    pub fn set_min_rnr_timer(&mut self, timer: RnrTimer) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            self.min_rnr_timer = Some(timer.encoding());
-        }
-        self
-    }
-
-    /// Sets the minimum time the new `QueuePair` waits for an ACK/NACK from the remote QP before
-    /// retransmitting the packet.
-    ///
-    /// The device supports exactly the timeouts `4.096 µs × 2^n` for `n` in `1..=31` (8.192 µs up
-    /// to about 2.4 hours); [`AckTimeout::at_least`] rounds a [`Duration`] up to the next one.
-    /// [`AckTimeout::INFINITE`] waits forever (useful for debugging): if a packet is lost and no
-    /// ACK or NACK arrives, no retry ever occurs and the QP just stops sending data.
-    ///
-    /// Defaults to 65.536 µs.
-    ///
-    /// Ignored (silently) unless this is an RC queue pair.
-    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            self.timeout = Some(timeout.exponent());
-        }
-        self
-    }
-
-    /// Sets the total number of times that the new `QueuePair` will try to resend the packets
-    /// before reporting an error because the remote side doesn't answer in the primary path.
-    ///
-    /// This 3 bit value defaults to 6.
-    ///
-    /// Ignored (silently) unless this is an RC queue pair.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a count higher than 7 is given.
-    pub fn set_retry_count(&mut self, count: u8) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            assert!(count <= 7);
-            self.retry_count = Some(count);
-        }
-        self
-    }
-
-    /// Sets the total number of times that the new `QueuePair` will try to resend the packets when
-    /// an RNR NACK was sent by the remote QP before reporting an error.
-    ///
-    /// This 3 bit value defaults to 6. The value 7 is special and specify to retry sending the
-    /// message indefinitely when a RNR Nack is being sent by remote side.
-    ///
-    /// Ignored (silently) unless this is an RC queue pair.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a limit higher than 7 is given.
-    pub fn set_rnr_retry(&mut self, n: u8) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            assert!(n <= 7);
-            self.rnr_retry = Some(n);
-        }
-        self
-    }
-
     /// Set the Shared Receive Queue (SRQ) associated with this QP.
     pub fn set_srq(&mut self, srq: &SharedReceiveQueue) -> &mut Self {
         self.srq = Some(srq.clone());
-        self
-    }
-
-    /// Set the number of outstanding RDMA reads & atomic operations on the destination Queue Pair.
-    ///
-    /// This defaults to 1.
-    ///
-    /// Ignored (silently) unless this is an RC queue pair.
-    pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            self.max_rd_atomic = Some(max_rd_atomic);
-        }
-        self
-    }
-
-    /// Set the number of responder resources for handling incoming RDMA reads & atomic operations.
-    ///
-    /// This defaults to 1.
-    ///
-    /// Ignored (silently) unless this is an RC queue pair.
-    pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
-            self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
-        }
-        self
-    }
-
-    /// Set the path MTU.
-    ///
-    /// Defaults to the port's active MTU.
-    ///
-    /// Ignored (silently) unless this is an RC or UC queue pair.
-    pub fn set_path_mtu(&mut self, path_mtu: Mtu) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
-        {
-            self.path_mtu = Some(path_mtu.into());
-        }
-        self
-    }
-
-    /// Set the PSN for the receive queue.
-    ///
-    /// Defaults to 0.
-    ///
-    /// Ignored (silently) unless this is an RC or UC queue pair.
-    pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
-        {
-            self.rq_psn = Some(rq_psn);
-        }
         self
     }
 
@@ -736,22 +709,9 @@ impl QueuePairBuilder {
         self
     }
 
-    /// Create a new `QueuePair` from this builder template.
-    ///
-    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
-    ///
-    /// This method will fail if asked to create QP of a type other than
-    /// [`QueuePairType::ReliableConnection`] or [`QueuePairType::UnreliableDatagram`] associated
-    /// with an SRQ.
-    ///
-    /// # Errors
-    ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `ibv_create_qp_ex` failed (`EINVAL` for an
-    ///    invalid `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
-    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
-    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
-    ///    to create a QP with this Transport Service Type).
-    pub fn build(&self) -> Result<PreparedQueuePair> {
+    /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
+    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
+    fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
         use ffi::ibv_qp_create_send_ops_flags as SendOps;
         use ffi::ibv_qp_type::{IBV_QPT_RC, IBV_QPT_UC};
 
@@ -814,6 +774,7 @@ impl QueuePairBuilder {
                     _recv_cq: self.recv.clone(),
                     qp,
                     qp_ex,
+                    _transport: std::marker::PhantomData,
                 },
                 gid_index: self.gid_index,
                 traffic_class: self.traffic_class,
@@ -829,6 +790,141 @@ impl QueuePairBuilder {
                 service_level: self.service_level,
             })
         }
+    }
+}
+
+impl<T: Connected> QueuePairBuilder<T> {
+    /// Set the access flags for the new `QueuePair`.
+    ///
+    /// Defaults to [`AccessFlags::LOCAL_WRITE`].
+    pub fn set_access(&mut self, access: AccessFlags) -> &mut Self {
+        self.access = Some(access.into());
+        self
+    }
+
+    /// Set the path MTU.
+    ///
+    /// Defaults to the port's active MTU.
+    pub fn set_path_mtu(&mut self, path_mtu: Mtu) -> &mut Self {
+        self.path_mtu = Some(path_mtu.into());
+        self
+    }
+
+    /// Set the PSN for the receive queue.
+    ///
+    /// Defaults to 0.
+    pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
+        self.rq_psn = Some(rq_psn);
+        self
+    }
+
+    /// Create a new `QueuePair` from this builder template (`ibv_create_qp_ex`).
+    ///
+    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
+    ///
+    /// This method will fail if an unreliable-connection (UC) queue pair is associated with an
+    /// SRQ (devices support SRQs on RC and UD queue pairs).
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `ibv_create_qp_ex` failed (`EINVAL` for an
+    ///    invalid `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
+    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
+    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
+    ///    to create a QP with this Transport Service Type).
+    pub fn build(&self) -> Result<PreparedQueuePair<T>> {
+        self.build_impl()
+    }
+}
+
+impl QueuePairBuilder<Ud> {
+    /// Create a new `QueuePair` from this builder template (`ibv_create_qp_ex`).
+    ///
+    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `ibv_create_qp_ex` failed (`EINVAL` for an
+    ///    invalid `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
+    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
+    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
+    ///    to create a QP with this Transport Service Type).
+    pub fn build(&self) -> Result<PreparedQueuePair<Ud>> {
+        self.build_impl()
+    }
+}
+
+impl<T: Reliable> QueuePairBuilder<T> {
+    /// Sets the minimum RNR NAK timer for the new `QueuePair`: the wait it demands of its peer,
+    /// in each receiver-not-ready NAK, before the peer retries a send that arrived while no
+    /// receive was posted. It does not affect RNR NAKs sent for other reasons.
+    ///
+    /// The device supports 32 discrete delays between 0.01 ms and 655.36 ms;
+    /// [`RnrTimer::at_least`] rounds a [`Duration`] up to the next one.
+    ///
+    /// Defaults to a 2.56 ms delay.
+    pub fn set_min_rnr_timer(&mut self, timer: RnrTimer) -> &mut Self {
+        self.min_rnr_timer = Some(timer.encoding());
+        self
+    }
+
+    /// Sets the minimum time the new `QueuePair` waits for an ACK/NACK from the remote QP before
+    /// retransmitting the packet.
+    ///
+    /// The device supports exactly the timeouts `4.096 µs × 2^n` for `n` in `1..=31` (8.192 µs up
+    /// to about 2.4 hours); [`AckTimeout::at_least`] rounds a [`Duration`] up to the next one.
+    /// [`AckTimeout::INFINITE`] waits forever (useful for debugging): if a packet is lost and no
+    /// ACK or NACK arrives, no retry ever occurs and the QP just stops sending data.
+    ///
+    /// Defaults to 65.536 µs.
+    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
+        self.timeout = Some(timeout.exponent());
+        self
+    }
+
+    /// Sets the total number of times that the new `QueuePair` will try to resend the packets
+    /// before reporting an error because the remote side doesn't answer in the primary path.
+    ///
+    /// This 3 bit value defaults to 6.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a count higher than 7 is given.
+    pub fn set_retry_count(&mut self, count: u8) -> &mut Self {
+        assert!(count <= 7);
+        self.retry_count = Some(count);
+        self
+    }
+
+    /// Sets the total number of times that the new `QueuePair` will try to resend the packets when
+    /// an RNR NACK was sent by the remote QP before reporting an error.
+    ///
+    /// This 3 bit value defaults to 6. The value 7 is special and specify to retry sending the
+    /// message indefinitely when a RNR Nack is being sent by remote side.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a limit higher than 7 is given.
+    pub fn set_rnr_retry(&mut self, n: u8) -> &mut Self {
+        assert!(n <= 7);
+        self.rnr_retry = Some(n);
+        self
+    }
+
+    /// Set the number of outstanding RDMA reads & atomic operations on the destination Queue Pair.
+    ///
+    /// This defaults to 1.
+    pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
+        self.max_rd_atomic = Some(max_rd_atomic);
+        self
+    }
+
+    /// Set the number of responder resources for handling incoming RDMA reads & atomic operations.
+    ///
+    /// This defaults to 1.
+    pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
+        self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
+        self
     }
 }
 
@@ -859,9 +955,10 @@ impl QueuePairBuilder {
 ///
 /// For a runnable version of this exchange (self-connected, so it fits one process), see
 /// `examples/loopback.rs`; `examples/rdmacm_connect.rs` shows the same bring-up driven by the
-/// connection manager instead.
-pub struct PreparedQueuePair {
-    pub(crate) qp: QueuePair,
+/// connection manager instead. Datagram transports (UD and SRD) are connectionless and are
+/// brought up with `activate` instead of `handshake`.
+pub struct PreparedQueuePair<T: Transport> {
+    pub(crate) qp: QueuePair<T>,
     /// port local identifier
     pub(crate) lid: u16,
     /// the device port this queue pair is associated with (numbered from 1)
@@ -908,17 +1005,17 @@ pub struct QueuePairEndpoint {
     pub gid: Option<Gid>,
 }
 
-impl PreparedQueuePair {
+impl<T: Transport> PreparedQueuePair<T> {
     /// Extracts the still-uninitialized (`RESET`) queue pair without transitioning it, so you can
-    /// drive the state machine yourself with [`QueuePair::modify`] instead of using
-    /// [`handshake`](Self::handshake) / [`activate_ud`](Self::activate_ud).
+    /// drive the state machine yourself with [`QueuePair::modify`] instead of using `handshake` /
+    /// `activate`.
     ///
     /// This is an escape hatch for fully manual bring-up (custom partition keys, packet sequence
     /// numbers, alternate paths, and so on). The returned queue pair is in `RESET` and cannot send
     /// or receive until you transition it through `INIT`, `RTR`, and `RTS`; most users should prefer
-    /// `handshake`/`activate_ud`. The RDMA connection manager (the `rdmacm` module, behind the
+    /// `handshake`/`activate`. The RDMA connection manager (the `rdmacm` module, behind the
     /// feature of the same name) uses this to drive the transitions itself.
-    pub fn into_queue_pair(self) -> QueuePair {
+    pub fn into_queue_pair(self) -> QueuePair<T> {
         self.qp
     }
 
@@ -955,15 +1052,62 @@ impl PreparedQueuePair {
         })
     }
 
+    /// The connectionless `INIT` -> `RTR` -> `RTS` bring-up with a Q_Key, shared by the
+    /// datagram transports' `activate` (UD here, SRD in `efa.rs`).
+    pub(crate) fn activate_impl(self, qkey: u32) -> Result<QueuePair<T>> {
+        // INIT: associate with the port and set the Q_Key. UD has no access flags.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
+            pkey_index: 0,
+            port_num: self.port_num,
+            qkey,
+            ..Default::default()
+        };
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
+            | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
+            | ffi::ibv_qp_attr_mask::IBV_QP_PORT
+            | ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
+        }
+
+        // RTR: a UD queue pair needs no path or destination information.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
+            ..Default::default()
+        };
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
+        }
+
+        // RTS.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
+            sq_psn: 0,
+            ..Default::default()
+        };
+        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
+        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::ModifyQueuePair));
+        }
+
+        Ok(self.qp)
+    }
+}
+
+impl<T: Connected> PreparedQueuePair<T> {
     /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair`.
     ///
     /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
     /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`),
     /// applying the attributes configured on the builder (access flags, timeouts, path MTU,
     /// service level, and so on) at the appropriate steps. Further discussion of the protocol can
-    /// be found on [RDMAmojo]. This bring-up is for connected queue pairs (RC and UC); use
-    /// [`activate_ud`](Self::activate_ud) for UD queue pairs, or
-    /// [`into_queue_pair`](Self::into_queue_pair) to drive the state machine yourself.
+    /// be found on [RDMAmojo]. Use [`into_queue_pair`](Self::into_queue_pair) to drive the state
+    /// machine yourself instead.
     ///
     /// If the endpoint contains a Gid, the routing will be global. This means:
     /// ```text
@@ -990,7 +1134,7 @@ impl PreparedQueuePair {
     ///    type or the remote endpoint is unreachable.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
-    pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair> {
+    pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair<T>> {
         // init and associate with port
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
@@ -1010,12 +1154,11 @@ impl PreparedQueuePair {
             return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
-        // set ready to receive
+        // set ready to receive; the destination and path are meaningful because this bring-up
+        // only exists on the connected transports (RC and UC)
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-            // TODO: this is only valid for RC and UC
             dest_qp_num: remote.qp_num,
-            // TODO: this is only valid for RC and UC
             ah_attr: ffi::ibv_ah_attr {
                 dlid: remote.lid,
                 sl: self.service_level,
@@ -1105,63 +1248,25 @@ impl PreparedQueuePair {
 
         Ok(self.qp)
     }
+}
 
-    /// Activate this queue pair as an unreliable datagram (UD) queue pair.
+impl PreparedQueuePair<Ud> {
+    /// Activate this unreliable datagram (UD) queue pair.
     ///
-    /// Unlike [`handshake`](Self::handshake), UD is connectionless: there is no remote endpoint to
-    /// exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with the given `qkey`.
-    /// Incoming datagrams whose Q_Key does not match `qkey` are discarded (unless the sender's Q_Key
-    /// has its most significant bit set, meaning "use the QP's Q_Key").
+    /// Unlike a connected transport's handshake, UD is connectionless: there is no remote
+    /// endpoint to exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with the given
+    /// `qkey`. Incoming datagrams whose Q_Key does not match `qkey` are discarded (unless the
+    /// sender's Q_Key has its most significant bit set, meaning "use the QP's Q_Key").
     ///
     /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
-    /// [`SendOp::to`].
+    /// [`SendBatch::to`].
     ///
     /// # Errors
     ///
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
     ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources).
-    pub fn activate_ud(self, qkey: u32) -> Result<QueuePair> {
-        // INIT: associate with the port and set the Q_Key. UD has no access flags.
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
-            pkey_index: 0,
-            port_num: self.port_num,
-            qkey,
-            ..Default::default()
-        };
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
-            | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
-            | ffi::ibv_qp_attr_mask::IBV_QP_PORT
-            | ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-
-        // RTR: a UD queue pair needs no path or destination information.
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-            ..Default::default()
-        };
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-
-        // RTS.
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
-            sq_psn: 0,
-            ..Default::default()
-        };
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-
-        Ok(self.qp)
+    pub fn activate(self, qkey: u32) -> Result<QueuePair<Ud>> {
+        self.activate_impl(qkey)
     }
 }
 
@@ -1194,12 +1299,14 @@ impl<'a> RecvRequest<'a> {
 
 /// A batch of send work requests being built on a [`QueuePair`]'s send queue.
 ///
-/// Created by [`QueuePair::start_send`]. Each work request starts at [`op`](Self::op), is
-/// optionally modified ([`signaled`](SendOp::signaled), [`fenced`](SendOp::fenced),
-/// [`solicited`](SendOp::solicited), [`to`](SendOp::to)), and ends with the [`SendOp`] opcode
-/// method (`send`, `write`, `read`, ...) that appends it to the open block immediately, through
-/// the extended ("doorbell") interface. [`submit`](Self::submit) then rings the doorbell once for
-/// the whole batch. Dropping the batch without submitting aborts it.
+/// Created by [`QueuePair::start_send`]. Each work request starts at [`op`](Self::op) (on a
+/// datagram queue pair, at [`to`](Self::to), which also addresses it), is optionally modified
+/// ([`signaled`](SendOp::signaled), [`fenced`](SendOp::fenced),
+/// [`solicited`](SendOp::solicited)), and ends with the opcode method (`send`, `write`, `read`,
+/// ...) that appends it to the open block immediately, through the extended ("doorbell")
+/// interface. The opcodes available depend on the queue pair's transport (see [`Transport`]).
+/// [`submit`](Self::submit) then rings the doorbell once for the whole batch. Dropping the batch
+/// without submitting aborts it.
 ///
 /// # Borrow-checked guarantees
 ///
@@ -1216,8 +1323,9 @@ impl<'a> RecvRequest<'a> {
 /// # }
 /// ```
 ///
-/// Likewise, only one request at a time is configured on a batch: each [`op`](Self::op) borrows the
-/// batch until that work request is posted, so two half-built requests cannot overlap:
+/// Likewise, only one request at a time is configured on a batch: each [`op`](Self::op) (or
+/// [`to`](Self::to)) borrows the batch until that work request is posted, so two half-built
+/// requests cannot overlap:
 ///
 /// ```compile_fail,E0499
 /// # fn two_requests(qp: &mut ibverbs::QueuePair) {
@@ -1228,26 +1336,54 @@ impl<'a> RecvRequest<'a> {
 /// # }
 /// ```
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
-pub struct SendBatch<'qp> {
+pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
-    _qp: std::marker::PhantomData<&'qp mut QueuePair>,
+    _qp: std::marker::PhantomData<&'qp mut QueuePair<T>>,
 }
 
-impl<'qp> SendBatch<'qp> {
+impl<'qp, T: Connected> SendBatch<'qp, T> {
     /// Begin one work request on the batch.
     ///
     /// The returned [`SendOp`] carries the request until an opcode method posts it: chain the
-    /// modifiers first (`batch.op().signaled().to(&ah, qpn, qkey).send(id, sges)`), because the
-    /// provider reads the work-request flags and addressing inside the opcode builder.
+    /// modifiers first (`batch.op().signaled().send(id, sges)`), because the provider reads the
+    /// work-request flags inside the opcode builder.
     #[inline]
-    pub fn op(&mut self) -> SendOp<'_, 'qp> {
+    pub fn op(&mut self) -> SendOp<'_, 'qp, T> {
         SendOp {
             batch: self,
             flags: 0,
             dest: None,
         }
     }
+}
 
+impl<'qp, T: Datagram> SendBatch<'qp, T> {
+    /// Begin one work request on the batch, addressed to `ah` / `remote_qpn` / `remote_qkey`.
+    ///
+    /// Every datagram send needs a destination, so this is the datagram batch's entry point; the
+    /// destination is per work request, so one batch may address each request to a different
+    /// peer. The returned [`AddressedSendOp`] carries the request until an opcode method posts
+    /// it: chain the modifiers first (`batch.to(&ah, qpn, qkey).signaled().send(id, sges)`),
+    /// because the provider reads the work-request flags and addressing inside the opcode
+    /// builder.
+    #[inline]
+    pub fn to(
+        &mut self,
+        ah: &AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+    ) -> AddressedSendOp<'_, 'qp, T> {
+        AddressedSendOp {
+            op: SendOp {
+                batch: self,
+                flags: 0,
+                dest: Some((ah.as_ptr(), remote_qpn, remote_qkey)),
+            },
+        }
+    }
+}
+
+impl<'qp, T: Transport> SendBatch<'qp, T> {
     /// Post the whole batch to the device, ringing the doorbell once.
     ///
     /// # Safety
@@ -1274,7 +1410,7 @@ impl<'qp> SendBatch<'qp> {
     }
 }
 
-impl Drop for SendBatch<'_> {
+impl<T: Transport> Drop for SendBatch<'_, T> {
     fn drop(&mut self) {
         // Reached only when the batch was started (`wr_start`) but not submitted; `submit` forgets
         // the batch to skip this. Abort the open work-request block.
@@ -1283,18 +1419,20 @@ impl Drop for SendBatch<'_> {
 }
 
 /// One work request being configured and posted on a [`SendBatch`]. Created by
-/// [`SendBatch::op`].
+/// [`SendBatch::op`] (connected transports; a datagram batch starts each request at
+/// [`SendBatch::to`], which yields an [`AddressedSendOp`] instead).
 ///
 /// Chain the modifiers ([`signaled`](Self::signaled), [`fenced`](Self::fenced),
-/// [`solicited`](Self::solicited), [`to`](Self::to)) and finish with an opcode method (`send`,
-/// `write`, ...), which posts the request immediately.
-pub struct SendOp<'b, 'qp> {
-    batch: &'b mut SendBatch<'qp>,
+/// [`solicited`](Self::solicited)) and finish with an opcode method (`send`, `write`, ...), which
+/// posts the request immediately. The opcodes exist only on the transports that support them (see
+/// [`Transport`]).
+pub struct SendOp<'b, 'qp, T: Transport> {
+    batch: &'b mut SendBatch<'qp, T>,
     flags: u32,
     dest: Option<(*mut ffi::ibv_ah, u32, u32)>,
 }
 
-impl SendOp<'_, '_> {
+impl<T: Transport> SendOp<'_, '_, T> {
     /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
     #[inline]
     pub fn signaled(mut self) -> Self {
@@ -1320,18 +1458,15 @@ impl SendOp<'_, '_> {
         self
     }
 
-    /// Address this datagram send to `ah` / `remote_qpn` / `remote_qkey` (required for sends on
-    /// UD and SRD queue pairs).
-    #[inline]
-    pub fn to(mut self, ah: &AddressHandle, remote_qpn: u32, remote_qkey: u32) -> Self {
-        self.dest = Some((ah.as_ptr(), remote_qpn, remote_qkey));
-        self
-    }
-
     /// Post one work request: set id and flags, run the opcode builder, then the optional datagram
     /// address, then the scatter list.
     #[inline]
-    fn build(self, wr_id: u64, local: &[LocalMemorySlice], op: impl FnOnce(*mut ffi::ibv_qp_ex)) {
+    pub(crate) fn build(
+        self,
+        wr_id: u64,
+        local: &[LocalMemorySlice],
+        op: impl FnOnce(*mut ffi::ibv_qp_ex),
+    ) {
         let qpx = self.batch.qpx;
         unsafe {
             (*qpx).wr_id = wr_id;
@@ -1399,7 +1534,9 @@ impl SendOp<'_, '_> {
             );
         }
     }
+}
 
+impl<T: Connected> SendOp<'_, '_, T> {
     /// Post a SEND.
     #[inline]
     pub fn send(self, wr_id: u64, local: &[LocalMemorySlice]) {
@@ -1531,7 +1668,9 @@ impl SendOp<'_, '_> {
             (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
         })
     }
+}
 
+impl<T: Reliable> SendOp<'_, '_, T> {
     /// Post an RDMA READ from `remote` into `local`.
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
@@ -1569,6 +1708,94 @@ impl SendOp<'_, '_> {
         })
     }
 }
+
+/// One datagram work request being configured and posted on a [`SendBatch`], addressed at
+/// creation by [`SendBatch::to`].
+///
+/// Chain the modifiers ([`signaled`](Self::signaled), [`fenced`](Self::fenced),
+/// [`solicited`](Self::solicited)) and finish with an opcode method, which posts the request
+/// immediately. UD supports the two-sided sends (including the inline variants); SRD (behind the
+/// `efa` feature) additionally supports RDMA write (with immediate) and read.
+pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
+    pub(crate) op: SendOp<'b, 'qp, T>,
+}
+
+impl<T: Datagram> AddressedSendOp<'_, '_, T> {
+    /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
+    #[inline]
+    pub fn signaled(self) -> Self {
+        AddressedSendOp {
+            op: self.op.signaled(),
+        }
+    }
+
+    /// Mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
+    /// reads and atomic operations on this queue pair have completed. Used to order a send or
+    /// write after a read whose data it depends on.
+    #[inline]
+    pub fn fenced(self) -> Self {
+        AddressedSendOp {
+            op: self.op.fenced(),
+        }
+    }
+
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
+    /// raises a solicited event on the remote side, waking a peer blocked on its completion
+    /// channel after arming with [`CompletionQueue::req_notify`] for solicited events only.
+    #[inline]
+    pub fn solicited(self) -> Self {
+        AddressedSendOp {
+            op: self.op.solicited(),
+        }
+    }
+
+    /// Post a SEND.
+    #[inline]
+    pub fn send(self, wr_id: u64, local: &[LocalMemorySlice]) {
+        self.op
+            .build(wr_id, local, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    }
+
+    /// Post a SEND carrying a 32-bit immediate (host byte order).
+    #[inline]
+    pub fn send_imm(self, wr_id: u64, local: &[LocalMemorySlice], imm: u32) {
+        self.op.build(wr_id, local, move |q| unsafe {
+            (*q).wr_send_imm.unwrap()(q, imm.to_be())
+        })
+    }
+
+    /// Post a SEND whose payload is carried inline in the work request (see
+    /// [`QueuePairBuilder::set_max_inline_data`]).
+    #[inline]
+    pub fn send_inline(self, wr_id: u64, data: &[u8]) {
+        self.op
+            .build_inline(wr_id, data, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    }
+
+    /// Post a SEND carrying an inline payload and a 32-bit immediate (host byte order).
+    #[inline]
+    pub fn send_imm_inline(self, wr_id: u64, data: &[u8], imm: u32) {
+        self.op.build_inline(wr_id, data, move |q| unsafe {
+            (*q).wr_send_imm.unwrap()(q, imm.to_be())
+        })
+    }
+
+    /// Post a SEND whose inline payload is gathered from several buffers.
+    #[inline]
+    pub fn send_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>]) {
+        self.op
+            .build_inline_list(wr_id, bufs, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    }
+
+    /// Post a SEND carrying a gathered inline payload and a 32-bit immediate (host byte order).
+    #[inline]
+    pub fn send_imm_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>], imm: u32) {
+        self.op.build_inline_list(wr_id, bufs, move |q| unsafe {
+            (*q).wr_send_imm.unwrap()(q, imm.to_be())
+        })
+    }
+}
+
 /// A set of queue-pair attributes together with a mask of which of them are present.
 ///
 /// Used with [`QueuePair::modify`] to change a queue pair's attributes (the general escape hatch
@@ -1970,9 +2197,13 @@ fn qp_transition_masks(
     }
 }
 
-/// A fully initialized and ready `QueuePair`. Created by [`PreparedQueuePair::handshake`] /
-/// [`activate_ud`](PreparedQueuePair::activate_ud) (or
+/// A fully initialized and ready `QueuePair`. Created by the connected transports'
+/// [`handshake`](PreparedQueuePair::handshake) / the datagram transports' `activate` (or
 /// [`into_queue_pair`](PreparedQueuePair::into_queue_pair) for manual bring-up).
+///
+/// The transport marker `T` (see [`Transport`]) selects which operations the queue pair supports
+/// at compile time; it defaults to [`Rc`], so a plain `QueuePair` is a reliable-connection queue
+/// pair.
 ///
 /// A queue pair is the actual object that sends and receives data in the RDMA architecture
 /// (something like a socket). It's not exactly like a socket, however. A socket is an abstraction,
@@ -1980,7 +2211,7 @@ fn qp_transition_masks(
 /// is a resource of an RDMA device and a QP number can be used by one process at the same time
 /// (similar to a socket that is associated with a specific TCP or UDP port number)
 #[must_use = "QueuePair is immediately destroyed via drop() unless assigned to a variable"]
-pub struct QueuePair {
+pub struct QueuePair<T: Transport = Rc> {
     pub(crate) pd: Arc<ProtectionDomainInner>,
     pub(crate) _srq: Option<SharedReceiveQueue>,
     // Keep the completion queues alive while the queue pair references them; `ibv_destroy_cq` fails
@@ -1991,12 +2222,13 @@ pub struct QueuePair {
     // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
     // this aliases `qp` and lives exactly as long.
     pub(crate) qp_ex: *mut ffi::ibv_qp_ex,
+    pub(crate) _transport: std::marker::PhantomData<T>,
 }
 
-unsafe impl Send for QueuePair {}
-unsafe impl Sync for QueuePair {}
+unsafe impl<T: Transport> Send for QueuePair<T> {}
+unsafe impl<T: Transport> Sync for QueuePair<T> {}
 
-impl QueuePair {
+impl<T: Transport> QueuePair<T> {
     /// Returns the local QP number of this QueuePair.
     pub fn qp_num(&self) -> u32 {
         unsafe { *self.qp }.qp_num
@@ -2023,11 +2255,10 @@ impl QueuePair {
     /// Modify this queue pair's attributes (`ibv_modify_qp`).
     ///
     /// This is the general escape hatch for transitions and attribute changes that
-    /// [`PreparedQueuePair::handshake`], [`activate_ud`](PreparedQueuePair::activate_ud), and (with
-    /// the `efa` feature) `activate_srd` do not cover: changing access flags at runtime, draining
-    /// the send queue, moving the queue pair to `ERR` for teardown, setting a custom partition-key
-    /// index or packet sequence number, and so on. Only the attributes whose mask bits are set in
-    /// `attr` are applied.
+    /// [`PreparedQueuePair::handshake`] and the datagram transports' `activate` do not cover:
+    /// changing access flags at runtime, draining the send queue, moving the queue pair to `ERR`
+    /// for teardown, setting a custom partition-key index or packet sequence number, and so on.
+    /// Only the attributes whose mask bits are set in `attr` are applied.
     ///
     /// # Errors
     ///
@@ -2176,11 +2407,12 @@ impl QueuePair {
 
     /// Begin a batch of send work requests on this queue pair's send queue.
     ///
-    /// Each [`op`](SendBatch::op) on the returned [`SendBatch`] appends one request: chain
-    /// [`signaled`](SendOp::signaled) to request a completion and [`to`](SendOp::to) to address a
-    /// datagram send, then post with the opcode method (`send`, `write`, `read`, the atomics,
-    /// ...). Nothing reaches the device until [`submit`](SendBatch::submit), which rings the
-    /// doorbell once for the whole batch.
+    /// Each [`op`](SendBatch::op) on the returned [`SendBatch`] appends one request (a datagram
+    /// batch starts each request at [`to`](SendBatch::to) instead, which also addresses it):
+    /// chain [`signaled`](SendOp::signaled) to request a completion, then post with the opcode
+    /// method (`send`, `write`, `read`, the atomics, ...; which of them exist depends on the
+    /// transport — see [`Transport`]). Nothing reaches the device until
+    /// [`submit`](SendBatch::submit), which rings the doorbell once for the whole batch.
     ///
     /// As with any send, the memory backing each scatter/gather slice must stay valid until a work
     /// completion has been polled for the request.
@@ -2197,7 +2429,7 @@ impl QueuePair {
     /// # }
     /// ```
     #[inline]
-    pub fn start_send(&mut self) -> SendBatch<'_> {
+    pub fn start_send(&mut self) -> SendBatch<'_, T> {
         let qpx = self.qp_ex;
         unsafe { (*qpx).wr_start.unwrap()(qpx) };
         SendBatch {
@@ -2207,7 +2439,7 @@ impl QueuePair {
     }
 }
 
-impl Drop for QueuePair {
+impl<T: Transport> Drop for QueuePair<T> {
     fn drop(&mut self) {
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
         let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
