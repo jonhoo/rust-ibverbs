@@ -270,8 +270,11 @@ impl Context {
     pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            let remaining =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let remaining = deadline.map(|deadline| {
+                crate::completion::ceil_to_millis(
+                    deadline.saturating_duration_since(Instant::now()),
+                )
+            });
             let pollfd = nix::poll::PollFd::new(self.async_fd(), nix::poll::PollFlags::POLLIN);
             let ret = nix::poll::poll(
                 &mut [pollfd],

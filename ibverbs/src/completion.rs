@@ -12,6 +12,12 @@ use crate::error::{Error, Result};
 #[cfg(doc)]
 use crate::Context;
 
+/// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
+/// granularity) lasts at least the requested duration instead of returning fractionally early.
+pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
+    Duration::from_millis(remaining.as_nanos().div_ceil(1_000_000) as u64)
+}
+
 /// A completion channel: the file descriptor that delivers completion-queue notifications.
 /// Created by [`Context::create_comp_channel`].
 ///
@@ -129,8 +135,8 @@ impl CompletionChannel {
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
-            let remaining =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let remaining = deadline
+                .map(|deadline| ceil_to_millis(deadline.saturating_duration_since(Instant::now())));
             let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
             let ret = nix::poll::poll(
                 &mut [pollfd],

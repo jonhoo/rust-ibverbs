@@ -474,7 +474,9 @@ impl CmId {
     /// before each read, so the read itself never blocks past the deadline.
     fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<Option<CmEvent>> {
         if let Some(deadline) = deadline {
-            let remaining = deadline.saturating_duration_since(Instant::now());
+            let remaining = crate::completion::ceil_to_millis(
+                deadline.saturating_duration_since(Instant::now()),
+            );
             let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
             let ret = nix::poll::poll(
                 &mut [pollfd],
