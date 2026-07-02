@@ -3,9 +3,7 @@ use std::io;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
+use crate::error::{Error, Result};
 use crate::pd::ProtectionDomainInner;
 
 #[cfg(doc)]
@@ -229,8 +227,7 @@ impl LocalMemorySlice {
 /// Remote memory region, targetable by one-sided operations (RDMA read/write and atomics).
 ///
 /// Created by [`MemoryRegion::remote`], and typically serialized to the peer that initiates the
-/// access (with the `serde` feature).
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+/// access through [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes).
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct RemoteMemorySlice {
     /// Memory address of the registered region (might have been offset by slicing).
@@ -242,6 +239,37 @@ pub struct RemoteMemorySlice {
 }
 
 impl RemoteMemorySlice {
+    /// The length of the wire encoding produced by [`to_bytes`](Self::to_bytes).
+    pub const WIRE_LEN: usize = 20;
+
+    /// Encodes this slice in the crate's stable wire format, for handing to the peer that will
+    /// access it remotely.
+    ///
+    /// The layout, in network byte order: the address (8 bytes), the length (8 bytes), and the
+    /// remote key (4 bytes).
+    pub fn to_bytes(&self) -> [u8; Self::WIRE_LEN] {
+        let mut out = [0u8; Self::WIRE_LEN];
+        out[0..8].copy_from_slice(&self.addr.to_be_bytes());
+        out[8..16].copy_from_slice(&(self.len as u64).to_be_bytes());
+        out[16..20].copy_from_slice(&self.rkey.to_be_bytes());
+        out
+    }
+
+    /// Decodes a slice from the wire format produced by [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Errors
+    ///
+    ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the encoded length does not fit
+    ///    this platform's `usize`.
+    pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
+        let len = u64::from_be_bytes(bytes[8..16].try_into().expect("slice length is fixed"));
+        Ok(RemoteMemorySlice {
+            addr: u64::from_be_bytes(bytes[0..8].try_into().expect("slice length is fixed")),
+            len: usize::try_from(len).map_err(|_| Error::MalformedWireFormat)?,
+            rkey: u32::from_be_bytes(bytes[16..20].try_into().expect("slice length is fixed")),
+        })
+    }
+
     /// Make a subslice of this slice.
     ///
     /// # Panics
@@ -276,8 +304,8 @@ fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -
     (addr, len)
 }
 
-#[cfg(all(test, feature = "serde"))]
-mod test_serde {
+#[cfg(test)]
+mod test_layout {
     use super::*;
     #[test]
     fn test_local_memory_slice_sge_memory_layout() {
@@ -291,6 +319,17 @@ mod test_serde {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn remote_memory_slice_bytes_roundtrip() {
+        let remote = RemoteMemorySlice {
+            addr: 0xdead_beef_dead_beef,
+            len: 4096,
+            rkey: 0x1234_5678,
+        };
+        let encoded = remote.to_bytes();
+        assert_eq!(RemoteMemorySlice::from_bytes(&encoded).unwrap(), remote);
+    }
 
     #[test]
     fn local_memory_slice_sge_roundtrip() {

@@ -33,8 +33,8 @@
 //!     .set_gid_index(1)
 //!     .build()?;
 //!
-//! // Exchange endpoints with the peer out of band (they are serializable with the `serde`
-//! // feature), or let the `rdmacm` feature's connection manager negotiate the connection over IP.
+//! // Exchange endpoints with the peer out of band (`QueuePairEndpoint::to_bytes` is the wire
+//! // format), or let the `rdmacm` feature's connection manager negotiate the connection over IP.
 //! // This example self-connects the queue pair, so the "exchange" is with itself.
 //! let endpoint = prepared.endpoint()?;
 //! let mut qp = prepared.handshake(endpoint)?;
@@ -78,8 +78,6 @@
 //!
 //! # Cargo features
 //!
-//! - `serde`: [`QueuePairEndpoint`] and [`RemoteMemorySlice`] implement
-//!   `Serialize`/`Deserialize`, for sending to the peer during connection setup.
 //! - `rdmacm`: the `rdmacm` module, wrapping the `librdmacm` connection manager: connection setup
 //!   over IP addresses, blocking or event-loop driven, instead of an out-of-band endpoint
 //!   exchange. Links `librdmacm`.

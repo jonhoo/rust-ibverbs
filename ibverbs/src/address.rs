@@ -4,9 +4,6 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use crate::pd::ProtectionDomainInner;
 
 #[cfg(doc)]
@@ -31,7 +28,6 @@ use crate::{Context, ProtectionDomain, QueuePairBuilder};
 /// For continuity, the methods `subnet_prefix` and `interface_id` are provided.
 /// These methods read the array as big endian, regardless of native cpu
 /// endianness.
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct Gid {
@@ -223,27 +219,52 @@ impl GidEntry {
     }
 }
 
-#[cfg(all(test, feature = "serde"))]
-mod test_serde {
+#[cfg(test)]
+mod test_wire {
     use crate::QueuePairEndpoint;
+
     #[test]
-    fn encode_decode() {
-        let qpe_default = QueuePairEndpoint {
+    fn endpoint_bytes_roundtrip() {
+        let mut qpe = QueuePairEndpoint {
             qp_num: 72,
             lid: 9,
             gid: Some(Default::default()),
         };
-
-        let mut qpe = qpe_default;
         qpe.gid.as_mut().unwrap().raw =
             unsafe { std::mem::transmute::<[u64; 2], [u8; 16]>([87_u64.to_be(), 192_u64.to_be()]) };
-        let encoded = bincode::serialize(&qpe).unwrap();
 
-        let decoded: QueuePairEndpoint = bincode::deserialize(&encoded).unwrap();
+        let encoded = qpe.to_bytes();
+        let decoded = QueuePairEndpoint::from_bytes(&encoded).unwrap();
         assert_eq!(decoded.gid.unwrap().subnet_prefix(), 87);
         assert_eq!(decoded.gid.unwrap().interface_id(), 192);
         assert_eq!(qpe, decoded);
-        assert_ne!(qpe, qpe_default);
+    }
+
+    #[test]
+    fn endpoint_bytes_roundtrip_without_gid() {
+        let qpe = QueuePairEndpoint {
+            qp_num: u32::MAX,
+            lid: 0xbeef,
+            gid: None,
+        };
+        let encoded = qpe.to_bytes();
+        assert_eq!(encoded[0], 0);
+        assert_eq!(QueuePairEndpoint::from_bytes(&encoded).unwrap(), qpe);
+    }
+
+    #[test]
+    fn endpoint_bytes_rejects_unknown_flags() {
+        let mut encoded = QueuePairEndpoint {
+            qp_num: 1,
+            lid: 1,
+            gid: None,
+        }
+        .to_bytes();
+        encoded[0] = 2;
+        assert!(matches!(
+            QueuePairEndpoint::from_bytes(&encoded),
+            Err(crate::Error::MalformedWireFormat)
+        ));
     }
 }
 

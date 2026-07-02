@@ -4,9 +4,6 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
-#[cfg(feature = "serde")]
-use serde::{Deserialize, Serialize};
-
 use ffi::ibv_mtu;
 
 use crate::address::Gid;
@@ -990,12 +987,12 @@ pub struct PreparedQueuePair<T: Transport> {
 }
 
 /// An identifier for the network endpoint of a `QueuePair`. Returned by
-/// [`PreparedQueuePair::endpoint`], to exchange with the peer (it serializes with the `serde`
-/// feature).
+/// [`PreparedQueuePair::endpoint`], to exchange with the peer through
+/// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
+/// rdmacm connection request's `private_data`.
 ///
 /// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num`
     pub qp_num: u32,
@@ -1003,6 +1000,51 @@ pub struct QueuePairEndpoint {
     pub lid: u16,
     /// the context's `gid`, used for global routing
     pub gid: Option<Gid>,
+}
+
+impl QueuePairEndpoint {
+    /// The length of the wire encoding produced by [`to_bytes`](Self::to_bytes).
+    pub const WIRE_LEN: usize = 23;
+
+    /// Encodes this endpoint in the crate's stable wire format, for exchanging with the peer over
+    /// any transport (it also fits an rdmacm connection request's 56-byte `private_data`).
+    ///
+    /// The layout, in network byte order: one flags byte (bit 0: a GID is present; all other bits
+    /// zero), the queue pair number (4 bytes), the LID (2 bytes), and the raw GID (16 bytes,
+    /// zeroed when absent). Adding fields to the format means a new, longer encoding — this one
+    /// stays decodable.
+    pub fn to_bytes(&self) -> [u8; Self::WIRE_LEN] {
+        let mut out = [0u8; Self::WIRE_LEN];
+        out[0] = self.gid.is_some() as u8;
+        out[1..5].copy_from_slice(&self.qp_num.to_be_bytes());
+        out[5..7].copy_from_slice(&self.lid.to_be_bytes());
+        if let Some(gid) = self.gid {
+            out[7..23].copy_from_slice(&<[u8; 16]>::from(gid));
+        }
+        out
+    }
+
+    /// Decodes an endpoint from the wire format produced by [`to_bytes`](Self::to_bytes).
+    ///
+    /// # Errors
+    ///
+    ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the flags byte carries bits this
+    ///    version does not know.
+    pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
+        let gid = match bytes[0] {
+            0 => None,
+            1 => {
+                let raw: [u8; 16] = bytes[7..23].try_into().expect("slice length is fixed");
+                Some(Gid::from(raw))
+            }
+            _ => return Err(Error::MalformedWireFormat),
+        };
+        Ok(QueuePairEndpoint {
+            qp_num: u32::from_be_bytes(bytes[1..5].try_into().expect("slice length is fixed")),
+            lid: u16::from_be_bytes(bytes[5..7].try_into().expect("slice length is fixed")),
+            gid,
+        })
+    }
 }
 
 impl<T: Transport> PreparedQueuePair<T> {
