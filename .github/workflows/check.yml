@@ -79,6 +79,34 @@ jobs:
         run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: --cfg docsrs
+  semver:
+    # cargo-semver-checks compares the public API of this PR against its base revision, so API
+    # breakage has to be deliberate: the job fails unless the crate version was bumped to match.
+    # Its lints are structural (removed or renamed items, changed arity, and so on), not an
+    # exhaustive type-level diff.
+    runs-on: ubuntu-latest
+    name: stable / semver-checks
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+      - name: Configure CI host
+        run: ./configure-ci.sh
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo install cargo-semver-checks
+        uses: taiki-e/install-action@cargo-semver-checks
+      - name: cargo semver-checks
+        env:
+          # The baseline is built from a scratch checkout without the vendored submodule, so point
+          # every header lookup at this workspace's copy (mirroring configure-ci.sh's values as
+          # real environment variables, which apply to the baseline build too).
+          RDMA_CORE_INCLUDE_DIR: ${{ github.workspace }}/ibverbs-sys/vendor/rdma-core/build/include
+          RDMA_CORE_LIB_DIR: /usr/lib/x86_64-linux-gnu
+          IBVERBS_HEADER_DIR: ${{ github.workspace }}/ibverbs-sys/vendor/rdma-core/libibverbs
+        run: cargo semver-checks --package ibverbs --baseline-rev ${{ github.event.pull_request.base.sha }}
   hack:
     # cargo-hack checks combinations of feature flags to ensure that features are all additive
     # which is required for feature unification
