@@ -9,18 +9,23 @@ A safe Rust API for RDMA over InfiniBand, RoCE, and iWARP, wrapping `libibverbs`
 
 RDMA "verbs" let userspace talk to the network adapter directly: no system calls on the data
 path, no copies, single-digit-microsecond latencies. The C API leaves you to uphold a long list
-of lifetime and aliasing rules by hand. This crate encodes those rules in Rust types, without
-taking the low-level control away: every wrapper hands out its raw handle for verbs the safe API
-does not cover.
+of lifetime, aliasing, and transport rules by hand. This crate encodes those rules in Rust types
+— down to queue pairs being typed by their transport, so posting a datagram without an address
+handle or setting an RC-only timeout on a UD queue pair is a compile error — without taking the
+low-level control away: every wrapper hands out its raw handle for verbs the safe API does not
+cover.
 
 ```rust,no_run
+use ibverbs::{AccessFlags, RecvRequest};
+
 fn main() -> ibverbs::Result<()> {
     let ctx = ibverbs::devices()?.iter().next().expect("no device").open()?;
 
     let cq = ctx.create_cq(16).build()?;
     let pd = ctx.alloc_pd()?;
 
-    // On RoCE, routing needs a GID; pick the index of a routable entry from `ctx.gid_table()?`.
+    // A reliable-connected queue pair on port 1. On RoCE, routing needs a GID; pick the
+    // index of a suitable entry from `ctx.gid_table()?`.
     let prepared = pd
         .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
         .set_gid_index(1)
@@ -32,10 +37,11 @@ fn main() -> ibverbs::Result<()> {
     let endpoint = prepared.endpoint()?;
     let mut qp = prepared.handshake(endpoint)?;
 
-    let mut recv = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
-    let mut send = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
+    let mut recv = pd.allocate(4096, AccessFlags::PERMISSIVE)?;
+    let mut send = pd.allocate(4096, AccessFlags::PERMISSIVE)?;
     send.bytes_mut()[..5].copy_from_slice(b"hello");
-    unsafe { qp.post_recv([ibverbs::RecvRequest::new(1, &[recv.slice(..)])]) }?;
+
+    unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..)])]) }?;
     let mut batch = qp.start_send();
     batch.op().signaled().send(2, &[send.slice(..5)]);
     unsafe { batch.submit() }?;
@@ -54,102 +60,85 @@ fn main() -> ibverbs::Result<()> {
 }
 ```
 
-More complete programs live in [`ibverbs/examples/`](ibverbs/examples/): a loopback transfer, an
-`ibv_devinfo`-style device dump, doorbell batching, connection setup through the RDMA connection
-manager, and EFA SRD queue pairs.
+Complete programs live in [`ibverbs/examples/`](ibverbs/examples/): a loopback transfer, an
+event-driven loop multiplexing queues over one completion channel, an `ibv_devinfo`-style device
+dump, doorbell batching, connection setup through the RDMA connection manager, and EFA SRD queue
+pairs.
 
 ## What is covered
 
-- Device listing and typed device, port, and GID-table queries (including extended device
-  attributes and GID-to-netdev resolution).
-- RC, UC, and UD queue pairs, typed by their transport so transport-specific operations are
-  compile-time checked, with a builder for their many knobs, one-call bring-up (`handshake`,
-  `activate`), and validated manual state transitions (`modify`/`query`) when you want to drive
-  `INIT`/`RTR`/`RTS` yourself.
+- Reliable and unreliable connections (RC/UC) and unreliable datagrams (UD), typed at compile
+  time: builder knobs, activation, and postable operations exist only on the transports they
+  apply to, and a datagram send is addressed (`.to(&ah, qpn, qkey)`) by construction.
+- Device listing and typed device, port, and GID-table queries, including extended attributes
+  and GID-to-netdev resolution.
+- One-call connection bring-up (`handshake`, `activate`) with typed timeout/retry values, or
+  validated manual state transitions (`modify`/`query`) when you want to drive the state machine
+  yourself.
 - Memory regions that own their buffer, plus registration of caller-managed memory
   (`register_from_raw` for mmap/hugepages, `register_dmabuf` for device memory such as GPU
   buffers) and `ibv_advise_mr`.
-- Two-sided send/receive, one-sided RDMA read and write (with immediate), and atomics
-  (compare-and-swap, fetch-and-add), all also available as doorbell batches through the extended
-  `ibv_wr_*` API: many work requests, one doorbell, with per-operation `signaled`/`fenced`/inline
-  modifiers.
-- Inline sends, scatter/gather lists, and shared receive queues.
-- Completion queues on the extended (`ibv_cq_ex`) interface: batched lazy-read polling, optional
-  hardware completion timestamps, and event-driven waiting through completion channels that plug
-  into `epoll`/`tokio` (`AsFd`), including many queues multiplexed onto one descriptor.
-- The RDMA connection manager (`rdmacm` feature): connection setup over IP addresses, with
-  blocking helpers for the common case and a low-level, non-blocking `CmId` API for event loops.
+- Two-sided send/receive, one-sided RDMA read and write (with immediate), and atomics, all
+  posted as doorbell batches: many work requests, one doorbell, with per-operation
+  `signaled`/`fenced`/`solicited` modifiers, inline data, and scatter/gather lists.
+- Shared receive queues, batched receives.
+- Completion handling on the extended interface: lazy-read polling, hardware completion
+  timestamps, and event-driven waiting through completion channels that plug into
+  `epoll`/`tokio` — including many queues multiplexed onto one file descriptor — plus
+  device-level asynchronous events (port changes, queue errors, SRQ limits).
+- The RDMA connection manager (`rdmacm` feature): blocking helpers with timeouts and in-band
+  `private_data` exchange for the common case, and a low-level, non-blocking `CmId` API for
+  event loops.
 - AWS Elastic Fabric Adapter SRD queue pairs (`efa` feature).
 
-Everything else is reachable through the escape hatches: every wrapper exposes `as_raw`, the raw
-bindings are re-exported as `ibverbs::ffi`, and escape-hatch constructors such as
-`QueuePairAttribute::from_raw` and `PreparedQueuePair::into_queue_pair` let you mix safe and raw
-freely.
+Everything else stays reachable: every wrapper exposes `as_raw`, the raw bindings are
+re-exported as `ibverbs::ffi`, and escape-hatch constructors let you mix safe and raw freely.
 
 ## Safety model
 
-The crate aims for APIs that are misuse-resistant without costing data-path performance:
-
 - Resources are reference-counted internally; a queue pair keeps its completion queues and
-  protection domain alive, so handles cannot dangle, and there are no lifetime parameters to
+  protection domain alive, so handles cannot dangle and there are no lifetime parameters to
   thread through your types.
-- Polling is a lending iterator: a `WorkCompletion` cannot be held across `next()`, so you cannot
-  read fields of a completion the hardware cursor has moved past. Field reads are lazy; you only
-  pay for what you read.
-- Doorbell batches borrow the queue pair mutably until submitted, enforced at compile time (there
-  are `compile_fail` tests for this).
-- Buffers registered via `allocate` are owned by the `MemoryRegion`, so the memory cannot be
-  freed or moved while registered. Posting is `unsafe` with a precisely documented contract (the
-  device may still be reading/writing the buffer), rather than pretending a safe signature could
-  uphold it.
-- Errors are a `thiserror` enum with the failing verb and errno attached; queue-pair state
-  transitions diagnose exactly which attribute-mask bits were wrong.
+- Transport rules are enforced by the type system and pinned by `compile_fail` tests; so are the
+  posting rules — a doorbell batch borrows the queue pair until submitted, and polled
+  completions are lent, so stale reads don't compile.
+- Buffers registered via `allocate` are owned by the `MemoryRegion` and cannot be freed or moved
+  while registered. Posting is `unsafe` with a precisely documented contract (the device may
+  still be reading or writing the buffer), rather than pretending a safe signature could uphold
+  it.
+- Errors are a `thiserror` enum naming the failing verb; queue-pair state transitions diagnose
+  exactly which attribute-mask bits were wrong, and RoCE routing failures explain themselves.
+
+## Cargo features
+
+None are enabled by default.
+
+- `serde`: `QueuePairEndpoint` and `RemoteMemorySlice` implement `Serialize`/`Deserialize`, for
+  sending to the peer during connection setup.
+- `rdmacm`: the RDMA connection manager. Links `librdmacm`.
+- `efa`: SRD queue pairs on AWS Elastic Fabric Adapter. Links `libefa`.
 
 ## Building
 
-The compiled crate dynamically links `libibverbs` (part of
+At runtime, this crate dynamically links `libibverbs` (part of
 [`rdma-core`](https://github.com/linux-rdma/rdma-core); packaged as `libibverbs-dev` on
 Debian/Ubuntu, `rdma-core` on Arch, `rdma-core-devel` on Fedora), plus `librdmacm` and `libefa`
-with the corresponding features.
+when the corresponding features are enabled.
 
 At build time, bindings are generated from a vendored `rdma-core` checkout, built automatically
-by `ibverbs-sys` (this needs `cmake` and a C toolchain, but no RDMA packages). To use pre-built
-rdma-core headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
+by the `ibverbs-sys` crate (this needs `cmake` and a C toolchain, but no RDMA packages). To use
+pre-built rdma-core headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
+not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
 
 The minimum supported Rust version is 1.82.
 
-## Provider requirements
+### Provider requirements
 
-The crate drives completion queues and queue pairs exclusively through rdma-core's extended
-verbs — `ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API — so it needs a
-provider (the userspace driver for your device) that implements them. Of the providers in the
-rdma-core tree this workspace vendors (v63), `mlx5`, `hns`, `efa`, and `rxe` (SoftRoCE) implement
-both. A provider that lacks them fails cleanly at completion-queue or queue-pair creation
-(with `Error::Unsupported`) rather than degrading to the legacy verbs: `bnxt_re`
-implements the send API but not extended CQ creation, `mlx4`, `irdma`, and `ionic` the reverse,
-and the remaining providers neither.
-
-## Testing without RDMA hardware
-
-Any modern Linux kernel can attach a software RDMA device
-([SoftRoCE](https://docs.kernel.org/infiniband/rxe.html)) to an ordinary network interface:
-
-```console
-$ sudo rdma link add rxe0 type rxe netdev <netdev>
-```
-
-The examples and the integration test suite run against it unchanged. CI does exactly this on
-every pull request: the data-path tests (send/receive, RDMA read and write, doorbell batching,
-shared receive queues, timestamps, event-driven completion, and more) run against a SoftRoCE
-device and assert on the transferred bytes. A few tests cover paths the CI runner's rxe module
-mishandles (atomics, UC/UD, inline sends) and are skipped there; they pass on real hardware and
-current kernels.
-
-## Workspace layout
-
-- [`ibverbs`](ibverbs/) is the safe wrapper, and what you almost certainly want.
-- [`ibverbs-sys`](ibverbs-sys/) holds the raw bindgen bindings and the vendored `rdma-core`. You
-  do not need to depend on it directly: the `ibverbs` crate re-exports it as `ibverbs::ffi`.
+The crate drives completion queues and queue pairs exclusively through the extended verbs
+(`ibv_create_cq_ex`, `ibv_create_qp_ex`, and the `ibv_wr_*` send API). Providers that implement
+them include `mlx5`, `hns`, `efa`, and `rxe`; on providers that do not (for example
+`mlx4`-generation hardware), creation fails cleanly (with `Error::Unsupported`) rather than
+degrading to the legacy verbs.
 
 ## Documentation
 
@@ -166,11 +155,16 @@ Specification](https://tools.ietf.org/html/rfc5040), the upstream
 definitions, the manpages for the `ibv_*` functions, and the upstream [C
 examples](https://github.com/linux-rdma/rdma-core/tree/master/libibverbs/examples).
 
-## License
+## Testing without RDMA hardware
 
-Licensed under either of
+Any modern Linux kernel can attach a software RDMA device
+([SoftRoCE](https://docs.kernel.org/infiniband/rxe.html)) to an ordinary network interface:
 
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
+```console
+$ sudo rdma link add rxe0 type rxe netdev <netdev>
+```
 
-at your option.
+The examples and the integration test suite run against it unchanged, and CI does exactly this
+on every pull request: the data-path tests run against a SoftRoCE device and assert on the
+transferred bytes. A few tests cover paths the CI runner's rxe module mishandles (atomics,
+UC/UD, inline sends) and are skipped there; they pass on real hardware and current kernels.
