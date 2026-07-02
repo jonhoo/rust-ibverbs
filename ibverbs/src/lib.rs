@@ -1,64 +1,139 @@
-//! Rust API wrapping the `ibverbs` RDMA library.
+//! A safe Rust API for RDMA (`libibverbs`).
 //!
-//! `libibverbs` is a library that allows userspace processes to use RDMA "verbs" to perform
-//! high-throughput, low-latency network operations for both Infiniband (according to the
-//! Infiniband specifications) and iWarp (iWARP verbs specifications). It handles the control path
-//! of creating, modifying, querying and destroying resources such as Protection Domains,
-//! Completion Queues, Queue-Pairs, Shared Receive Queues, Address Handles, and Memory Regions. It
-//! also handles sending and receiving data posted to QPs and SRQs, and getting completions from
-//! CQs using polling and completions events.
+//! RDMA "verbs" let userspace perform high-throughput, low-latency network operations directly
+//! against the network adapter — zero copies on the data path and no kernel involvement — over
+//! InfiniBand, RoCE, and iWARP transports. This crate wraps both the control path (creating,
+//! querying, and tearing down resources such as protection domains, completion queues, queue
+//! pairs, and memory regions) and the data path (posting work requests and reaping completions) in
+//! safe Rust types whose lifetimes and aliasing rules encode the verbs contracts, while keeping
+//! escape hatches (`as_raw` on every wrapper, and the re-exported [`ffi`] bindings) for anything
+//! it does not yet cover.
 //!
-//! A good place to start is to look at the programs in [`examples/`](examples/), and the upstream
-//! [C examples]. You can test RDMA programs on modern Linux kernels even without specialized RDMA
-//! hardware by using [SoftRoCE][soft].
+//! # Quick start
+//!
+//! The path to a working connection is always the same: open a device [`Context`], allocate a
+//! [`ProtectionDomain`] and a [`CompletionQueue`], build a [`QueuePair`], exchange
+//! [`QueuePairEndpoint`]s with the peer, and connect with [`PreparedQueuePair::handshake`]. Then
+//! register memory, post work requests, and poll for their completions:
+//!
+//! ```no_run
+//! # fn main() -> ibverbs::Result<()> {
+//! let ctx = ibverbs::devices()?
+//!     .iter()
+//!     .next()
+//!     .expect("no rdma device available")
+//!     .open()?;
+//!
+//! let cq = ctx.create_cq(16).build()?;
+//! let pd = ctx.alloc_pd()?;
+//!
+//! // On RoCE, routing needs a GID; pick the index of a suitable entry in `ctx.gid_table()?`.
+//! let prepared = pd
+//!     .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)?
+//!     .set_gid_index(1)
+//!     .build()?;
+//!
+//! // Exchange endpoints with the peer out of band (they are serializable with the `serde`
+//! // feature), or let the `rdmacm` feature's connection manager negotiate the connection over IP.
+//! // This example self-connects the queue pair, so the "exchange" is with itself.
+//! let endpoint = prepared.endpoint()?;
+//! let mut qp = prepared.handshake(endpoint)?;
+//!
+//! // Register memory with the device and post work requests: a receive, and a send that loops
+//! // back into it.
+//! let mut recv = pd.allocate(4096)?;
+//! let mut send = pd.allocate(4096)?;
+//! send.bytes_mut()[..5].copy_from_slice(b"hello");
+//! unsafe { qp.post_receive(&[recv.slice(..)], /* wr_id */ 1) }?;
+//! unsafe { qp.post_send(&[send.slice(..5)], /* wr_id */ 2) }?;
+//!
+//! // Poll the completion queue until both work requests have completed.
+//! let mut pending = 2;
+//! while pending > 0 {
+//!     if let Some(mut completions) = cq.poll()? {
+//!         while let Some(wc) = completions.next() {
+//!             wc.ok().expect("work request failed");
+//!             pending -= 1;
+//!         }
+//!     }
+//! }
+//! assert_eq!(&recv.bytes_mut()[..5], b"hello");
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! Runnable programs live in the [`examples/` directory][examples] — a loopback transfer, an
+//! `ibv_devinfo`-style device dump, doorbell batching, the `rdmacm` connection manager, and EFA
+//! SRD queue pairs. You can run all of them (and this crate's test suite) without RDMA hardware on
+//! any modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`.
+//!
+//! # Cargo features
+//!
+//! - `serde` *(default)*: [`QueuePairEndpoint`] and [`RemoteMemorySlice`] implement
+//!   `Serialize`/`Deserialize`, for sending to the peer during connection setup.
+//! - `rdmacm`: the `rdmacm` module, wrapping the `librdmacm` connection manager: connection setup
+//!   over IP addresses, blocking or event-loop driven, instead of an out-of-band endpoint
+//!   exchange. Links `librdmacm`.
+//! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via
+//!   `ProtectionDomain::create_srd_qp`. Links `libefa`.
+//!
+//! # Library dependency
+//!
+//! At runtime, this crate dynamically links `libibverbs` (part of [`rdma-core`], packaged as
+//! `libibverbs-dev` on Debian/Ubuntu and `libibverbs` or `rdma-core-devel` elsewhere), plus
+//! `librdmacm` and `libefa` when the corresponding features are enabled.
+//!
+//! At build time, the bindings are generated from a vendored [`rdma-core`] checkout, which
+//! `ibverbs-sys` builds automatically (this requires `cmake` and a C toolchain, but nothing
+//! RDMA-specific to be installed). To generate bindings from pre-built rdma-core headers instead,
+//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
+//!
+//! # Thread safety
+//!
+//! The underlying ibverbs API [is thread safe][safe], and the wrapper types here are `Send` and
+//! `Sync` where that holds. Handles like [`Context`], [`ProtectionDomain`], and
+//! [`CompletionQueue`] can be shared freely across threads. Operations whose verbs contracts are
+//! per-caller are encoded in the types instead: posting work requests takes `&mut QueuePair`
+//! (wrap the queue pair in a lock to post from several threads), a [`PostBatch`] borrows its
+//! queue pair until submitted, and the views handed out during a poll ([`Completions`],
+//! [`WorkCompletion`]) borrow the queue and cannot outlive or escape it.
+//!
+//! # Resource cleanup
+//!
+//! Wrappers return their resource to the device when dropped, in dependency order (internal
+//! reference counts keep, for example, a completion queue alive until the last queue pair built on
+//! it is gone). If the device rejects a teardown — which can only happen when raw handles obtained
+//! through the escape hatches still reference the resource — the drop panics rather than silently
+//! leak the resource.
 //!
 //! # For the detail-oriented
 //!
 //! The control path is implemented through system calls to the `uverbs` kernel module, which
-//! further calls the low-level HW driver. The data path is implemented through calls made to
-//! low-level HW library which, in most cases, interacts directly with the HW provides kernel and
-//! network stack bypass (saving context/mode switches) along with zero copy and an asynchronous
-//! I/O model.
-//!
-//! iWARP ethernet NICs support RDMA over hardware-offloaded TCP/IP, while InfiniBand is a general
-//! high-throughput, low-latency networking technology. InfiniBand host channel adapters (HCAs) and
-//! iWARP NICs commonly support direct hardware access from userspace (kernel bypass), and
-//! `libibverbs` supports this when available.
+//! further calls the low-level hardware driver. The data path goes through a low-level hardware
+//! library (the provider) which, in most cases, talks to the device directly — bypassing the
+//! kernel and its network stack, with zero copies and an asynchronous I/O model.
 //!
 //! For more information on RDMA verbs, see the [InfiniBand Architecture Specification][infini]
 //! vol. 1, especially chapter 11, and the RDMA Consortium's [RDMA Protocol Verbs
 //! Specification][RFC5040]. See also the upstream [`libibverbs/verbs.h`] file for the original C
-//! definitions, as well as the manpages for the `ibv_*` methods.
-//!
-//! # Library dependency
-//!
-//! `libibverbs` is usually available as a free-standing [library package]. It [used to be][1]
-//! self-contained, but has recently been adopted into [`rdma-core`]. `cargo` will automatically
-//! build the necessary library files and place them in `vendor/rdma-core/build/lib`. If a
-//! system-wide installation is not available, those library files can be used instead by copying
-//! them to `/usr/lib`, or by adding that path to the dynamic linking search path.
-//!
-//! # Thread safety
-//!
-//! All interfaces are `Sync` and `Send` since the underlying ibverbs API [is thread safe][safe].
+//! definitions, the manpages for the `ibv_*` functions, and the upstream [C examples].
 //!
 //! # Documentation
 //!
 //! Much of the documentation of this crate borrows heavily from the excellent posts over at
 //! [RDMAmojo]. If you are going to be working a lot with ibverbs, chances are you will want to
-//! head over there. In particular, [this overview post][1] may be a good place to start.
+//! head over there. In particular, [this overview post][overview] may be a good place to start.
 //!
 //! [`rdma-core`]: https://github.com/linux-rdma/rdma-core
 //! [`libibverbs/verbs.h`]: https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h
-//! [library package]: https://launchpad.net/ubuntu/+source/libibverbs
 //! [C examples]: https://github.com/linux-rdma/rdma-core/tree/master/libibverbs/examples
-//! [1]: https://git.kernel.org/pub/scm/libs/infiniband/libibverbs.git/about/
+//! [examples]: https://github.com/jonhoo/rust-ibverbs/tree/main/ibverbs/examples
 //! [infini]: http://www.infinibandta.org/content/pages.php?pg=technology_public_specification
 //! [RFC5040]: https://tools.ietf.org/html/rfc5040
 //! [safe]: http://www.rdmamojo.com/2013/07/26/libibverbs-thread-safe-level/
-//! [soft]: https://github.com/SoftRoCE/rxe-dev/wiki/rxe-dev:-Home
+//! [soft]: https://docs.kernel.org/infiniband/rxe.html
 //! [RDMAmojo]: http://www.rdmamojo.com/
-//! [1]: http://www.rdmamojo.com/2012/05/18/libibverbs/
+//! [overview]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 
 #![deny(missing_docs)]
 #![warn(rust_2018_idioms)]
@@ -79,12 +154,17 @@ use std::time::{Duration, Instant};
 
 const PORT_NUM: u8 = 1;
 
-/// The RDMA connection manager (`librdmacm`): set up reliable connections without exchanging queue
-/// pair endpoints out of band.
 #[cfg(feature = "rdmacm")]
 pub mod rdmacm;
 
-/// Direct access to low-level libverbs FFI.
+/// The raw `libibverbs` bindings (the `ibverbs-sys` crate), re-exported.
+///
+/// This is the escape hatch of last resort: every wrapper in this crate exposes the raw handle it
+/// owns (see the `as_raw` methods), which can be passed to any verb here that the safe API does
+/// not cover — without adding a separate dependency on `ibverbs-sys` and keeping its version in
+/// sync.
+pub use ffi;
+
 pub use ffi::ibv_gid_type;
 pub use ffi::ibv_mtu;
 pub use ffi::ibv_port_state;
@@ -457,9 +537,9 @@ pub struct Guid {
 }
 
 impl Guid {
-    /// Upper 24 bits of the GUID are OUI (Organizationally Unique Identifier,
-    /// http://standards-oui.ieee.org/oui/oui.txt). The function returns OUI as
-    /// a 24-bit number inside a u32.
+    /// Upper 24 bits of the GUID are the vendor's [Organizationally Unique Identifier
+    /// (OUI)](https://standards-oui.ieee.org/oui/oui.txt). The function returns the OUI as a
+    /// 24-bit number inside a u32.
     pub fn oui(&self) -> u32 {
         let padded = [0, self.raw[0], self.raw[1], self.raw[2]];
         u32::from_be_bytes(padded)
@@ -511,7 +591,7 @@ impl AsRef<ffi::__be64> for Guid {
 }
 
 impl<'devlist> Device<'devlist> {
-    /// Opens an RMDA device and creates a context for further use.
+    /// Opens an RDMA device and creates a context for further use.
     ///
     /// This context will later be used to query its resources or for creating resources.
     ///
@@ -521,10 +601,10 @@ impl<'devlist> Device<'devlist> {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: port 1 is invalid (from `ibv_query_port_attr`).
-    ///  - `ENOMEM`: Out of memory (from `ibv_query_port_attr`).
-    ///  - `EMFILE`: Too many files are opened by this process (from `ibv_query_gid`).
-    ///  - Other: port 1 is not in `ACTIVE` or `ARMED` state.
+    ///  - [`OpenDevice`](Error::OpenDevice): `ibv_open_device` failed.
+    ///  - [`QueryPort`](Error::QueryPort): querying port 1 failed (`ibv_query_port`).
+    ///  - [`PortNotActive`](Error::PortNotActive): port 1 is not in the `ACTIVE` or `ARMED`
+    ///    state. Note that this check always targets the device's first port.
     pub fn open(&self) -> Result<Context> {
         Context::with_device(*self.0)
     }
@@ -542,14 +622,15 @@ impl<'devlist> Device<'devlist> {
     ///
     /// The name is composed from:
     ///
-    ///  - a *prefix* which describes the RDMA device vendor and model
-    ///    - `cxgb3` - Chelsio Communications, T3 RDMA family
-    ///    - `cxgb4` - Chelsio Communications, T4 RDMA family
-    ///    - `ehca` - IBM, eHCA family
-    ///    - `ipathverbs` - QLogic
-    ///    - `mlx4` - Mellanox Technologies, ConnectX family
-    ///    - `mthca` - Mellanox Technologies, InfiniHost family
-    ///    - `nes` - Intel, Intel-NE family
+    ///  - a *prefix* which describes the RDMA device vendor and model, or its driver
+    ///    - `mlx4`/`mlx5` - NVIDIA (Mellanox) ConnectX families
+    ///    - `bnxt_re` - Broadcom NetXtreme-E family
+    ///    - `cxgb4` - Chelsio Communications T4/T5/T6 families
+    ///    - `efa` - Amazon Elastic Fabric Adapter
+    ///    - `hns` - Hisilicon Hip family
+    ///    - `irdma` - Intel Ethernet Connection RDMA
+    ///    - `rxe` - software RDMA over Ethernet (SoftRoCE)
+    ///    - `siw` - software iWARP
     ///  - an *index* that helps to differentiate between several devices from the same vendor and
     ///    family in the same computer
     pub fn name(&self) -> Option<&'devlist CStr> {
@@ -582,10 +663,12 @@ impl<'devlist> Device<'devlist> {
         }
     }
 
-    /// Returns stable IB device index as it is assigned by the kernel
+    /// Returns the stable IB device index as it is assigned by the kernel.
+    ///
     /// # Errors
     ///
-    ///  - `ENOTSUP`: Stable index is not supported
+    ///  - [`DeviceIndexUnavailable`](Error::DeviceIndexUnavailable): the kernel does not expose a
+    ///    stable index for this device.
     pub fn index(&self) -> Result<i32> {
         let idx = unsafe { ffi::ibv_get_device_index(*self.0) };
         if idx == -1 {
@@ -770,11 +853,11 @@ impl Context {
         CompletionChannel::new(&self.inner)
     }
 
-    /// Allocate a protection domain (PDs) for the device's context.
+    /// Allocate a protection domain (PD) for the device's context.
     ///
     /// The created PD will be used primarily to create `QueuePair`s and `MemoryRegion`s.
     ///
-    /// A protection domain is a means of protection, and helps you create a group of object that
+    /// A protection domain is a means of protection, and helps you create a group of objects that
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
     pub fn alloc_pd(&self) -> Result<ProtectionDomain> {
@@ -1230,7 +1313,7 @@ impl Deref for DeviceAttr {
 
 /// Extended device-wide attributes and capabilities, as returned by [`Context::query_device_ex`].
 ///
-/// Dereferences to the raw [`ibv_device_attr_ex`], so every field is accessible; the inherent
+/// Dereferences to the raw [`ffi::ibv_device_attr_ex`], so every field is accessible; the inherent
 /// methods add typed accessors for the most useful extended capabilities, and [`orig`] returns the
 /// base attributes that [`Context::query_device`] reports.
 ///
@@ -1765,12 +1848,16 @@ impl WorkCompletion<'_> {
     }
 
     /// The opcode of the completed work request.
+    ///
+    /// Like `len` and the other detail fields, this is only meaningful when the completion
+    /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
+    /// [`wr_id`](Self::wr_id) and the status are defined.
     #[inline]
     pub fn opcode(&self) -> ffi::ibv_wc_opcode {
         unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }
     }
 
-    /// The number of bytes transferred.
+    /// The number of bytes transferred, for a successful completion.
     #[inline]
     pub fn len(&self) -> usize {
         unsafe { (*self.cq).read_byte_len.unwrap()(self.cq) as usize }
@@ -1908,6 +1995,10 @@ impl Completions<'_> {
     /// Return the next work completion, or `None` once the queue has no more.
     ///
     /// Consume with `while let Some(wc) = completions.next() { ... }`.
+    ///
+    /// `None` also ends the poll if the provider reports an error mid-poll (a rare provider-level
+    /// failure, distinct from a completion *status* error, which is reported per work completion
+    /// through [`WorkCompletion::ok`]); resources are still released correctly in that case.
     #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> Option<WorkCompletion<'_>> {
@@ -2479,8 +2570,8 @@ impl QueuePairBuilder {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid `ProtectionDomain`, sending or receiving `Context`, or invalid value
-    ///    provided in `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
+    ///  - `EINVAL`: Invalid `ProtectionDomain` or `CompletionQueue`, or invalid value provided in
+    ///    `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
     ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
@@ -2571,24 +2662,28 @@ impl QueuePairBuilder {
 /// initialized with calls to `ibv_modify_qp`.
 ///
 /// To complete the construction of the `QueuePair`, you will need to obtain the
-/// `QueuePairEndpoint` of the remote end (by using `PreparedQueuePair::endpoint`), and then call
-/// `PreparedQueuePair::handshake` on both sides with the other side's `QueuePairEndpoint`:
+/// [`QueuePairEndpoint`] of the remote end (by using [`endpoint`](Self::endpoint)), and then call
+/// [`handshake`](Self::handshake) on both sides with the other side's endpoint:
 ///
-/// ```rust,ignore
+/// ```text
 /// // on host 1
 /// let pqp: PreparedQueuePair = ...;
-/// let host1end = pqp.endpoint();
+/// let host1end = pqp.endpoint()?;
 /// host2.send(host1end);
 /// let host2end = host2.recv();
-/// let qp = pqp.handshake(host2end);
+/// let qp = pqp.handshake(host2end)?;
 ///
 /// // on host 2
 /// let pqp: PreparedQueuePair = ...;
-/// let host2end = pqp.endpoint();
+/// let host2end = pqp.endpoint()?;
 /// host1.send(host2end);
 /// let host1end = host1.recv();
-/// let qp = pqp.handshake(host1end);
+/// let qp = pqp.handshake(host1end)?;
 /// ```
+///
+/// For a runnable version of this exchange (self-connected, so it fits one process), see
+/// `examples/loopback.rs`; `examples/rdmacm_connect.rs` shows the same bring-up driven by the
+/// connection manager instead.
 pub struct PreparedQueuePair {
     qp: QueuePair,
     /// port local identifier
@@ -2621,10 +2716,10 @@ pub struct PreparedQueuePair {
     service_level: u8,
 }
 
-/// A Global identifier for ibv.
+/// A Global identifier (GID) for an RDMA device port.
 ///
-/// This struct acts as a rust wrapper for `ffi::ibv_gid`. We use it instead of
-/// `ffi::ibv_giv` because `ffi::ibv_gid` is actually an untagged union.
+/// This struct acts as a rust wrapper for [`ffi::ibv_gid`]. We use it instead of
+/// `ffi::ibv_gid` directly because the latter is actually an untagged union.
 ///
 /// ```c
 /// union ibv_gid {
@@ -2781,8 +2876,8 @@ impl PreparedQueuePair {
     /// This is an escape hatch for fully manual bring-up (custom partition keys, packet sequence
     /// numbers, alternate paths, and so on). The returned queue pair is in `RESET` and cannot send
     /// or receive until you transition it through `INIT`, `RTR`, and `RTS`; most users should prefer
-    /// `handshake`/`activate_ud`. The RDMA connection manager (the [`rdmacm`](crate::rdmacm) module)
-    /// uses this to drive the transitions itself.
+    /// `handshake`/`activate_ud`. The RDMA connection manager (the `rdmacm` module, behind the
+    /// feature of the same name) uses this to drive the transitions itself.
     pub fn into_queue_pair(self) -> QueuePair {
         self.qp
     }
@@ -2823,11 +2918,15 @@ impl PreparedQueuePair {
     /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair`.
     ///
     /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
-    /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`).
-    /// Further discussion of the protocol can be found on [RDMAmojo].
+    /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`),
+    /// applying the attributes configured on the builder (access flags, timeouts, path MTU,
+    /// service level, and so on) at the appropriate steps. Further discussion of the protocol can
+    /// be found on [RDMAmojo]. This bring-up is for connected queue pairs (RC and UC); use
+    /// [`activate_ud`](Self::activate_ud) for UD queue pairs, or
+    /// [`into_queue_pair`](Self::into_queue_pair) to drive the state machine yourself.
     ///
     /// If the endpoint contains a Gid, the routing will be global. This means:
-    /// ```text,ignore
+    /// ```text
     /// ah_attr.is_global = 1;
     /// ah_attr.grh.hop_limit = 0xff;
     /// ```
@@ -2836,20 +2935,19 @@ impl PreparedQueuePair {
     /// [`ProtectionDomain::create_qp_on_port`]). The handshake also sets the following parameters,
     /// which are currently not configurable:
     ///
-    /// # Examples
-    ///
-    /// ```text,ignore
+    /// ```text
     /// pkey_index = 0;
     /// sq_psn = 0;
-    ///
-    /// ah_attr.sl = 0;
     /// ah_attr.src_path_bits = 0;
     /// ```
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid value provided in `attr` or in `attr_mask`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - [`GidMismatch`](Error::GidMismatch): the remote endpoint carries a GID, but no
+    ///    `gid_index` was set on the builder to route from.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed
+    ///    (`ibv_modify_qp`), for example because an attribute is invalid for this queue pair's
+    ///    type or the remote endpoint is unreachable.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
     pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair> {
@@ -3166,7 +3264,15 @@ impl<O> MemoryRegion<O> {
         self.owner
     }
 
-    /// Make a subslice of this memory region.
+    /// Make a subslice of this memory region, to post as part of a work request.
+    ///
+    /// The slice carries the region's local key, so it stays postable on its own; but it borrows
+    /// nothing, so it is on you not to use it past the region's deregistration (see the safety
+    /// contracts on the post methods).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bounds` is empty or falls outside the region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) = calc_addr_len(
             bounds,
@@ -3193,6 +3299,11 @@ impl<O: DerefMut<Target = [u8]>> MemoryRegion<O> {
     /// The registered bytes, mutably.
     ///
     /// The length is fixed at registration; the buffer can be written but not resized.
+    ///
+    /// Note that the device also writes to the buffer: while a receive (or an incoming RDMA write)
+    /// targeting this region is outstanding, reading or writing the targeted bytes races with the
+    /// device. Only touch those bytes after the corresponding work completion has been reaped (see
+    /// the safety contract on [`QueuePair::post_receive`]).
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.owner
     }
@@ -3216,7 +3327,7 @@ impl LocalMemorySlice {
         self._sge.length as usize
     }
 
-    /// Get is_empty
+    /// Returns `true` if the slice has length zero.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -3227,6 +3338,10 @@ impl LocalMemorySlice {
     }
 
     /// Make a subslice of this slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bounds` is empty or falls outside this slice.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
         let (addr, len) = calc_addr_len(bounds, self.addr(), self.len());
         Self {
@@ -3252,6 +3367,10 @@ pub struct RemoteMemorySlice {
 
 impl RemoteMemorySlice {
     /// Make a subslice of this slice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bounds` is empty or falls outside this slice.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> Self {
         let (addr, len) = calc_addr_len(bounds, self.addr, self.len);
         Self {
@@ -3365,8 +3484,8 @@ impl ProtectionDomain {
 
     /// Creates a queue pair builder associated with this protection domain.
     ///
-    /// `send` and `recv` are the device `Context` to associate with the send and receive queues
-    /// respectively. `send` and `recv` may refer to the same `Context`.
+    /// `send` and `recv` are the [`CompletionQueue`]s that completions for the send and receive
+    /// queues are delivered to, respectively. They may refer to the same queue.
     ///
     /// `qp_type` indicates the requested Transport Service Type of this QP:
     ///
@@ -3439,23 +3558,12 @@ impl ProtectionDomain {
         }
     }
 
-    /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`.
+    /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`, with
+    /// the given access permissions.
     ///
-    /// This process allows the RDMA device to read and write data to the allocated memory. Only
-    /// registered memory can be sent from and received to by `QueuePair`s. Performing this
-    /// registration takes some time, so performing memory registration isn't recommended in the
-    /// data path, when fast response is required.
-    ///
-    /// Every successful registration will result with a MR which has unique (within a specific
-    /// RDMA device) `lkey` and `rkey` values. These keys must be communicated to the other end's
-    /// `QueuePair` for direct memory access.
-    ///
-    /// The maximum size of the block that can be registered is limited to
-    /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
-    /// that can be registered for a specific device.
-    ///
-    /// `allocate_with_permissions` accepts a set of permission flags, with local read access
-    /// always enabled for the Memory Region (MR).
+    /// This is [`allocate`](Self::allocate) with the permission flags under your control instead
+    /// of [`DEFAULT_ACCESS_FLAGS`]; see there for the details of allocation and registration.
+    /// Local read access is always enabled for the region.
     ///
     /// # Panics
     ///
@@ -3484,6 +3592,11 @@ impl ProtectionDomain {
     /// registration takes some time, so performing memory registration isn't recommended in the
     /// data path, when fast response is required.
     ///
+    /// The buffer is `n` zero-initialized bytes, owned by the returned [`MemoryRegion`] and
+    /// deregistered and freed when it drops. To register memory you manage yourself instead, see
+    /// [`register_from_raw`](Self::register_from_raw) and
+    /// [`register_dmabuf`](Self::register_dmabuf).
+    ///
     /// Every successful registration will result with a MR which has unique (within a specific
     /// RDMA device) `lkey` and `rkey` values. These keys must be communicated to the other end's
     /// `QueuePair` for direct memory access.
@@ -3492,15 +3605,10 @@ impl ProtectionDomain {
     /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
     /// that can be registered for a specific device.
     ///
-    /// `allocate` currently sets the following permissions for each new `MemoryRegion`:
-    ///
-    ///  - `IBV_ACCESS_LOCAL_WRITE`: Enables Local Write Access
-    ///  - `IBV_ACCESS_REMOTE_WRITE`: Enables Remote Write Access
-    ///  - `IBV_ACCESS_REMOTE_READ`: Enables Remote Read Access
-    ///  - `IBV_ACCESS_REMOTE_ATOMIC`: Enables Remote Atomic Operation Access (if supported)
-    ///
-    /// Local read access is always enabled for the MR. For more fine-grained control over
-    /// permissions, see `allocate_with_permissions`.
+    /// `allocate` registers the region with [`DEFAULT_ACCESS_FLAGS`]: local write, remote write,
+    /// remote read, remote atomics, and relaxed ordering (local read access is always enabled).
+    /// For control over the permissions, see
+    /// [`allocate_with_permissions`](Self::allocate_with_permissions).
     ///
     /// # Panics
     ///
@@ -3557,8 +3665,12 @@ impl ProtectionDomain {
         Ok(MemoryRegion { inner, owner: () })
     }
 
-    /// Registers an already allocated DMA-BUF memory region (MR) associated with this `ProtectionDomain`.
-    /// https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html
+    /// Registers an already allocated DMA-BUF as a memory region (MR) associated with this
+    /// `ProtectionDomain` (`ibv_reg_dmabuf_mr`, see the [`ibv_reg_mr` man page][man]).
+    ///
+    /// This is how device memory (for example a GPU buffer exported as a DMA-BUF) is made
+    /// available for RDMA without staging through host memory. The buffer stays owned by its
+    /// exporter; the returned region only holds the registration, which is dropped on drop.
     ///
     /// # Arguments
     ///
@@ -3566,6 +3678,15 @@ impl ProtectionDomain {
     /// * `offset`, `len` - The MR starts at `offset` of the dma-buf and its size is `len`.
     /// * `iova` - The argument iova specifies the virtual base address of the MR when accessed through a lkey or rkey.
     ///   Note: `iova` must have the same page offset as `offset`
+    ///
+    /// # Errors
+    ///
+    ///  - [`Unsupported`](Error::Unsupported): the device or kernel does not support DMA-BUF
+    ///    registration.
+    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): `ibv_reg_dmabuf_mr` failed, for
+    ///    example due to an invalid descriptor, range, or access flags.
+    ///
+    /// [man]: https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html
     pub fn register_dmabuf(
         &self,
         fd: i32,
@@ -3591,9 +3712,20 @@ impl ProtectionDomain {
 
     /// Creates a shared receive queue (SRQ) associated with this protection domain.
     ///
+    /// A shared receive queue holds one pool of receive work requests that several queue pairs
+    /// consume from (set it with [`QueuePairBuilder::set_srq`]), instead of posting receives to
+    /// each queue pair separately.
+    ///
     /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
     /// `max_sge` is the maximum number of scatter/gather elements per work request.
-    /// `srq_limit` is the limit value of the SRQ (only valid for asynchronous events).
+    /// `srq_limit` arms the SRQ's low-watermark event: when the number of posted receives drops
+    /// below it, the device raises an `IBV_EVENT_SRQ_LIMIT_REACHED` asynchronous event (pass 0 to
+    /// disable).
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateSharedReceiveQueue`](Error::CreateSharedReceiveQueue): `ibv_create_srq` failed,
+    ///    for example because `max_wr` or `max_sge` exceed the device capabilities.
     ///
     /// See also [RDMAmojo's `ibv_create_srq` documentation][1] and the [man page][2].
     ///

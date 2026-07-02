@@ -43,24 +43,24 @@
 //!
 //! # Low-level control
 //!
-//! The [`Connector`](crate::rdmacm::Connector)/[`Acceptor`](crate::rdmacm::Acceptor) helpers block
+//! The [`Connector`]/[`Acceptor`] helpers block
 //! while they drive the connection-manager state machine, so they cannot be integrated with an event
 //! loop or async runtime. For full control, drive the state machine yourself with a
-//! [`CmId`](crate::rdmacm::CmId): it exposes every step ([`resolve_addr`], route resolution,
-//! [`connect`], [`accept`], …), hands back each [`CmEvent`](crate::rdmacm::CmEvent) as it arrives,
+//! [`CmId`]: it exposes every step ([`resolve_addr`], route resolution,
+//! [`connect`], [`accept`], …), hands back each [`CmEvent`] as it arrives,
 //! and can be put into non-blocking mode ([`set_nonblocking`]) so you wait on its file descriptor
 //! ([`AsRawFd`] / [`AsFd`]) with `epoll`, `poll`, a `tokio` `AsyncFd`, or any other reactor and pump
 //! events with [`poll_cm_event`]. You build the queue pair on the
-//! [`context`](crate::rdmacm::CmId::context) the id resolves to and transition it with
-//! [`init_qp_attr`](crate::rdmacm::CmId::init_qp_attr) plus
+//! [`context`](CmId::context) the id resolves to and transition it with
+//! [`init_qp_attr`](CmId::init_qp_attr) plus
 //! [`QueuePair::modify`](crate::QueuePair::modify). The blocking helpers are written on top of this
 //! same API.
 //!
-//! [`resolve_addr`]: crate::rdmacm::CmId::resolve_addr
-//! [`connect`]: crate::rdmacm::CmId::connect
-//! [`accept`]: crate::rdmacm::CmId::accept
-//! [`set_nonblocking`]: crate::rdmacm::CmId::set_nonblocking
-//! [`poll_cm_event`]: crate::rdmacm::CmId::poll_cm_event
+//! [`resolve_addr`]: CmId::resolve_addr
+//! [`connect`]: CmId::connect
+//! [`accept`]: CmId::accept
+//! [`set_nonblocking`]: CmId::set_nonblocking
+//! [`poll_cm_event`]: CmId::poll_cm_event
 //! [`AsRawFd`]: std::os::fd::AsRawFd
 //! [`AsFd`]: std::os::fd::AsFd
 
@@ -681,7 +681,7 @@ impl Incoming {
     }
 }
 
-/// An established connection: a connected [`QueuePair`](crate::QueuePair) plus the connection-manager
+/// An established connection: a connected [`QueuePair`] plus the connection-manager
 /// identifier that keeps it alive. Dropping it tears the connection down.
 pub struct Connection {
     id: Arc<CmId>,
