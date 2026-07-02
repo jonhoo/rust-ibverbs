@@ -25,9 +25,7 @@ fn main() {
         .iter()
         .filter(|e| e.port_num == 1)
         .find(|e| {
-            e.gid_type == ibverbs::ibv_gid_type::IBV_GID_TYPE_ROCE_V2
-                && e.gid.subnet_prefix() == 0
-                && e.gid.interface_id() >> 32 == 0xffff
+            e.gid_type == ibverbs::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 && e.gid.is_ipv4_mapped()
         })
         .or_else(|| gids.iter().find(|e| e.port_num == 1))
         .expect("no GID available")
