@@ -75,7 +75,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const PORT_NUM: u8 = 1;
 
@@ -133,8 +133,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Most variants wrap the underlying operating-system error (an `errno` from a libibverbs or
 /// librdmacm call); the specific variant identifies which operation failed and carries any relevant
-/// context. A few variants ([`Unsupported`](Error::Unsupported), [`TimedOut`](Error::TimedOut), ...)
-/// capture conditions that callers commonly branch on.
+/// context. A few variants ([`Unsupported`](Error::Unsupported), ...) capture conditions that
+/// callers commonly branch on.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -142,10 +142,6 @@ pub enum Error {
     /// (`EOPNOTSUPP`).
     #[error("operation not supported by the device")]
     Unsupported,
-
-    /// A blocking operation timed out (a completion-queue wait, or address/route resolution).
-    #[error("the operation timed out")]
-    TimedOut,
 
     /// The device port is not in the `ACTIVE` or `ARMED` state, so its GID table and routing are
     /// unusable.
@@ -218,7 +214,11 @@ pub enum Error {
     #[error("failed to advise on a memory region")]
     AdviseMemoryRegion(#[source] io::Error),
 
-    /// Creating a completion queue (or its completion channel) failed.
+    /// Creating a completion channel failed (`ibv_create_comp_channel`).
+    #[error("failed to create a completion channel")]
+    CreateCompletionChannel(#[source] io::Error),
+
+    /// Creating a completion queue failed (`ibv_create_cq_ex`).
     #[error("failed to create a completion queue")]
     CreateCompletionQueue(#[source] io::Error),
 
@@ -754,7 +754,20 @@ impl Context {
             cq_context: 0,
             comp_vector: 0,
             wc_flags: 0,
+            comp_channel: None,
         }
+    }
+
+    /// Create a completion channel: the file descriptor that delivers completion notifications for
+    /// the queues built on it with [`CompletionQueueBuilder::set_comp_channel`].
+    ///
+    /// By default a completion queue has no channel and is driven by polling alone; a channel is
+    /// what lets you block for completions ([`CompletionChannel::wait`]) or hand the descriptor to
+    /// an event loop instead. Several queues can share one channel — a single descriptor then
+    /// reports notifications for all of them, which is what you want for a server driving many
+    /// queue pairs from one `epoll`/reactor. See [`CompletionChannel`] for the notification loop.
+    pub fn create_comp_channel(&self) -> Result<CompletionChannel> {
+        CompletionChannel::new(&self.inner)
     }
 
     /// Allocate a protection domain (PDs) for the device's context.
@@ -1385,10 +1398,182 @@ impl Deref for PortAttr {
     }
 }
 
+/// A completion channel: the file descriptor that delivers completion-queue notifications.
+///
+/// By default a [`CompletionQueue`] has no channel and is driven by polling alone. To wait for
+/// completions instead of burning a core, create a channel with [`Context::create_comp_channel`]
+/// and build the queue on it with [`CompletionQueueBuilder::set_comp_channel`]; then arm the queue
+/// with [`CompletionQueue::req_notify`], drain it with [`poll`](CompletionQueue::poll), and block
+/// on the channel ([`wait`](Self::wait)) — or watch its descriptor
+/// ([`AsFd`]/[`AsRawFd`](std::os::fd::AsRawFd)) from your own reactor and consume notifications
+/// with [`get_event`](Self::get_event) — before draining and re-arming again.
+///
+/// Any number of queues can be built on one channel, collapsing their notifications onto a single
+/// file descriptor (what you want for a server driving many queue pairs from one `epoll`/reactor).
+/// A notification carries the context value of the queue it belongs to (set with
+/// [`CompletionQueueBuilder::set_context`]), which is how [`get_event`](Self::get_event) tells the
+/// sharers apart — give each queue a distinct one. The channel is a single stream of events:
+/// however many threads consume it, each notification is delivered to exactly one of them, so
+/// routing it to the right queue is the consumer's job.
+///
+/// Cloning is cheap (reference counted); the channel is destroyed once the last clone and every queue
+/// built on it are dropped.
+#[derive(Clone)]
+pub struct CompletionChannel {
+    inner: Arc<CompletionChannelInner>,
+}
+
+struct CompletionChannelInner {
+    // Kept so the device outlives the channel.
+    _ctx: Arc<ContextInner>,
+    cc: *mut ffi::ibv_comp_channel,
+}
+
+unsafe impl Send for CompletionChannelInner {}
+unsafe impl Sync for CompletionChannelInner {}
+
+impl Drop for CompletionChannelInner {
+    fn drop(&mut self) {
+        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("{e}");
+        }
+    }
+}
+
+impl CompletionChannel {
+    /// Create a completion channel on `ctx` (for [`Context::create_comp_channel`]), with its file
+    /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
+    /// instead of blocking.
+    fn new(ctx: &Arc<ContextInner>) -> Result<CompletionChannel> {
+        let cc = unsafe { ffi::ibv_create_comp_channel(ctx.ctx) };
+        if cc.is_null() {
+            return Err(Error::CreateCompletionChannel(io::Error::last_os_error()));
+        }
+        let channel = CompletionChannel {
+            inner: Arc::new(CompletionChannelInner {
+                _ctx: ctx.clone(),
+                cc,
+            }),
+        };
+        // If this fails, `channel` drops here and tears the half-created channel back down.
+        channel.set_nonblocking()?;
+        Ok(channel)
+    }
+
+    /// Set this channel's file descriptor to non-blocking.
+    fn set_nonblocking(&self) -> Result<()> {
+        let fd = unsafe { *self.inner.cc }.fd;
+        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
+            .map_err(|e| Error::CreateCompletionChannel(e.into()))?;
+        let arg = nix::fcntl::FcntlArg::F_SETFL(
+            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
+        );
+        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::CreateCompletionChannel(e.into()))?;
+        Ok(())
+    }
+
+    /// Consume one pending notification from the channel, returning the context value of the
+    /// completion queue it belongs to (the value set with [`CompletionQueueBuilder::set_context`]),
+    /// or `None` if none is pending.
+    ///
+    /// This is how you demultiplex several queues that share one channel: after the channel's file
+    /// descriptor becomes readable, drain notifications here and map each returned context back to
+    /// the queue, which you then [`poll`](CompletionQueue::poll) and re-arm with
+    /// [`req_notify`](CompletionQueue::req_notify). Give each queue a distinct
+    /// [`set_context`](CompletionQueueBuilder::set_context) value so they can be told apart.
+    /// Acknowledgement is handled for you.
+    pub fn get_event(&self) -> Result<Option<isize>> {
+        let mut out_cq = ptr::null_mut();
+        let mut out_cq_context = ptr::null_mut();
+        let rc = unsafe { ffi::ibv_get_cq_event(self.inner.cc, &mut out_cq, &mut out_cq_context) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(Error::PollCompletionQueue(e));
+        }
+        // Every event from ibv_get_cq_event() must eventually be acknowledged.
+        unsafe { ffi::ibv_ack_cq_events(out_cq, 1) };
+        Ok(Some(out_cq_context as isize))
+    }
+
+    /// Block until a notification is available on the channel (up to `timeout`), then consume it,
+    /// returning the context value of the completion queue it belongs to (the value set with
+    /// [`CompletionQueueBuilder::set_context`]). Returns `None` only if `timeout` elapses first;
+    /// with no timeout it waits indefinitely, even if other threads race it for notifications.
+    ///
+    /// This is the blocking form of [`get_event`](Self::get_event): it waits on the channel's file
+    /// descriptor for you rather than requiring an external reactor. Arm each queue with
+    /// [`CompletionQueue::req_notify`] and drain it with [`poll`](CompletionQueue::poll) *before*
+    /// blocking here — polling after arming closes the race where a completion lands between an
+    /// earlier poll and arming — then call this to learn which queue fired, and poll and re-arm
+    /// that queue.
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<isize>> {
+        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        loop {
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
+            let ret = nix::poll::poll(
+                &mut [pollfd],
+                remaining
+                    .map(nix::poll::PollTimeout::try_from)
+                    .transpose()
+                    .map_err(|_| {
+                        Error::PollCompletionQueue(io::Error::other(
+                            "failed to convert timeout to PollTimeout",
+                        ))
+                    })?,
+            )
+            .map_err(|e| Error::PollCompletionQueue(e.into()))?;
+            match ret {
+                0 => return Ok(None),
+                1 => {
+                    // The descriptor was readable, but another thread may have consumed the
+                    // notification first; if so, go back to waiting for the next one.
+                    if let Some(context) = self.get_event()? {
+                        return Ok(Some(context));
+                    }
+                }
+                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            }
+        }
+    }
+
+    /// Returns the underlying `ibv_comp_channel` pointer.
+    ///
+    /// This is an escape hatch for verbs this crate does not yet wrap. The pointer stays valid only
+    /// while a clone of this [`CompletionChannel`] (or a queue built on it) is alive; do not destroy
+    /// it.
+    pub fn as_raw(&self) -> *mut ffi::ibv_comp_channel {
+        self.inner.cc
+    }
+}
+
+impl std::os::fd::AsRawFd for CompletionChannel {
+    /// The raw file descriptor of this completion channel. It is non-blocking and becomes readable
+    /// when a notification arrives for any queue built on it after
+    /// [`req_notify`](CompletionQueue::req_notify).
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        unsafe { *self.inner.cc }.fd
+    }
+}
+
+impl AsFd for CompletionChannel {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the channel fd lives until the last `CompletionChannelInner` drops, and the borrow
+        // is tied to `&self`.
+        unsafe { BorrowedFd::borrow_raw((*self.inner.cc).fd) }
+    }
+}
+
 /// Builds a [`CompletionQueue`]. Created by [`Context::create_cq`].
 ///
 /// The queue size is fixed when the builder is created; everything else is optional and defaults to
-/// a plain interrupt-driven queue with the standard work-completion fields. Call
+/// a plain polled queue with the standard work-completion fields and no completion channel. Call
 /// [`build`](Self::build) to create the queue.
 #[must_use]
 pub struct CompletionQueueBuilder {
@@ -1398,6 +1583,8 @@ pub struct CompletionQueueBuilder {
     comp_vector: u32,
     /// extra work-completion fields requested on top of the always-present standard set
     wc_flags: u32,
+    /// the completion channel to deliver notifications on, if any
+    comp_channel: Option<CompletionChannel>,
 }
 
 impl CompletionQueueBuilder {
@@ -1434,6 +1621,21 @@ impl CompletionQueueBuilder {
         self
     }
 
+    /// Deliver this queue's completion notifications on `channel` (from
+    /// [`Context::create_comp_channel`]).
+    ///
+    /// Without a channel the queue can only be polled; with one, arming the queue with
+    /// [`CompletionQueue::req_notify`] makes the next completion raise a notification on the
+    /// channel, to block on ([`CompletionChannel::wait`]) or watch from an event loop. Several
+    /// queues can be built on one channel; give each a distinct
+    /// [`set_context`](Self::set_context) so [`CompletionChannel::get_event`] can tell them apart.
+    ///
+    /// Defaults to no channel.
+    pub fn set_comp_channel(&mut self, channel: &CompletionChannel) -> &mut Self {
+        self.comp_channel = Some(channel.clone());
+        self
+    }
+
     /// Create the completion queue.
     ///
     /// # Errors
@@ -1442,20 +1644,9 @@ impl CompletionQueueBuilder {
     ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`) or comp vector.
     ///  - `ENOMEM`: Not enough resources to complete this operation.
     pub fn build(&self) -> Result<CompletionQueue> {
-        let cc = unsafe { ffi::ibv_create_comp_channel(self.ctx.ctx) };
-        if cc.is_null() {
-            return Err(Error::CreateCompletionQueue(io::Error::last_os_error()));
-        }
-
-        let cc_fd = unsafe { *cc }.fd;
-        let flags = nix::fcntl::fcntl(cc_fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::CreateCompletionQueue(e.into()))?;
-        // the file descriptor needs to be set to non-blocking because `ibv_get_cq_event()`
-        // would block otherwise.
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(cc_fd, arg).map_err(|e| Error::CreateCompletionQueue(e.into()))?;
+        // The queue holds a reference to its channel (if any), so the channel cannot be destroyed
+        // out from under it.
+        let cc = self.comp_channel.clone();
 
         // Always request the standard work-completion fields so the lazy readers in `WorkCompletion`
         // can serve them, then add any caller-requested extras (such as the completion timestamp).
@@ -1467,7 +1658,9 @@ impl CompletionQueueBuilder {
         let mut cq_attr = ffi::ibv_cq_init_attr_ex {
             cqe: self.min_cq_entries as u32,
             cq_context: unsafe { ptr::null::<c_void>().offset(self.cq_context) } as *mut _,
-            channel: cc,
+            channel: cc
+                .as_ref()
+                .map_or(ptr::null_mut(), |channel| channel.as_raw()),
             comp_vector: self.comp_vector,
             wc_flags: wc_flags as u64,
             comp_mask: 0,
@@ -1477,11 +1670,10 @@ impl CompletionQueueBuilder {
         let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr as *mut _) };
 
         if cq_ex.is_null() {
-            // Tear down the completion channel we created, so a failed build (for example, an
-            // unsupported work-completion field) does not leak it.
-            let err = io::Error::last_os_error();
-            unsafe { ffi::ibv_destroy_comp_channel(cc) };
-            Err(Error::os(err, Error::CreateCompletionQueue))
+            Err(Error::os(
+                io::Error::last_os_error(),
+                Error::CreateCompletionQueue,
+            ))
         } else {
             Ok(CompletionQueue {
                 inner: Arc::new(CompletionQueueInner {
@@ -1497,7 +1689,7 @@ impl CompletionQueueBuilder {
 struct CompletionQueueInner {
     _ctx: Arc<ContextInner>,
     cq_ex: *mut ffi::ibv_cq_ex,
-    cc: *mut ffi::ibv_comp_channel,
+    cc: Option<CompletionChannel>,
 }
 
 impl CompletionQueueInner {
@@ -1518,11 +1710,9 @@ impl Drop for CompletionQueueInner {
             panic!("{e}");
         }
 
-        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
-        }
+        // The queue's reference to its completion channel (if any) is released when the `cc` field
+        // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel
+        // itself is destroyed once its other queues and clones are gone too.
     }
 }
 
@@ -1758,7 +1948,9 @@ impl CompletionQueue {
     /// `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting the
     /// number of inflight work requests.
     ///
-    /// `poll` does not block or cause a context switch; use [`wait`](Self::wait) to block.
+    /// `poll` does not block or cause a context switch; to block until completions arrive, build
+    /// the queue on a [`CompletionChannel`] and wait there instead of spinning on `poll` (see
+    /// [`req_notify`](Self::req_notify) for the loop).
     ///
     /// # Examples
     ///
@@ -1792,59 +1984,17 @@ impl CompletionQueue {
         }
     }
 
-    /// Block until at least one work completion is available, then begin polling.
-    ///
-    /// Unlike [`poll`](Self::poll), this arms the completion channel and blocks (up to `timeout`)
-    /// rather than returning `None` on an empty queue. It returns the same lending [`Completions`]
-    /// iterator.
-    ///
-    /// # Errors
-    ///  - `TimedOut`: the timeout expired before any completion arrived.
-    ///  - System errors from `req_notify_cq`, `poll`, or `ibv_get_cq_event`.
-    pub fn wait(&self, timeout: Option<Duration>) -> Result<Completions<'_>> {
-        loop {
-            // Arm the completion channel, then poll: polling after arming closes the race where a
-            // completion arrives between an earlier poll and arming.
-            self.req_notify(false)?;
-            if let Some(completions) = self.poll()? {
-                return Ok(completions);
-            }
-
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                timeout
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::PollCompletionQueue(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::PollCompletionQueue(e.into()))?;
-            match ret {
-                0 => {
-                    return Err(Error::TimedOut);
-                }
-                1 => {}
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
-            }
-
-            // Drain the notification the poll reported; re-arm and re-poll on the next iteration.
-            self.get_event()?;
-        }
-    }
-
-    /// Arm the completion channel so the next work completion generates a notification on the
-    /// channel's file descriptor (`ibv_req_notify_cq`).
+    /// Arm the completion queue so the next work completion generates a notification on its
+    /// completion channel (`ibv_req_notify_cq`).
     ///
     /// This is the building block for event-driven and asynchronous completion handling: arm the
-    /// channel, drain everything already pending with [`poll`](Self::poll), then wait for the
-    /// descriptor returned by [`AsFd`](std::os::fd::AsFd)/[`AsRawFd`](std::os::fd::AsRawFd) to become
-    /// readable (for example with `epoll`, or a `tokio` `AsyncFd`). When it is, call
-    /// [`get_event`](Self::get_event) to consume the notification, drain with [`poll`](Self::poll),
-    /// and arm again. [`wait`](Self::wait) is the blocking version of this loop.
+    /// queue, drain everything already pending with [`poll`](Self::poll), then wait for a
+    /// notification on the [completion channel](Self::comp_channel) — either by blocking with
+    /// [`CompletionChannel::wait`], or by watching its [`AsFd`] descriptor with
+    /// your own reactor (for example `epoll` or a `tokio` `AsyncFd`) and consuming the notification
+    /// with [`CompletionChannel::get_event`]. Then drain again and re-arm. Arming a queue that was
+    /// built without a channel ([`CompletionQueueBuilder::set_comp_channel`]) has nothing to
+    /// notify.
     ///
     /// If `solicited_only` is set, only completions of work requests that asked for a solicited
     /// event generate a notification.
@@ -1858,28 +2008,10 @@ impl CompletionQueue {
         Ok(())
     }
 
-    /// Consume one pending completion notification from the channel (`ibv_get_cq_event`), and
-    /// acknowledge it.
-    ///
-    /// Returns `true` if a notification was consumed and `false` if none was pending (the channel's
-    /// descriptor is non-blocking). Call this after the descriptor becomes readable, then re-arm
-    /// with [`req_notify`](Self::req_notify); see [`req_notify`](Self::req_notify) for the full loop.
-    /// Acknowledgement is handled for you, so there is no separate ack step.
-    pub fn get_event(&self) -> Result<bool> {
-        let mut out_cq = std::ptr::null_mut();
-        let mut out_cq_context = std::ptr::null_mut();
-        let rc = unsafe { ffi::ibv_get_cq_event(self.inner.cc, &mut out_cq, &mut out_cq_context) };
-        if rc < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::WouldBlock {
-                return Ok(false);
-            }
-            return Err(Error::PollCompletionQueue(e));
-        }
-        debug_assert_eq!(self.inner.cq(), out_cq);
-        // Every event from ibv_get_cq_event() must eventually be acknowledged.
-        unsafe { ffi::ibv_ack_cq_events(self.inner.cq(), 1) };
-        Ok(true)
+    /// The completion channel this queue delivers notifications on, if it was built with one
+    /// ([`CompletionQueueBuilder::set_comp_channel`]).
+    pub fn comp_channel(&self) -> Option<&CompletionChannel> {
+        self.inner.cc.as_ref()
     }
 
     /// Returns the underlying `ibv_cq` pointer.
@@ -1898,23 +2030,6 @@ impl CompletionQueue {
     /// while this [`CompletionQueue`] is alive; do not destroy it.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_cq_ex {
         self.inner.cq_ex
-    }
-}
-
-impl std::os::fd::AsRawFd for CompletionQueue {
-    /// The raw file descriptor of this completion queue's completion channel. It is non-blocking and
-    /// becomes readable when a notification arrives after [`req_notify`](CompletionQueue::req_notify);
-    /// see that method for the event-driven loop.
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        unsafe { *self.inner.cc }.fd
-    }
-}
-
-impl std::os::fd::AsFd for CompletionQueue {
-    fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: the comp channel fd lives until this `CompletionQueue`'s `Drop`, and the borrow is
-        // tied to `&self`.
-        unsafe { BorrowedFd::borrow_raw((*self.inner.cc).fd) }
     }
 }
 
@@ -3701,8 +3816,8 @@ impl<'qp> PostBatch<'qp> {
     }
 
     /// Mark the next work request as solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
-    /// raises a solicited event on the remote side, waking a peer blocked in
-    /// [`CompletionQueue::wait`](crate::CompletionQueue::wait) that armed for solicited events.
+    /// raises a solicited event on the remote side, waking a peer blocked on its completion channel
+    /// after arming with [`CompletionQueue::req_notify`] for solicited events only.
     #[inline]
     pub fn solicited(&mut self) -> PostOp<'_, 'qp> {
         PostOp {

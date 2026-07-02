@@ -89,6 +89,27 @@ fn loopback() -> Loopback {
     loopback_of(ibv_qp_type::IBV_QPT_RC)
 }
 
+/// Build a reliable-connected self-loopback queue pair on a caller-provided protection domain and
+/// completion queue (rather than fresh ones), so several queue pairs can share resources — used to
+/// test a completion channel shared across queues.
+fn loopback_on(pd: &ProtectionDomain, cq: &CompletionQueue) -> QueuePair {
+    let mut builder = pd
+        .create_qp(cq, cq, ibv_qp_type::IBV_QPT_RC)
+        .expect("failed to create queue pair");
+    builder
+        .set_gid_index(1)
+        .set_max_send_wr(16)
+        .set_max_recv_wr(16)
+        .set_max_send_sge(4)
+        .set_max_recv_sge(4)
+        .allow_remote_rw();
+    let prepared = builder.build().expect("failed to build queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    prepared
+        .handshake(endpoint)
+        .expect("failed to transition queue pair to RTS")
+}
+
 /// An owned snapshot of the completion fields the tests inspect (the borrowed `WorkCompletion`
 /// cannot escape the poll, so `drain` copies out what it needs).
 struct Completed {
@@ -379,29 +400,53 @@ fn multiple_outstanding() {
     }
 }
 
-/// The blocking completion-channel path (`wait`) returns completions just like polling does.
+/// Blocking on a completion channel (`CompletionChannel::wait`) delivers completions without
+/// busy-polling: arm the queue, drain it, and only then block on the channel.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn wait_for_completion() {
-    let mut lb = loopback();
+    const CQ_CONTEXT: isize = 7;
 
-    let mut recv = lb.pd.allocate(16).expect("failed to register recv MR");
-    let mut send = lb.pd.allocate(16).expect("failed to register send MR");
+    let ctx = open_test_device();
+    let channel = ctx
+        .create_comp_channel()
+        .expect("failed to create completion channel");
+    let cq = ctx
+        .create_cq(64)
+        .set_comp_channel(&channel)
+        .set_context(CQ_CONTEXT)
+        .build()
+        .expect("failed to create completion queue");
+    let pd = ctx
+        .alloc_pd()
+        .expect("failed to allocate protection domain");
+    let mut qp = loopback_on(&pd, &cq);
+
+    let mut recv = pd.allocate(16).expect("failed to register recv MR");
+    let mut send = pd.allocate(16).expect("failed to register send MR");
     send.bytes_mut()[..4].copy_from_slice(b"wait");
 
-    unsafe { lb.qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
-    unsafe { lb.qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
+    unsafe { qp.post_receive(&[recv.slice(..4)], 1) }.expect("post_receive failed");
+    unsafe { qp.post_send(&[send.slice(..4)], 2) }.expect("post_send failed");
 
-    // Block on the completion channel instead of busy-polling.
     let mut ids = Vec::new();
     while ids.len() < 2 {
-        let mut completions = lb
-            .cq
+        // Arm first, then drain: polling after arming closes the race where a completion lands
+        // between the drain and the arm (its notification then just wakes the wait immediately).
+        cq.req_notify(false).expect("failed to arm");
+        if let Some(mut completions) = cq.poll().expect("poll failed") {
+            while let Some(wc) = completions.next() {
+                assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
+                ids.push(wc.wr_id());
+            }
+            continue;
+        }
+        match channel
             .wait(Some(Duration::from_secs(5)))
-            .expect("wait failed");
-        while let Some(wc) = completions.next() {
-            assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
-            ids.push(wc.wr_id());
+            .expect("wait failed")
+        {
+            Some(context) => assert_eq!(context, CQ_CONTEXT),
+            None => panic!("timed out waiting for completions: {ids:?}"),
         }
     }
     assert!(
@@ -1046,30 +1091,46 @@ fn extended_wc_fields() {
 fn event_driven_completion() {
     use std::os::fd::AsRawFd;
 
-    let mut lb = loopback();
+    let ctx = open_test_device();
+    let channel = ctx
+        .create_comp_channel()
+        .expect("failed to create completion channel");
     // The completion channel is backed by a real (non-blocking) descriptor an event loop can wait on.
     assert!(
-        lb.cq.as_raw_fd() >= 0,
+        channel.as_raw_fd() >= 0,
         "completion channel should expose an fd"
     );
 
-    let mut recv = lb.pd.allocate(64).expect("failed to register recv MR");
-    let mut send = lb.pd.allocate(64).expect("failed to register send MR");
+    let cq = ctx
+        .create_cq(64)
+        .set_comp_channel(&channel)
+        .build()
+        .expect("failed to create completion queue");
+    assert_eq!(
+        cq.comp_channel().expect("built with a channel").as_raw_fd(),
+        channel.as_raw_fd()
+    );
+    let pd = ctx
+        .alloc_pd()
+        .expect("failed to allocate protection domain");
+    let mut qp = loopback_on(&pd, &cq);
+
+    let mut recv = pd.allocate(64).expect("failed to register recv MR");
+    let mut send = pd.allocate(64).expect("failed to register send MR");
     send.bytes_mut()[..5].copy_from_slice(b"hello");
 
-    // Arm the channel before posting so the completions raise a notification on the descriptor.
-    lb.cq
-        .req_notify(false)
-        .expect("failed to arm the completion channel");
-    unsafe { lb.qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
-    unsafe { lb.qp.post_send(&[send.slice(..5)], 2) }.expect("post_send failed");
+    // Arm the queue before posting so the completions raise a notification on the descriptor.
+    cq.req_notify(false)
+        .expect("failed to arm the completion queue");
+    unsafe { qp.post_receive(&[recv.slice(..5)], 1) }.expect("post_receive failed");
+    unsafe { qp.post_send(&[send.slice(..5)], 2) }.expect("post_send failed");
 
     // A real event loop would await readability of the descriptor; here we consume the notification
     // as soon as it arrives. `get_event` reads the (non-blocking) channel and acknowledges for us.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut notified = false;
     while Instant::now() < deadline {
-        if lb.cq.get_event().expect("get_event failed") {
+        if channel.get_event().expect("get_event failed").is_some() {
             notified = true;
             break;
         }
@@ -1081,7 +1142,7 @@ fn event_driven_completion() {
     );
 
     // The completions themselves are drained through the normal poll path.
-    let comps = drain(&lb.cq, 2);
+    let comps = drain(&cq, 2);
     assert!(
         comps.iter().any(|wc| wc.wr_id() == 1),
         "missing recv completion"
@@ -1346,4 +1407,117 @@ fn debug_formatting() {
 
     let port = ctx.query_port(1).expect("query_port failed");
     assert!(format!("{port:?}").contains("PortAttr"), "{port:?}");
+}
+
+/// Two completion queues share one completion channel, so a single file descriptor carries
+/// notifications for both. Drive them through the channel and demultiplex by the context value each
+/// queue was built with.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn shared_completion_channel() {
+    use std::collections::HashSet;
+    use std::os::fd::AsRawFd;
+
+    let ctx = open_test_device();
+    let channel = ctx
+        .create_comp_channel()
+        .expect("failed to create completion channel");
+
+    // Distinct context values let `CompletionChannel::get_event` say which queue a notification is
+    // for.
+    const CTX_A: isize = 1;
+    const CTX_B: isize = 2;
+    let cq_a = ctx
+        .create_cq(16)
+        .set_comp_channel(&channel)
+        .set_context(CTX_A)
+        .build()
+        .expect("failed to build first completion queue");
+    let cq_b = ctx
+        .create_cq(16)
+        .set_comp_channel(&channel)
+        .set_context(CTX_B)
+        .build()
+        .expect("failed to build second completion queue");
+
+    // The point of sharing: both queues and the channel expose the very same descriptor.
+    assert_eq!(
+        cq_a.comp_channel().expect("has a channel").as_raw_fd(),
+        channel.as_raw_fd()
+    );
+    assert_eq!(
+        cq_b.comp_channel().expect("has a channel").as_raw_fd(),
+        channel.as_raw_fd()
+    );
+
+    let pd = ctx.alloc_pd().expect("failed to allocate pd");
+    let mut qp_a = loopback_on(&pd, &cq_a);
+    let mut qp_b = loopback_on(&pd, &cq_b);
+
+    let mut recv_a = pd.allocate(16).expect("recv a");
+    let mut recv_b = pd.allocate(16).expect("recv b");
+    let mut send_a = pd.allocate(16).expect("send a");
+    let mut send_b = pd.allocate(16).expect("send b");
+    send_a.bytes_mut()[..4].copy_from_slice(b"aaaa");
+    send_b.bytes_mut()[..4].copy_from_slice(b"bbbb");
+
+    unsafe { qp_a.post_receive(&[recv_a.slice(..4)], 10) }.expect("post_receive a");
+    unsafe { qp_b.post_receive(&[recv_b.slice(..4)], 20) }.expect("post_receive b");
+
+    // Arm both queues before posting, so the completions raise notifications on the shared channel.
+    cq_a.req_notify(false).expect("arm a");
+    cq_b.req_notify(false).expect("arm b");
+
+    unsafe { qp_a.post_send(&[send_a.slice(..4)], 11) }.expect("post_send a");
+    unsafe { qp_b.post_send(&[send_b.slice(..4)], 21) }.expect("post_send b");
+
+    // Drive completions off the one channel, demultiplexing by context.
+    let mut a = HashSet::new();
+    let mut b = HashSet::new();
+    let mut contexts_seen = HashSet::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while a.len() < 2 || b.len() < 2 {
+        assert!(Instant::now() < deadline, "timed out: a={a:?} b={b:?}");
+        match channel
+            .wait(Some(Duration::from_millis(100)))
+            .expect("channel wait")
+        {
+            None => continue,
+            Some(context) => {
+                contexts_seen.insert(context);
+                let (cq, ids) = match context {
+                    CTX_A => (&cq_a, &mut a),
+                    CTX_B => (&cq_b, &mut b),
+                    other => panic!("unexpected completion-queue context {other}"),
+                };
+                // Re-arm before draining so a completion racing in is not missed.
+                cq.req_notify(false).expect("re-arm");
+                if let Some(mut completions) = cq.poll().expect("poll") {
+                    while let Some(wc) = completions.next() {
+                        assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
+                        ids.insert(wc.wr_id());
+                    }
+                }
+            }
+        }
+    }
+
+    assert!(
+        contexts_seen.contains(&CTX_A) && contexts_seen.contains(&CTX_B),
+        "both queues should have notified on the shared channel: {contexts_seen:?}"
+    );
+    assert_eq!(a, HashSet::from([10, 11]), "first queue's completions");
+    assert_eq!(b, HashSet::from([20, 21]), "second queue's completions");
+    assert_eq!(&recv_a.bytes_mut()[..4], b"aaaa");
+    assert_eq!(&recv_b.bytes_mut()[..4], b"bbbb");
+
+    // A queue built without a channel has none to reach.
+    let bare = ctx
+        .create_cq(16)
+        .build()
+        .expect("failed to build channel-less completion queue");
+    assert!(
+        bare.comp_channel().is_none(),
+        "a queue without set_comp_channel has no channel"
+    );
 }
