@@ -3672,7 +3672,12 @@ impl ProtectionDomain {
         let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
         // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
         if mr.is_null() {
-            Err(Error::RegisterMemoryRegion(io::Error::last_os_error()))
+            // Promotes EOPNOTSUPP (an access flag the device cannot honor) to Unsupported, like
+            // register_dmabuf and the other verbs.
+            Err(Error::os(
+                io::Error::last_os_error(),
+                Error::RegisterMemoryRegion,
+            ))
         } else {
             Ok(MemoryRegionInner {
                 _pd: self.inner.clone(),
@@ -3694,6 +3699,7 @@ impl ProtectionDomain {
     ///
     /// # Errors
     ///
+    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags.
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
@@ -3739,6 +3745,7 @@ impl ProtectionDomain {
     ///
     /// # Errors
     ///
+    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags.
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
@@ -3774,6 +3781,7 @@ impl ProtectionDomain {
     ///
     /// # Errors
     ///
+    ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags.
     ///  - `EINVAL`: Invalid access value.
     ///  - `ENOMEM`: Not enough resources (either in operating system or in RDMA device) to
     ///    complete this operation.
