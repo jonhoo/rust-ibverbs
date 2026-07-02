@@ -178,8 +178,8 @@ pub struct GidEntry {
     pub gid: Gid,
     /// The GID table index of this entry.
     pub gid_index: u32,
-    /// The port number that this GID belongs to.
-    pub port_num: u32,
+    /// The port number that this GID belongs to (numbered from 1, like every port in this crate).
+    pub port_num: u8,
     /// The type of the GID (InfiniBand, RoCE v1, or RoCE v2).
     pub gid_type: GidType,
     /// The interface index of the net device associated with this GID.
@@ -193,7 +193,9 @@ impl From<ffi::ibv_gid_entry> for GidEntry {
         Self {
             gid: gid_entry.gid.into(),
             gid_index: gid_entry.gid_index,
-            port_num: gid_entry.port_num,
+            // Port numbers are 8-bit on the wire; the C struct widens the field to u32 purely to
+            // keep `ibv_gid_entry` free of implicit padding across the kernel boundary.
+            port_num: gid_entry.port_num as u8,
             gid_type: GidType::from_raw(gid_entry.gid_type),
             ndev_ifindex: gid_entry.ndev_ifindex,
         }

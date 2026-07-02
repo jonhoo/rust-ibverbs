@@ -1456,7 +1456,7 @@ fn gid_and_device_introspection() {
     let table = ctx.gid_table().expect("failed to read GID table");
     let entry = table.first().expect("expected at least one GID entry");
     let gid = ctx
-        .query_gid(entry.port_num as u8, entry.gid_index)
+        .query_gid(entry.port_num, entry.gid_index)
         .expect("query_gid failed");
     assert_eq!(gid, entry.gid);
 
