@@ -31,19 +31,18 @@ register_toolchains("@rust_toolchains//:all")
 # Register the bindgen toolchain backed by the prebuilt LLVM distribution (see //:bindgen_toolchain)
 register_toolchains("//:bindgen_toolchain")
 
-# Set up crates repository for dependencies (nix, serde, thiserror)
+# Resolve crate dependencies straight from the Cargo workspace, so the Bazel build cannot
+# drift from Cargo.toml/Cargo.lock.
 crate = use_extension("@rules_rust//crate_universe:extension.bzl", "crate")
-crate.spec(
-    package = "nix",
-    version = "0.31.3",
-    default_features = False,
-    features = ["fs", "poll"],
+crate.from_cargo(
+    name = "crates",
+    cargo_lockfile = "//:Cargo.lock",
+    manifests = [
+        "//:Cargo.toml",
+        "//ibverbs:Cargo.toml",
+        "//ibverbs-sys:Cargo.toml",
+    ],
 )
-crate.spec(
-    package = "thiserror",
-    version = "2.0",
-)
-crate.from_specs()
 use_repo(crate, "crates")
 
 # Fetch rdma-core source for headers
