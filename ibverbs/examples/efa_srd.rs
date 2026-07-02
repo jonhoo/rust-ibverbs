@@ -21,13 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Two SRD queue pairs. SRD is connectionless, so each is just brought to ready with a Q_Key.
     let mut sender = pd
-        .create_srd_qp(&cq, &cq)?
+        .create_srd_qp(&cq, &cq, 1)?
         .set_gid_index(GID_INDEX)
         .build_srd()?
         .activate_srd(QKEY)?;
 
     let receiver_prepared = pd
-        .create_srd_qp(&cq, &cq)?
+        .create_srd_qp(&cq, &cq, 1)?
         .set_gid_index(GID_INDEX)
         .build_srd()?;
     let receiver_endpoint = receiver_prepared.endpoint()?;
@@ -39,8 +39,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ah_attr.set_grh(receiver_gid, GID_INDEX as u8, 64, 0);
     let ah = pd.create_address_handle(&ah_attr)?;
 
-    let mut send_buf = pd.allocate(64)?;
-    let recv_buf = pd.allocate(64)?;
+    let mut send_buf = pd.allocate(64, ibverbs::AccessFlags::PERMISSIVE)?;
+    let recv_buf = pd.allocate(64, ibverbs::AccessFlags::PERMISSIVE)?;
     send_buf.bytes_mut()[..5].copy_from_slice(b"hello");
 
     // Post the receive, then the send. Both go through the normal, non-EFA-specific API.

@@ -22,7 +22,7 @@ fn main() -> ibverbs::Result<()> {
 
     // On RoCE, routing needs a GID; pick the index of a routable entry from `ctx.gid_table()?`.
     let prepared = pd
-        .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)?
+        .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)?
         .set_gid_index(1)
         .build()?;
 
@@ -32,8 +32,8 @@ fn main() -> ibverbs::Result<()> {
     let endpoint = prepared.endpoint()?;
     let mut qp = prepared.handshake(endpoint)?;
 
-    let mut recv = pd.allocate(4096)?;
-    let mut send = pd.allocate(4096)?;
+    let mut recv = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
+    let mut send = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
     send.bytes_mut()[..5].copy_from_slice(b"hello");
     unsafe { qp.post_receive(&[recv.slice(..)], 1) }?;
     unsafe { qp.post_send(&[send.slice(..5)], 2) }?;

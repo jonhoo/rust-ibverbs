@@ -6,7 +6,7 @@
 //! This runs against the first RDMA device; on a machine without one, create a SoftRoCE device
 //! with `rdma link add rxe0 type rxe netdev <netdev>`.
 
-use ibverbs::{LocalMemorySlice, RemoteMemorySlice};
+use ibverbs::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 
 const RECEIVE_NOTIFICATION_WR_ID: u64 = 100;
 const NOTIFY_BUF_SIZE: usize = std::mem::size_of::<u32>();
@@ -35,14 +35,12 @@ fn main() {
     let gid_index = gids
         .iter()
         .filter(|e| e.port_num == 1)
-        .find(|e| {
-            e.gid_type == ibverbs::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 && e.gid.is_ipv4_mapped()
-        })
+        .find(|e| e.gid_type == ibverbs::GidType::RoceV2 && e.gid.is_ipv4_mapped())
         .or_else(|| gids.iter().find(|e| e.port_num == 1))
         .expect("no GID available")
         .gid_index;
     let prepared_qp = pd
-        .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)
         .unwrap()
         .set_gid_index(gid_index)
         .set_max_send_wr(MAX_SEND_WR)
@@ -57,13 +55,17 @@ fn main() {
     // We will write pieces of a string into a destination buffer using RDMA Writes,
     // then send a final notification containing the count of write operations.
     let text = b"Hello from chained RDMA writes!";
-    let mut src_mr = pd.allocate(text.len()).unwrap();
+    let mut src_mr = pd.allocate(text.len(), AccessFlags::PERMISSIVE).unwrap();
     src_mr.bytes_mut().copy_from_slice(text);
 
-    let dest_mr = pd.allocate(text.len()).unwrap();
+    let dest_mr = pd.allocate(text.len(), AccessFlags::PERMISSIVE).unwrap();
 
-    let mut notify_mr = pd.allocate(NOTIFY_BUF_SIZE).unwrap();
-    let recv_mr = pd.allocate(NOTIFY_BUF_SIZE).unwrap();
+    let mut notify_mr = pd
+        .allocate(NOTIFY_BUF_SIZE, AccessFlags::PERMISSIVE)
+        .unwrap();
+    let recv_mr = pd
+        .allocate(NOTIFY_BUF_SIZE, AccessFlags::PERMISSIVE)
+        .unwrap();
 
     // 5. Post receive request for the final send notification (4-byte payload)
     unsafe { qp.post_receive(&[recv_mr.slice(..)], RECEIVE_NOTIFICATION_WR_ID) }.unwrap();
@@ -89,10 +91,11 @@ fn main() {
     let mut batch = qp.start_send();
     // Chain the RDMA Write operations for each word segment.
     for i in 0..num_writes {
-        batch.write((i + 1) as u64, &locals[i], remotes[i]);
+        batch.op().write((i + 1) as u64, &locals[i], remotes[i]);
     }
     // Append the final Send to signal completion of the chain and carry the write count.
     batch
+        .op()
         .signaled()
         .send(send_chain_completion_wr_id, &notify_slice);
     // Post (ring the doorbell once) for the whole chain.

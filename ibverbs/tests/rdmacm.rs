@@ -11,11 +11,8 @@ use std::os::fd::AsRawFd;
 use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
-use ibverbs::ibv_qp_type::IBV_QPT_RC;
-use ibverbs::rdmacm::{
-    rdma_cm_event_type, rdma_port_space, Acceptor, CmId, ConnectionParameter, Connector,
-};
-use ibverbs::{ibv_qp_state, CompletionQueue, Context};
+use ibverbs::rdmacm::{Acceptor, CmEventType, CmId, ConnectionParameter, Connector, PortSpace};
+use ibverbs::{AccessFlags, CompletionQueue, Context, QueuePairState, QueuePairType};
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
 fn open_test_device() -> Context {
@@ -78,7 +75,7 @@ fn connect_and_send() {
 
     // Passive side: bind, accept, receive the message.
     let server = std::thread::spawn(move || {
-        let acceptor = Acceptor::bind(addr, rdma_port_space::RDMA_PS_TCP, 1).expect("bind");
+        let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 1).expect("bind");
         ready_tx.send(()).expect("signal ready");
 
         let incoming = acceptor.accept().expect("accept");
@@ -86,11 +83,13 @@ fn connect_and_send() {
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
-            .create_qp(&cq, &cq, IBV_QPT_RC)
+            .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
             .expect("server qp builder")
             .build()
             .expect("server qp");
-        let mut recv = pd.allocate(64).expect("server recv mr");
+        let mut recv = pd
+            .allocate(64, AccessFlags::PERMISSIVE)
+            .expect("server recv mr");
 
         let mut conn = incoming
             .accept(qp, ConnectionParameter::default())
@@ -109,7 +108,7 @@ fn connect_and_send() {
 
     // Active side: connect and send.
     ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(rdma_port_space::RDMA_PS_TCP)
+    let resolved = Connector::new(PortSpace::Tcp)
         .expect("connector")
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
@@ -117,11 +116,13 @@ fn connect_and_send() {
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp(&cq, &cq, IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("client qp builder")
         .build()
         .expect("client qp");
-    let mut send = pd.allocate(64).expect("client send mr");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("client send mr");
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
 
     let mut conn = resolved
@@ -156,7 +157,7 @@ fn two_connections() {
 
     let server_barrier = barrier.clone();
     let server = std::thread::spawn(move || {
-        let acceptor = Acceptor::bind(addr, rdma_port_space::RDMA_PS_TCP, 2).expect("bind");
+        let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 2).expect("bind");
         ready_tx.send(()).expect("signal ready");
 
         let mut received = Vec::new();
@@ -167,11 +168,13 @@ fn two_connections() {
             let pd = ctx.alloc_pd().expect("server pd");
             let cq = ctx.create_cq(16).build().expect("server cq");
             let qp = pd
-                .create_qp(&cq, &cq, IBV_QPT_RC)
+                .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
                 .expect("server qp builder")
                 .build()
                 .expect("server qp");
-            let mut recv = pd.allocate(64).expect("server recv mr");
+            let mut recv = pd
+                .allocate(64, AccessFlags::PERMISSIVE)
+                .expect("server recv mr");
             let mut conn = incoming
                 .accept(qp, ConnectionParameter::default())
                 .expect("accept");
@@ -195,7 +198,7 @@ fn two_connections() {
         .map(|tag| {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
-                let resolved = Connector::new(rdma_port_space::RDMA_PS_TCP)
+                let resolved = Connector::new(PortSpace::Tcp)
                     .expect("connector")
                     .resolve(addr, Duration::from_secs(5))
                     .expect("resolve");
@@ -203,11 +206,13 @@ fn two_connections() {
                 let pd = ctx.alloc_pd().expect("client pd");
                 let cq = ctx.create_cq(16).build().expect("client cq");
                 let qp = pd
-                    .create_qp(&cq, &cq, IBV_QPT_RC)
+                    .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
                     .expect("client qp builder")
                     .build()
                     .expect("client qp");
-                let mut send = pd.allocate(64).expect("client send mr");
+                let mut send = pd
+                    .allocate(64, AccessFlags::PERMISSIVE)
+                    .expect("client send mr");
                 send.bytes_mut()[..MESSAGE.len()].fill(tag);
                 let mut conn = resolved
                     .connect(qp, ConnectionParameter::default())
@@ -238,7 +243,7 @@ fn two_connections() {
 /// Pump events on `id` in non-blocking mode until the wanted one arrives, ignoring (acknowledging)
 /// others. Mirrors how a reactor would drive the connection manager: poll, and only sleep when the
 /// channel is empty. Exercises [`CmId::poll_cm_event`] and [`CmId::set_nonblocking`].
-fn pump_until(id: &CmId, want: rdma_cm_event_type) {
+fn pump_until(id: &CmId, want: CmEventType) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         match id.poll_cm_event().expect("poll cm event") {
@@ -274,14 +279,14 @@ fn low_level_connect_and_send() {
 
     // Passive side: bind, listen, take the request id, build and ready the queue pair, accept.
     let server = std::thread::spawn(move || {
-        let listener = CmId::create(rdma_port_space::RDMA_PS_TCP).expect("listener");
+        let listener = CmId::create(PortSpace::Tcp).expect("listener");
         listener.bind_addr(addr).expect("bind");
         listener.listen(1).expect("listen");
         ready_tx.send(()).expect("signal ready");
 
         let request = loop {
             let event = listener.get_cm_event().expect("listener event");
-            if event.event_type() == rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
+            if event.event_type() == CmEventType::ConnectRequest {
                 break event.connection_request().expect("connection request");
             }
         };
@@ -289,20 +294,22 @@ fn low_level_connect_and_send() {
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let mut qp = pd
-            .create_qp(&cq, &cq, IBV_QPT_RC)
+            .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
             .expect("server qp builder")
             .build()
             .expect("server prepared qp")
             .into_queue_pair();
         for state in [
-            ibv_qp_state::IBV_QPS_INIT,
-            ibv_qp_state::IBV_QPS_RTR,
-            ibv_qp_state::IBV_QPS_RTS,
+            QueuePairState::Init,
+            QueuePairState::ReadyToReceive,
+            QueuePairState::ReadyToSend,
         ] {
             let attr = request.init_qp_attr(state).expect("server init_qp_attr");
             qp.modify(&attr).expect("server modify");
         }
-        let mut recv = pd.allocate(64).expect("server recv mr");
+        let mut recv = pd
+            .allocate(64, AccessFlags::PERMISSIVE)
+            .expect("server recv mr");
         unsafe { qp.post_receive(&[recv.slice(..MESSAGE.len())], 1) }.expect("post_receive");
 
         let mut param = ConnectionParameter::default();
@@ -310,7 +317,7 @@ fn low_level_connect_and_send() {
         request.accept(&param).expect("accept");
         loop {
             let event = request.get_cm_event().expect("server event");
-            if event.event_type() == rdma_cm_event_type::RDMA_CM_EVENT_ESTABLISHED {
+            if event.event_type() == CmEventType::Established {
                 break;
             }
         }
@@ -322,7 +329,7 @@ fn low_level_connect_and_send() {
 
     // Active side: drive resolution and connection non-blocking, off the channel's file descriptor.
     ready_rx.recv().expect("server ready");
-    let id = CmId::create(rdma_port_space::RDMA_PS_TCP).expect("client id");
+    let id = CmId::create(PortSpace::Tcp).expect("client id");
     assert!(
         id.as_raw_fd() >= 0,
         "the event channel exposes a file descriptor"
@@ -331,36 +338,38 @@ fn low_level_connect_and_send() {
 
     id.resolve_addr(addr, Duration::from_secs(5))
         .expect("resolve_addr");
-    pump_until(&id, rdma_cm_event_type::RDMA_CM_EVENT_ADDR_RESOLVED);
+    pump_until(&id, CmEventType::AddressResolved);
     id.resolve_route(Duration::from_secs(5))
         .expect("resolve_route");
-    pump_until(&id, rdma_cm_event_type::RDMA_CM_EVENT_ROUTE_RESOLVED);
+    pump_until(&id, CmEventType::RouteResolved);
 
     let ctx = id.context().expect("client device context");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let mut qp = pd
-        .create_qp(&cq, &cq, IBV_QPT_RC)
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
         .expect("client qp builder")
         .build()
         .expect("client prepared qp")
         .into_queue_pair();
     let init = id
-        .init_qp_attr(ibv_qp_state::IBV_QPS_INIT)
+        .init_qp_attr(QueuePairState::Init)
         .expect("client init attr");
     qp.modify(&init).expect("client init");
 
     let mut param = ConnectionParameter::default();
     param.set_qp_num(qp.qp_num());
     id.connect(&param).expect("connect");
-    pump_until(&id, rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_RESPONSE);
-    for state in [ibv_qp_state::IBV_QPS_RTR, ibv_qp_state::IBV_QPS_RTS] {
+    pump_until(&id, CmEventType::ConnectResponse);
+    for state in [QueuePairState::ReadyToReceive, QueuePairState::ReadyToSend] {
         let attr = id.init_qp_attr(state).expect("client init_qp_attr");
         qp.modify(&attr).expect("client modify");
     }
     id.establish().expect("establish");
 
-    let mut send = pd.allocate(64).expect("client send mr");
+    let mut send = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("client send mr");
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
     unsafe { qp.post_send(&[send.slice(..MESSAGE.len())], 2) }.expect("post_send");
     wait_for(&cq, 2);

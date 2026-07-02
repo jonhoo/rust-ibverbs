@@ -24,15 +24,13 @@ fn main() {
     let gid_index = gids
         .iter()
         .filter(|e| e.port_num == 1)
-        .find(|e| {
-            e.gid_type == ibverbs::ibv_gid_type::IBV_GID_TYPE_ROCE_V2 && e.gid.is_ipv4_mapped()
-        })
+        .find(|e| e.gid_type == ibverbs::GidType::RoceV2 && e.gid.is_ipv4_mapped())
         .or_else(|| gids.iter().find(|e| e.port_num == 1))
         .expect("no GID available")
         .gid_index;
 
     let qp_builder = pd
-        .create_qp(&cq, &cq, ibverbs::ibv_qp_type::IBV_QPT_RC)
+        .create_qp(&cq, &cq, ibverbs::QueuePairType::ReliableConnection, 1)
         .unwrap()
         .set_gid_index(gid_index)
         .build()
@@ -43,7 +41,7 @@ fn main() {
     let endpoint = qp_builder.endpoint().unwrap();
     let mut qp = qp_builder.handshake(endpoint).unwrap();
 
-    let mut mr = pd.allocate(16).unwrap();
+    let mut mr = pd.allocate(16, ibverbs::AccessFlags::PERMISSIVE).unwrap();
     mr.bytes_mut()[9] = 0x42;
 
     // Receive into the first half of the buffer what we send from the second half. Note that byte

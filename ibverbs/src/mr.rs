@@ -11,6 +11,50 @@ use crate::pd::ProtectionDomainInner;
 #[cfg(doc)]
 use crate::QueuePair;
 
+flags_newtype! {
+    /// Access permissions for a memory region or queue pair (the `IBV_ACCESS_*` bits).
+    ///
+    /// Combine flags with `|`, or start from the [`PERMISSIVE`](Self::PERMISSIVE) bundle. Local
+    /// read access is always enabled and has no flag.
+    pub struct AccessFlags(ffi::ibv_access_flags) {
+        /// Local write access (required to receive into the region).
+        LOCAL_WRITE = IBV_ACCESS_LOCAL_WRITE;
+        /// Remote peers may RDMA-write into the region.
+        REMOTE_WRITE = IBV_ACCESS_REMOTE_WRITE;
+        /// Remote peers may RDMA-read from the region.
+        REMOTE_READ = IBV_ACCESS_REMOTE_READ;
+        /// Remote peers may target the region with atomic operations.
+        REMOTE_ATOMIC = IBV_ACCESS_REMOTE_ATOMIC;
+        /// A memory window may be bound to the region.
+        MW_BIND = IBV_ACCESS_MW_BIND;
+        /// Remote access uses zero-based virtual addresses.
+        ZERO_BASED = IBV_ACCESS_ZERO_BASED;
+        /// Register the region for on-demand paging (no pinning; pages fault in on access).
+        ON_DEMAND = IBV_ACCESS_ON_DEMAND;
+        /// Back the region with huge pages.
+        HUGETLB = IBV_ACCESS_HUGETLB;
+        /// Remote peers may issue a FLUSH to global visibility on the region.
+        FLUSH_GLOBAL = IBV_ACCESS_FLUSH_GLOBAL;
+        /// Remote peers may issue a FLUSH to persistence on the region.
+        FLUSH_PERSISTENT = IBV_ACCESS_FLUSH_PERSISTENT;
+        /// Allow the device to relax PCIe write ordering for higher throughput.
+        RELAXED_ORDERING = IBV_ACCESS_RELAXED_ORDERING;
+    }
+}
+
+impl AccessFlags {
+    /// Local write plus all remote data access — remote read, remote write, and remote atomics —
+    /// with relaxed ordering: a convenient bundle for buffers both sides fully trust. Narrow it
+    /// when the region does not need to be remotely writable.
+    pub const PERMISSIVE: AccessFlags = AccessFlags(
+        AccessFlags::LOCAL_WRITE.0
+            | AccessFlags::REMOTE_WRITE.0
+            | AccessFlags::REMOTE_READ.0
+            | AccessFlags::REMOTE_ATOMIC.0
+            | AccessFlags::RELAXED_ORDERING.0,
+    );
+}
+
 pub(crate) struct MemoryRegionInner {
     pub(crate) _pd: Arc<ProtectionDomainInner>,
     pub(crate) mr: *mut ffi::ibv_mr,
@@ -30,17 +74,20 @@ impl Drop for MemoryRegionInner {
 }
 
 /// A region of memory registered for use with RDMA.
+///
+/// Created by [`ProtectionDomain::allocate`](crate::ProtectionDomain::allocate) (which owns its
+/// buffer), or by [`register_from_raw`](crate::ProtectionDomain::register_from_raw) /
+/// [`register_dmabuf`](crate::ProtectionDomain::register_dmabuf) for memory managed elsewhere.
 pub struct MemoryRegion<O> {
     pub(crate) inner: MemoryRegionInner,
     pub(crate) owner: O,
 }
 
 impl<O> MemoryRegion<O> {
-    /// Get the remote authentication key used to allow direct remote access to this memory region.
-    pub fn rkey(&self) -> RemoteKey {
-        RemoteKey {
-            key: unsafe { &*self.inner.mr }.rkey,
-        }
+    /// Get the remote key of this memory region: the key peers use to access it directly, usually
+    /// communicated as part of [`remote`](Self::remote).
+    pub fn rkey(&self) -> u32 {
+        unsafe { &*self.inner.mr }.rkey
     }
 
     /// Get the local key of this memory region (the one [`slice`](Self::slice) stamps on every
@@ -116,7 +163,9 @@ impl<O: DerefMut<Target = [u8]>> MemoryRegion<O> {
     }
 }
 
-/// Local memory slice.
+/// Local memory slice, postable as a scatter/gather entry of a work request.
+///
+/// Created by [`MemoryRegion::slice`].
 #[derive(Debug, Default, Copy, Clone)]
 #[repr(transparent)]
 pub struct LocalMemorySlice {
@@ -177,7 +226,10 @@ impl LocalMemorySlice {
     }
 }
 
-/// Remote memory region.
+/// Remote memory region, targetable by one-sided operations (RDMA read/write and atomics).
+///
+/// Created by [`MemoryRegion::remote`], and typically serialized to the peer that initiates the
+/// access (with the `serde` feature).
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct RemoteMemorySlice {
@@ -203,14 +255,6 @@ impl RemoteMemorySlice {
             rkey: self.rkey,
         }
     }
-}
-
-/// A key that authorizes direct memory access to a memory region.
-#[derive(Debug, Clone, Copy)]
-#[non_exhaustive]
-pub struct RemoteKey {
-    /// The actual key value.
-    pub key: u32,
 }
 
 fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, usize) {
@@ -263,5 +307,52 @@ mod test {
         assert_eq!(back.addr, sge.addr);
         assert_eq!(back.length, sge.length);
         assert_eq!(back.lkey, sge.lkey);
+    }
+
+    #[test]
+    fn access_flags_roundtrip() {
+        let flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ;
+        let raw: ffi::ibv_access_flags = flags.into();
+        assert_eq!(
+            raw,
+            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
+                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
+        );
+        assert_eq!(AccessFlags::from(raw), flags);
+        assert_eq!(
+            AccessFlags::from(ffi::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING),
+            AccessFlags::RELAXED_ORDERING
+        );
+    }
+
+    #[test]
+    fn access_flags_bit_ops() {
+        let mut flags = AccessFlags::empty();
+        assert!(!flags.contains(AccessFlags::LOCAL_WRITE));
+        flags |= AccessFlags::LOCAL_WRITE;
+        flags |= AccessFlags::REMOTE_WRITE;
+        assert!(flags.contains(AccessFlags::LOCAL_WRITE));
+        assert!(flags.contains(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE));
+        assert!(!flags.contains(AccessFlags::REMOTE_ATOMIC));
+        assert_eq!(flags & AccessFlags::LOCAL_WRITE, AccessFlags::LOCAL_WRITE);
+        assert_eq!(flags & AccessFlags::REMOTE_ATOMIC, AccessFlags::empty());
+        assert!(
+            AccessFlags::PERMISSIVE.contains(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_ATOMIC)
+        );
+        assert!(!AccessFlags::PERMISSIVE.contains(AccessFlags::ON_DEMAND));
+    }
+
+    #[test]
+    fn access_flags_debug_lists_names() {
+        assert_eq!(format!("{:?}", AccessFlags::empty()), "AccessFlags(0)");
+        assert_eq!(
+            format!("{:?}", AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ),
+            "AccessFlags(LOCAL_WRITE | REMOTE_READ)"
+        );
+        // Unknown bits are kept visible as a hex remainder.
+        assert_eq!(
+            format!("{:?}", AccessFlags(AccessFlags::LOCAL_WRITE.0 | 1 << 30)),
+            "AccessFlags(LOCAL_WRITE | 0x40000000)"
+        );
     }
 }

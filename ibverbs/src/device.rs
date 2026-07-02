@@ -30,7 +30,7 @@ pub fn devices() -> Result<DeviceList> {
     Ok(DeviceList(devices))
 }
 
-/// List of available RDMA devices.
+/// List of available RDMA devices. Returned by [`devices()`].
 #[must_use]
 pub struct DeviceList(&'static mut [*mut ffi::ibv_device]);
 
@@ -90,7 +90,7 @@ impl<'iter> Iterator for DeviceListIter<'iter> {
     }
 }
 
-/// An RDMA device.
+/// An RDMA device. Returned by [`DeviceList::iter`] / [`DeviceList::get`].
 pub struct Device<'devlist>(&'devlist *mut ffi::ibv_device);
 unsafe impl Sync for Device<'_> {}
 unsafe impl Send for Device<'_> {}
@@ -268,10 +268,10 @@ impl<'devlist> Device<'devlist> {
 
     /// Returns the transport type of this device (for example InfiniBand or iWARP).
     ///
-    /// RoCE devices report [`IBV_TRANSPORT_IB`](ffi::ibv_transport_type::IBV_TRANSPORT_IB), since
-    /// RoCE is InfiniBand transport over Ethernet.
-    pub fn transport_type(&self) -> ffi::ibv_transport_type {
-        unsafe { (**self.0).transport_type }
+    /// RoCE devices report [`TransportType::Ib`], since RoCE is InfiniBand transport over
+    /// Ethernet.
+    pub fn transport_type(&self) -> TransportType {
+        unsafe { (**self.0).transport_type }.into()
     }
 
     /// Returns the underlying `ibv_device` pointer.
@@ -281,6 +281,64 @@ impl<'devlist> Device<'devlist> {
     /// that list is alive.
     pub fn as_raw(&self) -> *mut ffi::ibv_device {
         *self.0
+    }
+}
+
+/// The transport a device speaks. Returned by [`Device::transport_type`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TransportType {
+    /// The transport could not be determined.
+    Unknown,
+    /// InfiniBand (also reported by RoCE devices: RoCE is InfiniBand transport over Ethernet).
+    Ib,
+    /// iWARP (RDMA over TCP).
+    Iwarp,
+    /// Cisco usNIC.
+    Usnic,
+    /// Cisco usNIC over UDP.
+    UsnicUdp,
+    /// The transport is unspecified.
+    Unspecified,
+}
+
+impl From<ffi::ibv_transport_type> for TransportType {
+    fn from(transport: ffi::ibv_transport_type) -> Self {
+        match transport {
+            ffi::ibv_transport_type::IBV_TRANSPORT_UNKNOWN => TransportType::Unknown,
+            ffi::ibv_transport_type::IBV_TRANSPORT_IB => TransportType::Ib,
+            ffi::ibv_transport_type::IBV_TRANSPORT_IWARP => TransportType::Iwarp,
+            ffi::ibv_transport_type::IBV_TRANSPORT_USNIC => TransportType::Usnic,
+            ffi::ibv_transport_type::IBV_TRANSPORT_USNIC_UDP => TransportType::UsnicUdp,
+            ffi::ibv_transport_type::IBV_TRANSPORT_UNSPECIFIED => TransportType::Unspecified,
+        }
+    }
+}
+
+impl From<TransportType> for ffi::ibv_transport_type {
+    fn from(transport: TransportType) -> Self {
+        match transport {
+            TransportType::Unknown => ffi::ibv_transport_type::IBV_TRANSPORT_UNKNOWN,
+            TransportType::Ib => ffi::ibv_transport_type::IBV_TRANSPORT_IB,
+            TransportType::Iwarp => ffi::ibv_transport_type::IBV_TRANSPORT_IWARP,
+            TransportType::Usnic => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC,
+            TransportType::UsnicUdp => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC_UDP,
+            TransportType::Unspecified => ffi::ibv_transport_type::IBV_TRANSPORT_UNSPECIFIED,
+        }
+    }
+}
+
+impl fmt::Display for TransportType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            TransportType::Unknown => "unknown",
+            TransportType::Ib => "InfiniBand",
+            TransportType::Iwarp => "iWARP",
+            TransportType::Usnic => "usNIC",
+            TransportType::UsnicUdp => "usNIC UDP",
+            TransportType::Unspecified => "unspecified",
+        };
+        f.write_str(name)
     }
 }
 
@@ -309,5 +367,25 @@ mod test_display {
         let guid = Guid::from(0x0002_c903_00a0_7c8e_u64);
         assert_eq!(guid.to_string(), "0002:c903:00a0:7c8e");
         assert_eq!(format!("{guid:?}"), "Guid(0002:c903:00a0:7c8e)");
+    }
+
+    #[test]
+    fn transport_type_roundtrip() {
+        for (wrapper, raw) in [
+            (TransportType::Ib, ffi::ibv_transport_type::IBV_TRANSPORT_IB),
+            (
+                TransportType::Iwarp,
+                ffi::ibv_transport_type::IBV_TRANSPORT_IWARP,
+            ),
+            (
+                TransportType::Unknown,
+                ffi::ibv_transport_type::IBV_TRANSPORT_UNKNOWN,
+            ),
+        ] {
+            assert_eq!(TransportType::from(raw), wrapper);
+            assert_eq!(ffi::ibv_transport_type::from(wrapper), raw);
+        }
+        assert_eq!(TransportType::Ib.to_string(), "InfiniBand");
+        assert_eq!(TransportType::Iwarp.to_string(), "iWARP");
     }
 }

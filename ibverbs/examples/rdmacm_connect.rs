@@ -11,9 +11,8 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use ibverbs::ibv_qp_type::IBV_QPT_RC;
-use ibverbs::rdmacm::{rdma_port_space, Acceptor, ConnectionParameter, Connector};
-use ibverbs::CompletionQueue;
+use ibverbs::rdmacm::{Acceptor, ConnectionParameter, Connector, PortSpace};
+use ibverbs::{AccessFlags, CompletionQueue, QueuePairType};
 
 const MESSAGE: &[u8] = b"hello over rdmacm";
 
@@ -52,15 +51,19 @@ fn wait_for(cq: &CompletionQueue, wr_id: u64) {
 }
 
 fn server(addr: SocketAddr) {
-    let acceptor = Acceptor::bind(addr, rdma_port_space::RDMA_PS_TCP, 1).unwrap();
+    let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 1).unwrap();
     println!("listening on {addr}");
 
     let incoming = acceptor.accept().unwrap();
     let ctx = incoming.context().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd.create_qp(&cq, &cq, IBV_QPT_RC).unwrap().build().unwrap();
-    let mut recv = pd.allocate(64).unwrap();
+    let qp = pd
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut recv = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
 
     let mut conn = incoming.accept(qp, ConnectionParameter::default()).unwrap();
     unsafe {
@@ -78,15 +81,19 @@ fn server(addr: SocketAddr) {
 }
 
 fn client(addr: SocketAddr) {
-    let resolved = Connector::new(rdma_port_space::RDMA_PS_TCP)
+    let resolved = Connector::new(PortSpace::Tcp)
         .unwrap()
         .resolve(addr, Duration::from_secs(5))
         .unwrap();
     let ctx = resolved.context().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd.create_qp(&cq, &cq, IBV_QPT_RC).unwrap().build().unwrap();
-    let mut send = pd.allocate(64).unwrap();
+    let qp = pd
+        .create_qp(&cq, &cq, QueuePairType::ReliableConnection, 1)
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut send = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
 
     let mut conn = resolved

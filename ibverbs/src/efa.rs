@@ -15,25 +15,28 @@ use std::ptr;
 use crate::completion::CompletionQueue;
 use crate::error::{Error, Result};
 use crate::pd::ProtectionDomain;
-use crate::qp::{PreparedQueuePair, QueuePair, QueuePairBuilder};
+use crate::qp::{PreparedQueuePair, QueuePair, QueuePairBuilder, QueuePairType};
 
 #[cfg(doc)]
 use crate::AddressHandle;
 
 impl ProtectionDomain {
-    /// Begin building an EFA SRD queue pair associated with this protection domain.
+    /// Begin building an EFA SRD queue pair associated with `port_num` (numbered from 1) on this
+    /// protection domain's device.
     ///
     /// Configure it like any other queue pair (GID index, queue/SGE limits), then create it with
     /// [`build_srd`](QueuePairBuilder::build_srd) and bring it to ready with
     /// [`activate_srd`](PreparedQueuePair::activate_srd). Send with
-    /// [`post_send_ud`](QueuePair::post_send_ud) (or `start_send().to(..)`), receive with
+    /// [`post_send_ud`](QueuePair::post_send_ud) (or `start_send()` and
+    /// [`op().to(..)`](crate::SendOp::to)), receive with
     /// [`post_receive`](QueuePair::post_receive).
     pub fn create_srd_qp(
         &self,
         send: &CompletionQueue,
         recv: &CompletionQueue,
+        port_num: u8,
     ) -> Result<QueuePairBuilder> {
-        self.create_qp(send, recv, ffi::ibv_qp_type::IBV_QPT_DRIVER)
+        self.create_qp(send, recv, QueuePairType::Driver, port_num)
     }
 }
 
