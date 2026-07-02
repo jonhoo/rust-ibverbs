@@ -157,7 +157,7 @@ impl<O: DerefMut<Target = [u8]>> MemoryRegion<O> {
     /// Note that the device also writes to the buffer: while a receive (or an incoming RDMA write)
     /// targeting this region is outstanding, reading or writing the targeted bytes races with the
     /// device. Only touch those bytes after the corresponding work completion has been reaped (see
-    /// the safety contract on [`QueuePair::post_receive`]).
+    /// the safety contract on [`QueuePair::post_recv`]).
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         &mut self.owner
     }

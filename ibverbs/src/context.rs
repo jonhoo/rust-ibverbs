@@ -4,14 +4,12 @@ use std::fmt;
 use std::io;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::address::{Gid, GidEntry};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
 use crate::error::{Error, Result};
 use crate::pd::{ProtectionDomain, ProtectionDomainInner};
-use crate::PORT_NUM;
 
 #[cfg(doc)]
 use crate::{Device, QueuePairBuilder, WorkCompletion};
@@ -111,7 +109,7 @@ impl fmt::Debug for Context {
 }
 
 impl Context {
-    /// Opens a context for the given device, and queries its port and gid.
+    /// Opens a context for the given device.
     pub(crate) fn with_device(dev: *mut ffi::ibv_device) -> Result<Context> {
         assert!(!dev.is_null());
 
@@ -124,10 +122,7 @@ impl Context {
             ownership: ContextOwnership::Owned,
         });
 
-        let ctx = Context { inner };
-        // checks that the (default) port is active/armed.
-        ctx.inner.query_port(PORT_NUM)?;
-        Ok(ctx)
+        Ok(Context { inner })
     }
 
     /// Wraps a raw `ibv_context` owned by `owner` (the RDMA connection manager's `rdma_cm_id`).
@@ -172,7 +167,7 @@ impl Context {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_cq(&self, min_cq_entries: i32) -> CompletionQueueBuilder {
+    pub fn create_cq(&self, min_cq_entries: u32) -> CompletionQueueBuilder {
         CompletionQueueBuilder {
             ctx: self.inner.clone(),
             min_cq_entries,
@@ -253,7 +248,8 @@ impl Context {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid `port_num` or `gid_index`.
+    ///  - [`QueryGid`](Error::QueryGid): `ibv_query_gid` failed (`EINVAL` for an invalid
+    ///    `port_num` or `gid_index`).
     pub fn query_gid(&self, port_num: u8, gid_index: u32) -> Result<Gid> {
         let mut gid = ffi::ibv_gid::default();
         let rc =
@@ -288,7 +284,8 @@ impl Context {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid arguments.
+    ///  - [`QueryDevice`](Error::QueryDevice): `ibv_query_device` failed (`EINVAL` for invalid
+    ///    arguments).
     pub fn query_device(&self) -> Result<DeviceAttr> {
         let mut device_attr = ffi::ibv_device_attr::default();
         let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
@@ -310,7 +307,8 @@ impl Context {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid arguments.
+    ///  - [`QueryDevice`](Error::QueryDevice): `ibv_query_device_ex` failed (`EINVAL` for invalid
+    ///    arguments).
     pub fn query_device_ex(&self) -> Result<DeviceAttrEx> {
         // `ibv_device_attr_ex` embeds unions, so it has no `Default`; all-zero is a valid start.
         let mut device_attr: ffi::ibv_device_attr_ex = unsafe { std::mem::zeroed() };
@@ -329,15 +327,15 @@ impl Context {
     /// maximum MTU, its LID, its link layer, and its GID- and pkey-table lengths, with typed
     /// accessors for the state, MTU, speed, width, link layer, and physical state; it dereferences
     /// to the raw [`ffi::ibv_port_attr`] for everything else. Unlike the check performed when a
-    /// context is opened, this returns the attributes regardless of the port state.
+    /// queue pair is created on a port, this returns the attributes regardless of the port state.
     ///
     /// Port attributes are not constant (the subnet manager or the hardware may change them), so
     /// avoid caching the result for long.
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid `port_num`.
-    ///  - `ENOMEM`: Out of memory.
+    ///  - [`QueryPort`](Error::QueryPort): `ibv_query_port` failed (`EINVAL` for an invalid
+    ///    `port_num`, `ENOMEM` when out of memory).
     pub fn query_port(&self, port_num: u8) -> Result<PortAttr> {
         let mut port_attr = ffi::ibv_port_attr::default();
         // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
@@ -363,14 +361,16 @@ impl Context {
 
     /// Read the device's current free-running hardware clock (`ibv_query_rt_values_ex`).
     ///
-    /// The returned [`Duration`] is the device's raw clock value, the same time base that
-    /// [`WorkCompletion::completion_timestamp`] reports its (HCA-clock) timestamps in. Sampling it
-    /// lets you relate completion timestamps to host time.
+    /// The returned [`HcaClock`] is a raw tick count, not a time: it is the same time base that
+    /// [`WorkCompletion::completion_timestamp`] reports its timestamps in, so sampling it lets you
+    /// relate completion timestamps to host time (convert tick deltas via
+    /// [`DeviceAttrEx::hca_core_clock_khz`]).
     ///
     /// # Errors
     ///
-    ///  - `EOPNOTSUPP`: The device does not support querying real-time values.
-    pub fn query_rt_values_ex(&self) -> Result<Duration> {
+    ///  - [`Unsupported`](Error::Unsupported): the device does not support querying real-time
+    ///    values (`EOPNOTSUPP`).
+    pub fn query_rt_values_ex(&self) -> Result<HcaClock> {
         // SAFETY: `ibv_values_ex` is a plain C struct (a mask plus a `timespec`); all-zero is a valid
         // initial value.
         let mut values: ffi::ibv_values_ex = unsafe { std::mem::zeroed() };
@@ -379,10 +379,42 @@ impl Context {
         if errno != 0 {
             return Err(Error::errno(errno, Error::QueryRealTimeValues));
         }
-        Ok(Duration::new(
-            values.raw_clock.tv_sec as u64,
-            values.raw_clock.tv_nsec as u32,
+        // The C ABI reports the raw clock through a `timespec`, but the value is a tick count, not
+        // a time (mlx5, for instance, returns the whole counter through `tv_nsec`); fold the two
+        // fields back into the single 64-bit counter.
+        Ok(HcaClock(
+            (values.raw_clock.tv_sec as u64)
+                .wrapping_mul(1_000_000_000)
+                .wrapping_add(values.raw_clock.tv_nsec as u64),
         ))
+    }
+}
+
+/// A reading of the device's free-running hardware clock (the "HCA core clock"), in raw ticks.
+///
+/// Returned by [`Context::query_rt_values_ex`] and
+/// [`WorkCompletion::completion_timestamp`], so clock samples and completion timestamps can be
+/// compared directly. A tick is *not* a unit of time: convert a tick delta (the [`Sub`] impl, or
+/// [`ticks`](Self::ticks)) to time using the device's clock frequency,
+/// [`DeviceAttrEx::hca_core_clock_khz`].
+///
+/// [`Sub`]: std::ops::Sub
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HcaClock(pub(crate) u64);
+
+impl HcaClock {
+    /// The raw tick count.
+    pub fn ticks(&self) -> u64 {
+        self.0
+    }
+}
+
+impl std::ops::Sub for HcaClock {
+    type Output = u64;
+
+    /// The number of ticks from `rhs` to `self`.
+    fn sub(self, rhs: HcaClock) -> u64 {
+        self.0 - rhs.0
     }
 }
 

@@ -6,7 +6,7 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::context::ContextInner;
+use crate::context::{ContextInner, HcaClock};
 use crate::error::{Error, Result};
 
 #[cfg(doc)]
@@ -99,7 +99,7 @@ impl CompletionChannel {
     /// [`req_notify`](CompletionQueue::req_notify). Give each queue a distinct
     /// [`set_context`](CompletionQueueBuilder::set_context) value so they can be told apart.
     /// Acknowledgement is handled for you.
-    pub fn get_event(&self) -> Result<Option<isize>> {
+    pub fn get_event(&self) -> Result<Option<u64>> {
         let mut out_cq = ptr::null_mut();
         let mut out_cq_context = ptr::null_mut();
         let rc = unsafe { ffi::ibv_get_cq_event(self.inner.cc, &mut out_cq, &mut out_cq_context) };
@@ -112,7 +112,7 @@ impl CompletionChannel {
         }
         // Every event from ibv_get_cq_event() must eventually be acknowledged.
         unsafe { ffi::ibv_ack_cq_events(out_cq, 1) };
-        Ok(Some(out_cq_context as isize))
+        Ok(Some(out_cq_context as usize as u64))
     }
 
     /// Block until a notification is available on the channel (up to `timeout`), then consume it,
@@ -126,7 +126,7 @@ impl CompletionChannel {
     /// blocking here — polling after arming closes the race where a completion lands between an
     /// earlier poll and arming — then call this to learn which queue fired, and poll and re-arm
     /// that queue.
-    pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<isize>> {
+    pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
             let remaining =
@@ -193,8 +193,8 @@ impl AsFd for CompletionChannel {
 #[must_use]
 pub struct CompletionQueueBuilder {
     pub(crate) ctx: Arc<ContextInner>,
-    pub(crate) min_cq_entries: i32,
-    pub(crate) cq_context: isize,
+    pub(crate) min_cq_entries: u32,
+    pub(crate) cq_context: u64,
     pub(crate) comp_vector: u32,
     /// extra work-completion fields requested on top of the always-present standard set
     pub(crate) wc_flags: u32,
@@ -206,7 +206,7 @@ impl CompletionQueueBuilder {
     /// Set an opaque context value associated with the completion queue.
     ///
     /// Defaults to 0.
-    pub fn set_context(&mut self, id: isize) -> &mut Self {
+    pub fn set_context(&mut self, id: u64) -> &mut Self {
         self.cq_context = id;
         self
     }
@@ -255,9 +255,11 @@ impl CompletionQueueBuilder {
     ///
     /// # Errors
     ///
-    ///  - `EOPNOTSUPP`: The device does not support a requested work-completion field.
-    ///  - `EINVAL`: Invalid `min_cq_entries` (must be `1 <= cqe <= dev_cap.max_cqe`) or comp vector.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
+    ///    work-completion field (`EOPNOTSUPP`).
+    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `ibv_create_cq_ex` failed
+    ///    (`EINVAL` for an invalid `min_cq_entries` — must be `1 <= cqe <= dev_cap.max_cqe` — or
+    ///    comp vector, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<CompletionQueue> {
         // The queue holds a reference to its channel (if any), so the channel cannot be destroyed
         // out from under it.
@@ -271,8 +273,9 @@ impl CompletionQueueBuilder {
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0
             | self.wc_flags;
         let mut cq_attr = ffi::ibv_cq_init_attr_ex {
-            cqe: self.min_cq_entries as u32,
-            cq_context: unsafe { ptr::null::<c_void>().offset(self.cq_context) } as *mut _,
+            cqe: self.min_cq_entries,
+            // The cookie is a plain integer to the caller; the C ABI carries it as a pointer.
+            cq_context: self.cq_context as usize as *mut c_void,
             channel: cc
                 .as_ref()
                 .map_or(ptr::null_mut(), |channel| channel.as_raw()),
@@ -391,8 +394,8 @@ flags_newtype! {
     }
 }
 
-/// The completion status of a work request, reported by [`WorkCompletion::ok`] /
-/// [`WorkCompletion::error`].
+/// The completion status of a work request, reported by [`WorkCompletion::ok`] (as the
+/// [`WcError::status`] of a failed completion).
 ///
 /// Anything other than [`Success`](Self::Success) means the work request failed (and, on a
 /// connected queue pair, that the queue pair has moved to the error state); once one work request
@@ -548,6 +551,28 @@ impl fmt::Display for WcStatus {
     }
 }
 
+/// The failure of a work request, reported by [`WorkCompletion::ok`]: the completion status and
+/// the provider-specific vendor error syndrome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WcError {
+    /// The completion status (anything other than [`WcStatus::Success`]).
+    pub status: WcStatus,
+    /// The provider-specific vendor error syndrome, for support tickets and provider debugging.
+    pub vendor_err: u32,
+}
+
+impl fmt::Display for WcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "work request failed: {} (vendor error {})",
+            self.status, self.vendor_err
+        )
+    }
+}
+
+impl std::error::Error for WcError {}
+
 /// The kind of operation a work completion reports on. Returned by [`WorkCompletion::opcode`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -669,29 +694,16 @@ impl WorkCompletion<'_> {
         unsafe { (*self.cq).wr_id }
     }
 
-    /// Whether this work request completed successfully (`IBV_WC_SUCCESS`).
+    /// `Ok(())` if the work request completed successfully (`IBV_WC_SUCCESS`), otherwise the
+    /// [`WcError`] carrying the status and vendor error syndrome.
     #[inline]
-    pub fn is_success(&self) -> bool {
-        unsafe { (*self.cq).status == ffi::ibv_wc_status::IBV_WC_SUCCESS }
-    }
-
-    /// `Ok(())` if the work request completed successfully, otherwise the status and vendor error.
-    #[inline]
-    pub fn ok(&self) -> std::result::Result<(), (WcStatus, u32)> {
-        match self.error() {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
-    }
-
-    /// The completion status and vendor error syndrome if the work request did not succeed.
-    #[inline]
-    pub fn error(&self) -> Option<(WcStatus, u32)> {
+    pub fn ok(&self) -> std::result::Result<(), WcError> {
         match unsafe { (*self.cq).status } {
-            ffi::ibv_wc_status::IBV_WC_SUCCESS => None,
-            status => Some((status.into(), unsafe {
-                (*self.cq).read_vendor_err.unwrap()(self.cq)
-            })),
+            ffi::ibv_wc_status::IBV_WC_SUCCESS => Ok(()),
+            status => Err(WcError {
+                status: status.into(),
+                vendor_err: unsafe { (*self.cq).read_vendor_err.unwrap()(self.cq) },
+            }),
         }
     }
 
@@ -714,7 +726,7 @@ impl WorkCompletion<'_> {
     /// The 32-bit immediate value (host byte order) if one was carried ([`WcFlags::WITH_IMM`]).
     #[inline]
     pub fn imm_data(&self) -> Option<u32> {
-        if self.is_success() && self.wc_flags().contains(WcFlags::WITH_IMM) {
+        if self.ok().is_ok() && self.wc_flags().contains(WcFlags::WITH_IMM) {
             Some(u32::from_be(unsafe {
                 (*self.cq).read_imm_data.unwrap()(self.cq)
             }))
@@ -735,19 +747,20 @@ impl WorkCompletion<'_> {
         unsafe { (*self.cq).read_src_qp.unwrap()(self.cq) }
     }
 
-    /// The hardware timestamp captured when this work request completed, in the device's free-running
-    /// clock units (the same time base as [`Context::query_rt_values_ex`]).
+    /// The hardware timestamp captured when this work request completed, as a reading of the
+    /// device's free-running clock (the same time base as [`Context::query_rt_values_ex`]; see
+    /// [`HcaClock`] for converting tick deltas to time).
     ///
     /// Only valid on a completion queue that requested [`WcFields::COMPLETION_TIMESTAMP`] (see
     /// [`CompletionQueueBuilder::set_wc_flags`]). Calling this on a completion from any other
     /// completion queue panics, because the provider did not install the timestamp reader.
     #[inline]
-    pub fn completion_timestamp(&self) -> u64 {
-        unsafe {
+    pub fn completion_timestamp(&self) -> HcaClock {
+        HcaClock(unsafe {
             (*self.cq)
                 .read_completion_ts
                 .expect("completion queue was not created with timestamps")(self.cq)
-        }
+        })
     }
 
     /// The wallclock hardware timestamp (in nanoseconds) captured when this work request completed.
@@ -894,8 +907,8 @@ impl CompletionQueue {
     /// # fn drain(cq: &CompletionQueue) -> ibverbs::Result<()> {
     /// if let Some(mut completions) = cq.poll()? {
     ///     while let Some(wc) = completions.next() {
-    ///         if let Err((status, _)) = wc.ok() {
-    ///             eprintln!("work request {} failed: {status:?}", wc.wr_id());
+    ///         if let Err(e) = wc.ok() {
+    ///             eprintln!("work request {}: {e}", wc.wr_id());
     ///         }
     ///     }
     /// }

@@ -344,30 +344,14 @@ impl QueuePairBuilder {
 
     /// Set the access flags for the new `QueuePair`.
     ///
-    /// Valid only for RC and UC QPs.
-    ///
     /// Defaults to [`AccessFlags::LOCAL_WRITE`].
+    ///
+    /// Ignored (silently) unless this is an RC or UC queue pair.
     pub fn set_access(&mut self, access: AccessFlags) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
         {
             self.access = Some(access.into());
-        }
-        self
-    }
-
-    /// Set the access flags of the new `QueuePair` such that it allows remote reads and writes.
-    ///
-    /// Valid only for RC and UC QPs.
-    pub fn allow_remote_rw(&mut self) -> &mut Self {
-        if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-            || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
-        {
-            self.access = Some(
-                self.access.expect("always set to Some in new")
-                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_WRITE
-                    | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ,
-            );
         }
         self
     }
@@ -404,7 +388,6 @@ impl QueuePairBuilder {
     /// Sets the minimum RNR NAK Timer Field Value for the new `QueuePair`.
     ///
     /// Defaults to 16 (2.56 ms delay).
-    /// Valid only for RC QPs.
     ///
     /// When an incoming message to this QP should consume a Work Request from the Receive Queue,
     /// but no Work Request is outstanding on that Queue, the QP will send an RNR NAK packet to
@@ -443,6 +426,8 @@ impl QueuePairBuilder {
     ///  - 29 - 245.76 ms delay
     ///  - 30 - 327.68 ms delay
     ///  - 31 - 491.52 ms delay
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     pub fn set_min_rnr_timer(&mut self, timer: u8) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
             self.min_rnr_timer = Some(timer);
@@ -454,7 +439,6 @@ impl QueuePairBuilder {
     /// retransmitting the packet.
     ///
     /// Defaults to 4 (65.536µs).
-    /// Valid only for RC QPs.
     ///
     /// The value zero is special value that waits an infinite time for the ACK/NACK (useful
     /// for debugging). This means that if any packet in a message is being lost and no ACK or NACK
@@ -494,6 +478,8 @@ impl QueuePairBuilder {
     ///  - 29 - 2200 s
     ///  - 30 - 4400 s
     ///  - 31 - 8800 s
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
             self.timeout = Some(timeout);
@@ -505,7 +491,8 @@ impl QueuePairBuilder {
     /// before reporting an error because the remote side doesn't answer in the primary path.
     ///
     /// This 3 bit value defaults to 6.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     ///
     /// # Panics
     ///
@@ -523,7 +510,8 @@ impl QueuePairBuilder {
     ///
     /// This 3 bit value defaults to 6. The value 7 is special and specify to retry sending the
     /// message indefinitely when a RNR Nack is being sent by remote side.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     ///
     /// # Panics
     ///
@@ -545,7 +533,8 @@ impl QueuePairBuilder {
     /// Set the number of outstanding RDMA reads & atomic operations on the destination Queue Pair.
     ///
     /// This defaults to 1.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
             self.max_rd_atomic = Some(max_rd_atomic);
@@ -556,7 +545,8 @@ impl QueuePairBuilder {
     /// Set the number of responder resources for handling incoming RDMA reads & atomic operations.
     ///
     /// This defaults to 1.
-    /// Valid only for RC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC queue pair.
     pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
             self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
@@ -567,7 +557,8 @@ impl QueuePairBuilder {
     /// Set the path MTU.
     ///
     /// Defaults to the port's active MTU.
-    /// Valid only for RC and UC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC or UC queue pair.
     pub fn set_path_mtu(&mut self, path_mtu: Mtu) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
@@ -580,7 +571,8 @@ impl QueuePairBuilder {
     /// Set the PSN for the receive queue.
     ///
     /// Defaults to 0.
-    /// Valid only for RC and UC QPs.
+    ///
+    /// Ignored (silently) unless this is an RC or UC queue pair.
     pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
         if self.qp_type == ffi::ibv_qp_type::IBV_QPT_RC
             || self.qp_type == ffi::ibv_qp_type::IBV_QPT_UC
@@ -665,11 +657,11 @@ impl QueuePairBuilder {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid `ProtectionDomain` or `CompletionQueue`, or invalid value provided in
-    ///    `max_send_wr`, `max_recv_wr`, or in `max_inline_data`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
-    ///  - `ENOSYS`: QP with this Transport Service Type isn't supported by this RDMA device.
-    ///  - `EPERM`: Not enough permissions to create a QP with this Transport Service Type.
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `ibv_create_qp_ex` failed (`EINVAL` for an
+    ///    invalid `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
+    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
+    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
+    ///    to create a QP with this Transport Service Type).
     pub fn build(&self) -> Result<PreparedQueuePair> {
         use ffi::ibv_qp_create_send_ops_flags as SendOps;
         use ffi::ibv_qp_type::{IBV_QPT_RC, IBV_QPT_UC};
@@ -1033,12 +1025,12 @@ impl PreparedQueuePair {
     /// has its most significant bit set, meaning "use the QP's Q_Key").
     ///
     /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
-    /// [`QueuePair::post_send_ud`].
+    /// [`SendOp::to`].
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid value provided in `attr` or `attr_mask`.
-    ///  - `ENOMEM`: Not enough resources to complete this operation.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
+    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources).
     pub fn activate_ud(self, qkey: u32) -> Result<QueuePair> {
         // INIT: associate with the port and set the Q_Key. UD has no access flags.
         let mut attr = ffi::ibv_qp_attr {
@@ -1086,11 +1078,12 @@ impl PreparedQueuePair {
 
 /// A receive work request, binding the lifetime of its scatter/gather buffers.
 ///
-/// Build one with [`RecvRequest::new`] and post a batch of them with [`QueuePair::post_recv`]. Unlike
-/// the send doorbell, receives are posted from a caller-owned slice, so batching allocates nothing.
+/// Build one with [`RecvRequest::new`] and post a batch of them with [`QueuePair::post_recv`] or
+/// [`SharedReceiveQueue::post_recv`]. Unlike the send doorbell, receives are posted from a
+/// caller-owned slice, so batching allocates nothing.
 #[repr(transparent)]
 pub struct RecvRequest<'a> {
-    wr: ffi::ibv_recv_wr,
+    pub(crate) wr: ffi::ibv_recv_wr,
     _local: std::marker::PhantomData<&'a [LocalMemorySlice]>,
 }
 
@@ -1175,8 +1168,9 @@ impl<'qp> SendBatch<'qp> {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: invalid value in one of the work requests.
-    ///  - `ENOMEM`: the send queue is full or out of resources.
+    ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
+    ///    value in one of the work requests, `ENOMEM` when the send queue is full or out of
+    ///    resources).
     pub unsafe fn submit(self) -> Result<()> {
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
@@ -2040,88 +2034,6 @@ impl QueuePair {
         }
     }
 
-    /// Posts a single send Work Request (WR) containing a scatter-gather list of local
-    /// memory slices to the Send Queue of this Queue Pair.
-    ///
-    /// `wr_id` is a 64 bits value associated with this WR. If a Work Completion will be generated
-    /// when this Work Request ends, it will contain this value.
-    ///
-    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send). The local memory
-    /// slices will be sent as a single `ibv_send_wr` using `IBV_WR_SEND`. The send has
-    /// `IBV_SEND_SIGNALED` set, so a work completion will also be triggered as a result of this send.
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
-    #[inline]
-    pub unsafe fn post_send(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
-        let mut batch = self.start_send();
-        batch.op().signaled().send(wr_id, local);
-        unsafe { batch.submit() }
-    }
-
-    /// Posts a single unreliable-datagram (UD) send, addressed by `ah` / `remote_qpn` /
-    /// `remote_qkey`. The request is signaled, so it generates a work completion.
-    ///
-    /// Only valid on a UD queue pair (see [`PreparedQueuePair::activate_ud`]). A single UD queue
-    /// pair can address many destinations by passing a different [`AddressHandle`] per call.
-    ///
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send). The address handle and the local buffers must remain valid until a
-    /// work completion for this request has been retrieved.
-    #[inline]
-    pub unsafe fn post_send_ud(
-        &mut self,
-        local: &[LocalMemorySlice],
-        ah: &AddressHandle,
-        remote_qpn: u32,
-        remote_qkey: u32,
-        wr_id: u64,
-    ) -> Result<()> {
-        let mut batch = self.start_send();
-        batch
-            .op()
-            .signaled()
-            .to(ah, remote_qpn, remote_qkey)
-            .send(wr_id, local);
-        unsafe { batch.submit() }
-    }
-
-    /// Posts a single receive Work Request (WR) containing a scatter-gather list of local
-    /// memory slices to the Receive Queue of this Queue Pair.
-    ///
-    /// Generates a HW-specific Receive Request out of it and add it to the tail of the Queue
-    /// Pair's Receive Queue without performing any context switch. The RDMA device will take one
-    /// of those Work Requests as soon as an incoming opcode to that QP will consume a Receive
-    /// Request (RR). If there is a failure in one of the WRs because the Receive Queue is full or
-    /// one of the attributes in the WR is bad, it stops immediately and return the pointer to that
-    /// WR.
-    ///
-    /// `wr_id` is a 64 bits value associated with this WR. When a Work Completion is generated
-    /// when this Work Request ends, it will contain this value.
-    ///
-    /// Internally, the local memory slices will be received into as a single `ibv_recv_wr`.
-    ///
-    /// See also [RDMAmojo's `ibv_post_recv` documentation][1].
-    ///
-    /// # Safety
-    ///
-    /// The memory region can only be safely reused or dropped after the request is fully executed
-    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
-    /// until `CompletionQueue::poll` returns a completion for this receive).
-    ///
-    /// # Errors
-    ///
-    ///  - `EINVAL`: Invalid value provided in the Work Request.
-    ///  - `ENOMEM`: Receive Queue is full or not enough resources to complete this operation.
-    ///  - `EFAULT`: Invalid value provided in `QueuePair`.
-    ///
-    /// [1]: http://www.rdmamojo.com/2013/02/02/ibv_post_recv/
-    #[inline]
-    pub unsafe fn post_receive(&mut self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
-        unsafe { self.post_recv([RecvRequest::new(wr_id, local)]) }
-    }
-
     /// Posts a batch of receive Work Requests to this Queue Pair's receive queue with a single
     /// `ibv_post_recv`.
     ///
@@ -2141,8 +2053,9 @@ impl QueuePair {
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: invalid value in one of the work requests.
-    ///  - `ENOMEM`: the receive queue is full or out of resources.
+    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
+    ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
+    ///    resources).
     pub unsafe fn post_recv<'a>(&mut self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
@@ -2170,53 +2083,6 @@ impl QueuePair {
         } else {
             Ok(())
         }
-    }
-
-    #[inline]
-    /// Remote RDMA write.
-    ///
-    /// Immediate data can be used to signal the completion of the write operation.
-    /// The other side uses `post_recv` on a dummy buffer and gets the imm data from the work completion.
-    ///
-    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send).
-    ///
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
-    pub unsafe fn post_write(
-        &mut self,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-        imm_data: Option<u32>,
-    ) -> Result<()> {
-        let mut batch = self.start_send();
-        match imm_data {
-            Some(imm) => batch.op().signaled().write_imm(wr_id, local, remote, imm),
-            None => batch.op().signaled().write(wr_id, local, remote),
-        };
-        unsafe { batch.submit() }
-    }
-
-    #[inline]
-    /// Remote RDMA read.
-    ///
-    /// RDMA read does not support immediate data.
-    ///
-    /// Internally, this is a convenience wrapper around [`start_send`](Self::start_send).
-    ///
-    /// # Safety
-    ///
-    /// See [`start_send`](Self::start_send) for more details on the asynchronous execution, safety, and errors.
-    pub unsafe fn post_read(
-        &mut self,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        wr_id: u64,
-    ) -> Result<()> {
-        let mut batch = self.start_send();
-        batch.op().signaled().read(wr_id, local, remote);
-        unsafe { batch.submit() }
     }
 
     /// Begin a batch of send work requests on this queue pair's send queue.

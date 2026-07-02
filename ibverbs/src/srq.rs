@@ -3,8 +3,8 @@ use std::ptr;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::mr::LocalMemorySlice;
 use crate::pd::ProtectionDomainInner;
+use crate::qp::RecvRequest;
 
 pub(crate) struct SharedReceiveQueueInner {
     pub(crate) _pd: Arc<ProtectionDomainInner>,
@@ -40,22 +40,17 @@ impl SharedReceiveQueue {
         self.inner.srq
     }
 
-    /// Posts a linked list of Work Requests (WRs) to this Shared Receive Queue (SRQ).
+    /// Posts a batch of receive Work Requests to this Shared Receive Queue (SRQ) with a single
+    /// `ibv_post_srq_recv`.
     ///
-    /// Generates a HW-specific Receive Request out of it and adds it to the tail of the SRQ
-    /// without performing any context switch. The RDMA device will take one of those Work Requests
-    /// as soon as an incoming opcode to any Queue Pair (QP) associated with this SRQ consumes a
-    /// Receive Request (RR). If there is a failure in one of the WRs because the SRQ is full or
-    /// one of the attributes in the WR is bad, it stops immediately and returns the pointer to that
-    /// WR.
+    /// Receives have no doorbell form, so the requests are posted as a linked list. `recvs` is the
+    /// caller's storage — a stack array or a reusable `Vec` — linked in place rather than copied, so
+    /// posting allocates nothing. The RDMA device will take one of the posted work requests as soon
+    /// as an incoming message to any Queue Pair (QP) associated with this SRQ consumes a Receive
+    /// Request (RR).
     ///
-    /// `wr_id` is a 64-bit value associated with this WR. When a Work Completion is generated
-    /// when this Work Request ends, it will contain this value.
-    ///
-    /// Internally, the memory at `local[range]` will be received into as a single `ibv_recv_wr`.
-    ///
-    /// If a WR is being posted to a UD QP associated with an SRQ, the Global Routing Header (GRH)
-    /// of the incoming message will be placed in the first 40 bytes of the buffer(s) in the
+    /// If a work request is consumed by a UD QP associated with this SRQ, the Global Routing Header
+    /// (GRH) of the incoming message will be placed in the first 40 bytes of the buffer(s) in the
     /// scatter list. If no GRH is present in the incoming message, then the first bytes will be
     /// undefined. This means that in all cases, the actual data of the incoming message will start
     /// at an offset of 40 bytes into the buffer(s) in the scatter list.
@@ -64,34 +59,37 @@ impl SharedReceiveQueue {
     ///
     /// # Safety
     ///
-    /// The memory region can only be safely reused or dropped after the request is fully executed
-    /// and a work completion has been retrieved from the corresponding completion queue (i.e.,
-    /// until `CompletionQueue::poll` returns a completion for this receive).
+    /// Each referenced memory region must stay valid until a work completion has been polled for
+    /// the corresponding `wr_id` (i.e., until `CompletionQueue::poll` returns a completion for
+    /// that receive).
     ///
     /// # Errors
     ///
-    ///  - `EINVAL`: Invalid value provided in the Work Request.
-    ///  - `ENOMEM`: Receive Queue is full or not enough resources to complete this operation.
-    ///  - `EFAULT`: Invalid value provided in `SharedReceiveQueue`.
+    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_srq_recv` failed (`EINVAL` for an invalid
+    ///    value in one of the work requests, `ENOMEM` when the SRQ is full or out of resources,
+    ///    `EFAULT` for an invalid `SharedReceiveQueue`).
     ///
     /// [1]: https://www.rdmamojo.com/2013/02/08/ibv_post_srq_recv/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_post_srq_recv.3.html
-    #[inline]
-    pub unsafe fn post_receive(&self, local: &[LocalMemorySlice], wr_id: u64) -> Result<()> {
-        let mut wr = ffi::ibv_recv_wr {
-            wr_id,
-            next: ptr::null_mut(),
-            sg_list: local.as_ptr() as *mut ffi::ibv_sge,
-            num_sge: local.len() as i32,
-        };
-        let mut bad_wr = ptr::null_mut();
+    pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
+        let recvs = recvs.as_mut();
+        if recvs.is_empty() {
+            return Ok(());
+        }
+        // Link the requests into the list `ibv_post_srq_recv` expects.
+        for i in 0..recvs.len() - 1 {
+            let next = &mut recvs[i + 1].wr as *mut ffi::ibv_recv_wr;
+            recvs[i].wr.next = next;
+        }
+        recvs.last_mut().unwrap().wr.next = ptr::null_mut();
 
+        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
         let ctx = unsafe { *self.inner.srq }.context;
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
             ops.post_srq_recv.as_mut().unwrap()(
                 self.inner.srq,
-                &mut wr as *mut _,
+                &mut recvs[0].wr as *mut _,
                 &mut bad_wr as *mut _,
             )
         };

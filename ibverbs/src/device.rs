@@ -12,9 +12,8 @@ use crate::error::{Error, Result};
 ///
 /// # Errors
 ///
-///  - `EPERM`: Permission denied.
-///  - `ENOMEM`: Insufficient memory to complete the operation.
-///  - `ENOSYS`: No kernel support for RDMA.
+///  - [`GetDeviceList`](Error::GetDeviceList): `ibv_get_device_list` failed (`EPERM` if
+///    permission is denied, `ENOMEM` if out of memory, `ENOSYS` without kernel support for RDMA).
 pub fn devices() -> Result<DeviceList> {
     let mut n = 0i32;
     let devices = unsafe { ffi::ibv_get_device_list(&mut n as *mut _) };
@@ -190,9 +189,6 @@ impl<'devlist> Device<'devlist> {
     /// # Errors
     ///
     ///  - [`OpenDevice`](Error::OpenDevice): `ibv_open_device` failed.
-    ///  - [`QueryPort`](Error::QueryPort): querying port 1 failed (`ibv_query_port`).
-    ///  - [`PortNotActive`](Error::PortNotActive): port 1 is not in the `ACTIVE` or `ARMED`
-    ///    state. Note that this check always targets the device's first port.
     pub fn open(&self) -> Result<Context> {
         Context::with_device(*self.0)
     }
@@ -240,7 +236,8 @@ impl<'devlist> Device<'devlist> {
     ///
     /// # Errors
     ///
-    ///  - `EMFILE`: Too many files are opened by this process.
+    ///  - [`DeviceGuid`](Error::DeviceGuid): `ibv_get_device_guid` failed (`EMFILE` if too many
+    ///    files are opened by this process).
     pub fn guid(&self) -> Result<Guid> {
         let guid_int = unsafe { ffi::ibv_get_device_guid(*self.0) };
         let guid: Guid = guid_int.into();
@@ -257,12 +254,12 @@ impl<'devlist> Device<'devlist> {
     ///
     ///  - [`DeviceIndexUnavailable`](Error::DeviceIndexUnavailable): the kernel does not expose a
     ///    stable index for this device.
-    pub fn index(&self) -> Result<i32> {
+    pub fn index(&self) -> Result<u32> {
         let idx = unsafe { ffi::ibv_get_device_index(*self.0) };
         if idx == -1 {
             Err(Error::DeviceIndexUnavailable)
         } else {
-            Ok(idx)
+            Ok(idx as u32)
         }
     }
 

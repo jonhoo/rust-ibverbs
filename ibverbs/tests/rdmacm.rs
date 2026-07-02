@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use ibverbs::rdmacm::{Acceptor, CmEventType, CmId, ConnectionParameter, Connector, PortSpace};
-use ibverbs::{AccessFlags, CompletionQueue, Context, QueuePairState, QueuePairType};
+use ibverbs::{AccessFlags, CompletionQueue, Context, QueuePairState, QueuePairType, RecvRequest};
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
 fn open_test_device() -> Context {
@@ -49,9 +49,8 @@ fn wait_for(cq: &CompletionQueue, wr_id: u64) {
     loop {
         if let Some(mut completions) = cq.poll().expect("failed to poll CQ") {
             while let Some(wc) = completions.next() {
-                wc.ok().unwrap_or_else(|(status, _)| {
-                    panic!("work request {wr_id} failed: {status:?}")
-                });
+                wc.ok()
+                    .unwrap_or_else(|e| panic!("work request {wr_id} failed: {e}"));
                 if wc.wr_id() == wr_id {
                     return;
                 }
@@ -97,9 +96,9 @@ fn connect_and_send() {
         // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
         unsafe {
             conn.queue_pair()
-                .post_receive(&[recv.slice(..MESSAGE.len())], 1)
+                .post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
         }
-        .expect("post_receive");
+        .expect("post_recv");
 
         wait_for(&cq, 1);
         assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
@@ -128,11 +127,12 @@ fn connect_and_send() {
     let mut conn = resolved
         .connect(qp, ConnectionParameter::default())
         .expect("connect");
-    unsafe {
-        conn.queue_pair()
-            .post_send(&[send.slice(..MESSAGE.len())], 2)
-    }
-    .expect("post_send");
+    let mut batch = conn.queue_pair().start_send();
+    batch
+        .op()
+        .signaled()
+        .send(2, &[send.slice(..MESSAGE.len())]);
+    unsafe { batch.submit() }.expect("send");
     wait_for(&cq, 2);
 
     done_rx
@@ -180,9 +180,9 @@ fn two_connections() {
                 .expect("accept");
             unsafe {
                 conn.queue_pair()
-                    .post_receive(&[recv.slice(..MESSAGE.len())], 1)
+                    .post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
             }
-            .expect("post_receive");
+            .expect("post_recv");
             wait_for(&cq, 1);
             received.push(recv.bytes_mut()[..MESSAGE.len()].to_vec());
             // Keep the connection (and its cq/pd) alive until all transfers are done.
@@ -217,11 +217,12 @@ fn two_connections() {
                 let mut conn = resolved
                     .connect(qp, ConnectionParameter::default())
                     .expect("connect");
-                unsafe {
-                    conn.queue_pair()
-                        .post_send(&[send.slice(..MESSAGE.len())], 2)
-                }
-                .expect("post_send");
+                let mut batch = conn.queue_pair().start_send();
+                batch
+                    .op()
+                    .signaled()
+                    .send(2, &[send.slice(..MESSAGE.len())]);
+                unsafe { batch.submit() }.expect("send");
                 wait_for(&cq, 2);
                 barrier.wait();
             })
@@ -310,7 +311,8 @@ fn low_level_connect_and_send() {
         let mut recv = pd
             .allocate(64, AccessFlags::PERMISSIVE)
             .expect("server recv mr");
-        unsafe { qp.post_receive(&[recv.slice(..MESSAGE.len())], 1) }.expect("post_receive");
+        unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) }
+            .expect("post_recv");
 
         let mut param = ConnectionParameter::default();
         param.set_qp_num(qp.qp_num());
@@ -371,7 +373,12 @@ fn low_level_connect_and_send() {
         .allocate(64, AccessFlags::PERMISSIVE)
         .expect("client send mr");
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
-    unsafe { qp.post_send(&[send.slice(..MESSAGE.len())], 2) }.expect("post_send");
+    let mut batch = qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .send(2, &[send.slice(..MESSAGE.len())]);
+    unsafe { batch.submit() }.expect("send");
     wait_for(&cq, 2);
 
     done_rx

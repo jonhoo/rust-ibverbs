@@ -6,13 +6,13 @@
 //! This runs against the first RDMA device; on a machine without one, create a SoftRoCE device
 //! with `rdma link add rxe0 type rxe netdev <netdev>`.
 
-use ibverbs::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
+use ibverbs::{AccessFlags, LocalMemorySlice, RecvRequest, RemoteMemorySlice};
 
 const RECEIVE_NOTIFICATION_WR_ID: u64 = 100;
 const NOTIFY_BUF_SIZE: usize = std::mem::size_of::<u32>();
 
 // Queue capacities (sized to 16, which is larger than the 6 send work requests and 2 completion queue entries needed)
-const CQ_CAPACITY: usize = 16;
+const CQ_CAPACITY: u32 = 16;
 const MAX_SEND_WR: u32 = 16;
 
 fn main() {
@@ -26,7 +26,7 @@ fn main() {
         .unwrap();
 
     // 2. Create Completion Queue (CQ) and Protection Domain (PD)
-    let cq = ctx.create_cq(CQ_CAPACITY as i32).build().unwrap();
+    let cq = ctx.create_cq(CQ_CAPACITY).build().unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
     // 3. Create Queue Pair (QP) and connect it to itself in loopback mode. See the loopback
@@ -44,7 +44,7 @@ fn main() {
         .unwrap()
         .set_gid_index(gid_index)
         .set_max_send_wr(MAX_SEND_WR)
-        .allow_remote_rw()
+        .set_access(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ)
         .build()
         .unwrap();
 
@@ -68,7 +68,13 @@ fn main() {
         .unwrap();
 
     // 5. Post receive request for the final send notification (4-byte payload)
-    unsafe { qp.post_receive(&[recv_mr.slice(..)], RECEIVE_NOTIFICATION_WR_ID) }.unwrap();
+    unsafe {
+        qp.post_recv([RecvRequest::new(
+            RECEIVE_NOTIFICATION_WR_ID,
+            &[recv_mr.slice(..)],
+        )])
+    }
+    .unwrap();
 
     // 6. Split the string into slices by space delimiter and prepare the notification payload
     let (locals, remotes): (Vec<[LocalMemorySlice; 1]>, Vec<RemoteMemorySlice>) = text
@@ -115,13 +121,12 @@ fn main() {
             println!(
                 "Polled WC: wr_id={}, status={:?}, opcode={:?}",
                 wc.wr_id(),
-                wc.error(),
+                wc.ok(),
                 wc.opcode()
             );
-            if !wc.is_success() {
+            if let Err(e) = wc.ok() {
                 panic!(
-                    "Work completion failed: {:?}, wr_id: {}, opcode: {:?}",
-                    wc.error(),
+                    "Work completion failed: {e}, wr_id: {}, opcode: {:?}",
                     wc.wr_id(),
                     wc.opcode()
                 );
