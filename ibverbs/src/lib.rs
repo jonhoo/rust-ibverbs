@@ -101,7 +101,7 @@
 //! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
 //! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`, and
 //! `rxe` (SoftRoCE) implement both. A provider that lacks them fails cleanly at completion-queue
-//! or queue-pair creation (typically with [`Error::Unsupported`]) rather than degrading to the
+//! or queue-pair creation (with [`Error::Unsupported`]) rather than degrading to the
 //! legacy verbs.
 //!
 //! # Thread safety

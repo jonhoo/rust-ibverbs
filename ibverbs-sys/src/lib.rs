@@ -394,9 +394,21 @@ pub unsafe fn ___ibv_query_port(
     }
 }
 
+/// Set `errno`, so the shims below can report failures the way the C inlines do (they set
+/// `errno = EOPNOTSUPP` before returning null).
+///
+/// rdma-core targets only Linux, where both glibc and musl expose `__errno_location`.
+unsafe fn set_errno(err: ::std::os::raw::c_int) {
+    extern "C" {
+        fn __errno_location() -> *mut ::std::os::raw::c_int;
+    }
+    *__errno_location() = err;
+}
+
 /// Create an extended completion queue (`ibv_create_cq_ex`).
 ///
-/// Returns null if the provider does not implement the extended verb (matching the C inline).
+/// Returns null with `errno` set to `EOPNOTSUPP` if the provider does not implement the extended
+/// verb (matching the C inline).
 ///
 /// # Safety
 ///
@@ -411,13 +423,18 @@ pub unsafe fn ibv_create_cq_ex(
         - ::std::mem::offset_of!(verbs_context, create_cq_ex);
     match (*vctx).create_cq_ex {
         Some(create_cq_ex) if (*vctx).sz >= need => create_cq_ex(context, cq_attr),
-        _ => ::std::ptr::null_mut(),
+        _ => {
+            // EOPNOTSUPP, 95 on Linux, the only platform rdma-core targets.
+            set_errno(95);
+            ::std::ptr::null_mut()
+        }
     }
 }
 
 /// Create an extended queue pair (`ibv_create_qp_ex`).
 ///
-/// Returns null if the provider does not implement the extended verb (matching the C inline).
+/// Returns null with `errno` set to `EOPNOTSUPP` if the provider does not implement the extended
+/// verb (matching the C inline).
 ///
 /// # Safety
 ///
@@ -432,7 +449,11 @@ pub unsafe fn ibv_create_qp_ex(
         - ::std::mem::offset_of!(verbs_context, create_qp_ex);
     match (*vctx).create_qp_ex {
         Some(create_qp_ex) if (*vctx).sz >= need => create_qp_ex(context, qp_attr),
-        _ => ::std::ptr::null_mut(),
+        _ => {
+            // EOPNOTSUPP, 95 on Linux, the only platform rdma-core targets.
+            set_errno(95);
+            ::std::ptr::null_mut()
+        }
     }
 }
 
