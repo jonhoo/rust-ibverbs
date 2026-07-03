@@ -55,7 +55,7 @@ impl From<MrAdvice> for ffi::ib_uverbs_advise_mr_advice {
 pub struct MrAdviseFlags(pub(crate) u32);
 
 impl MrAdviseFlags {
-    /// The advice may be flushed by other verbs (rather than being sticky).
+    /// Perform the advise synchronously: the call returns only once the operation has completed.
     pub const FLUSHABLE: MrAdviseFlags =
         MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH as u32);
 
@@ -138,7 +138,7 @@ impl Drop for ProtectionDomainInner {
         let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
+            panic!("ibv_dealloc_pd failed: {e}");
         }
     }
 }
@@ -227,8 +227,8 @@ impl ProtectionDomain {
     /// The transport is chosen at compile time by the marker `T` (for example
     /// `pd.create_qp::<Rc>(&send, &recv, 1)` for a reliable connection); the resulting queue-pair
     /// family only offers the operations that transport supports. The types without a marker
-    /// (raw packet, XRC, non-EFA driver) are not usable through the portable wrapper anyway; when
-    /// they become so, they will get their own typed markers.
+    /// (raw packet, XRC, and driver-specific types other than EFA's SRD) are not usable through
+    /// the portable wrapper anyway; if that changes, they will get their own markers.
     ///
     /// `send` and `recv` are the [`CompletionQueue`]s that completions for the send and receive
     /// queues are delivered to, respectively. They may refer to the same queue.
@@ -297,26 +297,25 @@ impl ProtectionDomain {
     /// the given access permissions.
     ///
     /// This process allows the RDMA device to read and write data to the allocated memory. Only
-    /// registered memory can be sent from and received to by `QueuePair`s. Performing this
-    /// registration takes some time, so performing memory registration isn't recommended in the
-    /// data path, when fast response is required.
+    /// registered memory can be used in sends and receives by `QueuePair`s. Registration takes
+    /// time, so avoid registering memory on the data path, when fast response is required.
     ///
     /// The buffer is `n` zero-initialized bytes, owned by the returned [`MemoryRegion`] and
     /// deregistered and freed when it drops. To register memory you manage yourself instead, see
     /// [`register_from_raw`](Self::register_from_raw) and
     /// [`register_dmabuf`](Self::register_dmabuf).
     ///
-    /// Every successful registration will result with a MR which has unique (within a specific
-    /// RDMA device) `lkey` and `rkey` values. These keys must be communicated to the other end's
-    /// `QueuePair` for direct memory access.
+    /// Every successful registration results in an MR with `lkey` and `rkey` values that are
+    /// unique within the device. The rkey (together with the address) is what a peer needs for
+    /// direct access; the lkey stays local.
     ///
     /// The maximum size of the block that can be registered is limited to
     /// `device_attr.max_mr_size`. There isn't any way to know what is the total size of memory
     /// that can be registered for a specific device.
     ///
     /// `access_flags` are the permissions the region is registered with; local read access is
-    /// always enabled. [`AccessFlags::PERMISSIVE`] is the everything-enabled set: local write, remote
-    /// write, remote read, remote atomics, and relaxed ordering.
+    /// always enabled. [`AccessFlags::PERMISSIVE`] is the local-write plus all-remote-data-access
+    /// bundle: local write, remote write, remote read, remote atomics, and relaxed ordering.
     ///
     /// # Panics
     ///
@@ -346,7 +345,8 @@ impl ProtectionDomain {
     /// access the bytes through your own pointer.
     ///
     /// `access_flags` are the permissions the region is registered with; local read access is
-    /// always enabled ([`AccessFlags::PERMISSIVE`] is the everything-enabled set).
+    /// always enabled ([`AccessFlags::PERMISSIVE`] is the local-write plus all-remote-data-access
+    /// bundle).
     ///
     /// # Safety
     ///
@@ -365,7 +365,7 @@ impl ProtectionDomain {
     ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags
     ///    (`EOPNOTSUPP`).
     ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): `ibv_reg_mr` failed (`EINVAL`
-    ///    for an invalid access value, `ENOMEM` when out of resources — either in the operating
+    ///    for an invalid access value, `ENOMEM` when out of resources, either in the operating
     ///    system or in the RDMA device).
     pub unsafe fn register_from_raw(
         &self,
@@ -383,14 +383,13 @@ impl ProtectionDomain {
     ///
     /// This is how device memory (for example a GPU buffer exported as a DMA-BUF) is made
     /// available for RDMA without staging through host memory. The buffer stays owned by its
-    /// exporter; the returned region only holds the registration, which is dropped on drop.
+    /// exporter; the returned region only holds the registration, which is released when the
+    /// region is dropped.
     ///
-    /// # Arguments
-    ///
-    /// * `fd` - The file descriptor of the DMA-BUF to be registered. This must refer to an already allocated buffer.
-    /// * `offset`, `len` - The MR starts at `offset` of the dma-buf and its size is `len`.
-    /// * `iova` - The argument iova specifies the virtual base address of the MR when accessed through a lkey or rkey.
-    ///   Note: `iova` must have the same page offset as `offset`
+    /// `fd` is the file descriptor of the DMA-BUF to register; it must refer to an already
+    /// allocated buffer. The region starts at `offset` bytes into the DMA-BUF and covers `len`
+    /// bytes. `iova` is the virtual base address of the region when accessed through an `lkey` or
+    /// `rkey`; it must have the same page offset as `offset`.
     ///
     /// # Errors
     ///
@@ -435,10 +434,13 @@ impl ProtectionDomain {
     ///
     /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
     /// `max_sge` is the maximum number of scatter/gather elements per work request.
-    /// `srq_limit` arms the SRQ's low-watermark event: when the number of posted receives drops
-    /// below it, the device raises an [`SrqLimitReached`](crate::AsyncEventType::SrqLimitReached)
-    /// asynchronous event — receive it with [`Context::poll_async_event`] /
-    /// [`Context::wait_async_event`] and top the SRQ back up (pass 0 to disable).
+    /// `srq_limit` is recorded at creation and, on providers that honor it there (Soft-RoCE's rxe
+    /// does; this crate's test suite relies on that), arms the low-watermark event: once fewer
+    /// receives than the limit remain posted, the device raises
+    /// [`AsyncEventType::SrqLimitReached`](crate::AsyncEventType::SrqLimitReached) once. The
+    /// `ibv_create_srq` man page considers the field irrelevant at creation, so portable arming
+    /// requires `ibv_modify_srq`, which this crate does not wrap (reachable via
+    /// [`as_raw`](SharedReceiveQueue::as_raw)). Pass 0 for no limit.
     ///
     /// # Errors
     ///

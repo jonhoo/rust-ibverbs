@@ -70,6 +70,7 @@ fn server(addr: SocketAddr) {
         )
         .unwrap();
     println!("connected to {:?}", conn.peer_addr());
+    // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
     unsafe {
         conn.queue_pair()
             .post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])

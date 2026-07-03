@@ -1,7 +1,8 @@
 //! The RDMA connection manager (`librdmacm`).
 //!
-//! The connection manager establishes reliable connections (and unreliable datagrams) over an
-//! IP address, so applications do not have to exchange [`QueuePairEndpoint`](crate::QueuePairEndpoint)s
+//! The connection manager establishes reliably-connected queue pairs (and datagram associations)
+//! over an IP address, so applications do not have to exchange
+//! [`QueuePairEndpoint`](crate::QueuePairEndpoint)s
 //! out of band the way [`PreparedQueuePair::handshake`](crate::PreparedQueuePair::handshake)
 //! requires. It picks the device, resolves the route, and negotiates the queue pair parameters.
 //!
@@ -9,7 +10,7 @@
 //! the active side uses a [`Connector`], the passive side an [`Acceptor`]. Each owns its event
 //! channel and drives the whole exchange internally, handing back a connected [`Connection`].
 //!
-//! Setup is two phased because the device only exists once the address resolves: a handle exposes
+//! Setup is two-phase because the device only exists once the address resolves: a handle exposes
 //! the [`Context`] to build the queue pair on, then a second call finishes the connection. This
 //! wrapper deliberately does not use `rdma_create_qp`/`rdma_create_ep` (which tie the queue pair's
 //! lifetime to the connection and limit control over its attributes); you build a normal queue pair
@@ -226,7 +227,7 @@ impl From<CmEventType> for ffi::rdma_cm_event_type {
 }
 
 impl std::fmt::Display for PortSpace {
-    /// Formats the port space under its name in the C headers, for example `TCP` for
+    /// Formats the port space as it is named in the C headers, for example `TCP` for
     /// [`Tcp`](Self::Tcp).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -240,7 +241,7 @@ impl std::fmt::Display for PortSpace {
 }
 
 impl std::fmt::Display for CmEventType {
-    /// Formats the event under its name in the C headers, for example `CONNECT_REQUEST` for
+    /// Formats the event as it is named in the C headers, for example `CONNECT_REQUEST` for
     /// [`ConnectRequest`](Self::ConnectRequest).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -763,8 +764,8 @@ impl CmEvent {
     /// ([`ConnectionParameter::set_private_data`]), or `None` if the event carries none.
     ///
     /// The transport pads (and can truncate) the payload to its wire format, so the length here
-    /// is the transport's reported length — typically longer than the sender's write, with the
-    /// tail zero-filled — not the exact number of bytes the sender set.
+    /// is the transport's reported length, not the exact number of bytes the sender set. It is
+    /// typically longer than the sender's write, with the tail zero-filled.
     pub fn private_data(&self) -> Option<&[u8]> {
         // The `conn` and `ud` union members lead with the same private_data/private_data_len
         // prefix, so reading `conn` is valid for connected and datagram events alike.
@@ -1020,8 +1021,8 @@ impl Acceptor {
                     id: event.connection_request()?,
                 });
             }
-            // The listener channel only carries connection requests; anything else is acknowledged
-            // and ignored when `event` drops here.
+            // Only connection requests matter here; anything else is acknowledged and ignored
+            // when `event` drops.
         }
     }
 }

@@ -5,7 +5,7 @@ use std::io;
 use crate::context::Context;
 use crate::error::{Error, Result};
 
-/// Get list of available RDMA devices.
+/// Returns the list of available RDMA devices.
 ///
 /// # Errors
 ///
@@ -108,9 +108,9 @@ impl fmt::Debug for Device<'_> {
     }
 }
 
-/// A Global unique identifier for ibv.
+/// The globally unique identifier (GUID) of an RDMA device.
 ///
-/// This struct acts as a rust wrapper for GUID value represented as `__be64` in
+/// This struct acts as a Rust wrapper for GUID value represented as `__be64` in
 /// libibverbs. We introduce this struct, because u64 is stored in host
 /// endianness, whereas ibverbs stores GUID in network order (big endian).
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
@@ -174,7 +174,7 @@ impl AsRef<ffi::__be64> for Guid {
 }
 
 impl<'devlist> Device<'devlist> {
-    /// Opens an RDMA device and creates a context for further use.
+    /// Creates a verbs context for this device.
     ///
     /// This context will later be used to query its resources or for creating resources.
     ///
@@ -196,9 +196,8 @@ impl<'devlist> Device<'devlist> {
     /// can be found in different machines).
     ///
     /// When there are more than one RDMA devices in a computer, changing the device location in
-    /// the computer (i.e. in the PCI bus) may result a change in the names associated with the
-    /// devices. In order to distinguish between the device, it is recommended using the device
-    /// GUID, returned by `Device::guid`.
+    /// the computer (i.e. in the PCI bus) may result in a change in the names associated with the
+    /// devices. To tell devices apart, use the device GUID, returned by `Device::guid`.
     ///
     /// The name is composed from:
     ///
@@ -222,18 +221,17 @@ impl<'devlist> Device<'devlist> {
         }
     }
 
-    /// Returns the Global Unique IDentifier (GUID) of this RDMA device.
+    /// Returns the globally unique identifier (GUID) of this RDMA device.
     ///
-    /// This GUID, that was assigned to this device by its vendor during the manufacturing, is
+    /// This GUID, which was assigned to this device by its vendor during the manufacturing, is
     /// unique and can be used as an identifier to an RDMA device.
     ///
-    /// From the prefix of the RDMA device GUID, one can know who is the vendor of that device
-    /// using the [IEEE OUI](http://standards.ieee.org/develop/regauth/oui/oui.txt).
+    /// The prefix of the RDMA device GUID identifies the device's vendor, via the
+    /// [IEEE OUI](http://standards.ieee.org/develop/regauth/oui/oui.txt).
     ///
     /// # Errors
     ///
-    ///  - [`DeviceGuid`](Error::DeviceGuid): `ibv_get_device_guid` failed (`EMFILE` if too many
-    ///    files are opened by this process).
+    ///  - [`DeviceGuid`](Error::DeviceGuid): `ibv_get_device_guid` failed.
     pub fn guid(&self) -> Result<Guid> {
         let guid_int = unsafe { ffi::ibv_get_device_guid(*self.0) };
         let guid: Guid = guid_int.into();

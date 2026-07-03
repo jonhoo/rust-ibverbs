@@ -4,6 +4,7 @@
 # - clippy: checks that the code does not contain any clippy warnings
 # - doc: checks that the code can be documented without errors
 # - hack: check combinations of feature flags
+# - semver: checks pull requests for undeclared public-API breakage
 # - msrv: check that the msrv specified in the crate is correct
 permissions:
   contents: read
@@ -133,7 +134,7 @@ jobs:
     # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
     strategy:
       matrix:
-        msrv: ["1.82.0"] # bindgen 1.71
+        msrv: ["1.82.0"] # unsafe extern in the generated bindings (see ibverbs-sys/Cargo.toml)
     name: ubuntu / ${{ matrix.msrv }}
     steps:
       - uses: actions/checkout@v4

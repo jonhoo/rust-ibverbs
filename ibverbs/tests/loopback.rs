@@ -1,6 +1,6 @@
 //! Integration tests for the RDMA data path.
 //!
-//! Each test self-loops a single queue pair (connected to its own endpoint), so it needs only one
+//! Most tests self-loop a single queue pair (connected to its own endpoint), so they need only one
 //! host and no peer, which makes the data path testable with Soft-RoCE (rxe).
 //!
 //! The tests require a real RDMA device, so they are `#[ignore]`d: plain `cargo test` skips them
@@ -576,7 +576,7 @@ fn unreliable_connection() {
 }
 
 /// Shared receive queue: the queue pair draws its receive buffers from an SRQ rather than its own
-/// receive queue. This exercises a feature the crate exposes that some alternatives do not.
+/// receive queue.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn shared_receive_queue() {
@@ -1472,8 +1472,9 @@ fn gid_and_device_introspection() {
     }
 }
 
+/// `query` and `modify` inspect and change a queue pair's attributes after `handshake`.
 #[test]
-#[ignore]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn modify_and_query_queue_pair() {
     // `loopback()` builds an RC queue pair and drives it to RTS via `handshake`. The general
     // `query`/`modify` API then lets us inspect and change it afterwards.
@@ -1603,8 +1604,8 @@ fn inline_send_list() {
 
     // Soft-RoCE's `wr_set_inline_data_list` copies the payload but forgets to accumulate the total
     // length (providers/rxe/rxe.c omits `tot_length += length`), so it transmits a zero-length
-    // message. The gather call and the completions still succeed, which is what this exercises on
-    // rxe; only check the delivered bytes on a provider that reports the real length.
+    // message. The gather call and the completions still succeed; only check the delivered bytes
+    // on a provider that reports the real length.
     if recv_len == 0 {
         return;
     }

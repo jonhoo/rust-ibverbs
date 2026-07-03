@@ -11,7 +11,7 @@ use crate::{Context, ProtectionDomain, QueuePairBuilder};
 
 /// A Global identifier (GID) for an RDMA device port.
 ///
-/// This struct acts as a rust wrapper for [`ffi::ibv_gid`]. We use it instead of
+/// This struct acts as a Rust wrapper for [`ffi::ibv_gid`]. We use it instead of
 /// `ffi::ibv_gid` directly because the latter is actually an untagged union.
 ///
 /// ```c
@@ -24,9 +24,9 @@ use crate::{Context, ProtectionDomain, QueuePairBuilder};
 /// };
 /// ```
 ///
-/// It appears that `global` exists for convenience, but can be safely ignored.
+/// The `global` view is a convenience; the raw bytes are authoritative.
 /// For continuity, the methods `subnet_prefix` and `interface_id` are provided.
-/// These methods read the array as big endian, regardless of native cpu
+/// These methods read the array as big endian, regardless of native CPU
 /// endianness.
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
@@ -60,7 +60,7 @@ impl Gid {
     }
 }
 
-/// A GID is an IPv6 address by construction (RoCE GIDs literally mirror the interface's IP
+/// A GID is an IPv6 address by construction (RoCE GIDs mirror the interface's IP
 /// addresses); this conversion makes it printable and comparable as one.
 impl From<Gid> for std::net::Ipv6Addr {
     fn from(gid: Gid) -> Self {
@@ -166,7 +166,7 @@ impl fmt::Display for GidType {
 
 /// A GID table entry. Returned by [`Context::gid_table`].
 ///
-/// This struct acts as a rust wrapper for `ffi::ibv_gid_entry`. We use it instead of
+/// This struct acts as a Rust wrapper for `ffi::ibv_gid_entry`. We use it instead of
 /// `ffi::ibv_gid_entry` because `ffi::ibv_gid` is wrapped by `Gid`.
 #[derive(Debug, Clone)]
 pub struct GidEntry {
@@ -323,8 +323,8 @@ pub struct AddressHandleAttribute {
 }
 
 impl AddressHandleAttribute {
-    /// A new address-handle attribute routing from `port_num`, the local physical port through
-    /// which the destination is reached (the port this handle routes from; numbered from 1).
+    /// A new address-handle attribute routing from `port_num`, the local port through which the
+    /// destination is reached (numbered from 1).
     pub fn new(port_num: u8) -> Self {
         AddressHandleAttribute {
             attr: ffi::ibv_ah_attr {
@@ -349,7 +349,9 @@ impl AddressHandleAttribute {
     /// Set the global route (GRH), required for RoCE and routed InfiniBand.
     ///
     /// `dgid` is the destination GID, `sgid_index` indexes the *local* port's GID table to source
-    /// from, and `hop_limit` is the IP hop limit (commonly `0xff`).
+    /// from, `hop_limit` is the IP hop limit (commonly `0xff`), and `traffic_class` is the GRH
+    /// traffic class, with which the originator of the packets specifies the required delivery
+    /// priority for handling them by the routers.
     pub fn set_grh(
         &mut self,
         dgid: Gid,
@@ -400,7 +402,7 @@ impl Drop for AddressHandle {
         let errno = unsafe { ffi::ibv_destroy_ah(self.ah) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
+            panic!("ibv_destroy_ah failed: {e}");
         }
     }
 }

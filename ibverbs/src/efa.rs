@@ -3,14 +3,13 @@
 //
 // EFA's transport is SRD (Scalable Reliable Datagram): reliable like RC but connectionless and
 // addressed like UD. Only queue-pair *creation* is EFA-specific (`efadv_create_qp_ex`); the resulting
-// queue pair is created with the same extended send operations as every other, so sends go through
-// the normal doorbell path ([`QueuePair::start_send`] with a `.to(..)`), receives through
+// queue pair carries the same extended send operations as every other queue pair, so sends go
+// through the normal doorbell path ([`QueuePair::start_send`] with a `.to(..)`), receives through
 // [`QueuePair::post_recv`], and completions through [`CompletionQueue::poll`].
 // ---------------------------------------------------------------------------
 
 use std::io;
 use std::os::raw::c_void;
-use std::ptr;
 
 use crate::completion::CompletionQueue;
 use crate::error::{Error, Result};
@@ -74,12 +73,13 @@ impl QueuePairBuilder<Srd> {
             | SendOps::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0
             | SendOps::IBV_QP_EX_WITH_RDMA_READ.0;
 
-        // As in `build`: zero the storage and write only the fields the driver reads, handing the
-        // pointer to C without `assume_init` (the `qp_type` enum has no zero variant).
+        // As in the generic `build_impl` in qp.rs: zero the storage and write only the fields the
+        // driver reads, handing the pointer to C without `assume_init` (the `qp_type` enum has no
+        // zero variant).
         let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr_ex>::zeroed();
         let p = attr.as_mut_ptr();
         unsafe {
-            (*p).qp_context = ptr::null::<c_void>().offset(self.ctx) as *mut _;
+            (*p).qp_context = self.ctx as usize as *mut c_void;
             (*p).send_cq = self.send.cq();
             (*p).recv_cq = self.recv.cq();
             (*p).cap = ffi::ibv_qp_cap {

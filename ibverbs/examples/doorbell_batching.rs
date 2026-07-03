@@ -16,7 +16,7 @@ const CQ_CAPACITY: u32 = 16;
 const MAX_SEND_WR: u32 = 16;
 
 fn main() {
-    // 1. Find and open the first RDMA device
+    // Find and open the first RDMA device
     let ctx = ibverbs::devices()
         .unwrap()
         .iter()
@@ -25,11 +25,11 @@ fn main() {
         .open()
         .unwrap();
 
-    // 2. Create Completion Queue (CQ) and Protection Domain (PD)
+    // Create Completion Queue (CQ) and Protection Domain (PD)
     let cq = ctx.create_cq(CQ_CAPACITY).build().unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
-    // 3. Create Queue Pair (QP) and connect it to itself in loopback mode. See the loopback
+    // Create Queue Pair (QP) and connect it to itself in loopback mode. See the loopback
     // example for how the routable GID is picked.
     let gids = ctx.gid_table().unwrap();
     let gid_index = gids
@@ -51,7 +51,7 @@ fn main() {
     let endpoint = prepared_qp.endpoint().unwrap();
     let mut qp = prepared_qp.handshake(endpoint).unwrap();
 
-    // 4. Allocate memory regions
+    // Allocate memory regions
     // We will write pieces of a string into a destination buffer using RDMA Writes,
     // then send a final notification containing the count of write operations.
     let text = b"Hello from chained RDMA writes!";
@@ -67,7 +67,7 @@ fn main() {
         .allocate(NOTIFY_BUF_SIZE, AccessFlags::PERMISSIVE)
         .unwrap();
 
-    // 5. Post receive request for the final send notification (4-byte payload)
+    // Post receive request for the final send notification (4-byte payload)
     unsafe {
         qp.post_recv([RecvRequest::new(
             RECEIVE_NOTIFICATION_WR_ID,
@@ -76,7 +76,7 @@ fn main() {
     }
     .unwrap();
 
-    // 6. Split the string into slices by space delimiter and prepare the notification payload
+    // Split the string into slices by space delimiter and prepare the notification payload
     let (locals, remotes): (Vec<[LocalMemorySlice; 1]>, Vec<RemoteMemorySlice>) = text
         .split_inclusive(|&b| b == b' ')
         .map(|sub| {
@@ -93,7 +93,7 @@ fn main() {
     notify_mr.bytes_mut()[..NOTIFY_BUF_SIZE].copy_from_slice(&(num_writes as u32).to_ne_bytes());
     let notify_slice = [notify_mr.slice(..)];
 
-    // 7. Build and post the chain of work requests as a single doorbell batch.
+    // Build and post the chain of work requests as a single doorbell batch.
     let mut batch = qp.start_send();
     // Chain the RDMA Write operations for each word segment.
     for i in 0..num_writes {
@@ -107,9 +107,9 @@ fn main() {
     // Post (ring the doorbell once) for the whole chain.
     unsafe { batch.submit() }.unwrap();
 
-    // 8. Poll completion queue until both the send chain and the receive completion are done.
-    // Note that because the writes and the send are chained, only the last operation (the Send)
-    // in the chain generates a completion event.
+    // Poll completion queue until both the send chain and the receive completion are done.
+    // Note that only the final send is posted `.signaled()`, so it alone reports a completion;
+    // the unsignaled writes complete silently.
     let mut chain_completed = false;
     let mut receive_completed = false;
 
@@ -151,7 +151,7 @@ fn main() {
         }
     }
 
-    // 9. Print the written data on the receiver side
+    // Print the written data on the receiver side
     let written_str = std::str::from_utf8(dest_mr.bytes()).unwrap();
     println!("Written data in destination buffer: {:?}", written_str);
     assert_eq!(written_str, "Hello from chained RDMA writes!");
