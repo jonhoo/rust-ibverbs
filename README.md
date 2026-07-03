@@ -9,11 +9,10 @@ A safe Rust API for RDMA over InfiniBand, RoCE, and iWARP, wrapping `libibverbs`
 
 RDMA "verbs" let userspace talk to the network adapter directly: no system calls on the data
 path, no copies, single-digit-microsecond latencies. The C API leaves you to uphold a long list
-of lifetime, aliasing, and transport rules by hand. This crate encodes those rules in Rust types
-— down to queue pairs being typed by their transport, so posting a datagram without an address
-handle or setting an RC-only timeout on a UD queue pair is a compile error — without taking the
-low-level control away: every wrapper hands out its raw handle for verbs the safe API does not
-cover.
+of lifetime, aliasing, and transport rules by hand. This crate encodes those rules in Rust
+types: queue pairs are typed by their transport, so posting a datagram without an address
+handle, or setting an RC-only timeout on a UD queue pair, is a compile error. The low-level
+control stays: every wrapper hands out its raw handle for verbs the safe API does not cover.
 
 ```rust,no_run
 use ibverbs::{AccessFlags, RecvRequest};
@@ -24,7 +23,7 @@ fn main() -> ibverbs::Result<()> {
     let cq = ctx.create_cq(16).build()?;
     let pd = ctx.alloc_pd()?;
 
-    // A reliable-connected queue pair on port 1. On RoCE, routing needs a GID; pick the
+    // A reliable-connection (RC) queue pair on port 1. On RoCE, routing needs a GID; pick the
     // index of a suitable entry from `ctx.gid_table()?`.
     let prepared = pd
         .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
@@ -81,7 +80,7 @@ pairs.
 - Two-sided send/receive, one-sided RDMA read and write (with immediate), and atomics, all
   posted as doorbell batches: many work requests, one doorbell, with per-operation
   `signaled`/`fenced`/`solicited` modifiers, inline data, and scatter/gather lists.
-- Shared receive queues, batched receives.
+- Shared receive queues, with receives posted in batches on queue pairs and SRQs alike.
 - Completion handling on the extended interface: lazy-read polling, hardware completion
   timestamps, and event-driven waiting through completion channels that plug into
   `epoll`/`tokio` — including many queues multiplexed onto one file descriptor — plus
@@ -91,8 +90,8 @@ pairs.
   event loops.
 - AWS Elastic Fabric Adapter SRD queue pairs (`efa` feature).
 
-Everything else stays reachable: every wrapper exposes `as_raw`, the raw bindings are
-re-exported as `ibverbs::ffi`, and escape-hatch constructors let you mix safe and raw freely.
+Everything else stays reachable through `as_raw` on every wrapper and the raw bindings
+re-exported as `ibverbs::ffi`.
 
 ## Safety model
 
@@ -107,7 +106,8 @@ re-exported as `ibverbs::ffi`, and escape-hatch constructors let you mix safe an
   still be reading or writing the buffer), rather than pretending a safe signature could uphold
   it.
 - Errors are a `thiserror` enum naming the failing verb; queue-pair state transitions diagnose
-  exactly which attribute-mask bits were wrong, and RoCE routing failures explain themselves.
+  exactly which attribute-mask bits were wrong, and RoCE routing failures say what was wrong
+  with the route.
 
 ## Cargo features
 
@@ -118,14 +118,14 @@ None are enabled by default.
 
 ## Building
 
-At runtime, this crate dynamically links `libibverbs` (part of
-[`rdma-core`](https://github.com/linux-rdma/rdma-core); packaged as `libibverbs-dev` on
-Debian/Ubuntu, `rdma-core` on Arch, `rdma-core-devel` on Fedora), plus `librdmacm` and `libefa`
-when the corresponding features are enabled.
+This crate dynamically links `libibverbs`, which is part of
+[`rdma-core`](https://github.com/linux-rdma/rdma-core) (the package is `libibverbs1`, with
+`libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core` on Arch; `rdma-core-devel` on
+Fedora), plus `librdmacm` and `libefa` when the corresponding features are enabled.
 
 At build time, bindings are generated from a vendored `rdma-core` checkout, built automatically
 by the `ibverbs-sys` crate (this needs `cmake` and a C toolchain, but no RDMA packages). To use
-pre-built rdma-core headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
+pre-built `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
 not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
 
 The minimum supported Rust version is 1.82.
@@ -162,7 +162,8 @@ Any modern Linux kernel can attach a software RDMA device
 $ sudo rdma link add rxe0 type rxe netdev <netdev>
 ```
 
-The examples and the integration test suite run against it unchanged, and CI does exactly this
+The examples (except the EFA one, which needs EFA hardware) and the integration test suite run
+against it unchanged, and CI does exactly this
 on every pull request: the data-path tests run against a SoftRoCE device and assert on the
 transferred bytes. A few tests cover paths the CI runner's rxe module mishandles (atomics,
 UC/UD, inline sends) and are skipped there; they pass on real hardware and current kernels.

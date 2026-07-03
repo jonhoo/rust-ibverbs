@@ -3,7 +3,7 @@
 # - required: runs the test suite on ubuntu with stable and beta rust toolchains
 # - minimal: runs the test suite with the minimal versions of the dependencies that satisfy the
 #   requirements of this crate, and its dependencies
-# - os-check: runs the test suite on mac and windows
+# - integration: runs the ignored data-path tests against a Soft-RoCE (rxe) device
 # - coverage: runs the test suite and collects coverage information
 # See check.yml for information about how the concurrency cancellation and workflow triggering works
 permissions:

@@ -19,7 +19,7 @@ impl Drop for SharedReceiveQueueInner {
         let errno = unsafe { ffi::ibv_destroy_srq(self.srq) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
+            panic!("ibv_destroy_srq failed: {e}");
         }
     }
 }

@@ -25,9 +25,9 @@ pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
 /// completions instead of burning a core, create a channel with [`Context::create_comp_channel`]
 /// and build the queue on it with [`CompletionQueueBuilder::set_comp_channel`]; then arm the queue
 /// with [`CompletionQueue::req_notify`], drain it with [`poll`](CompletionQueue::poll), and block
-/// on the channel ([`wait`](Self::wait)) — or watch its descriptor
+/// on the channel ([`wait`](Self::wait)), or watch its descriptor
 /// ([`AsFd`]/[`AsRawFd`](std::os::fd::AsRawFd)) from your own reactor and consume notifications
-/// with [`get_event`](Self::get_event) — before draining and re-arming again.
+/// with [`get_event`](Self::get_event), before draining and re-arming again.
 ///
 /// Any number of queues can be built on one channel, collapsing their notifications onto a single
 /// file descriptor (what you want for a server driving many queue pairs from one `epoll`/reactor).
@@ -58,7 +58,7 @@ impl Drop for CompletionChannelInner {
         let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
+            panic!("ibv_destroy_comp_channel failed: {e}");
         }
     }
 }
@@ -100,12 +100,16 @@ impl CompletionChannel {
     /// completion queue it belongs to (the value set with [`CompletionQueueBuilder::set_context`]),
     /// or `None` if none is pending.
     ///
-    /// This is how you demultiplex several queues that share one channel: after the channel's file
-    /// descriptor becomes readable, drain notifications here and map each returned context back to
-    /// the queue, which you then [`poll`](CompletionQueue::poll) and re-arm with
+    /// Demultiplexing several queues that share one channel works by draining notifications here
+    /// after the channel's file descriptor becomes readable, and mapping each returned context
+    /// back to the queue, which you then [`poll`](CompletionQueue::poll) and re-arm with
     /// [`req_notify`](CompletionQueue::req_notify). Give each queue a distinct
     /// [`set_context`](CompletionQueueBuilder::set_context) value so they can be told apart.
     /// Acknowledgement is handled for you.
+    ///
+    /// # Errors
+    ///
+    ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_get_cq_event` failed.
     pub fn get_event(&self) -> Result<Option<u64>> {
         let mut out_cq = ptr::null_mut();
         let mut out_cq_context = ptr::null_mut();
@@ -127,12 +131,17 @@ impl CompletionChannel {
     /// [`CompletionQueueBuilder::set_context`]). Returns `None` only if `timeout` elapses first;
     /// with no timeout it waits indefinitely, even if other threads race it for notifications.
     ///
-    /// This is the blocking form of [`get_event`](Self::get_event): it waits on the channel's file
+    /// The blocking form of [`get_event`](Self::get_event): it waits on the channel's file
     /// descriptor for you rather than requiring an external reactor. Arm each queue with
     /// [`CompletionQueue::req_notify`] and drain it with [`poll`](CompletionQueue::poll) *before*
-    /// blocking here — polling after arming closes the race where a completion lands between an
-    /// earlier poll and arming — then call this to learn which queue fired, and poll and re-arm
+    /// blocking here; polling after arming closes the race where a completion lands between an
+    /// earlier poll and arming. Then call this to learn which queue fired, and poll and re-arm
     /// that queue.
+    ///
+    /// # Errors
+    ///
+    ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): waiting on the descriptor (`poll`)
+    ///    or consuming the notification failed.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
@@ -265,8 +274,8 @@ impl CompletionQueueBuilder {
     ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
     ///    work-completion field (`EOPNOTSUPP`).
     ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `ibv_create_cq_ex` failed
-    ///    (`EINVAL` for an invalid `min_cq_entries` — must be `1 <= cqe <= dev_cap.max_cqe` — or
-    ///    comp vector, `ENOMEM` when out of resources).
+    ///    (`EINVAL` for an invalid `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`,
+    ///    or an invalid completion vector, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<CompletionQueue> {
         // The queue holds a reference to its channel (if any), so the channel cannot be destroyed
         // out from under it.
@@ -332,7 +341,7 @@ impl Drop for CompletionQueueInner {
         let errno = unsafe { ffi::ibv_destroy_cq(self.cq()) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
+            panic!("ibv_destroy_cq failed: {e}");
         }
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
@@ -349,8 +358,8 @@ flags_newtype! {
     /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
     ///
     /// The byte length, immediate data, QP number, and source QP are always requested; these flags
-    /// add fields on top, at the cost of a larger completion entry. The matching accessor on
-    /// [`WorkCompletion`] panics if its field was not requested.
+    /// add fields on top, at the cost of a larger completion entry. Fields with an accessor on
+    /// [`WorkCompletion`] panic when read if they were not requested.
     pub struct WcFields(ffi::ibv_create_cq_wc_flags) {
         /// The number of bytes transferred ([`WorkCompletion::len`]; always requested).
         BYTE_LEN = IBV_WC_EX_WITH_BYTE_LEN;
@@ -683,7 +692,7 @@ impl From<WcOpcode> for ffi::ibv_wc_opcode {
 }
 
 impl std::fmt::Display for WcOpcode {
-    /// Formats the opcode under its name in the C headers, for example `RDMA_WRITE` for
+    /// Formats the opcode as it is named in the C headers, for example `RDMA_WRITE` for
     /// [`RdmaWrite`](Self::RdmaWrite).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -937,6 +946,11 @@ impl CompletionQueue {
     /// the queue on a [`CompletionChannel`] and wait there instead of spinning on `poll` (see
     /// [`req_notify`](Self::req_notify) for the loop).
     ///
+    /// # Errors
+    ///
+    ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): starting the poll failed
+    ///    (`ibv_start_poll`).
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -972,17 +986,21 @@ impl CompletionQueue {
     /// Arm the completion queue so the next work completion generates a notification on its
     /// completion channel (`ibv_req_notify_cq`).
     ///
-    /// This is the building block for event-driven and asynchronous completion handling: arm the
+    /// Event-driven and asynchronous completion handling builds on this: arm the
     /// queue, drain everything already pending with [`poll`](Self::poll), then wait for a
     /// notification on the [completion channel](Self::comp_channel) — either by blocking with
     /// [`CompletionChannel::wait`], or by watching its [`AsFd`] descriptor with
     /// your own reactor (for example `epoll` or a `tokio` `AsyncFd`) and consuming the notification
-    /// with [`CompletionChannel::get_event`]. Then drain again and re-arm. Arming a queue that was
-    /// built without a channel ([`CompletionQueueBuilder::set_comp_channel`]) has nothing to
+    /// with [`CompletionChannel::get_event`]. Then drain again and re-arm. On a queue built
+    /// without a channel ([`CompletionQueueBuilder::set_comp_channel`]), arming has nothing to
     /// notify.
     ///
     /// If `solicited_only` is set, only completions of work requests that asked for a solicited
     /// event generate a notification.
+    ///
+    /// # Errors
+    ///
+    ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
         let cq = self.inner.cq();
         let ctx = unsafe { *cq }.context;

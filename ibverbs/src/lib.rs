@@ -1,7 +1,7 @@
 //! A safe Rust API for RDMA (`libibverbs`).
 //!
 //! RDMA "verbs" let userspace perform high-throughput, low-latency network operations directly
-//! against the network adapter — zero copies on the data path and no kernel involvement — over
+//! against the network adapter (zero copies on the data path and no kernel involvement) over
 //! InfiniBand, RoCE, and iWARP transports. This crate wraps both the control path (creating,
 //! querying, and tearing down resources such as protection domains, completion queues, queue
 //! pairs, and memory regions) and the data path (posting work requests and reaping completions) in
@@ -66,8 +66,9 @@
 //!
 //! Runnable programs live in the [`examples/` directory][examples] — a loopback transfer, an
 //! event-driven loop over a shared completion channel, an `ibv_devinfo`-style device dump,
-//! doorbell batching, the `rdmacm` connection manager, and EFA SRD queue pairs. You can run all of them (and this crate's test suite) without RDMA hardware on
-//! any modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`.
+//! doorbell batching, the `rdmacm` connection manager, and EFA SRD queue pairs. You can run all
+//! of them except the EFA example (and this crate's test suite) without RDMA hardware on any
+//! modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`.
 //!
 //! You do not have to poll: completion channels ([`Context::create_comp_channel`]) deliver
 //! completion notifications on a file descriptor to block on ([`CompletionChannel::wait`]) or hand
@@ -86,14 +87,15 @@
 //!
 //! # Library dependency
 //!
-//! At runtime, this crate dynamically links `libibverbs` (part of [`rdma-core`], packaged as
-//! `libibverbs-dev` on Debian/Ubuntu and `libibverbs` or `rdma-core-devel` elsewhere), plus
-//! `librdmacm` and `libefa` when the corresponding features are enabled.
+//! At runtime, this crate dynamically links `libibverbs`, which is part of [`rdma-core`] (the
+//! package is `libibverbs1`, with `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core`
+//! on Arch; `rdma-core-devel` on Fedora), plus `librdmacm` and `libefa` when the corresponding
+//! features are enabled.
 //!
 //! At build time, the bindings are generated from a vendored [`rdma-core`] checkout, which
 //! `ibverbs-sys` builds automatically (this requires `cmake` and a C toolchain, but nothing
-//! RDMA-specific to be installed). To generate bindings from pre-built rdma-core headers instead,
-//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
+//! RDMA-specific to be installed). To generate bindings from pre-built `rdma-core` headers
+//! instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
 //!
 //! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
 //! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
@@ -108,9 +110,9 @@
 //! RDMA read/write, and atomics; [`Uc`] sends and RDMA writes; [`Ud`] (and, behind the `efa`
 //! feature, `Srd`) datagram sends addressed through an [`AddressHandle`]. Transport-specific
 //! operations only exist on the matching types, so using one on the wrong transport is a compile
-//! error. The queue-pair types without a marker (raw packet, XRC, non-EFA driver) are not usable
-//! through the portable wrapper anyway; when they become so, they will get their own typed
-//! markers.
+//! error. The queue-pair types without a marker (raw packet, XRC, and driver-specific types other
+//! than EFA's SRD) are not usable through the portable wrapper anyway; if that changes, they will
+//! get their own markers.
 //!
 //! # Thread safety
 //!

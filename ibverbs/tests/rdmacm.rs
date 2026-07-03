@@ -1,7 +1,8 @@
 //! Integration test for the RDMA connection manager (`rdmacm` feature).
 //!
-//! It connects a queue pair to itself across two threads in one process, using the connection
-//! manager to set up the connection over the device's own IP address (Soft-RoCE works for this).
+//! Each test connects client and server queue pairs across two threads in one process, using the
+//! connection manager to set up the connection over the device's own IP address (Soft-RoCE works
+//! for this).
 //! Like the other data-path tests it needs a real RDMA device, so it is `#[ignore]`d; run it with
 //! `cargo test --features rdmacm -- --ignored`. It uses the first device, or `IBVERBS_TEST_DEVICE`.
 #![cfg(feature = "rdmacm")]
@@ -15,7 +16,8 @@ use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
-    AccessFlags, CompletionQueue, Context, QueuePairEndpoint, QueuePairState, Rc, RecvRequest,
+    AccessFlags, CompletionQueue, Context, GidType, QueuePairEndpoint, QueuePairState, Rc,
+    RecvRequest,
 };
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
@@ -34,14 +36,16 @@ fn open_test_device() -> Context {
     device.open().expect("failed to open the RDMA device")
 }
 
-/// The device's RoCEv2 IPv4 address, read from its GID table. The connection manager needs to route
-/// over an IP address, and a RoCEv2 GID is the IPv4 address mapped into IPv6 (`::ffff:a.b.c.d`).
+/// The device's RoCEv2 IPv4 address, read from its GID table. The connection manager needs to
+/// route over an IP address; prefer the RoCEv2 entry holding the interface's IPv4 address (an
+/// IPv4-mapped GID).
 fn device_ipv4(ctx: &Context) -> Ipv4Addr {
     let gids = ctx.gid_table().expect("failed to read GID table");
     for entry in gids {
-        let raw: [u8; 16] = entry.gid.into();
-        if raw[..10] == [0; 10] && raw[10] == 0xff && raw[11] == 0xff {
-            return Ipv4Addr::new(raw[12], raw[13], raw[14], raw[15]);
+        if entry.gid_type == GidType::RoceV2 && entry.gid.is_ipv4_mapped() {
+            if let Some(ipv4) = std::net::Ipv6Addr::from(entry.gid).to_ipv4_mapped() {
+                return ipv4;
+            }
         }
     }
     panic!("no RoCEv2 IPv4 GID found; the connection manager test needs an IP-addressed device");
@@ -54,7 +58,7 @@ fn wait_for(cq: &CompletionQueue, wr_id: u64) {
         if let Some(mut completions) = cq.poll().expect("failed to poll CQ") {
             while let Some(wc) = completions.next() {
                 wc.ok()
-                    .unwrap_or_else(|e| panic!("work request {wr_id} failed: {e}"));
+                    .unwrap_or_else(|e| panic!("work request {} failed: {e}", wc.wr_id()));
                 if wc.wr_id() == wr_id {
                     return;
                 }
@@ -300,8 +304,8 @@ fn pump_until(id: &CmId, want: CmEventType) -> CmEvent {
     }
 }
 
-/// The private data each side attaches to its connection request or reply. The transport pads the
-/// payload on the wire, so the receiver asserts on the prefix it knows, within the reported length.
+/// The private data the server attaches to its reply; the client's request carries its endpoint
+/// encoding instead.
 const SERVER_PDATA: &[u8] = b"server says welcome";
 
 #[test]

@@ -29,7 +29,7 @@ fn main() {
         .expect("no GID available")
         .gid_index;
 
-    let qp_builder = pd
+    let prepared = pd
         .create_qp::<ibverbs::Rc>(&cq, &cq, 1)
         .unwrap()
         .set_gid_index(gid_index)
@@ -38,8 +38,8 @@ fn main() {
 
     // Both sides of a connection exchange endpoints and handshake; connected to ourselves, we
     // "exchange" with ourselves.
-    let endpoint = qp_builder.endpoint().unwrap();
-    let mut qp = qp_builder.handshake(endpoint).unwrap();
+    let endpoint = prepared.endpoint().unwrap();
+    let mut qp = prepared.handshake(endpoint).unwrap();
 
     let mut mr = pd.allocate(16, ibverbs::AccessFlags::PERMISSIVE).unwrap();
     mr.bytes_mut()[9] = 0x42;

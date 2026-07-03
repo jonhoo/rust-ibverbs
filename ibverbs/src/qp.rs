@@ -256,7 +256,7 @@ impl From<QueuePairState> for ffi::ibv_qp_state {
 }
 
 impl std::fmt::Display for QueuePairState {
-    /// Formats the state under its name in the InfiniBand specification (and the C headers), for
+    /// Formats the state as it is named in the InfiniBand specification (and the C headers), for
     /// example `RTS` for [`ReadyToSend`](Self::ReadyToSend).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
@@ -543,15 +543,14 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// Prepare a new `QueuePair` builder.
     ///
     /// `max_send_wr` is the maximum number of outstanding Work Requests that can be posted to the
-    /// Send Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`. There may be RDMA
-    /// devices that for specific transport types may support less outstanding Work Requests than
-    /// the maximum reported value.
+    /// Send Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`. Some devices
+    /// support fewer outstanding work requests for specific transport types than the maximum
+    /// reported value.
     ///
     /// Similarly, `max_recv_wr` is the maximum number of outstanding Work Requests that can be
     /// posted to the Receive Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`.
-    /// There may be RDMA devices that for specific transport types may support less outstanding
-    /// Work Requests than the maximum reported value. This value is ignored if the Queue Pair is
-    /// associated with an SRQ
+    /// Some devices support fewer outstanding work requests for specific transport types than the
+    /// maximum reported value. This value is ignored if the Queue Pair is associated with an SRQ.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pd: Arc<ProtectionDomainInner>,
@@ -607,7 +606,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// Set the service level of the new `QueuePair`.
-    /// service level (0-15). Higher value means higher priority.
+    ///
+    /// The service level (0–15); higher values mean higher priority.
+    ///
     /// Defaults to 0.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
         self.service_level = service_level;
@@ -615,8 +616,10 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// Sets the GID table index that should be used for the new `QueuePair`.
-    /// The entry corresponds to the index in `Context::gid_table()`. This is only used if the
-    /// `QueuePairEndpoint` that is passed to `QueuePair::handshake()` has a `gid`.
+    /// The entry corresponds to the index in [`Context::gid_table`](crate::Context::gid_table).
+    /// [`PreparedQueuePair::endpoint`] embeds the GID at this index in the local endpoint, and
+    /// [`handshake`](PreparedQueuePair::handshake) routes with it when the remote endpoint
+    /// carries a `gid`.
     ///
     /// Defaults to unset.
     pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
@@ -649,7 +652,7 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the maximum number of send requests in the work queue
+    /// Set the maximum number of send requests in the work queue.
     ///
     /// Defaults to 1.
     pub fn set_max_send_wr(&mut self, max_send_wr: u32) -> &mut Self {
@@ -660,9 +663,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The maximum number of scatter/gather elements in any Work Request
     /// that can be posted to the Send Queue in that Queue Pair.
     ///
-    /// Value can be [0..dev_cap.max_sge]. There may be RDMA devices that
-    /// for specific transport types may support less scatter/gather elements
-    /// than the maximum reported value.
+    /// Value can be `[0..dev_cap.max_sge]`. Some devices support fewer
+    /// scatter/gather elements for specific transport types than the
+    /// maximum reported value.
     ///
     /// Defaults to 1.
     pub fn set_max_send_sge(&mut self, max_send_sge: u32) -> &mut Self {
@@ -670,7 +673,7 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the maximum number of receive requests in the work queue
+    /// Set the maximum number of receive requests in the work queue.
     ///
     /// Defaults to 1.
     pub fn set_max_recv_wr(&mut self, max_recv_wr: u32) -> &mut Self {
@@ -681,9 +684,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The maximum number of scatter/gather elements in any Work Request
     /// that can be posted to the Receive Queue in that Queue Pair.
     ///
-    /// Value can be [0..dev_cap.max_sge]. There may be RDMA devices that
-    /// for specific transport types may support less scatter/gather elements
-    /// than the maximum reported value. This value is ignored if the
+    /// Value can be `[0..dev_cap.max_sge]`. Some devices support fewer
+    /// scatter/gather elements for specific transport types than the
+    /// maximum reported value. This value is ignored if the
     /// Queue Pair is associated with an SRQ.
     ///
     /// Defaults to 1.
@@ -697,8 +700,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// Inline sends (see [`SendOp::send_inline`]) copy their payload directly into the work request
     /// rather than referencing a registered memory region, which lowers latency for small messages.
     /// A send queue must reserve this capacity up front; the actual value granted by the device can
-    /// be larger than requested and is reported in the `max_inline_data` field returned by
-    /// `ibv_query_qp`. Posting more inline bytes than the queue pair supports fails at submit time.
+    /// be larger than requested and is reported by [`QueuePair::query`] (see
+    /// [`QueuePairInitAttribute::max_inline_data`]). Posting more inline bytes than the queue pair
+    /// supports fails at submit time.
     ///
     /// Defaults to 0 (inline sends disabled).
     pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
@@ -734,7 +738,7 @@ impl<T: Transport> QueuePairBuilder<T> {
         let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr_ex>::zeroed();
         let p = attr.as_mut_ptr();
         unsafe {
-            (*p).qp_context = ptr::null::<c_void>().offset(self.ctx) as *mut _;
+            (*p).qp_context = self.ctx as usize as *mut c_void;
             (*p).send_cq = self.send.cq();
             (*p).recv_cq = self.recv.cq();
             (*p).srq = self
@@ -815,9 +819,9 @@ impl<T: Connected> QueuePairBuilder<T> {
         self
     }
 
-    /// Create a new `QueuePair` from this builder template (`ibv_create_qp_ex`).
+    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
     ///
-    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
+    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
     ///
     /// This method will fail if an unreliable-connection (UC) queue pair is associated with an
     /// SRQ (devices support SRQs on RC and UD queue pairs).
@@ -835,9 +839,9 @@ impl<T: Connected> QueuePairBuilder<T> {
 }
 
 impl QueuePairBuilder<Ud> {
-    /// Create a new `QueuePair` from this builder template (`ibv_create_qp_ex`).
+    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
     ///
-    /// The returned `QueuePair` is associated with the builder's `ProtectionDomain`.
+    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
     ///
     /// # Errors
     ///
@@ -882,7 +886,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// Sets the total number of times that the new `QueuePair` will try to resend the packets
     /// before reporting an error because the remote side doesn't answer in the primary path.
     ///
-    /// This 3 bit value defaults to 6.
+    /// This 3-bit value defaults to 6.
     ///
     /// # Panics
     ///
@@ -896,8 +900,8 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// Sets the total number of times that the new `QueuePair` will try to resend the packets when
     /// an RNR NACK was sent by the remote QP before reporting an error.
     ///
-    /// This 3 bit value defaults to 6. The value 7 is special and specify to retry sending the
-    /// message indefinitely when a RNR Nack is being sent by remote side.
+    /// This 3-bit value defaults to 6. The value 7 is special: it retries indefinitely when the
+    /// remote side answers with an RNR NAK.
     ///
     /// # Panics
     ///
@@ -927,7 +931,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
 
 /// An allocated but uninitialized `QueuePair`. Created by [`QueuePairBuilder::build`].
 ///
-/// Specifically, this `QueuePair` has been allocated with `ibv_create_qp`, but has not yet been
+/// Specifically, this `QueuePair` has been allocated with `ibv_create_qp_ex`, but has not yet been
 /// initialized with calls to `ibv_modify_qp`.
 ///
 /// To complete the construction of the `QueuePair`, you will need to obtain the
@@ -996,9 +1000,9 @@ pub struct PreparedQueuePair<T: Transport> {
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num`
     pub qp_num: u32,
-    /// the context's `lid`
+    /// the port's `lid`
     pub lid: u16,
-    /// the context's `gid`, used for global routing
+    /// the port's `gid` at the configured index, used for global routing
     pub gid: Option<Gid>,
 }
 
@@ -1064,6 +1068,11 @@ impl<T: Transport> PreparedQueuePair<T> {
     /// Get the network endpoint for this `QueuePair`.
     ///
     /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
+    ///
+    /// # Errors
+    ///
+    ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
+    ///    (`ibv_query_gid`).
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
         let qp_num = unsafe { &*self.qp.qp }.qp_num;
         let gid = if let Some(gid_index) = self.gid_index {
@@ -1125,7 +1134,7 @@ impl<T: Transport> PreparedQueuePair<T> {
             return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
-        // RTS.
+        // RTS: start the send queue at PSN 0.
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
             sq_psn: 0,
@@ -1297,8 +1306,9 @@ impl PreparedQueuePair<Ud> {
     ///
     /// Unlike a connected transport's handshake, UD is connectionless: there is no remote
     /// endpoint to exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with the given
-    /// `qkey`. Incoming datagrams whose Q_Key does not match `qkey` are discarded (unless the
-    /// sender's Q_Key has its most significant bit set, meaning "use the QP's Q_Key").
+    /// `qkey`. Incoming datagrams whose Q_Key does not match `qkey` are discarded (a sender whose
+    /// work request sets the Q_Key's most significant bit transmits with its own QP's Q_Key
+    /// instead).
     ///
     /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
     /// [`SendBatch::to`].
@@ -1966,14 +1976,14 @@ impl QueuePairAttribute {
         self
     }
 
-    /// Set the minimum RNR-NAK timer.
+    /// Set the minimum RNR-NAK timer (see [`RnrTimer`] for the typed form).
     pub fn set_min_rnr_timer(&mut self, min_rnr_timer: u8) -> &mut Self {
         self.attr.min_rnr_timer = min_rnr_timer;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
         self
     }
 
-    /// Set the ACK timeout (the actual time is `4.096 * 2^timeout` microseconds; 0 means infinite).
+    /// Set the ACK timeout (see [`AckTimeout`] for the typed form).
     pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
         self.attr.timeout = timeout;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT;
@@ -1987,7 +1997,7 @@ impl QueuePairAttribute {
         self
     }
 
-    /// Set the RNR retry count (7 means retry infinitely).
+    /// Set the RNR retry count (see [`QueuePairBuilder::set_rnr_retry`] for the encoding).
     pub fn set_rnr_retry(&mut self, rnr_retry: u8) -> &mut Self {
         self.attr.rnr_retry = rnr_retry;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY;
@@ -2250,8 +2260,8 @@ fn qp_transition_masks(
 /// A queue pair is the actual object that sends and receives data in the RDMA architecture
 /// (something like a socket). It's not exactly like a socket, however. A socket is an abstraction,
 /// which is maintained by the network stack and doesn't have a physical resource behind it. A QP
-/// is a resource of an RDMA device and a QP number can be used by one process at the same time
-/// (similar to a socket that is associated with a specific TCP or UDP port number)
+/// is a resource of an RDMA device and only one process at a time can use a given QP number (much
+/// as one socket binds a TCP or UDP port).
 #[must_use = "QueuePair is immediately destroyed via drop() unless assigned to a variable"]
 pub struct QueuePair<T: Transport = Rc> {
     pub(crate) pd: Arc<ProtectionDomainInner>,
@@ -2330,6 +2340,10 @@ impl<T: Transport> QueuePair<T> {
     /// `mask` selects which attributes to read; the returned [`QueuePairAttribute`]'s getters are
     /// meaningful only for the requested fields. The second return value describes the queue pair's
     /// configured capacities.
+    ///
+    /// # Errors
+    ///
+    ///  - [`QueryQueuePair`](Error::QueryQueuePair): `ibv_query_qp` failed.
     pub fn query(
         &self,
         mask: QueuePairAttributeMask,
@@ -2401,8 +2415,7 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// Receives have no doorbell form, so the requests are posted as a linked list. `recvs` is the
     /// caller's storage — a stack array or a reusable `Vec` — linked in place rather than copied, so
-    /// posting allocates nothing. Each request is consumed by the device when a matching message
-    /// arrives.
+    /// posting allocates nothing. Each request is consumed in order as incoming messages arrive.
     ///
     /// On a UD queue pair the 40-byte GRH of an incoming message is placed at the front of the
     /// scatter buffers, so the payload starts at offset 40. If the queue pair uses a shared receive
@@ -2487,7 +2500,7 @@ impl<T: Transport> Drop for QueuePair<T> {
         let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
+            panic!("ibv_destroy_qp failed: {e}");
         }
     }
 }

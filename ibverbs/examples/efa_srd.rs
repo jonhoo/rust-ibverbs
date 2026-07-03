@@ -1,11 +1,11 @@
 //! Minimal EFA SRD example: two SRD queue pairs on one device, one sends a datagram to the other.
 //!
-//! The only EFA-specific calls are `create_srd_qp` / `build` / `activate`; everything else
-//! (`start_send`, `post_recv`, `poll`) is the same API every other transport uses.
+//! The only EFA-specific call is `create_srd_qp`; from there, building, activating, and the data
+//! path are the same API every other transport uses.
 //!
 //! Requires an AWS Elastic Fabric Adapter (EFA) device and the `efa` feature
-//! (`cargo run --features efa --example efa_srd`). It is illustrative: the data path should be
-//! validated on real EFA hardware.
+//! (`cargo run --features efa --example efa_srd`). This example follows the EFA documentation but
+//! has not been run on EFA hardware; validate before relying on it.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     const GID_INDEX: u32 = 0;

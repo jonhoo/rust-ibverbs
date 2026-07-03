@@ -41,7 +41,7 @@ flags_newtype! {
 }
 
 impl AccessFlags {
-    /// Local write plus all remote data access — remote read, remote write, and remote atomics —
+    /// Local write plus all remote data access (remote read, remote write, and remote atomics),
     /// with relaxed ordering: a convenient bundle for buffers both sides fully trust. Narrow it
     /// when the region does not need to be remotely writable.
     pub const PERMISSIVE: AccessFlags = AccessFlags(
@@ -66,15 +66,15 @@ impl Drop for MemoryRegionInner {
         let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
         if errno != 0 {
             let e = io::Error::from_raw_os_error(errno);
-            panic!("{e}");
+            panic!("ibv_dereg_mr failed: {e}");
         }
     }
 }
 
 /// A region of memory registered for use with RDMA.
 ///
-/// Created by [`ProtectionDomain::allocate`](crate::ProtectionDomain::allocate) (which owns its
-/// buffer), or by [`register_from_raw`](crate::ProtectionDomain::register_from_raw) /
+/// Created by [`ProtectionDomain::allocate`](crate::ProtectionDomain::allocate) (the returned
+/// region owns its buffer), or by [`register_from_raw`](crate::ProtectionDomain::register_from_raw) /
 /// [`register_dmabuf`](crate::ProtectionDomain::register_dmabuf) for memory managed elsewhere.
 pub struct MemoryRegion<O> {
     pub(crate) inner: MemoryRegionInner,
@@ -102,7 +102,8 @@ impl<O> MemoryRegion<O> {
         self.inner.mr
     }
 
-    /// Remote region.
+    /// The remote handle (address, length, and rkey) covering this whole region, for a peer's
+    /// one-sided access.
     pub fn remote(&self) -> RemoteMemorySlice {
         RemoteMemorySlice {
             addr: unsafe { *self.inner.mr }.addr as u64,
@@ -232,7 +233,7 @@ impl LocalMemorySlice {
 pub struct RemoteMemorySlice {
     /// Memory address of the registered region (might have been offset by slicing).
     pub addr: u64,
-    /// Length of the registered memory region (might have been offset by slicing).
+    /// Length of the registered memory region (might have been narrowed by slicing).
     pub len: usize,
     /// Remote key for accessing this memory region.
     pub rkey: u32,

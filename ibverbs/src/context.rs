@@ -75,8 +75,11 @@ impl Drop for ContextInner {
     fn drop(&mut self) {
         match &self.ownership {
             ContextOwnership::Owned => {
-                let ok = unsafe { ffi::ibv_close_device(self.ctx) };
-                assert_eq!(ok, 0);
+                let errno = unsafe { ffi::ibv_close_device(self.ctx) };
+                if errno != 0 {
+                    let e = io::Error::from_raw_os_error(errno);
+                    panic!("ibv_close_device failed: {e}");
+                }
             }
             // Borrowed: don't close the device; dropping the kept-alive owner is enough.
             #[cfg(feature = "rdmacm")]
@@ -134,8 +137,8 @@ impl Context {
     /// Wraps a raw `ibv_context` owned by `owner` (the RDMA connection manager's `rdma_cm_id`).
     ///
     /// The returned [`Context`] does not close the device on drop, and keeps `owner` alive for as
-    /// long as the context — or any protection domain, completion queue, queue pair, or memory
-    /// region built from it — is alive, so `ctx` cannot dangle.
+    /// long as the context (or any protection domain, completion queue, queue pair, or memory
+    /// region built from it) is alive, so `ctx` cannot dangle.
     #[cfg(feature = "rdmacm")]
     pub(crate) fn from_borrowed_context(
         ctx: *mut ffi::ibv_context,
@@ -171,18 +174,20 @@ impl Context {
     /// Begin building a completion queue (CQ) with room for at least `min_cq_entries` entries.
     ///
     /// When an outstanding Work Request, within a Send or Receive Queue, is completed, a Work
-    /// Completion is being added to the CQ of that Work Queue. This Work Completion indicates that
+    /// Completion is added to the CQ of that Work Queue. This Work Completion indicates that
     /// the outstanding Work Request has been completed (and no longer considered outstanding) and
     /// provides details on it (status, direction, opcode, etc.).
     ///
-    /// A single CQ can be shared for sending, receiving, and sharing across multiple QPs. The Work
+    /// A single CQ can be shared by the send and receive queues of multiple QPs. The Work
     /// Completion holds the information to specify the QP number and the Queue (Send or Receive)
     /// that it came from.
     ///
     /// `min_cq_entries` is the minimum size of the CQ (the actual size can be larger) and is the only
-    /// required parameter. The optional ones — an opaque context cookie, the completion vector, and
-    /// extra work-completion fields such as a hardware timestamp — are configured on the returned
-    /// [`CompletionQueueBuilder`]; call [`build`](CompletionQueueBuilder::build) to create the queue.
+    /// required parameter. The optional ones are configured on the returned
+    /// [`CompletionQueueBuilder`]: an opaque context cookie, the completion vector, a completion
+    /// channel ([`set_comp_channel`](CompletionQueueBuilder::set_comp_channel)), and extra
+    /// work-completion fields such as a hardware timestamp. Call
+    /// [`build`](CompletionQueueBuilder::build) to create the queue.
     ///
     /// # Examples
     ///
@@ -211,6 +216,11 @@ impl Context {
     /// an event loop instead. Several queues can share one channel — a single descriptor then
     /// reports notifications for all of them, which is what you want for a server driving many
     /// queue pairs from one `epoll`/reactor. See [`CompletionChannel`] for the notification loop.
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateCompletionChannel`](Error::CreateCompletionChannel): creating the channel or
+    ///    setting its descriptor non-blocking failed.
     pub fn create_comp_channel(&self) -> Result<CompletionChannel> {
         CompletionChannel::new(&self.inner)
     }
@@ -310,6 +320,10 @@ impl Context {
     /// A protection domain is a means of protection, and helps you create a group of objects that
     /// can work together. If several objects were created using PD1, and others were created using
     /// PD2, working with objects from group1 together with objects from group2 will not work.
+    ///
+    /// # Errors
+    ///
+    ///  - [`AllocProtectionDomain`](Error::AllocProtectionDomain): `ibv_alloc_pd` failed.
     pub fn alloc_pd(&self) -> Result<ProtectionDomain> {
         let pd = unsafe { ffi::ibv_alloc_pd(self.inner.ctx) };
         if pd.is_null() {
@@ -328,6 +342,12 @@ impl Context {
     ///
     /// The entries span all of the device's ports; each carries the `port_num` and `gid_index` it
     /// belongs to (the latter is what [`QueuePairBuilder::set_gid_index`] expects).
+    ///
+    /// # Errors
+    ///
+    ///  - [`QueryDevice`](Error::QueryDevice) / [`QueryPort`](Error::QueryPort): sizing the table
+    ///    failed.
+    ///  - [`QueryGidTable`](Error::QueryGidTable): `ibv_query_gid_table` failed.
     pub fn gid_table(&self) -> Result<Vec<GidEntry>> {
         // The table spans every port, so size the buffer for all of them: each port contributes
         // up to its own `gid_tbl_len` entries.
@@ -483,6 +503,8 @@ impl Context {
     ///
     ///  - [`Unsupported`](Error::Unsupported): the device does not support querying real-time
     ///    values (`EOPNOTSUPP`).
+    ///  - [`QueryRealTimeValues`](Error::QueryRealTimeValues): `ibv_query_rt_values_ex` failed
+    ///    (every non-`EOPNOTSUPP` errno).
     pub fn query_rt_values_ex(&self) -> Result<HcaClock> {
         // SAFETY: `ibv_values_ex` is a plain C struct (a mask plus a `timespec`); all-zero is a valid
         // initial value.
@@ -576,7 +598,7 @@ impl fmt::Debug for AsyncEvent<'_> {
 
 /// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
 ///
-/// The events fall into four scopes: affiliated errors and state changes on a completion queue,
+/// The events fall into three scopes: affiliated errors and state changes on a completion queue,
 /// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which),
 /// port-level changes (with [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,7 +711,7 @@ impl From<AsyncEventType> for ffi::ibv_event_type {
 }
 
 impl std::fmt::Display for AsyncEventType {
-    /// Formats the event under its name in the C headers, for example `SRQ_LIMIT_REACHED` for
+    /// Formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
     /// [`SrqLimitReached`](Self::SrqLimitReached).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {

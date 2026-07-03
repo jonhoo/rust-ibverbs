@@ -15,8 +15,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Most variants wrap the underlying operating-system error (an `errno` from a libibverbs or
 /// librdmacm call); the specific variant identifies which operation failed and carries any relevant
-/// context. A few variants ([`Unsupported`](Error::Unsupported), ...) capture conditions that
-/// callers commonly branch on.
+/// context. A few variants — [`Unsupported`](Error::Unsupported),
+/// [`PortNotActive`](Error::PortNotActive), [`GidMismatch`](Error::GidMismatch),
+/// [`MalformedWireFormat`](Error::MalformedWireFormat), and the two `InvalidQueuePair*` diagnoses
+/// — capture conditions that callers commonly branch on.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
@@ -30,7 +32,7 @@ pub enum Error {
     #[error("port {0} is not ACTIVE or ARMED")]
     PortNotActive(u8),
 
-    /// A global routing identifier (GID) was set for the remote endpoint but not the local one.
+    /// A global identifier (GID) was set for the remote endpoint but not the local one.
     #[error("a GID was set for the remote endpoint but not the local one")]
     GidMismatch,
 
@@ -168,7 +170,8 @@ pub enum Error {
     #[error("failed to poll the completion queue")]
     PollCompletionQueue(#[source] io::Error),
 
-    /// Reading a device asynchronous event failed (`ibv_get_async_event`).
+    /// Waiting for or reading a device asynchronous event failed (`poll` /
+    /// `ibv_get_async_event`).
     #[error("failed to read a device asynchronous event")]
     AsyncEvent(#[source] io::Error),
 
@@ -179,7 +182,9 @@ pub enum Error {
 
     /// Decoding a wire-format value ([`QueuePairEndpoint::from_bytes`](crate::QueuePairEndpoint::from_bytes)
     /// or [`RemoteMemorySlice::from_bytes`](crate::RemoteMemorySlice::from_bytes)) failed: the
-    /// bytes carry a flag or value this version does not understand.
+    /// bytes carry a flag or value this version does not understand. A length in a
+    /// [`RemoteMemorySlice`](crate::RemoteMemorySlice) encoding that does not fit the platform's
+    /// `usize` also produces this error.
     #[error("malformed wire-format encoding")]
     MalformedWireFormat,
 
@@ -216,7 +221,7 @@ pub enum Error {
     /// Another connection-manager setup step failed (creating the id, listening, getting an event,
     /// disconnecting, ...).
     #[cfg(feature = "rdmacm")]
-    #[error("connection manager setup failed")]
+    #[error("failed to set up the connection manager")]
     ConnectionSetup(#[source] io::Error),
 }
 

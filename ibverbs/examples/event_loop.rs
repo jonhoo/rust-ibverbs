@@ -2,7 +2,7 @@
 //! completion channel is blocked on. Two queue pairs (each self-connected, as in the loopback
 //! example) share one channel, so a single file descriptor reports notifications for both, and
 //! the context cookie set at build time says which queue fired — the shape a server driving many
-//! connections from one `epoll`/reactor uses. Device-level async events are drained on the side.
+//! connections from one `epoll`/reactor uses. Device-level async events are checked at the end.
 //!
 //! This runs against the first RDMA device; on a machine without one, create a SoftRoCE device
 //! with `rdma link add rxe0 type rxe netdev <netdev>`.
