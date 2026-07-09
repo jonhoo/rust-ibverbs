@@ -983,6 +983,62 @@ impl CompletionQueue {
         }
     }
 
+    /// Poll for work completions through the standard `ibv_poll_cq` interface, filling `wc` with as
+    /// many completions as are ready (up to its length) and returning the filled prefix.
+    ///
+    /// This is the batch counterpart to [`poll`](Self::poll). Where `poll` reads each field lazily
+    /// through the extended interface — an indirect provider call per field — this copies whole
+    /// completions into caller-owned [`ibv_wc`](ffi::ibv_wc) entries in one call, then lets you read
+    /// their fields as plain struct accesses. For high-throughput draining where you consume many
+    /// completions and touch several fields of each, avoiding the per-field indirection makes this
+    /// the faster path; when you poll a completion at a time and read only a field or two,
+    /// [`poll`](Self::poll) is cheaper. It is also a compatibility fallback for the fields the
+    /// standard `ibv_wc` carries, independent of which extended fields the queue was built with.
+    ///
+    /// The returned slice is empty when no completions are ready. Like [`poll`](Self::poll), this
+    /// neither blocks nor causes a context switch; to wait for completions, build the queue on a
+    /// [`CompletionChannel`] and drive it through [`req_notify`](Self::req_notify) rather than
+    /// spinning here.
+    ///
+    /// Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
+    /// `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting the
+    /// number of inflight work requests.
+    ///
+    /// # Errors
+    ///
+    ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_poll_cq` reported an error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ibverbs::{ffi, CompletionQueue};
+    /// # fn drain(cq: &CompletionQueue) -> ibverbs::Result<()> {
+    /// let mut wc = [ffi::ibv_wc::default(); 16];
+    /// for completion in cq.poll_into(&mut wc)? {
+    ///     if let Some((status, vendor_err)) = completion.error() {
+    ///         eprintln!("work request {}: {status:?} (vendor {vendor_err})", completion.wr_id());
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[inline]
+    pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
+        let cq = self.inner.cq();
+        // `ibv_poll_cq` is a `static inline` in verbs.h that dispatches through the context op
+        // table; an `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
+        // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
+        let ctx = unsafe { (*cq).context };
+        let num_entries = wc.len().min(i32::MAX as usize) as i32;
+        let n = unsafe { (*ctx).ops.poll_cq.unwrap()(cq, num_entries, wc.as_mut_ptr()) };
+        if n < 0 {
+            // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
+            // surface whatever the provider left there as the cause.
+            return Err(Error::PollCompletionQueue(io::Error::last_os_error()));
+        }
+        Ok(&mut wc[..n as usize])
+    }
+
     /// Arm the completion queue so the next work completion generates a notification on its
     /// completion channel (`ibv_req_notify_cq`).
     ///

@@ -158,6 +158,38 @@ fn drain(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     }
 }
 
+/// Like [`drain`], but through the standard `ibv_poll_cq` batch path ([`CompletionQueue::poll_into`])
+/// instead of the extended lazy-read path, so the tests cover both interfaces.
+fn drain_into(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
+    let mut observed = Vec::with_capacity(n);
+    let mut wc = vec![ibverbs::ffi::ibv_wc::default(); n];
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    loop {
+        for completion in cq.poll_into(&mut wc).expect("failed to poll CQ") {
+            if let Some((status, vendor_err)) = completion.error() {
+                panic!(
+                    "work request {} failed: {status:?} (vendor {vendor_err})",
+                    completion.wr_id()
+                );
+            }
+            observed.push(Completed {
+                wr_id: completion.wr_id(),
+                len: completion.len(),
+                imm_data: completion.imm_data(),
+            });
+        }
+        if observed.len() >= n {
+            return observed;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for completions: got {} of {n}",
+            observed.len()
+        );
+    }
+}
+
 /// Read the first 8 bytes of a buffer as a host-order `u64`.
 fn first_u64(bytes: &[u8]) -> u64 {
     u64::from_ne_bytes(bytes[..8].try_into().unwrap())
@@ -204,6 +236,56 @@ fn send_recv() {
         "missing send completion"
     );
     assert_eq!(&recv.bytes_mut()[..5], b"hello");
+}
+
+/// The standard `ibv_poll_cq` batch path drains the same SEND / RECV completions as the extended
+/// interface, reporting matching `wr_id`s and byte lengths.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn send_recv_poll_into() {
+    let mut lb = loopback();
+
+    let mut recv = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    send.bytes_mut()[..5].copy_from_slice(b"hello");
+
+    unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }
+        .expect("post_recv failed");
+    let mut batch = lb.qp.start_send();
+    batch.op().signaled().send(2, &[send.slice(..5)]);
+    unsafe { batch.submit() }.expect("send failed");
+
+    let comps = drain_into(&lb.cq, 2);
+    assert!(
+        comps.iter().any(|wc| wc.wr_id() == 1),
+        "missing recv completion"
+    );
+    assert!(
+        comps.iter().any(|wc| wc.wr_id() == 2),
+        "missing send completion"
+    );
+    let recv_wc = comps
+        .iter()
+        .find(|wc| wc.wr_id() == 1)
+        .expect("missing recv completion");
+    assert_eq!(recv_wc.len(), 5, "received byte length mismatch");
+    assert_eq!(&recv.bytes_mut()[..5], b"hello");
+}
+
+/// Polling into an empty completion queue returns an empty slice rather than blocking or erroring.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn poll_into_empty_is_empty() {
+    let lb = loopback();
+    let mut wc = [ibverbs::ffi::ibv_wc::default(); 8];
+    let ready = lb.cq.poll_into(&mut wc).expect("failed to poll CQ");
+    assert!(ready.is_empty(), "no completions were posted");
 }
 
 /// A larger transfer that spans multiple MTU-sized packets reports the right received byte length.
