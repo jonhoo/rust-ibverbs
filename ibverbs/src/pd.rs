@@ -289,6 +289,7 @@ impl ProtectionDomain {
             Ok(MemoryRegionInner {
                 _pd: self.inner.clone(),
                 mr,
+                addr: ptr as u64,
             })
         }
     }
@@ -421,6 +422,7 @@ impl ProtectionDomain {
             let inner = MemoryRegionInner {
                 _pd: self.inner.clone(),
                 mr,
+                addr: iova,
             };
             Ok(MemoryRegion { inner, owner: () })
         }
