@@ -123,8 +123,9 @@ This crate dynamically links `libibverbs`, which is part of
 `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core` on Arch; `rdma-core-devel` on
 Fedora), plus `librdmacm` and `libefa` when the corresponding features are enabled.
 
-At build time, bindings are generated from a vendored `rdma-core` checkout, built automatically
-by the `ibverbs-sys` crate (this needs `cmake` and a C toolchain, but no RDMA packages). To use
+At build time, bindings are generated from a vendored `rdma-core` checkout, whose headers the
+`ibverbs-sys` crate generates by running `cmake`'s configure step (nothing is compiled, so this
+needs `cmake` and a C compiler for its probes, but no RDMA development packages). To use
 pre-built `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
 not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
 
