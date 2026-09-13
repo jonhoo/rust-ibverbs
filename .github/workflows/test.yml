@@ -72,34 +72,62 @@ jobs:
   integration:
     # Exercise the data path against a real RDMA device. The integration tests are #[ignore]d
     # because they need a device, so the rest of CI only compile-checks them. Here we stand up a
-    # Soft-RoCE (rxe) device by building the rdma_rxe kernel module from the matching upstream
-    # kernel source (the runner's own kernel ships only siw) and attaching it to the runner's
-    # network interface, then run the ignored tests against it. Pinned to 22.04: the rxe module we
-    # build from v6.8 source is reliable, whereas the build for ubuntu-latest's newer (6.17) kernel
-    # drops completions on most two-sided transfers (its source diverges more from the azure kernel).
-    runs-on: ubuntu-22.04
+    # Soft-RoCE (rxe) device by building the rdma_rxe kernel module from the Ubuntu source package
+    # of the running kernel (the runner's own kernel ships only siw) and attaching it to the
+    # runner's network interface, then run the ignored tests against it.
+    #
+    # The tests run against the vendored rdma-core built in place, not the distribution's: the
+    # rxe provider in rdma-core 50 (what ubuntu-24.04 ships) advances the completion queue's
+    # consumer index once too often when a poll drains the queue, after which the kernel sees the
+    # queue as full and drops the next completion. The vendored version has the fix, and is also
+    # the one the bindings are generated from.
+    runs-on: ubuntu-latest
     name: ubuntu / stable / soft-roce
+    env:
+      # Link and load the in-place rdma-core build (libibverbs, its providers, and librdmacm).
+      RDMA_CORE_LIB_DIR: ${{ github.workspace }}/rdma-core-build/lib
+      LD_LIBRARY_PATH: ${{ github.workspace }}/rdma-core-build/lib
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Configure CI host
         run: ./configure-ci.sh
+      - name: Build the vendored rdma-core in place
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libnl-3-dev libnl-route-3-dev
+          cmake -S ibverbs-sys/vendor/rdma-core -B rdma-core-build \
+            -DIN_PLACE=1 -DNO_MAN_PAGES=1 -DNO_PYVERBS=1 -DCMAKE_BUILD_TYPE=Release
+          cmake --build rdma-core-build -j"$(nproc)"
+          ls rdma-core-build/lib/libibverbs.so* rdma-core-build/lib/librdmacm.so* \
+            rdma-core-build/lib/librxe-rdmav*.so
       - name: Set up a Soft-RoCE (rxe) device
         run: |
           set -euxo pipefail
-          # GitHub-hosted runner kernels ship the siw module but not rdma_rxe, so build the rxe
-          # module from the matching upstream kernel source against the running kernel's headers
-          # and load that. rxe is a software RoCE provider, so this needs no special hardware.
+          # Enable source packages so the running kernel's own source can be fetched.
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            linux-headers-"$(uname -r)" build-essential libelf-dev dwarves git \
+            linux-headers-"$(uname -r)" build-essential libelf-dev dwarves dpkg-dev patchutils \
             ibverbs-providers ibverbs-utils iproute2
-          src=$(uname -r); src=${src%%-*}; src=${src%.0}   # 6.8.0-1059-azure -> 6.8 (the tag name)
-          # Fetch just the rxe driver directory rather than the whole kernel tree.
-          git clone --quiet --depth 1 --filter=tree:0 --sparse --branch "v${src}" \
-            https://github.com/torvalds/linux.git linux-src
-          git -C linux-src sparse-checkout set drivers/infiniband/sw/rxe
-          cd linux-src/drivers/infiniband/sw/rxe
+          mkdir ksrc && cd ksrc
+          # Ask for the modules package's source: the image package resolves to the tiny signing
+          # wrapper package instead. Prefer the running kernel's exact version, and fall back to
+          # whatever the archive currently carries if that one has been superseded.
+          modules=linux-modules-"$(uname -r)"
+          version=$(dpkg-query -W -f='${Version}' "$modules")
+          apt-get source --download-only "$modules=$version" \
+            || apt-get source --download-only "$modules"
+          ls -l
+          # The source package is the upstream tarball plus one distribution diff. Unpack only the
+          # rxe driver from the tarball and apply just that directory's part of the diff.
+          tar -xf ./*.orig.tar.* --wildcards --strip-components=1 '*/drivers/infiniband/sw/rxe/*'
+          if ls ./*.diff.gz >/dev/null 2>&1; then
+            zcat ./*.diff.gz | filterdiff -p1 -i 'drivers/infiniband/sw/rxe/*' | patch -p1 --forward
+          fi
+          cd drivers/infiniband/sw/rxe
           # Turn the in-tree build file into an out-of-tree module build forced on.
           mv Makefile Kbuild
           sed -i 's/$(CONFIG_RDMA_RXE)/m/g' Kbuild
@@ -115,7 +143,8 @@ jobs:
           echo "Attaching rxe0 to $netdev"
           sudo rdma link add rxe0 type rxe netdev "$netdev"
           rdma link
-          ibv_devices
+          # Through the in-place build, so this also proves its rxe provider finds the device.
+          "$GITHUB_WORKSPACE"/rdma-core-build/bin/ibv_devices
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
       - name: cargo generate-lockfile
@@ -125,21 +154,13 @@ jobs:
         env:
           IBVERBS_TEST_DEVICE: rxe0
         # Run serially: the tests share one rxe device, and Soft-RoCE drops completions when many
-        # queue pairs drive it concurrently. The skipped tests cover RC atomics, the UC/UD transports,
-        # and inline data, which this rxe build does not handle correctly (they pass on real hardware
-        # and a current 7.x kernel); everything else gates the full RC data path.
-        run: |
-          cargo test --locked --test loopback -- --ignored --test-threads=1 \
-            --skip atomic_operations \
-            --skip unreliable_connection \
-            --skip unreliable_datagram \
-            --skip inline_send
+        # queue pairs drive it concurrently.
+        run: cargo test --locked --test loopback -- --ignored --test-threads=1
       - name: cargo test --features rdmacm -- --ignored
         env:
           IBVERBS_TEST_DEVICE: rxe0
         # The connection manager binds the runner's own IPv4 address, which resolves onto the same
-        # rxe device (librdmacm-dev was installed by configure-ci.sh above). Serial for the same
-        # reason as the loopback tests.
+        # rxe device. Serial for the same reason as the loopback tests.
         run: cargo test --locked --features rdmacm --test rdmacm -- --ignored --test-threads=1
       - name: Dump the RDMA state
         # The device is set up from scratch on every run, so when a test fails the interesting
@@ -150,7 +171,7 @@ jobs:
           ip -4 addr || true
           ls -l /dev/infiniband || true
           lsmod | grep -E '^(rdma|ib_|rxe)' || true
-          ibv_devinfo -v || true
+          "$GITHUB_WORKSPACE"/rdma-core-build/bin/ibv_devinfo -v || true
           sudo dmesg | tail -n 60 || true
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
