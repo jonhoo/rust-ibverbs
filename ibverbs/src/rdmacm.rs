@@ -1336,8 +1336,11 @@ impl Incoming {
 }
 
 /// An established connection: a connected [`QueuePair`] plus the connection-manager
-/// identifier that keeps it alive. Returned by [`Resolved::connect`] / [`Incoming::accept`];
-/// dropping it tears the connection down.
+/// identifier that keeps it alive. Returned by [`Resolved::connect`] / [`Incoming::accept`].
+///
+/// Dropping it disconnects (the peer sees [`CmEventType::Disconnected`]) and destroys the queue
+/// pair; [`disconnect`](Self::disconnect) does the same while keeping the queue pair around to
+/// reap the flushed completions.
 pub struct Connection {
     id: CmId,
     qp: QueuePair<Rc>,
@@ -1388,6 +1391,16 @@ impl Connection {
     /// neither IPv4 nor IPv6.
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.id.local_addr()
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Tell the peer now: the id itself is only destroyed (which would also send the
+        // disconnect) once every resource built on the borrowed device context has gone, which
+        // can be much later. Fails harmlessly if already disconnected. The queue pair is destroyed
+        // right after this, which flushes it.
+        let _ = self.id.disconnect();
     }
 }
 
