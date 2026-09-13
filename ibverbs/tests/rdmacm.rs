@@ -510,3 +510,53 @@ fn low_level_connect_and_send() {
     id.disconnect().ok();
     server.join().expect("server thread");
 }
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn dropped_connect_request_is_rejected() {
+    // A listener that drops a connection-request event without taking its id declines the
+    // request, so the peer fails fast instead of retrying until its timeout.
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let listener = bind_listener(ip);
+        listener.listen(1).expect("listen");
+        ready_tx
+            .send(listener.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let event = listener.get_cm_event().expect("listener event");
+        assert_eq!(event.event_type(), CmEventType::ConnectRequest);
+        drop(event);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client saw the rejection");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    let before = Instant::now();
+    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+        Err(Error::ConnectionManager(CmEventType::Rejected)) => {}
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got a connection"),
+    }
+    assert!(
+        before.elapsed() < Duration::from_secs(5),
+        "the rejection arrived promptly, not after the request's retries"
+    );
+    done_tx.send(()).expect("signal done");
+    server.join().expect("server thread");
+}

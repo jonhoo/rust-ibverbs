@@ -325,6 +325,9 @@ fn timeout_ms(timeout: Duration) -> c_int {
     timeout.as_millis().min(c_int::MAX as u128) as c_int
 }
 
+/// The most private-data bytes a rejection (`rdma_reject`) can carry: the CM REJ payload.
+const MAX_REJECT_PRIVATE_DATA: usize = 148;
+
 /// Whether a connection-manager event reports a failure that aborts setup.
 fn is_failure(event: CmEventType) -> bool {
     matches!(
@@ -440,6 +443,7 @@ impl CmId {
         Ok(CmEvent {
             event,
             _id: self.clone(),
+            taken: false,
         })
     }
 
@@ -464,6 +468,7 @@ impl CmId {
         Ok(Some(CmEvent {
             event,
             _id: self.clone(),
+            taken: false,
         }))
     }
 
@@ -654,6 +659,38 @@ impl CmId {
         Ok(())
     }
 
+    /// Declines a connection request (passive side), on the id taken from a
+    /// [`CmEventType::ConnectRequest`] with [`CmEvent::connection_request`]. The peer's connect
+    /// fails with [`CmEventType::Rejected`], carrying `private_data` (at most 148 bytes) for it to
+    /// read. Drop the id afterwards; it has no further use.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_reject` failed, or `private_data`
+    ///    is longer than a rejection can carry.
+    pub fn reject(&self, private_data: &[u8]) -> Result<()> {
+        if private_data.len() > MAX_REJECT_PRIVATE_DATA {
+            return Err(Error::ConnectionSetup(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "rejection private data is limited to {MAX_REJECT_PRIVATE_DATA} bytes, got {}",
+                    private_data.len()
+                ),
+            )));
+        }
+        let ret = unsafe {
+            ffi::rdma_reject(
+                self.inner.id,
+                private_data.as_ptr().cast::<c_void>(),
+                private_data.len() as u8,
+            )
+        };
+        if ret != 0 {
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     /// Completes connection establishment on the active side after the queue pair has reached
     /// `RTS`, in response to a [`CmEventType::ConnectResponse`].
     pub fn establish(&self) -> Result<()> {
@@ -753,11 +790,16 @@ impl AsFd for CmId {
 ///
 /// The event keeps the id whose channel delivered it alive: `rdma_destroy_id` blocks until every
 /// event delivered for an id has been acknowledged, so the id cannot go away underneath an
-/// outstanding event.
+/// outstanding event. A [`ConnectRequest`](CmEventType::ConnectRequest) whose new id is never
+/// taken with [`connection_request`](Self::connection_request) is rejected on drop, so the peer
+/// learns right away rather than after its retries time out.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
     /// The id whose channel delivered the event (the listener, for a connection request).
     _id: CmId,
+    /// Whether a connection request's new id has been taken over by
+    /// [`connection_request`](Self::connection_request).
+    taken: bool,
 }
 
 // The event (and the id it holds, which is `Send + Sync` itself) can move between threads:
@@ -814,15 +856,30 @@ impl CmEvent {
     /// on return.
     ///
     /// The returned id is the passive side of the new connection: build a queue pair on its
-    /// [`context`](CmId::context), move it to `RTS`, and [`accept`](CmId::accept).
-    pub fn connection_request(self) -> Result<CmId> {
+    /// [`context`](CmId::context), move it to `RTS`, and [`accept`](CmId::accept) — or
+    /// [`reject`](CmId::reject) it.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): this is not a connection request, or its
+    ///    id could not be moved onto a new event channel (the request is then rejected).
+    pub fn connection_request(mut self) -> Result<CmId> {
+        if self.event_type() != CmEventType::ConnectRequest {
+            return Err(Error::ConnectionSetup(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("not a connection request: {}", self.event_type()),
+            )));
+        }
         let channel = EventChannel::new()?;
         let id = unsafe { (*self.event).id };
+        // From here on the id is ours to release: `Drop` must no longer reject and destroy it.
+        self.taken = true;
         let ret = unsafe { ffi::rdma_migrate_id(id, channel.chan) };
         if ret != 0 {
+            let err = io::Error::last_os_error();
             // The request id is ours to destroy once we abandon it; `channel` drops after.
             unsafe { ffi::rdma_destroy_id(id) };
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
+            return Err(Error::ConnectionSetup(err));
         }
         Ok(CmId {
             inner: Arc::new(CmIdInner { channel, id }),
@@ -832,7 +889,21 @@ impl CmEvent {
 
 impl Drop for CmEvent {
     fn drop(&mut self) {
-        unsafe { ffi::rdma_ack_cm_event(self.event) };
+        unsafe {
+            if !self.taken
+                && (*self.event).event == ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST
+            {
+                // Nobody took the new connection's id: decline the request and free the id
+                // librdmacm allocated for it, which only `rdma_destroy_id` releases (the event is
+                // charged to the listener, so destroying the new id does not wait on it).
+                let id = (*self.event).id;
+                ffi::rdma_reject(id, ptr::null(), 0);
+                ffi::rdma_ack_cm_event(self.event);
+                ffi::rdma_destroy_id(id);
+            } else {
+                ffi::rdma_ack_cm_event(self.event);
+            }
+        }
     }
 }
 
@@ -1053,9 +1124,9 @@ impl Acceptor {
     }
 }
 
-/// An incoming connection request, ready for its queue pair to be built and accepted. Returned by
-/// [`Acceptor::accept`]. It carries its own event channel, so it is self-contained and can be
-/// handed to another thread.
+/// An incoming connection request, ready for its queue pair to be built and accepted (or
+/// rejected). Returned by [`Acceptor::accept`]. It carries its own event channel, so it is
+/// self-contained and can be handed to another thread. Dropping it declines the request.
 pub struct Incoming {
     id: CmId,
 }
@@ -1085,6 +1156,17 @@ impl Incoming {
         self.id.accept(&param)?;
         self.id.wait_for(CmEventType::Established, deadline)?;
         Ok(Connection { id: self.id, qp })
+    }
+
+    /// Declines the request instead of accepting it. The peer's connect fails with
+    /// [`CmEventType::Rejected`] and can read `private_data` (at most 148 bytes) from the error.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_reject` failed, or `private_data`
+    ///    is longer than a rejection can carry.
+    pub fn reject(self, private_data: &[u8]) -> Result<()> {
+        self.id.reject(private_data)
     }
 }
 
