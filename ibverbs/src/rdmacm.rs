@@ -329,6 +329,12 @@ fn timeout_ms(timeout: Duration) -> c_int {
     timeout.as_millis().min(c_int::MAX as u128) as c_int
 }
 
+/// The `RDMA_MAX_RESP_RES` / `RDMA_MAX_INIT_DEPTH` sentinels of `rdma_cma.h`: a connection
+/// parameter of this value means "whatever the connection manager negotiated", and the queue pair
+/// is left with the attributes `rdma_init_qp_attr` computed.
+const RDMA_MAX_RESP_RES: u8 = 0xFF;
+const RDMA_MAX_INIT_DEPTH: u8 = 0xFF;
+
 /// The most private-data bytes a connection request (`rdma_connect`) can carry in a port space:
 /// the InfiniBand CM REQ (92 bytes) or, for the datagram port spaces, SIDR REQ (216 bytes) payload,
 /// minus the 36-byte header the connection manager prepends in the IP-based port spaces.
@@ -824,9 +830,26 @@ impl CmId {
     }
 
     /// Moves `qp` from `INIT` through `RTR` to `RTS`, completing the connection-manager transition.
-    fn ready(&self, qp: &mut QueuePair<Rc>) -> Result<()> {
-        self.transition(qp, QueuePairState::ReadyToReceive)?;
-        self.transition(qp, QueuePairState::ReadyToSend)
+    ///
+    /// Like librdmacm, `responder_resources` and `initiator_depth` override the outstanding-RDMA
+    /// limits the connection manager computed (`max_dest_rd_atomic` at `RTR`, `max_rd_atomic` at
+    /// `RTS`), so the queue pair is configured with the values this side advertises in its reply.
+    fn ready(
+        &self,
+        qp: &mut QueuePair<Rc>,
+        responder_resources: Option<u8>,
+        initiator_depth: Option<u8>,
+    ) -> Result<()> {
+        let mut rtr = self.init_qp_attr(QueuePairState::ReadyToReceive)?;
+        if let Some(responder_resources) = responder_resources {
+            rtr.set_max_dest_rd_atomic(responder_resources);
+        }
+        qp.modify(&rtr)?;
+        let mut rts = self.init_qp_attr(QueuePairState::ReadyToSend)?;
+        if let Some(initiator_depth) = initiator_depth {
+            rts.set_max_rd_atomic(initiator_depth);
+        }
+        qp.modify(&rts)
     }
 
     /// Transitions `qp` to `state` using the attributes the connection manager computes from the
@@ -1172,7 +1195,7 @@ impl Resolved {
         // was no connection to derive them from); now there is one, so apply `INIT` again — as
         // librdmacm does — before moving on. The RDMA limits come from the negotiated reply.
         self.id.transition(&mut qp, QueuePairState::Init)?;
-        self.id.ready(&mut qp)?;
+        self.id.ready(&mut qp, None, None)?;
         self.id.establish()?;
         Ok(Connection {
             id: self.id,
@@ -1255,7 +1278,10 @@ impl Incoming {
     }
 
     /// Accepts the connection (blocking) using `qp`, returning the established [`Connection`]. The
-    /// queue pair number in `param` is set automatically.
+    /// queue pair number in `param` is set automatically, and the queue pair is configured with
+    /// the outstanding-RDMA limits `param` advertises to the peer
+    /// ([`set_responder_resources`](ConnectionParameter::set_responder_resources) /
+    /// [`set_initiator_depth`](ConnectionParameter::set_initiator_depth)).
     ///
     /// `timeout` bounds how long to wait for the connection to establish: on expiry
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
@@ -1276,7 +1302,12 @@ impl Incoming {
     ) -> Result<Connection> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let mut qp = self.id.init_qp(qp)?;
-        self.id.ready(&mut qp)?;
+        let responder_resources = (param.param.responder_resources != RDMA_MAX_RESP_RES)
+            .then_some(param.param.responder_resources);
+        let initiator_depth = (param.param.initiator_depth != RDMA_MAX_INIT_DEPTH)
+            .then_some(param.param.initiator_depth);
+        self.id
+            .ready(&mut qp, responder_resources, initiator_depth)?;
         let param = param.set_qp_num(qp.qp_num());
         self.id.accept(&param)?;
         self.id.wait_for(CmEventType::Established, deadline)?;

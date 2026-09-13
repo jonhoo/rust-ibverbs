@@ -17,8 +17,8 @@ use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
-    AccessFlags, CompletionQueue, Context, Error, GidType, QueuePairEndpoint, QueuePairState, Rc,
-    RecvRequest, RemoteMemorySlice,
+    AccessFlags, CompletionQueue, Context, Error, GidType, QueuePairAttributeMask,
+    QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice,
 };
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
@@ -613,6 +613,74 @@ fn server_writes_into_client() {
     .expect("post_recv");
     wait_for(&cq, 1);
     assert_eq!(&target.bytes()[..MESSAGE.len()], MESSAGE);
+    done_tx.send(()).expect("signal done");
+    server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn accept_applies_rd_atomic_parameters() {
+    // The outstanding-RDMA limits the passive side advertises in its reply are also what its queue
+    // pair is configured with, and the active side ends up with the matching (swapped) pair.
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let rd_atomic =
+        QueuePairAttributeMask::MAX_QP_RD_ATOMIC | QueuePairAttributeMask::MAX_DEST_RD_ATOMIC;
+
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let ctx = incoming.context().expect("server device context");
+        let pd = ctx.alloc_pd().expect("server pd");
+        let cq = ctx.create_cq(16).build().expect("server cq");
+        let qp = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("server qp builder")
+            .build()
+            .expect("server qp");
+        let param = ConnectionParameter::default()
+            .set_responder_resources(4)
+            .set_initiator_depth(2);
+        let mut conn = incoming.accept(qp, param, SETUP_TIMEOUT).expect("accept");
+        let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
+        assert_eq!(attr.max_dest_rd_atomic(), 4, "server responder resources");
+        assert_eq!(attr.max_rd_atomic(), 2, "server initiator depth");
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client done");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    let mut conn = resolved
+        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .expect("connect");
+    let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
+    assert_eq!(
+        attr.max_rd_atomic(),
+        4,
+        "client initiator depth = server responder resources"
+    );
+    assert_eq!(
+        attr.max_dest_rd_atomic(),
+        2,
+        "client responder resources = server initiator depth"
+    );
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }
