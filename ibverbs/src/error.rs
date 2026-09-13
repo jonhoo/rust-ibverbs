@@ -188,10 +188,21 @@ pub enum Error {
     #[error("malformed wire-format encoding")]
     MalformedWireFormat,
 
-    /// The connection manager reported a failure event.
+    /// The connection manager reported a failure event while a blocking helper was waiting for
+    /// the next setup step.
     #[cfg(feature = "rdmacm")]
-    #[error("the connection manager reported {0:?}")]
-    ConnectionManager(CmEventType),
+    #[error("the connection manager reported {event} (status {status})")]
+    ConnectionManager {
+        /// The failure event.
+        event: CmEventType,
+        /// The event's status: a negative `errno` for address, route, and connection errors, or
+        /// the transport's reject reason for [`Rejected`](CmEventType::Rejected) (28, "consumer
+        /// defined", when the peer declined the request itself).
+        status: i32,
+        /// The private data the peer attached to its rejection, padded by the transport to its
+        /// wire format; empty when there is none.
+        private_data: Vec<u8>,
+    },
 
     /// Binding a connection-manager identifier to a local address failed (`rdma_bind_addr`).
     #[cfg(feature = "rdmacm")]

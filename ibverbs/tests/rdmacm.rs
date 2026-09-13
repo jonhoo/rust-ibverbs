@@ -7,6 +7,7 @@
 //! `cargo test --features rdmacm -- --ignored`. It uses the first device, or `IBVERBS_TEST_DEVICE`.
 #![cfg(feature = "rdmacm")]
 
+use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::{mpsc, Arc, Barrier};
@@ -351,8 +352,9 @@ fn pump_until(id: &CmId, want: CmEventType) -> CmEvent {
 }
 
 /// The private data the server attaches to its reply; the client's request carries its endpoint
-/// encoding instead.
-const SERVER_PDATA: &[u8] = b"server says welcome";
+/// encoding instead. Longer than a request may carry (56 bytes), since a reply may carry 196.
+const SERVER_PDATA: &[u8] =
+    b"server says welcome, and keeps on saying it for well over fifty-six bytes of reply";
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
@@ -513,6 +515,58 @@ fn low_level_connect_and_send() {
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn rejected_request_reports_reason_and_private_data() {
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        incoming.reject(b"nope").expect("reject");
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client saw the rejection");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+        Err(Error::ConnectionManager {
+            event: CmEventType::Rejected,
+            status,
+            private_data,
+        }) => {
+            // 28 is the InfiniBand CM's "consumer defined" reject reason: the peer itself said no.
+            assert_eq!(status, 28, "reject reason");
+            assert!(
+                private_data.len() >= 4 && &private_data[..4] == b"nope",
+                "the rejection carries the peer's private data: {private_data:?}"
+            );
+        }
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got a connection"),
+    }
+    done_tx.send(()).expect("signal done");
+    server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn dropped_connect_request_is_rejected() {
     // A listener that drops a connection-request event without taking its id declines the
     // request, so the peer fails fast instead of retrying until its timeout.
@@ -549,7 +603,10 @@ fn dropped_connect_request_is_rejected() {
         .expect("client qp");
     let before = Instant::now();
     match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
-        Err(Error::ConnectionManager(CmEventType::Rejected)) => {}
+        Err(Error::ConnectionManager {
+            event: CmEventType::Rejected,
+            ..
+        }) => {}
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
     }
@@ -559,4 +616,25 @@ fn dropped_connect_request_is_rejected() {
     );
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn connect_rejects_oversized_private_data() {
+    let id = CmId::create(PortSpace::Tcp).expect("id");
+    // 57 bytes is one more than a TCP-port-space request can carry; the parameter itself holds
+    // up to a reply's worth (196 bytes), which the request check rejects too.
+    for len in [57, 196] {
+        let param = ConnectionParameter::default().set_private_data(&vec![0x5a; len]);
+        match id.connect(&param) {
+            Err(Error::Connect(e)) if e.kind() == io::ErrorKind::InvalidInput => {}
+            other => panic!("expected an InvalidInput error for {len} bytes, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+#[should_panic(expected = "limited to 196 bytes")]
+fn private_data_beyond_any_limit_panics() {
+    let _ = ConnectionParameter::default().set_private_data(&[0; 197]);
 }

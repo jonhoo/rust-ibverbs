@@ -325,6 +325,28 @@ fn timeout_ms(timeout: Duration) -> c_int {
     timeout.as_millis().min(c_int::MAX as u128) as c_int
 }
 
+/// The most private-data bytes a connection request (`rdma_connect`) can carry in a port space:
+/// the InfiniBand CM REQ (92 bytes) or, for the datagram port spaces, SIDR REQ (216 bytes) payload,
+/// minus the 36-byte header the connection manager prepends in the IP-based port spaces.
+fn max_connect_private_data(ps: ffi::rdma_port_space) -> usize {
+    use ffi::rdma_port_space::*;
+    match ps {
+        RDMA_PS_TCP => 56,
+        RDMA_PS_IB => 92,
+        RDMA_PS_UDP | RDMA_PS_IPOIB => 180,
+    }
+}
+
+/// The most private-data bytes a reply (`rdma_accept`) can carry in a port space: the CM REP
+/// (196 bytes) or SIDR REP (136 bytes) payload.
+fn max_accept_private_data(ps: ffi::rdma_port_space) -> usize {
+    use ffi::rdma_port_space::*;
+    match ps {
+        RDMA_PS_TCP | RDMA_PS_IB => 196,
+        RDMA_PS_UDP | RDMA_PS_IPOIB => 136,
+    }
+}
+
 /// The most private-data bytes a rejection (`rdma_reject`) can carry: the CM REJ payload.
 const MAX_REJECT_PRIVATE_DATA: usize = 148;
 
@@ -554,23 +576,23 @@ impl CmId {
         Ok(Some(self.get_cm_event()?))
     }
 
-    /// Blocks until an `expected` event arrives (up to `deadline`), acknowledging and skipping any
-    /// others, and returning an error on a failure event or on an expired deadline. Drives the
-    /// blocking setup helpers.
-    fn wait_for(&self, expected: CmEventType, deadline: Option<Instant>) -> Result<()> {
+    /// Blocks until an `expected` event arrives (up to `deadline`) and returns it, acknowledging
+    /// and skipping any others, and returning an error on a failure event or on an expired
+    /// deadline. Drives the blocking setup helpers.
+    fn wait_for(&self, expected: CmEventType, deadline: Option<Instant>) -> Result<CmEvent> {
         loop {
             // This blocks on the channel's fd until an event arrives — it does not spin. The loop
             // only goes around to skip a non-matching event, re-blocking on the next read. Each
-            // event is acknowledged when it drops at the iteration end.
+            // skipped event is acknowledged when it drops at the iteration end.
             let Some(event) = self.get_cm_event_deadline(deadline)? else {
                 return Err(Error::TimedOut);
             };
             let kind = event.event_type();
             if kind == expected {
-                return Ok(());
+                return Ok(event);
             }
             if is_failure(kind) {
-                return Err(Error::ConnectionManager(kind));
+                return Err(event.into_error());
             }
         }
     }
@@ -633,7 +655,24 @@ impl CmId {
     /// event is delivered. `param` carries the local queue pair number; set it with
     /// [`ConnectionParameter::set_qp_num`] to the number of the queue pair you built. After the
     /// response, move the queue pair to `RTR`/`RTS` and call [`establish`](Self::establish).
+    ///
+    /// # Errors
+    ///
+    ///  - [`Connect`](Error::Connect): `rdma_connect` failed, or the private data exceeds what a
+    ///    request can carry in this id's port space (56 bytes for [`PortSpace::Tcp`], 92 for
+    ///    [`PortSpace::Ib`], 180 for the datagram port spaces).
     pub fn connect(&self, param: &ConnectionParameter) -> Result<()> {
+        let limit = max_connect_private_data(self.port_space());
+        if usize::from(param.param.private_data_len) > limit {
+            return Err(Error::Connect(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "connection request private data is limited to {limit} bytes in this port \
+                     space, got {}",
+                    param.param.private_data_len
+                ),
+            )));
+        }
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
@@ -648,7 +687,24 @@ impl CmId {
     /// [`CmEventType::ConnectRequest`]. Build and move the queue pair to `RTS` first; `param`
     /// carries its number, set with [`ConnectionParameter::set_qp_num`]. On success a
     /// [`CmEventType::Established`] event is delivered.
+    ///
+    /// # Errors
+    ///
+    ///  - [`Accept`](Error::Accept): `rdma_accept` failed, or the private data exceeds what a
+    ///    reply can carry in this id's port space (196 bytes for [`PortSpace::Tcp`] and
+    ///    [`PortSpace::Ib`], 136 for the datagram port spaces).
     pub fn accept(&self, param: &ConnectionParameter) -> Result<()> {
+        let limit = max_accept_private_data(self.port_space());
+        if usize::from(param.param.private_data_len) > limit {
+            return Err(Error::Accept(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "connection reply private data is limited to {limit} bytes in this port \
+                     space, got {}",
+                    param.param.private_data_len
+                ),
+            )));
+        }
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
@@ -734,6 +790,11 @@ impl CmId {
         self.inner.id
     }
 
+    /// The port space this id was created in.
+    fn port_space(&self) -> ffi::rdma_port_space {
+        unsafe { (*self.inner.id).ps }
+    }
+
     /// The device context the connection manager bound this id to (its `verbs`). Only available once
     /// the address has resolved.
     fn verbs(&self) -> Result<*mut ffi::ibv_context> {
@@ -807,15 +868,25 @@ pub struct CmEvent {
 unsafe impl Send for CmEvent {}
 
 impl CmEvent {
+    /// The failure this event reports, for the blocking helpers to return.
+    fn into_error(self) -> Error {
+        Error::ConnectionManager {
+            event: self.event_type(),
+            status: self.status(),
+            private_data: self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
+        }
+    }
+
     /// The kind of event. Match on the [`CmEventType`] to decide what to do next; see [`CmId`] for
     /// the expected sequence.
     pub fn event_type(&self) -> CmEventType {
         unsafe { (*self.event).event }.into()
     }
 
-    /// The event's status: `0` on success, otherwise a negative errno (for connection-error and
-    /// rejected events) or a transport-specific value. Informational; the setup steps already turn
-    /// failure events into errors.
+    /// The event's status: `0` on success, otherwise a negative errno (for address, route, and
+    /// connection errors) or a transport-specific value (the reject reason for
+    /// [`Rejected`](CmEventType::Rejected)). The blocking helpers carry it in
+    /// [`Error::ConnectionManager`].
     pub fn status(&self) -> i32 {
         unsafe { (*self.event).status }
     }
@@ -907,9 +978,10 @@ impl Drop for CmEvent {
     }
 }
 
-/// The most private-data bytes a connection request can carry: `rdma_connect`'s limit for a
-/// reliable connection, once the connection manager's own wire header is accounted for.
-const MAX_PRIVATE_DATA: usize = 56;
+/// The most private-data bytes any connection-manager call accepts (a reply's, see
+/// [`max_accept_private_data`]); [`CmId::connect`] and [`CmId::accept`] enforce the tighter
+/// per-call limits.
+const MAX_PRIVATE_DATA: usize = 196;
 
 /// Parameters for connecting and accepting.
 ///
@@ -980,15 +1052,19 @@ impl ConnectionParameter {
     }
 
     /// Sets the application payload carried inside the connection request or reply, for the peer
-    /// to read with [`CmEvent::private_data`] — typically a protocol version, a token, or
-    /// bootstrap parameters that save a round trip.
+    /// to read with [`Incoming::peer_private_data`] / [`Connection::peer_private_data`] (or
+    /// [`CmEvent::private_data`]) — typically a protocol version, a token, or bootstrap parameters
+    /// that save a round trip.
     ///
-    /// At most 56 bytes, the `rdma_connect` limit for a reliable connection. The bytes are copied
-    /// into the parameter.
+    /// How much fits depends on the call and port space: a request ([`Resolved::connect`] /
+    /// [`CmId::connect`]) carries at most 56 bytes in [`PortSpace::Tcp`] (92 in
+    /// [`PortSpace::Ib`], 180 in the datagram port spaces), a reply ([`Incoming::accept`] /
+    /// [`CmId::accept`]) up to 196 (136 in the datagram port spaces); those calls fail with an
+    /// error when the data does not fit. The bytes are copied into the parameter.
     ///
     /// # Panics
     ///
-    /// Panics if `data` is longer than 56 bytes.
+    /// Panics if `data` is longer than 196 bytes, more than any call accepts.
     pub fn set_private_data(mut self, data: &[u8]) -> Self {
         assert!(
             data.len() <= MAX_PRIVATE_DATA,
@@ -1060,6 +1136,15 @@ impl Resolved {
     ///
     /// `timeout` bounds how long to wait for the remote's response: on expiry
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionManager`](Error::ConnectionManager): the peer rejected the request (with
+    ///    its reject reason and private data), or was unreachable.
+    ///  - [`Connect`](Error::Connect): `rdma_connect` failed, or the private data does not fit a
+    ///    request (see [`ConnectionParameter::set_private_data`]).
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed.
+    ///  - [`TimedOut`](Error::TimedOut): the response did not arrive in time.
     pub fn connect(
         self,
         qp: PreparedQueuePair<Rc>,
@@ -1070,10 +1155,18 @@ impl Resolved {
         let mut qp = self.id.init_qp(qp)?;
         let param = param.set_qp_num(qp.qp_num());
         self.id.connect(&param)?;
-        self.id.wait_for(CmEventType::ConnectResponse, deadline)?;
+        let response = self.id.wait_for(CmEventType::ConnectResponse, deadline)?;
+        let private_data = response
+            .private_data()
+            .map_or_else(Vec::new, <[u8]>::to_vec);
+        drop(response);
         self.id.ready(&mut qp)?;
         self.id.establish()?;
-        Ok(Connection { id: self.id, qp })
+        Ok(Connection {
+            id: self.id,
+            qp,
+            private_data,
+        })
     }
 }
 
@@ -1114,8 +1207,10 @@ impl Acceptor {
                 return Err(Error::TimedOut);
             };
             if event.event_type() == CmEventType::ConnectRequest {
+                let private_data = event.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
                 return Ok(Incoming {
                     id: event.connection_request()?,
+                    private_data,
                 });
             }
             // Only connection requests matter here; anything else is acknowledged and ignored
@@ -1129,6 +1224,7 @@ impl Acceptor {
 /// self-contained and can be handed to another thread. Dropping it declines the request.
 pub struct Incoming {
     id: CmId,
+    private_data: Vec<u8>,
 }
 
 impl Incoming {
@@ -1138,11 +1234,28 @@ impl Incoming {
         self.id.context()
     }
 
+    /// The private data the peer attached to its request
+    /// ([`ConnectionParameter::set_private_data`]), as reported by the transport: padded to its
+    /// wire format, so typically longer than what the peer wrote, with the tail zero-filled.
+    /// Empty when the peer attached none.
+    pub fn peer_private_data(&self) -> &[u8] {
+        &self.private_data
+    }
+
     /// Accepts the connection (blocking) using `qp`, returning the established [`Connection`]. The
     /// queue pair number in `param` is set automatically.
     ///
     /// `timeout` bounds how long to wait for the connection to establish: on expiry
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
+    ///
+    /// # Errors
+    ///
+    ///  - [`Accept`](Error::Accept): `rdma_accept` failed, or the private data does not fit a
+    ///    reply (see [`ConnectionParameter::set_private_data`]).
+    ///  - [`ConnectionManager`](Error::ConnectionManager): the peer gave up before the connection
+    ///    was established.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed.
+    ///  - [`TimedOut`](Error::TimedOut): the connection was not established in time.
     pub fn accept(
         self,
         qp: PreparedQueuePair<Rc>,
@@ -1155,7 +1268,11 @@ impl Incoming {
         let param = param.set_qp_num(qp.qp_num());
         self.id.accept(&param)?;
         self.id.wait_for(CmEventType::Established, deadline)?;
-        Ok(Connection { id: self.id, qp })
+        Ok(Connection {
+            id: self.id,
+            qp,
+            private_data: self.private_data,
+        })
     }
 
     /// Declines the request instead of accepting it. The peer's connect fails with
@@ -1176,6 +1293,8 @@ impl Incoming {
 pub struct Connection {
     id: CmId,
     qp: QueuePair<Rc>,
+    /// The private data the peer attached to its request (passive side) or reply (active side).
+    private_data: Vec<u8>,
 }
 
 impl Connection {
@@ -1183,6 +1302,14 @@ impl Connection {
     /// you built it with.
     pub fn queue_pair(&mut self) -> &mut QueuePair<Rc> {
         &mut self.qp
+    }
+
+    /// The private data the peer attached to its connection request (on the accepting side) or
+    /// its reply (on the connecting side), as reported by the transport: padded to its wire
+    /// format, so typically longer than what the peer wrote, with the tail zero-filled. Empty
+    /// when the peer attached none.
+    pub fn peer_private_data(&self) -> &[u8] {
+        &self.private_data
     }
 
     /// Disconnects the connection. The peer is notified with a [`CmEventType::Disconnected`]
