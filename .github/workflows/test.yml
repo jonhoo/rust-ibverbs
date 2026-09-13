@@ -108,6 +108,9 @@ jobs:
           sudo cp rdma_rxe.ko "/lib/modules/$(uname -r)/extra/"
           sudo depmod -a
           sudo modprobe rdma_rxe
+          # librdmacm reaches the kernel connection manager through rdma_ucm; load it explicitly
+          # rather than relying on the first rdma_cm open to autoload it.
+          sudo modprobe rdma_ucm
           netdev=$(ip -o -4 route show to default | awk '{print $5; exit}')
           echo "Attaching rxe0 to $netdev"
           sudo rdma link add rxe0 type rxe netdev "$netdev"
@@ -138,6 +141,17 @@ jobs:
         # rxe device (librdmacm-dev was installed by configure-ci.sh above). Serial for the same
         # reason as the loopback tests.
         run: cargo test --locked --features rdmacm --test rdmacm -- --ignored --test-threads=1
+      - name: Dump the RDMA state
+        # The device is set up from scratch on every run, so when a test fails the interesting
+        # evidence is what the kernel and the device looked like at that moment.
+        if: failure()
+        run: |
+          rdma link || true
+          ip -4 addr || true
+          ls -l /dev/infiniband || true
+          lsmod | grep -E '^(rdma|ib_|rxe)' || true
+          ibv_devinfo -v || true
+          sudo dmesg | tail -n 60 || true
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
     # that this crate is compatible with the minimal version that this crate and its dependencies
