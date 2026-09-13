@@ -18,7 +18,7 @@ use ibverbs::rdmacm::{
 };
 use ibverbs::{
     AccessFlags, CompletionQueue, Context, Error, GidType, QueuePairAttributeMask,
-    QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice,
+    QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice, WcStatus,
 };
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
@@ -786,6 +786,81 @@ fn dropped_connect_request_is_rejected() {
         before.elapsed() < Duration::from_secs(5),
         "the rejection arrived promptly, not after the request's retries"
     );
+    done_tx.send(()).expect("signal done");
+    server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn disconnect_flushes_outstanding_receives() {
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let ctx = incoming.context().expect("server device context");
+        let pd = ctx.alloc_pd().expect("server pd");
+        let cq = ctx.create_cq(16).build().expect("server cq");
+        let qp = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("server qp builder")
+            .build()
+            .expect("server qp");
+        let _conn = incoming
+            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+            .expect("accept");
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client done");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    let recv = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("client recv mr");
+    let mut conn = resolved
+        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .expect("connect");
+    unsafe {
+        conn.queue_pair()
+            .post_recv([RecvRequest::new(7, &[recv.slice(..)])])
+    }
+    .expect("post_recv");
+    conn.disconnect().expect("disconnect");
+
+    // The receive never got a message; disconnecting flushes it with an error completion.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let status = 'flushed: loop {
+        if let Some(mut completions) = cq.poll().expect("poll") {
+            while let Some(wc) = completions.next() {
+                if wc.wr_id() == 7 {
+                    break 'flushed wc.ok().map_err(|e| e.status);
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the flushed receive"
+        );
+    };
+    assert_eq!(status, Err(WcStatus::WorkRequestFlushed));
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }

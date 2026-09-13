@@ -773,6 +773,11 @@ impl CmId {
 
     /// Disconnects an established connection, delivering [`CmEventType::Disconnected`] to both
     /// sides.
+    ///
+    /// The queue pair is not touched: it is not attached to the id, so `rdma_disconnect` does not
+    /// move it to the error state the way it would a connection-manager-created one. Do that
+    /// yourself with [`QueuePair::modify`] so outstanding work requests are flushed (the blocking
+    /// [`Connection::disconnect`] does).
     pub fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.inner.id) };
         if ret != 0 {
@@ -1355,10 +1360,22 @@ impl Connection {
         &self.private_data
     }
 
-    /// Disconnects the connection. The peer is notified with a [`CmEventType::Disconnected`]
-    /// event.
-    pub fn disconnect(&self) -> Result<()> {
-        self.id.disconnect()
+    /// Disconnects the connection and moves the queue pair to the error state, so every
+    /// outstanding work request completes with
+    /// [`WorkRequestFlushed`](crate::WcStatus::WorkRequestFlushed) on its completion queue. The
+    /// peer is notified with a [`CmEventType::Disconnected`] event.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed (for example
+    ///    because the connection is already down).
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): moving the queue pair to the error state
+    ///    failed.
+    pub fn disconnect(&mut self) -> Result<()> {
+        self.id.disconnect()?;
+        let mut error = QueuePairAttribute::new();
+        error.set_state(QueuePairState::Error);
+        self.qp.modify(&error)
     }
 
     /// The IP address and port of the remote end of this connection, or `None` if its address
