@@ -112,7 +112,10 @@ impl QueuePairBuilder<Srd> {
             )
         };
         if qp.is_null() {
-            return Err(Error::CreateQueuePair(io::Error::last_os_error()));
+            return Err(Error::os(
+                io::Error::last_os_error(),
+                Error::CreateQueuePair,
+            ));
         }
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         Ok(PreparedQueuePair {

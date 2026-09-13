@@ -777,7 +777,10 @@ impl<T: Transport> QueuePairBuilder<T> {
 
         let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, attr.as_mut_ptr()) };
         if qp.is_null() {
-            Err(Error::CreateQueuePair(io::Error::last_os_error()))
+            Err(Error::os(
+                io::Error::last_os_error(),
+                Error::CreateQueuePair,
+            ))
         } else {
             let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
             Ok(PreparedQueuePair {
