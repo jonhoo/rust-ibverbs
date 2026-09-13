@@ -56,8 +56,12 @@
 //! events with [`poll_cm_event`]. You build the queue pair on the
 //! [`context`](CmId::context) the id resolves to and transition it with
 //! [`init_qp_attr`](CmId::init_qp_attr) plus
-//! [`QueuePair::modify`](crate::QueuePair::modify). The blocking helpers are written on top of this
-//! same API.
+//! [`QueuePair::modify`](crate::QueuePair::modify): on the active side `Init` before [`connect`],
+//! then — once the [`ConnectResponse`](CmEventType::ConnectResponse) has arrived — `Init` again
+//! (the attributes computed before the connection existed carry no remote-access flags),
+//! `ReadyToReceive`, `ReadyToSend`, and [`establish`](CmId::establish); on the passive side
+//! `Init`, `ReadyToReceive`, and `ReadyToSend` before [`accept`]. The blocking helpers are written
+//! on top of this same API.
 //!
 //! [`resolve_addr`]: CmId::resolve_addr
 //! [`connect`]: CmId::connect
@@ -528,7 +532,10 @@ impl CmId {
     /// [`ReadyToReceive`](QueuePairState::ReadyToReceive), and
     /// [`ReadyToSend`](QueuePairState::ReadyToSend) at the points the blocking helpers do (see the
     /// [module docs](self#low-level-control)) by calling this for each state and passing the
-    /// result to [`QueuePair::modify`](crate::QueuePair::modify).
+    /// result to [`QueuePair::modify`](crate::QueuePair::modify). On the active side, apply
+    /// `Init` a second time once the [`ConnectResponse`](CmEventType::ConnectResponse) has
+    /// arrived: before the connection exists the `Init` attributes carry no remote-access flags,
+    /// and only the second application grants the peer the RDMA access negotiated in the request.
     pub fn init_qp_attr(&self, target_state: QueuePairState) -> Result<QueuePairAttribute> {
         // Start from the valid default (an all-zero `ibv_qp_attr` is not one: `path_mtu` has no
         // zero variant). `rdma_init_qp_attr` reads the target state from the attribute and fills
@@ -654,7 +661,8 @@ impl CmId {
     /// [`CmEventType::ConnectResponse`] (external queue pair) or [`CmEventType::Established`]
     /// event is delivered. `param` carries the local queue pair number; set it with
     /// [`ConnectionParameter::set_qp_num`] to the number of the queue pair you built. After the
-    /// response, move the queue pair to `RTR`/`RTS` and call [`establish`](Self::establish).
+    /// response, apply the `Init` attributes again (see [`init_qp_attr`](Self::init_qp_attr)),
+    /// move the queue pair to `RTR`/`RTS`, and call [`establish`](Self::establish).
     ///
     /// # Errors
     ///
@@ -1160,6 +1168,10 @@ impl Resolved {
             .private_data()
             .map_or_else(Vec::new, <[u8]>::to_vec);
         drop(response);
+        // The `INIT` attributes applied before connecting carried no remote-access flags (there
+        // was no connection to derive them from); now there is one, so apply `INIT` again — as
+        // librdmacm does — before moving on. The RDMA limits come from the negotiated reply.
+        self.id.transition(&mut qp, QueuePairState::Init)?;
         self.id.ready(&mut qp)?;
         self.id.establish()?;
         Ok(Connection {

@@ -18,7 +18,7 @@ use ibverbs::rdmacm::{
 };
 use ibverbs::{
     AccessFlags, CompletionQueue, Context, Error, GidType, QueuePairEndpoint, QueuePairState, Rc,
-    RecvRequest,
+    RecvRequest, RemoteMemorySlice,
 };
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
@@ -488,6 +488,17 @@ fn low_level_connect_and_send() {
     );
     assert_eq!(&pdata[..SERVER_PDATA.len()], SERVER_PDATA);
     drop(response);
+    // The `Init` attributes computed before connecting carried no remote-access flags; now that
+    // the connection exists, applying `Init` again grants the peer the negotiated RDMA access.
+    let init = id
+        .init_qp_attr(QueuePairState::Init)
+        .expect("client init attr after the response");
+    assert!(
+        init.access_flags().contains(AccessFlags::REMOTE_WRITE),
+        "the connection's INIT attributes grant remote write: {:?}",
+        init.access_flags()
+    );
+    qp.modify(&init).expect("client re-init");
     for state in [QueuePairState::ReadyToReceive, QueuePairState::ReadyToSend] {
         let attr = id.init_qp_attr(state).expect("client init_qp_attr");
         qp.modify(&attr).expect("client modify");
@@ -510,6 +521,99 @@ fn low_level_connect_and_send() {
         .recv_timeout(Duration::from_secs(10))
         .expect("server received the message");
     id.disconnect().ok();
+    server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn server_writes_into_client() {
+    // A peer-initiated one-sided operation aimed at the active side: the client hands the server a
+    // remote slice in its request's private data, the server RDMA-writes the message into it and
+    // then sends a one-byte notification, which the client receives before checking the buffer.
+    // Catches an active-side queue pair brought up without its remote-access flags.
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let pdata = incoming.peer_private_data();
+        assert!(
+            pdata.len() >= RemoteMemorySlice::WIRE_LEN,
+            "the request carries a remote slice"
+        );
+        let bytes: [u8; RemoteMemorySlice::WIRE_LEN] =
+            pdata[..RemoteMemorySlice::WIRE_LEN].try_into().unwrap();
+        let target = RemoteMemorySlice::from_bytes(&bytes).expect("well-formed remote slice");
+
+        let ctx = incoming.context().expect("server device context");
+        let pd = ctx.alloc_pd().expect("server pd");
+        let cq = ctx.create_cq(16).build().expect("server cq");
+        let qp = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("server qp builder")
+            .set_max_send_wr(4)
+            .build()
+            .expect("server qp");
+        let mut src = pd
+            .allocate(64, AccessFlags::PERMISSIVE)
+            .expect("server source mr");
+        src.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
+        let notify = pd
+            .allocate(1, AccessFlags::PERMISSIVE)
+            .expect("server notify mr");
+        let mut conn = incoming
+            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+            .expect("accept");
+
+        let mut batch = conn.queue_pair().start_send();
+        batch
+            .op()
+            .signaled()
+            .write(1, &[src.slice(..MESSAGE.len())], target);
+        batch.op().signaled().send(2, &[notify.slice(..)]);
+        unsafe { batch.submit() }.expect("submit");
+        wait_for(&cq, 1);
+        wait_for(&cq, 2);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client saw the write");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    let target = pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("client target mr");
+    let notify = pd
+        .allocate(1, AccessFlags::PERMISSIVE)
+        .expect("client notify mr");
+    let param = ConnectionParameter::default()
+        .set_private_data(&target.remote().slice(..MESSAGE.len()).to_bytes());
+    let mut conn = resolved.connect(qp, param, SETUP_TIMEOUT).expect("connect");
+    unsafe {
+        conn.queue_pair()
+            .post_recv([RecvRequest::new(1, &[notify.slice(..)])])
+    }
+    .expect("post_recv");
+    wait_for(&cq, 1);
+    assert_eq!(&target.bytes()[..MESSAGE.len()], MESSAGE);
+    done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }
 
