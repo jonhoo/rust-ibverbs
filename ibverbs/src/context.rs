@@ -1126,12 +1126,12 @@ pub struct DeviceAttr(ffi::ibv_device_attr);
 impl DeviceAttr {
     /// The node GUID of the device.
     pub fn node_guid(&self) -> Guid {
-        self.0.node_guid.into()
+        Guid::from_be64(self.0.node_guid)
     }
 
     /// The system-image GUID, shared by the ports of the same physical device.
     pub fn sys_image_guid(&self) -> Guid {
-        self.0.sys_image_guid.into()
+        Guid::from_be64(self.0.sys_image_guid)
     }
 
     /// The device's firmware version, decoded from the fixed-size `fw_ver` C string. Borrows when it
@@ -1189,12 +1189,12 @@ impl DeviceAttrEx {
 
     /// The node GUID of the device.
     pub fn node_guid(&self) -> Guid {
-        self.0.orig_attr.node_guid.into()
+        Guid::from_be64(self.0.orig_attr.node_guid)
     }
 
     /// The system-image GUID, shared by the ports of the same physical device.
     pub fn sys_image_guid(&self) -> Guid {
-        self.0.orig_attr.sys_image_guid.into()
+        Guid::from_be64(self.0.orig_attr.sys_image_guid)
     }
 
     /// The mask that bounds the device's completion timestamps: the free-running HCA clock that

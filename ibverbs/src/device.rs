@@ -132,6 +132,15 @@ impl Guid {
     pub fn is_reserved(&self) -> bool {
         self.raw == [0; 8]
     }
+
+    /// Wraps a GUID the way libibverbs hands it out: a `__be64`, whose bytes in memory are
+    /// already in wire (big-endian) order. Interpreting that integer as a host-order number would
+    /// reverse the bytes on little-endian hosts, so they are copied as they are.
+    pub(crate) fn from_be64(be: ffi::__be64) -> Self {
+        Self {
+            raw: be.to_ne_bytes(),
+        }
+    }
 }
 
 impl fmt::Display for Guid {
@@ -227,8 +236,7 @@ impl<'devlist> Device<'devlist> {
     ///
     ///  - [`DeviceGuid`](Error::DeviceGuid): `ibv_get_device_guid` failed.
     pub fn guid(&self) -> Result<Guid> {
-        let guid_int = unsafe { ffi::ibv_get_device_guid(*self.0) };
-        let guid: Guid = guid_int.into();
+        let guid = Guid::from_be64(unsafe { ffi::ibv_get_device_guid(*self.0) });
         if guid.is_reserved() {
             Err(Error::os(io::Error::last_os_error(), Error::DeviceGuid))
         } else {
@@ -333,13 +341,24 @@ mod test_guid {
     #[test]
     fn encode_decode_guid() {
         let guid_u64 = 0x12_34_56_78_9a_bc_de_f0_u64;
-        let _be: ffi::__be64 = guid_u64.to_be();
         let guid: Guid = guid_u64.into();
 
         assert!(!guid.is_reserved());
         assert_eq!(guid.raw, [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0]);
-        println!("{:#08x}", guid.oui());
         assert_eq!(guid.oui(), 0x123456);
+        assert_eq!(u64::from(guid), guid_u64);
+    }
+
+    #[test]
+    fn guid_from_be64_keeps_wire_order() {
+        // What `ibv_get_device_guid` and `ibv_device_attr::node_guid` hold: the GUID's bytes in
+        // network order, read as a native integer (so byte-swapped on little-endian hosts).
+        let be: ffi::__be64 = 0x0002_c903_00a0_7c8e_u64.to_be();
+        let guid = Guid::from_be64(be);
+        assert_eq!(guid.raw, [0x00, 0x02, 0xc9, 0x03, 0x00, 0xa0, 0x7c, 0x8e]);
+        assert_eq!(guid.to_string(), "0002:c903:00a0:7c8e");
+        assert_eq!(guid.oui(), 0x0002c9);
+        assert_eq!(u64::from(guid), 0x0002_c903_00a0_7c8e);
     }
 }
 
