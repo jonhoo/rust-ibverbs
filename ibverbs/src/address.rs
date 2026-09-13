@@ -97,8 +97,10 @@ impl From<ffi::ibv_gid> for Gid {
 }
 
 impl From<Gid> for ffi::ibv_gid {
-    fn from(mut gid: Gid) -> Self {
-        *gid.as_mut()
+    fn from(gid: Gid) -> Self {
+        // By value: `Gid` is a byte array (align 1) while the `ibv_gid` union holds `__be64`s
+        // (align 8), so a reference cast between them would be misaligned.
+        ffi::ibv_gid { raw: gid.raw }
     }
 }
 
@@ -111,18 +113,6 @@ impl From<Gid> for [u8; 16] {
 impl From<[u8; 16]> for Gid {
     fn from(raw: [u8; 16]) -> Self {
         Self { raw }
-    }
-}
-
-impl AsRef<ffi::ibv_gid> for Gid {
-    fn as_ref(&self) -> &ffi::ibv_gid {
-        unsafe { &*self.raw.as_ptr().cast::<ffi::ibv_gid>() }
-    }
-}
-
-impl AsMut<ffi::ibv_gid> for Gid {
-    fn as_mut(&mut self) -> &mut ffi::ibv_gid {
-        unsafe { &mut *self.raw.as_mut_ptr().cast::<ffi::ibv_gid>() }
     }
 }
 

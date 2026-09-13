@@ -167,12 +167,6 @@ impl From<Guid> for u64 {
     }
 }
 
-impl AsRef<ffi::__be64> for Guid {
-    fn as_ref(&self) -> &ffi::__be64 {
-        unsafe { &*self.raw.as_ptr().cast::<ffi::__be64>() }
-    }
-}
-
 impl<'devlist> Device<'devlist> {
     /// Creates a verbs context for this device.
     ///
