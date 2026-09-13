@@ -68,7 +68,6 @@
 //! [`AsFd`]: std::os::fd::AsFd
 
 use std::io;
-use std::mem::MaybeUninit;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::{c_int, c_void};
@@ -498,17 +497,20 @@ impl CmId {
     /// [module docs](self#low-level-control)) by calling this for each state and passing the
     /// result to [`QueuePair::modify`](crate::QueuePair::modify).
     pub fn init_qp_attr(&self, target_state: QueuePairState) -> Result<QueuePairAttribute> {
-        let mut attr = MaybeUninit::<ffi::ibv_qp_attr>::zeroed();
-        // `rdma_init_qp_attr` reads the target state from the attribute and fills in the rest.
-        unsafe { (*attr.as_mut_ptr()).qp_state = target_state.into() };
+        // Start from the valid default (an all-zero `ibv_qp_attr` is not one: `path_mtu` has no
+        // zero variant). `rdma_init_qp_attr` reads the target state from the attribute and fills
+        // in the fields it reports in the mask.
+        let mut attr = ffi::ibv_qp_attr {
+            qp_state: target_state.into(),
+            ..Default::default()
+        };
         let mut mask: c_int = 0;
-        let ret = unsafe { ffi::rdma_init_qp_attr(self.inner.id, attr.as_mut_ptr(), &mut mask) };
+        let ret = unsafe { ffi::rdma_init_qp_attr(self.inner.id, &mut attr, &mut mask) };
         if ret != 0 {
             return Err(Error::ModifyQueuePair(io::Error::last_os_error()));
         }
-        // SAFETY: `rdma_init_qp_attr` succeeded, so it initialized `attr`.
         Ok(QueuePairAttribute::from_raw(
-            unsafe { attr.assume_init() },
+            attr,
             ffi::ibv_qp_attr_mask(mask as u32),
         ))
     }

@@ -52,6 +52,8 @@ rust_bindgen(
         "--default-enum-style=rust",
         "--no-prepend-enum-name",
         "--blocklist-type=ibv_wc",
+        # `ibv_qp_attr` gets a hand-written `Default` in src/lib.rs (see build.rs)
+        "--no-default=ibv_qp_attr",
     ],
     cc_lib = ":ibverbs_c",
     header = "@rdma_core//:libibverbs/verbs.h",

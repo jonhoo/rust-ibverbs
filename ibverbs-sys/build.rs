@@ -120,6 +120,9 @@ fn main() {
             non_exhaustive: false,
         })
         .derive_default(true)
+        // `ibv_qp_attr` gets a hand-written `Default` in lib.rs: bindgen's fallback zeroes the
+        // struct, but its `path_mtu` enum has no zero variant, so that would be an invalid value.
+        .no_default("ibv_qp_attr")
         .derive_debug(true)
         .prepend_enum_name(false)
         .blocklist_type("ibv_wc")
