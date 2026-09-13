@@ -1271,18 +1271,28 @@ impl Acceptor {
     ///
     /// `timeout` bounds how long to wait for a request: on expiry [`TimedOut`](Error::TimedOut)
     /// is returned, and `None` waits indefinitely.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionManager`](Error::ConnectionManager): the listener reported a failure (its
+    ///    device was removed).
+    ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         loop {
             let Some(event) = self.listener.get_cm_event_deadline(deadline)? else {
                 return Err(Error::TimedOut);
             };
-            if event.event_type() == CmEventType::ConnectRequest {
+            let kind = event.event_type();
+            if kind == CmEventType::ConnectRequest {
                 let private_data = event.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
                 return Ok(Incoming {
                     id: event.connection_request()?,
                     private_data,
                 });
+            }
+            if is_failure(kind) {
+                return Err(event.into_error());
             }
             // Only connection requests matter here; anything else is acknowledged and ignored
             // when `event` drops.
