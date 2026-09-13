@@ -437,7 +437,10 @@ impl CmId {
         if ret != 0 {
             return Err(Error::ConnectionSetup(io::Error::last_os_error()));
         }
-        Ok(CmEvent { event })
+        Ok(CmEvent {
+            event,
+            _id: self.clone(),
+        })
     }
 
     /// Returns the next event on this id's channel, or `None` if none is currently pending.
@@ -458,7 +461,10 @@ impl CmId {
             }
             return Err(Error::ConnectionSetup(e));
         }
-        Ok(Some(CmEvent { event }))
+        Ok(Some(CmEvent {
+            event,
+            _id: self.clone(),
+        }))
     }
 
     /// Switches this id's event channel between blocking and non-blocking delivery.
@@ -744,9 +750,19 @@ impl AsFd for CmId {
 
 /// A connection-manager event, retrieved with [`CmId::get_cm_event`]/[`CmId::poll_cm_event`] and
 /// acknowledged automatically when dropped.
+///
+/// The event keeps the id whose channel delivered it alive: `rdma_destroy_id` blocks until every
+/// event delivered for an id has been acknowledged, so the id cannot go away underneath an
+/// outstanding event.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
+    /// The id whose channel delivered the event (the listener, for a connection request).
+    _id: CmId,
 }
+
+// The event (and the id it holds, which is `Send + Sync` itself) can move between threads:
+// librdmacm does not care which thread acknowledges an event.
+unsafe impl Send for CmEvent {}
 
 impl CmEvent {
     /// The kind of event. Match on the [`CmEventType`] to decide what to do next; see [`CmId`] for
