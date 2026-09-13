@@ -1387,6 +1387,22 @@ impl<'a> RecvRequest<'a> {
 /// let _ = (first, second);
 /// # }
 /// ```
+///
+/// A datagram request keeps its [`AddressHandle`] borrowed until it is posted, so the handle
+/// cannot be destroyed while the provider still has to read it:
+///
+/// ```compile_fail,E0505
+/// # fn dropped_handle(
+/// #     qp: &mut ibverbs::QueuePair<ibverbs::Ud>,
+/// #     ah: ibverbs::AddressHandle,
+/// #     sges: &[ibverbs::LocalMemorySlice],
+/// # ) {
+/// let mut batch = qp.start_send();
+/// let op = batch.to(&ah, 1, 2);
+/// drop(ah); // error: cannot move out of `ah` because it is borrowed by `op`
+/// op.send(1, sges);
+/// # }
+/// ```
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
@@ -1418,13 +1434,17 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
     /// it: chain the modifiers first (`batch.to(&ah, qpn, qkey).signaled().send(id, sges)`),
     /// because the provider reads the work-request flags and addressing inside the opcode
     /// builder.
+    ///
+    /// `ah` stays borrowed until the request is posted, since the provider reads the handle inside
+    /// the opcode builder. Keep it alive until the request completes too: some providers (rxe,
+    /// for one) only resolve the handle when the request executes.
     #[inline]
-    pub fn to(
-        &mut self,
-        ah: &AddressHandle,
+    pub fn to<'b>(
+        &'b mut self,
+        ah: &'b AddressHandle,
         remote_qpn: u32,
         remote_qkey: u32,
-    ) -> AddressedSendOp<'_, 'qp, T> {
+    ) -> AddressedSendOp<'b, 'qp, T> {
         AddressedSendOp {
             op: SendOp {
                 batch: self,
