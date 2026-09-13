@@ -288,20 +288,22 @@ impl CompletionQueueBuilder {
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0
             | self.wc_flags;
-        let mut cq_attr = ffi::ibv_cq_init_attr_ex {
-            cqe: self.min_cq_entries,
+        // Zero the attributes and write only the fields in use (`comp_mask`, `flags`, and
+        // `parent_domain` stay zero) rather than naming every field: rdma-core extends this struct
+        // over time, and an exhaustive literal stops compiling against newer headers.
+        let mut cq_attr = std::mem::MaybeUninit::<ffi::ibv_cq_init_attr_ex>::zeroed();
+        let p = cq_attr.as_mut_ptr();
+        unsafe {
+            (*p).cqe = self.min_cq_entries;
             // The cookie is a plain integer to the caller; the C ABI carries it as a pointer.
-            cq_context: self.cq_context as usize as *mut c_void,
-            channel: cc
+            (*p).cq_context = self.cq_context as usize as *mut c_void;
+            (*p).channel = cc
                 .as_ref()
-                .map_or(ptr::null_mut(), |channel| channel.as_raw()),
-            comp_vector: self.comp_vector,
-            wc_flags: wc_flags as u64,
-            comp_mask: 0,
-            flags: 0,
-            parent_domain: ptr::null_mut(),
-        };
-        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr as *mut _) };
+                .map_or(ptr::null_mut(), |channel| channel.as_raw());
+            (*p).comp_vector = self.comp_vector;
+            (*p).wc_flags = wc_flags as u64;
+        }
+        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, cq_attr.as_mut_ptr()) };
 
         if cq_ex.is_null() {
             Err(Error::os(
@@ -969,7 +971,7 @@ impl CompletionQueue {
     #[inline]
     pub fn poll(&self) -> Result<Option<Completions<'_>>> {
         let cq = self.inner.cq_ex;
-        let mut attr = ffi::ibv_poll_cq_attr { comp_mask: 0 };
+        let mut attr = ffi::ibv_poll_cq_attr::default();
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
         // paired with `end_poll`) when the queue is empty.
         match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {

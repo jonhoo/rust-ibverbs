@@ -96,18 +96,18 @@ impl QueuePairBuilder<Srd> {
             (*p).send_ops_flags = send_ops_flags as u64;
         }
 
-        let mut efa_attr = ffi::efadv_qp_init_attr {
-            comp_mask: 0,
-            driver_qp_type: ffi::EFADV_QP_DRIVER_TYPE_SRD as u32,
-            flags: 0,
-            sl: 0,
-            reserved: 0,
-        };
+        // Zero the EFA attributes and set only the driver queue-pair type rather than naming every
+        // field: rdma-core adds fields to this struct over time (64.0 added `wr_flags`), and the
+        // provider reads only as much as the passed-in length covers.
+        let mut efa_attr = std::mem::MaybeUninit::<ffi::efadv_qp_init_attr>::zeroed();
+        unsafe {
+            (*efa_attr.as_mut_ptr()).driver_qp_type = ffi::EFADV_QP_DRIVER_TYPE_SRD as u32;
+        }
         let qp = unsafe {
             ffi::efadv_create_qp_ex(
                 self.pd.ctx.ctx,
                 attr.as_mut_ptr(),
-                &mut efa_attr as *mut _,
+                efa_attr.as_mut_ptr(),
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
             )
         };
