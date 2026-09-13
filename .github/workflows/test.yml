@@ -3,6 +3,7 @@
 # - required: runs the test suite on ubuntu with stable and beta rust toolchains
 # - minimal: runs the test suite with the minimal versions of the dependencies that satisfy the
 #   requirements of this crate, and its dependencies
+# - vendored: builds with the vendored rdma-core headers, the way a crates.io consumer does
 # - integration: runs the ignored data-path tests against a Soft-RoCE (rxe) device
 # - coverage: runs the test suite and collects coverage information
 # See check.yml for information about how the concurrency cancellation and workflow triggering works
@@ -45,6 +46,29 @@ jobs:
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
         run: cargo test --locked --all-features --doc
+  vendored:
+    # Build the way a crates.io consumer does: with no RDMA_CORE_INCLUDE_DIR / IBVERBS_HEADER_DIR,
+    # ibverbs-sys configures the vendored rdma-core checkout with cmake and binds against the
+    # headers that generates. The host's rdma-core headers are deleted first (only the runtime
+    # libraries and their link-time symlinks stay), so this can only pass if the vendored headers
+    # really are the ones in use.
+    runs-on: ubuntu-latest
+    name: ubuntu / stable / vendored-headers
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Install the libraries and build tools, then remove the host headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libibverbs-dev librdmacm-dev clang cmake
+          sudo rm -rf /usr/include/infiniband /usr/include/rdma
+      - name: Install stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: cargo build --all-features --all-targets
+        run: cargo build --locked --all-features --all-targets
+      - name: cargo test --all-features
+        run: cargo test --locked --all-features
   integration:
     # Exercise the data path against a real RDMA device. The integration tests are #[ignore]d
     # because they need a device, so the rest of CI only compile-checks them. Here we stand up a
