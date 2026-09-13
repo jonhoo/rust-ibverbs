@@ -16,7 +16,7 @@ use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
-    AccessFlags, CompletionQueue, Context, GidType, QueuePairEndpoint, QueuePairState, Rc,
+    AccessFlags, CompletionQueue, Context, Error, GidType, QueuePairEndpoint, QueuePairState, Rc,
     RecvRequest,
 };
 
@@ -77,17 +77,62 @@ const MESSAGE: &[u8] = b"hello over rdmacm";
 /// trips if something hangs outright.
 const SETUP_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 
+/// How long to keep retrying a bind that fails with `ENODEV`. Right after a Soft-RoCE device is
+/// attached, the kernel connection manager can lag a moment behind the GID table in associating
+/// the interface's address with the device, and reports that as "no such device".
+const BIND_RETRY: Duration = Duration::from_secs(5);
+
+/// Whether a bind failure is the transient `ENODEV` worth retrying.
+fn is_transient_bind_error(err: &Error) -> bool {
+    matches!(err, Error::BindAddress(e) if e.raw_os_error() == Some(nix::libc::ENODEV))
+}
+
+/// Binds a listening acceptor on an ephemeral port of `ip` (so concurrent test runs never collide
+/// on a port), retrying a transient `ENODEV` for a while. Read the actual address back with
+/// [`Acceptor::local_addr`].
+fn bind_acceptor(ip: IpAddr, backlog: u32) -> Acceptor {
+    let addr = SocketAddr::new(ip, 0);
+    let deadline = Instant::now() + BIND_RETRY;
+    loop {
+        match Acceptor::bind(addr, PortSpace::Tcp, backlog) {
+            Ok(acceptor) => return acceptor,
+            Err(e) if is_transient_bind_error(&e) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("bind {addr}: {e:?}"),
+        }
+    }
+}
+
+/// The low-level counterpart of [`bind_acceptor`]: a bound (not yet listening) [`CmId`] on an
+/// ephemeral port of `ip`.
+fn bind_listener(ip: IpAddr) -> CmId {
+    let addr = SocketAddr::new(ip, 0);
+    let deadline = Instant::now() + BIND_RETRY;
+    loop {
+        let id = CmId::create(PortSpace::Tcp).expect("listener");
+        match id.bind_addr(addr) {
+            Ok(()) => return id,
+            Err(e) if is_transient_bind_error(&e) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => panic!("bind {addr}: {e:?}"),
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn connect_and_send() {
-    let addr = SocketAddr::new(IpAddr::V4(device_ipv4(&open_test_device())), 18599);
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
 
     // Passive side: bind, accept, receive the message.
     let server = std::thread::spawn(move || {
-        let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 1).expect("bind");
-        ready_tx.send(()).expect("signal ready");
+        let acceptor = bind_acceptor(ip, 1);
+        let addr = acceptor.local_addr().expect("listen address");
+        ready_tx.send(addr).expect("signal ready");
 
         let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
@@ -123,7 +168,7 @@ fn connect_and_send() {
     });
 
     // Active side: connect and send.
-    ready_rx.recv().expect("server ready");
+    let addr = ready_rx.recv().expect("server ready");
     let resolved = Connector::new(PortSpace::Tcp)
         .expect("connector")
         .resolve(addr, Duration::from_secs(5))
@@ -167,8 +212,7 @@ fn connect_and_send() {
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn accept_times_out() {
     // An acceptor with a timeout and no client reports TimedOut instead of blocking forever.
-    let addr = SocketAddr::new(IpAddr::V4(device_ipv4(&open_test_device())), 18605);
-    let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 1).expect("bind");
+    let acceptor = bind_acceptor(IpAddr::V4(device_ipv4(&open_test_device())), 1);
     let before = Instant::now();
     match acceptor.accept(Some(Duration::from_millis(50))) {
         Err(ibverbs::Error::TimedOut) => {}
@@ -185,7 +229,7 @@ fn two_connections() {
     // first connection is being set up: with a per-connection event channel each connection's events
     // are isolated, so the listener channel never loses a request. (A shared channel would discard
     // the second request while waiting for the first's establishment.)
-    let addr = SocketAddr::new(IpAddr::V4(device_ipv4(&open_test_device())), 18601);
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
     let (ready_tx, ready_rx) = mpsc::channel();
     // Holds every side connected until all three threads have finished their transfer, so no
     // connection is torn down early.
@@ -193,8 +237,9 @@ fn two_connections() {
 
     let server_barrier = barrier.clone();
     let server = std::thread::spawn(move || {
-        let acceptor = Acceptor::bind(addr, PortSpace::Tcp, 2).expect("bind");
-        ready_tx.send(()).expect("signal ready");
+        let acceptor = bind_acceptor(ip, 2);
+        let addr = acceptor.local_addr().expect("listen address");
+        ready_tx.send(addr).expect("signal ready");
 
         let mut received = Vec::new();
         let mut conns = Vec::new();
@@ -228,9 +273,10 @@ fn two_connections() {
         received
     });
 
-    ready_rx.recv().expect("server ready");
-    let clients: Vec<_> = [b'A', b'B']
-        .into_iter()
+    let addr = ready_rx.recv().expect("server ready");
+    let clients: Vec<_> = b"AB"
+        .iter()
+        .copied()
         .map(|tag| {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
@@ -316,16 +362,16 @@ fn low_level_connect_and_send() {
     // side runs its channel non-blocking and pumps events off the file descriptor the way an event
     // loop would. Proves the low-level escape hatch can set up a working connection, and that
     // private data crosses it in both directions.
-    let addr = SocketAddr::new(IpAddr::V4(device_ipv4(&open_test_device())), 18603);
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
 
     // Passive side: bind, listen, take the request id, build and ready the queue pair, accept.
     let server = std::thread::spawn(move || {
-        let listener = CmId::create(PortSpace::Tcp).expect("listener");
-        listener.bind_addr(addr).expect("bind");
+        let listener = bind_listener(ip);
         listener.listen(1).expect("listen");
-        ready_tx.send(()).expect("signal ready");
+        let addr = listener.local_addr().expect("listen address");
+        ready_tx.send(addr).expect("signal ready");
 
         let request = loop {
             let event = listener.get_cm_event().expect("listener event");
@@ -389,7 +435,7 @@ fn low_level_connect_and_send() {
     });
 
     // Active side: drive resolution and connection non-blocking, off the channel's file descriptor.
-    ready_rx.recv().expect("server ready");
+    let addr = ready_rx.recv().expect("server ready");
     let id = CmId::create(PortSpace::Tcp).expect("client id");
     assert!(
         id.as_raw_fd() >= 0,

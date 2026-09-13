@@ -997,13 +997,21 @@ pub struct Acceptor {
 }
 
 impl Acceptor {
-    /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device) and starts
+    /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
+    /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
     /// listening, queueing up to `backlog` pending connections.
     pub fn bind(addr: SocketAddr, port_space: PortSpace, backlog: u32) -> Result<Self> {
         let listener = CmId::create(port_space)?;
         listener.bind_addr(addr)?;
         listener.listen(backlog)?;
         Ok(Acceptor { listener })
+    }
+
+    /// The local address the acceptor listens on: the address passed to [`bind`](Self::bind),
+    /// with the port the connection manager assigned when that was 0. `None` if the address
+    /// family is neither IPv4 nor IPv6.
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.listener.local_addr()
     }
 
     /// Blocks until the next connection request arrives and returns it, moved onto its own event
