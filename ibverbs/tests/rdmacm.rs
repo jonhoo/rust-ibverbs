@@ -959,6 +959,22 @@ fn connect_rejects_oversized_private_data() {
 }
 
 #[test]
+fn blocking_helpers_need_a_connected_port_space() {
+    // Checked before anything touches a device, so this needs none.
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+    for port_space in [PortSpace::Udp, PortSpace::Ipoib] {
+        assert!(
+            matches!(Connector::new(port_space), Err(Error::ConnectionSetup(e)) if e.kind() == io::ErrorKind::InvalidInput),
+            "Connector refuses {port_space}"
+        );
+        assert!(
+            matches!(Acceptor::bind(addr, port_space, 1), Err(Error::ConnectionSetup(e)) if e.kind() == io::ErrorKind::InvalidInput),
+            "Acceptor refuses {port_space}"
+        );
+    }
+}
+
+#[test]
 #[should_panic(expected = "limited to 196 bytes")]
 fn private_data_beyond_any_limit_panics() {
     let _ = ConnectionParameter::default().set_private_data(&[0; 197]);

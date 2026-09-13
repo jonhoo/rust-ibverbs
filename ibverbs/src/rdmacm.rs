@@ -360,6 +360,21 @@ fn max_accept_private_data(ps: ffi::rdma_port_space) -> usize {
 /// The most private-data bytes a rejection (`rdma_reject`) can carry: the CM REJ payload.
 const MAX_REJECT_PRIVATE_DATA: usize = 148;
 
+/// The blocking helpers only set up reliable connections; the datagram port spaces would make
+/// them wait for events that never come.
+fn require_connected_port_space(port_space: PortSpace, helper: &str) -> Result<()> {
+    match port_space {
+        PortSpace::Tcp | PortSpace::Ib => Ok(()),
+        _ => Err(Error::ConnectionSetup(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "{helper} only sets up reliable connections (PortSpace::Tcp or PortSpace::Ib); \
+                 drive a CmId directly for the datagram port spaces"
+            ),
+        ))),
+    }
+}
+
 /// Whether a connection-manager event reports a failure that aborts setup.
 fn is_failure(event: CmEventType) -> bool {
     matches!(
@@ -1134,7 +1149,14 @@ pub struct Connector {
 
 impl Connector {
     /// Creates a connector with its own event channel.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): creating the id failed, or `port_space`
+    ///    is a datagram port space ([`Udp`](PortSpace::Udp) / [`Ipoib`](PortSpace::Ipoib)): the
+    ///    blocking helpers set up reliable connections only.
     pub fn new(port_space: PortSpace) -> Result<Self> {
+        require_connected_port_space(port_space, "Connector")?;
         Ok(Connector {
             id: CmId::create(port_space)?,
         })
@@ -1220,7 +1242,16 @@ impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
     /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
     /// listening, queueing up to `backlog` pending connections.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): creating the id or listening failed, or
+    ///    `port_space` is a datagram port space ([`Udp`](PortSpace::Udp) /
+    ///    [`Ipoib`](PortSpace::Ipoib)): the blocking helpers set up reliable connections only.
+    ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed, for example because no
+    ///    RDMA device answers to `addr`.
     pub fn bind(addr: SocketAddr, port_space: PortSpace, backlog: u32) -> Result<Self> {
+        require_connected_port_space(port_space, "Acceptor")?;
         let listener = CmId::create(port_space)?;
         listener.bind_addr(addr)?;
         listener.listen(backlog)?;
