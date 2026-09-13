@@ -530,8 +530,8 @@ pub struct QueuePairBuilder<T: Transport> {
     max_dest_rd_atomic: Option<u8>,
     /// only valid for RC and UC
     path_mtu: Option<ibv_mtu>,
-    /// only valid for RC and UC
-    rq_psn: Option<u32>,
+    /// the packet sequence number the send queue starts at; the peer learns it from the endpoint
+    pub(crate) psn: u32,
     /// service level (0-15). Higher value means higher priority.
     pub(crate) service_level: u8,
     /// shared receive queue
@@ -596,9 +596,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             path_mtu: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(port_active_mtu),
-            rq_psn: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-                || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
-                .then_some(0),
+            psn: 0,
             service_level: 0,
             srq: None,
             _transport: std::marker::PhantomData,
@@ -649,6 +647,23 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// Defaults to 0.
     pub fn set_context(&mut self, ctx: isize) -> &mut Self {
         self.ctx = ctx;
+        self
+    }
+
+    /// Set the packet sequence number (PSN) the send queue starts at.
+    ///
+    /// The peer's receive queue must expect the same number. [`endpoint`] carries it, and
+    /// [`handshake`] sets the local receive-queue PSN from the remote endpoint, so the two sides
+    /// agree without further configuration (the datagram transports' `activate` also starts the
+    /// send queue here). Applications that reuse queue pairs typically pick a random starting PSN
+    /// per connection so stale packets from an earlier connection are not mistaken for new ones.
+    ///
+    /// Defaults to 0.
+    ///
+    /// [`endpoint`]: PreparedQueuePair::endpoint
+    /// [`handshake`]: PreparedQueuePair::handshake
+    pub fn set_sq_psn(&mut self, psn: u32) -> &mut Self {
+        self.psn = psn;
         self
     }
 
@@ -787,7 +802,7 @@ impl<T: Transport> QueuePairBuilder<T> {
                 max_rd_atomic: self.max_rd_atomic,
                 max_dest_rd_atomic: self.max_dest_rd_atomic,
                 path_mtu: self.path_mtu,
-                rq_psn: self.rq_psn,
+                psn: self.psn,
                 service_level: self.service_level,
             })
         }
@@ -808,14 +823,6 @@ impl<T: Connected> QueuePairBuilder<T> {
     /// Defaults to the port's active MTU.
     pub fn set_path_mtu(&mut self, path_mtu: Mtu) -> &mut Self {
         self.path_mtu = Some(path_mtu.into());
-        self
-    }
-
-    /// Set the PSN for the receive queue.
-    ///
-    /// Defaults to 0.
-    pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
-        self.rq_psn = Some(rq_psn);
         self
     }
 
@@ -984,8 +991,8 @@ pub struct PreparedQueuePair<T: Transport> {
     pub(crate) max_dest_rd_atomic: Option<u8>,
     /// only valid for RC and UC
     pub(crate) path_mtu: Option<ibv_mtu>,
-    /// only valid for RC and UC
-    pub(crate) rq_psn: Option<u32>,
+    /// the packet sequence number the send queue starts at
+    pub(crate) psn: u32,
     /// service level (0-15). Higher value means higher priority.
     pub(crate) service_level: u8,
 }
@@ -995,7 +1002,8 @@ pub struct PreparedQueuePair<T: Transport> {
 /// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
 /// rdmacm connection request's `private_data`.
 ///
-/// Internally, this contains the `QueuePair`'s `qp_num`, as well as the context's `lid` and `gid`.
+/// Internally, this contains the `QueuePair`'s `qp_num`, the context's `lid` and `gid`, and the
+/// packet sequence number the queue pair's send queue starts at.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num`
@@ -1004,19 +1012,22 @@ pub struct QueuePairEndpoint {
     pub lid: u16,
     /// the port's `gid` at the configured index, used for global routing
     pub gid: Option<Gid>,
+    /// the packet sequence number this queue pair's send queue starts at, which the peer's receive
+    /// queue must expect (see [`QueuePairBuilder::set_sq_psn`])
+    pub psn: u32,
 }
 
 impl QueuePairEndpoint {
     /// The length of the wire encoding produced by [`to_bytes`](Self::to_bytes).
-    pub const WIRE_LEN: usize = 23;
+    pub const WIRE_LEN: usize = 27;
 
     /// Encodes this endpoint in the crate's stable wire format, for exchanging with the peer over
     /// any transport (it also fits an rdmacm connection request's 56-byte `private_data`).
     ///
     /// The layout, in network byte order: one flags byte (bit 0: a GID is present; all other bits
-    /// zero), the queue pair number (4 bytes), the LID (2 bytes), and the raw GID (16 bytes,
-    /// zeroed when absent). Adding fields to the format means a new, longer encoding — this one
-    /// stays decodable.
+    /// zero), the queue pair number (4 bytes), the LID (2 bytes), the raw GID (16 bytes, zeroed
+    /// when absent), and the starting PSN (4 bytes). Adding fields to the format means a new,
+    /// longer encoding — this one stays decodable.
     pub fn to_bytes(&self) -> [u8; Self::WIRE_LEN] {
         let mut out = [0u8; Self::WIRE_LEN];
         out[0] = self.gid.is_some() as u8;
@@ -1025,6 +1036,7 @@ impl QueuePairEndpoint {
         if let Some(gid) = self.gid {
             out[7..23].copy_from_slice(&<[u8; 16]>::from(gid));
         }
+        out[23..27].copy_from_slice(&self.psn.to_be_bytes());
         out
     }
 
@@ -1047,6 +1059,7 @@ impl QueuePairEndpoint {
             qp_num: u32::from_be_bytes(bytes[1..5].try_into().expect("slice length is fixed")),
             lid: u16::from_be_bytes(bytes[5..7].try_into().expect("slice length is fixed")),
             gid,
+            psn: u32::from_be_bytes(bytes[23..27].try_into().expect("slice length is fixed")),
         })
     }
 }
@@ -1100,6 +1113,7 @@ impl<T: Transport> PreparedQueuePair<T> {
             qp_num,
             lid: self.lid,
             gid,
+            psn: self.psn,
         })
     }
 
@@ -1134,10 +1148,10 @@ impl<T: Transport> PreparedQueuePair<T> {
             return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
-        // RTS: start the send queue at PSN 0.
+        // RTS: start the send queue at the configured PSN.
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
-            sq_psn: 0,
+            sq_psn: self.psn,
             ..Default::default()
         };
         let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
@@ -1166,13 +1180,16 @@ impl<T: Connected> PreparedQueuePair<T> {
     /// ah_attr.grh.hop_limit = 0xff;
     /// ```
     ///
+    /// The packet sequence numbers pair up through the endpoints: the local send queue starts at
+    /// this queue pair's PSN ([`QueuePairBuilder::set_sq_psn`], carried to the peer by
+    /// [`endpoint`](Self::endpoint)), and the local receive queue starts at the PSN in `remote`.
+    ///
     /// The queue pair is associated with the port chosen when it was created (see
     /// [`ProtectionDomain::create_qp`]). The handshake also sets the following parameters,
     /// which are currently not configurable:
     ///
     /// ```text
     /// pkey_index = 0;
-    /// sq_psn = 0;
     /// ah_attr.src_path_bits = 0;
     /// ```
     ///
@@ -1242,10 +1259,9 @@ impl<T: Connected> PreparedQueuePair<T> {
             attr.path_mtu = path_mtu;
             mask |= ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU;
         }
-        if let Some(rq_psn) = self.rq_psn {
-            attr.rq_psn = rq_psn;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN;
-        }
+        // The receive queue starts at the PSN the peer's send queue starts at.
+        attr.rq_psn = remote.psn;
+        mask |= ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN;
         let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
         if errno != 0 {
             // On RoCE, the provider resolves the route to the remote GID during this transition,
@@ -1269,10 +1285,10 @@ impl<T: Connected> PreparedQueuePair<T> {
             return Err(Error::errno(errno, Error::ModifyQueuePair));
         }
 
-        // set ready to send
+        // set ready to send, starting the send queue at the PSN advertised in our endpoint
         let mut attr = ffi::ibv_qp_attr {
             qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
-            sq_psn: 0,
+            sq_psn: self.psn,
             ..Default::default()
         };
         let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;

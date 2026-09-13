@@ -219,6 +219,7 @@ mod test_wire {
             qp_num: 72,
             lid: 9,
             gid: Some(Default::default()),
+            psn: 0x00ab_cdef,
         };
         qpe.gid.as_mut().unwrap().raw =
             unsafe { std::mem::transmute::<[u64; 2], [u8; 16]>([87_u64.to_be(), 192_u64.to_be()]) };
@@ -236,9 +237,11 @@ mod test_wire {
             qp_num: u32::MAX,
             lid: 0xbeef,
             gid: None,
+            psn: u32::MAX - 1,
         };
         let encoded = qpe.to_bytes();
         assert_eq!(encoded[0], 0);
+        assert_eq!(&encoded[23..27], &[0xff, 0xff, 0xff, 0xfe]);
         assert_eq!(QueuePairEndpoint::from_bytes(&encoded).unwrap(), qpe);
     }
 
@@ -248,6 +251,7 @@ mod test_wire {
             qp_num: 1,
             lid: 1,
             gid: None,
+            psn: 0,
         }
         .to_bytes();
         encoded[0] = 2;

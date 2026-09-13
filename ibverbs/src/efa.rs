@@ -137,7 +137,7 @@ impl QueuePairBuilder<Srd> {
             max_rd_atomic: None,
             max_dest_rd_atomic: None,
             path_mtu: None,
-            rq_psn: None,
+            psn: self.psn,
             service_level: self.service_level,
         })
     }
