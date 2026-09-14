@@ -27,10 +27,12 @@
 //! let cq = ctx.create_cq(16).build()?;
 //! let pd = ctx.alloc_pd()?;
 //!
-//! // On RoCE, routing needs a GID; pick the index of a suitable entry in `ctx.gid_table()?`.
+//! // On RoCE, routing needs a GID; take the port's routable entry (its IPv4 RoCE v2 one, when
+//! // there is one).
+//! let gid = ctx.routable_gid(1)?.expect("no GID on port 1");
 //! let prepared = pd
 //!     .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
-//!     .set_gid_index(1)
+//!     .set_gid_index(gid.gid_index)
 //!     .build()?;
 //!
 //! // Exchange endpoints with the peer out of band (`QueuePairEndpoint::to_bytes` is the wire

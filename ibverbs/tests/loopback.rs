@@ -41,6 +41,15 @@ fn open_test_device() -> Context {
     device.open().expect("failed to open the RDMA device")
 }
 
+/// The GID index the tests route from on port 1: the device's routable entry (its IPv4 RoCE v2
+/// one on Soft-RoCE).
+fn gid_index(ctx: &Context) -> u32 {
+    ctx.routable_gid(1)
+        .expect("failed to read the GID table")
+        .expect("no GID on port 1")
+        .gid_index
+}
+
 /// Build a self-connected queue pair of the given connected transport, with generous queue/SGE
 /// limits and the given remote-access grants so the tests can post batches, multi-SGE lists, and
 /// one-sided operations (which loop back to this same QP).
@@ -58,7 +67,7 @@ fn loopback_of<T: Connected>(access: AccessFlags) -> Loopback<T> {
         .create_qp::<T>(&cq, &cq, 1)
         .expect("failed to create queue pair");
     builder
-        .set_gid_index(1)
+        .set_gid_index(gid_index(&ctx))
         .set_max_send_wr(16)
         .set_max_recv_wr(16)
         .set_max_send_sge(4)
@@ -88,12 +97,12 @@ fn loopback() -> Loopback<Rc> {
 /// Build a reliable-connected self-loopback queue pair on a caller-provided protection domain and
 /// completion queue (rather than fresh ones), so several queue pairs can share resources — used to
 /// test a completion channel shared across queues.
-fn loopback_on(pd: &ProtectionDomain, cq: &CompletionQueue) -> QueuePair {
+fn loopback_on(pd: &ProtectionDomain, cq: &CompletionQueue, gid_index: u32) -> QueuePair {
     let mut builder = pd
         .create_qp::<Rc>(cq, cq, 1)
         .expect("failed to create queue pair");
     builder
-        .set_gid_index(1)
+        .set_gid_index(gid_index)
         .set_max_send_wr(16)
         .set_max_recv_wr(16)
         .set_max_send_sge(4)
@@ -580,7 +589,7 @@ fn wait_for_completion() {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-    let mut qp = loopback_on(&pd, &cq);
+    let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
 
     let mut recv = pd
         .allocate(16, AccessFlags::PERMISSIVE)
@@ -672,7 +681,7 @@ fn shared_receive_queue() {
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP")
-        .set_gid_index(1)
+        .set_gid_index(gid_index(&ctx))
         .set_srq(&srq)
         .build()
         .expect("failed to build QP");
@@ -750,7 +759,7 @@ fn srq_limit_reached_async_event() {
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP")
-        .set_gid_index(1)
+        .set_gid_index(gid_index(&ctx))
         .set_srq(&srq)
         .set_max_send_wr(8)
         .build()
@@ -810,13 +819,13 @@ fn unreliable_datagram() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
-    const GID_INDEX: u32 = 1;
+    let gid_index = gid_index(&ctx);
     const QKEY: u32 = 0x1234_5678;
 
     let prepared = pd
         .create_qp::<Ud>(&cq, &cq, 1)
         .expect("failed to create UD QP")
-        .set_gid_index(GID_INDEX)
+        .set_gid_index(gid_index)
         .build()
         .expect("failed to build UD QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
@@ -825,7 +834,7 @@ fn unreliable_datagram() {
     // Address handle pointing at our own GID, so the datagram loops back to us.
     let my_gid = endpoint.gid.expect("RoCE requires a GID");
     let mut ah_attr = AddressHandleAttribute::new(1);
-    ah_attr.set_grh(my_gid, GID_INDEX as u8, 64, 0);
+    ah_attr.set_grh(my_gid, gid_index as u8, 64, 0);
     let ah = pd
         .create_address_handle(&ah_attr)
         .expect("failed to create address handle");
@@ -1200,7 +1209,7 @@ fn raw_handles() {
     let prepared = pd
         .create_qp::<Ud>(&cq, &cq, 1)
         .expect("failed to create UD QP")
-        .set_gid_index(1)
+        .set_gid_index(gid_index(&ctx))
         .build()
         .expect("failed to build UD QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
@@ -1229,9 +1238,12 @@ fn inline_send() {
     let mut builder = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create RC QP");
-    builder.set_gid_index(1).set_max_inline_data(64).set_access(
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-    );
+    builder
+        .set_gid_index(gid_index(&ctx))
+        .set_max_inline_data(64)
+        .set_access(
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
+        );
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
@@ -1277,7 +1289,7 @@ fn queue_pair_on_explicit_port() {
     let mut builder = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP on port 1");
-    builder.set_gid_index(1).set_access(
+    builder.set_gid_index(gid_index(&ctx)).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
@@ -1338,7 +1350,7 @@ fn completion_timestamps() {
     let mut builder = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP");
-    builder.set_gid_index(1).set_access(
+    builder.set_gid_index(gid_index(&ctx)).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
@@ -1403,7 +1415,7 @@ fn extended_wc_fields() {
     let mut builder = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP");
-    builder.set_gid_index(1).set_access(
+    builder.set_gid_index(gid_index(&ctx)).set_access(
         AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
     );
     let prepared = builder.build().expect("failed to build QP");
@@ -1473,7 +1485,7 @@ fn event_driven_completion() {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-    let mut qp = loopback_on(&pd, &cq);
+    let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
 
     let mut recv = pd
         .allocate(64, AccessFlags::PERMISSIVE)
@@ -1660,9 +1672,12 @@ fn inline_send_list() {
     let mut builder = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create RC QP");
-    builder.set_gid_index(1).set_max_inline_data(64).set_access(
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-    );
+    builder
+        .set_gid_index(gid_index(&ctx))
+        .set_max_inline_data(64)
+        .set_access(
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
+        );
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
     let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
@@ -1820,8 +1835,8 @@ fn shared_completion_channel() {
     );
 
     let pd = ctx.alloc_pd().expect("failed to allocate pd");
-    let mut qp_a = loopback_on(&pd, &cq_a);
-    let mut qp_b = loopback_on(&pd, &cq_b);
+    let mut qp_a = loopback_on(&pd, &cq_a, gid_index(&ctx));
+    let mut qp_b = loopback_on(&pd, &cq_b, gid_index(&ctx));
 
     let mut recv_a = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv a");
     let mut recv_b = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv b");
@@ -1907,7 +1922,7 @@ fn roce_route_failure_diagnostic() {
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create QP")
-        .set_gid_index(1)
+        .set_gid_index(gid_index(&ctx))
         .build()
         .expect("failed to build QP");
 
@@ -1932,4 +1947,27 @@ fn roce_route_failure_diagnostic() {
         Err(other) => panic!("unexpected error kind: {other:?}"),
         Ok(_) => panic!("handshake to an unanswerable GID unexpectedly succeeded"),
     }
+}
+
+/// `routable_gid` names an entry of the port's GID table, and reports a port without entries.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn routable_gid() {
+    let ctx = open_test_device();
+    let entry = ctx
+        .routable_gid(1)
+        .expect("failed to read the GID table")
+        .expect("port 1 has a GID");
+    assert_eq!(entry.port_num, 1);
+    let table = ctx.gid_table().expect("failed to read the GID table");
+    assert!(
+        table
+            .iter()
+            .any(|e| e.port_num == 1 && e.gid_index == entry.gid_index && e.gid == entry.gid),
+        "the routable entry comes from the table: {entry:?}"
+    );
+    assert!(ctx
+        .routable_gid(250)
+        .expect("failed to read the GID table")
+        .is_none());
 }
