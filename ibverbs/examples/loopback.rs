@@ -16,16 +16,11 @@ fn main() {
     let cq = ctx.create_cq(16).build().unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
-    // Routing needs a GID on RoCE, and not every table entry routes: on the queue pair's port
-    // (1, the default; GID indices are per port), prefer the RoCEv2 entry holding the interface's
-    // IPv4 address (an IPv4-mapped GID, `::ffff:a.b.c.d`), which is the one plain-Ethernet setups
-    // actually answer on, and fall back to the port's first entry otherwise.
-    let gids = ctx.gid_table().unwrap();
-    let gid_index = gids
-        .iter()
-        .filter(|e| e.port_num == 1)
-        .find(|e| e.gid_type == ibverbs::GidType::RoceV2 && e.gid.is_ipv4_mapped())
-        .or_else(|| gids.iter().find(|e| e.port_num == 1))
+    // Routing needs a GID on RoCE, and not every table entry routes; `routable_gid` picks the
+    // port's entry that does (its IPv4 RoCE v2 one on a plain-Ethernet setup).
+    let gid_index = ctx
+        .routable_gid(1)
+        .unwrap()
         .expect("no GID available")
         .gid_index;
 
@@ -54,9 +49,7 @@ fn main() {
     let mut sent = false;
     let mut received = false;
     while !sent || !received {
-        let Some(mut completions) = cq.poll().unwrap() else {
-            continue;
-        };
+        let mut completions = cq.poll().unwrap();
         while let Some(wc) = completions.next() {
             wc.ok().expect("work request failed");
             match wc.wr_id() {

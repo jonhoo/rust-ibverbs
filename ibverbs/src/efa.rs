@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
 use crate::qp::{
-    sealed, AddressedSendOp, Datagram, PreparedQueuePair, QueuePair, QueuePairBuilder,
+    sealed, AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
     QueuePairType, Transport,
 };
 
@@ -65,13 +65,9 @@ impl QueuePairBuilder<Srd> {
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): `efadv_create_qp_ex` failed (`EINVAL` for
     ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
-        use ffi::ibv_qp_create_send_ops_flags as SendOps;
-        // SRD supports send and one-sided RDMA, including the immediate variants.
-        let send_ops_flags = SendOps::IBV_QP_EX_WITH_SEND.0
-            | SendOps::IBV_QP_EX_WITH_SEND_WITH_IMM.0
-            | SendOps::IBV_QP_EX_WITH_RDMA_WRITE.0
-            | SendOps::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0
-            | SendOps::IBV_QP_EX_WITH_RDMA_READ.0;
+        // SRD supports send and one-sided RDMA, including the immediate variants (the transport's
+        // default set), or whatever the builder was told to request instead.
+        let send_ops_flags = self.send_ops().0;
 
         // As in the generic `build_impl` in qp.rs: zero the storage and write only the fields the
         // driver reads, handing the pointer to C without `assume_init` (the `qp_type` enum has no
@@ -163,32 +159,25 @@ impl PreparedQueuePair<Srd> {
 }
 
 impl AddressedSendOp<'_, '_, Srd> {
-    /// Post an RDMA WRITE into `remote`.
+    /// Post an RDMA WRITE of `payload` into `remote`, with the immediate set by
+    /// [`imm`](Self::imm) if any.
     #[inline]
-    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.op.build(wr_id, local, move |q| unsafe {
-            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
-        })
-    }
-
-    /// Post an RDMA WRITE into `remote` carrying a 32-bit immediate (host byte order).
-    #[inline]
-    pub fn write_imm(
-        self,
-        wr_id: u64,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        imm: u32,
-    ) {
-        self.op.build(wr_id, local, move |q| unsafe {
-            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+    pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
+        let imm = self.op.imm;
+        self.op.build(wr_id, payload.into(), move |q| unsafe {
+            match imm {
+                Some(imm) => {
+                    (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+                }
+                None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
+            }
         })
     }
 
     /// Post an RDMA READ from `remote` into `local`.
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.op.build(wr_id, local, move |q| unsafe {
+        self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {
             (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
         })
     }

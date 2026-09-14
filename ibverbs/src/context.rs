@@ -8,7 +8,7 @@ use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::address::{Gid, GidEntry};
+use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
 use crate::error::{Error, Result};
@@ -372,6 +372,33 @@ impl Context {
         gid_table.truncate(num_entries as usize);
         let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
         Ok(gid_table)
+    }
+
+    /// The GID table entry to route from on `port_num` (numbered from 1), or `None` if the port
+    /// has no entries.
+    ///
+    /// Not every entry routes. On RoCE over plain Ethernet, peers answer on the RoCE v2 entry that
+    /// holds the interface's IP address, and for an IPv4 network that is the IPv4-mapped one
+    /// (`::ffff:a.b.c.d`); this prefers such an entry and otherwise falls back to the port's first
+    /// entry (on InfiniBand, the port GID at index 0, where any entry routes). Pass the entry's
+    /// [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
+    /// [`gid`](GidEntry::gid) to the peer or to [`AddressHandleAttribute::set_grh`]. Choose
+    /// differently from [`gid_table`](Self::gid_table) when the network needs another entry.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`gid_table`](Self::gid_table).
+    ///
+    /// [`AddressHandleAttribute::set_grh`]: crate::AddressHandleAttribute::set_grh
+    pub fn routable_gid(&self, port_num: u8) -> Result<Option<GidEntry>> {
+        let table = self.gid_table()?;
+        let on_port = |entry: &&GidEntry| entry.port_num == port_num;
+        let entry = table
+            .iter()
+            .filter(on_port)
+            .find(|entry| entry.gid_type == GidType::RoceV2 && entry.gid.is_ipv4_mapped())
+            .or_else(|| table.iter().find(on_port));
+        Ok(entry.cloned())
     }
 
     /// Query a single entry of a port's GID table (`ibv_query_gid`).

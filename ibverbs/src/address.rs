@@ -367,6 +367,7 @@ impl AddressHandleAttribute {
 /// Created with [`ProtectionDomain::create_address_handle`] and passed by reference to each UD send;
 /// a single UD queue pair can address many destinations with different handles (see
 /// [`SendBatch::to`](crate::SendBatch::to)).
+#[must_use = "the address handle is destroyed when dropped"]
 pub struct AddressHandle {
     // Keeps the protection domain (and so its context) alive until the handle is destroyed.
     pub(crate) _pd: Arc<ProtectionDomainInner>,

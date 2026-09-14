@@ -40,6 +40,7 @@ pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
 /// Cloning is cheap (reference counted); the channel is destroyed once the last clone and every queue
 /// built on it are dropped.
 #[derive(Clone)]
+#[must_use]
 pub struct CompletionChannel {
     inner: Arc<CompletionChannelInner>,
 }
@@ -882,34 +883,49 @@ impl WorkCompletion<'_> {
     }
 }
 
-/// An in-progress poll of a [`CompletionQueue`], yielding work completions one at a time.
+/// One poll of a [`CompletionQueue`]: the work completions that were ready when it started,
+/// yielded one at a time.
 ///
 /// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
-/// call (which is why it cannot implement [`Iterator`]). The completion queue is released
-/// (`ibv_end_poll`) when the `Completions` is dropped.
+/// call (which is why it cannot implement [`Iterator`]); [`for_each`](Self::for_each) runs a
+/// closure over the rest instead. The provider holds the queue's poll lock from the poll's start
+/// until the `Completions` is dropped (`ibv_end_poll`), so keep it short-lived; a poll of an
+/// empty queue holds nothing.
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
+    /// Whether `start_poll` handed out an entry, and so `end_poll` is owed on drop; `false` for
+    /// a poll of an empty queue.
+    open: bool,
+    /// Whether the next entry is the one `start_poll` positioned on (not yet yielded).
     first: bool,
+    /// Whether the entries are exhausted (or the provider reported an error), so `next_poll`
+    /// must not be called again.
+    done: bool,
     _cq: std::marker::PhantomData<&'cq CompletionQueueInner>,
 }
 
 impl Completions<'_> {
-    /// Return the next work completion, or `None` once the queue has no more.
+    /// Return the next work completion, or `None` once the poll has no more.
     ///
     /// Consume with `while let Some(wc) = completions.next() { ... }`.
     ///
     /// `None` also ends the poll if the provider reports an error mid-poll (a rare provider-level
     /// failure, distinct from a completion *status* error, which is reported per work completion
-    /// through [`WorkCompletion::ok`]); resources are still released correctly in that case.
+    /// through [`WorkCompletion::ok`]); resources are still released correctly in that case, and
+    /// later calls keep returning `None`.
     #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> Option<WorkCompletion<'_>> {
+        if self.done {
+            return None;
+        }
         if self.first {
             self.first = false;
         } else if unsafe { (*self.cq).next_poll.unwrap()(self.cq) } != 0 {
             // ENOENT (no more) or an error: either way the poll is finished.
+            self.done = true;
             return None;
         }
         Some(WorkCompletion {
@@ -917,11 +933,24 @@ impl Completions<'_> {
             _iter: std::marker::PhantomData,
         })
     }
+
+    /// Run `f` on each remaining work completion, then release the queue.
+    ///
+    /// The closure form of the `while let` loop over [`next`](Self::next):
+    /// `cq.poll()?.for_each(|wc| ..)`.
+    #[inline]
+    pub fn for_each(mut self, mut f: impl FnMut(WorkCompletion<'_>)) {
+        while let Some(wc) = self.next() {
+            f(wc);
+        }
+    }
 }
 
 impl Drop for Completions<'_> {
     fn drop(&mut self) {
-        unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+        if self.open {
+            unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+        }
     }
 }
 
@@ -934,11 +963,10 @@ pub struct CompletionQueue {
 }
 
 impl CompletionQueue {
-    /// Begin polling for work completions through the extended interface.
+    /// Poll for the work completions that are ready, through the extended interface.
     ///
-    /// Returns `None` if the queue is currently empty. The returned [`Completions`] is a lending
-    /// iterator whose [`WorkCompletion`]s read their fields lazily, so you only pay for the fields
-    /// you read.
+    /// The returned [`Completions`] is a lending iterator whose [`WorkCompletion`]s read their
+    /// fields lazily, so you only pay for the fields you read; it is empty when the queue is.
     ///
     /// Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
     /// `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting the
@@ -958,29 +986,38 @@ impl CompletionQueue {
     /// ```no_run
     /// # use ibverbs::CompletionQueue;
     /// # fn drain(cq: &CompletionQueue) -> ibverbs::Result<()> {
-    /// if let Some(mut completions) = cq.poll()? {
-    ///     while let Some(wc) = completions.next() {
-    ///         if let Err(e) = wc.ok() {
-    ///             eprintln!("work request {}: {e}", wc.wr_id());
-    ///         }
+    /// let mut completions = cq.poll()?;
+    /// while let Some(wc) = completions.next() {
+    ///     if let Err(e) = wc.ok() {
+    ///         eprintln!("work request {}: {e}", wc.wr_id());
     ///     }
     /// }
+    /// // Or, as a closure over the batch:
+    /// cq.poll()?.for_each(|wc| println!("work request {} completed", wc.wr_id()));
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    pub fn poll(&self) -> Result<Option<Completions<'_>>> {
+    pub fn poll(&self) -> Result<Completions<'_>> {
         let cq = self.inner.cq_ex;
         let mut attr = ffi::ibv_poll_cq_attr::default();
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
         // paired with `end_poll`) when the queue is empty.
         match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
-            0 => Ok(Some(Completions {
+            0 => Ok(Completions {
                 cq,
+                open: true,
                 first: true,
+                done: false,
                 _cq: std::marker::PhantomData,
-            })),
-            e if e == nix::libc::ENOENT => Ok(None),
+            }),
+            e if e == nix::libc::ENOENT => Ok(Completions {
+                cq,
+                open: false,
+                first: false,
+                done: true,
+                _cq: std::marker::PhantomData,
+            }),
             e => Err(Error::errno(e, Error::PollCompletionQueue)),
         }
     }

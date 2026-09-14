@@ -29,14 +29,11 @@ fn main() {
     let cq = ctx.create_cq(CQ_CAPACITY).build().unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
-    // Create Queue Pair (QP) and connect it to itself in loopback mode. See the loopback
-    // example for how the routable GID is picked.
-    let gids = ctx.gid_table().unwrap();
-    let gid_index = gids
-        .iter()
-        .filter(|e| e.port_num == 1)
-        .find(|e| e.gid_type == ibverbs::GidType::RoceV2 && e.gid.is_ipv4_mapped())
-        .or_else(|| gids.iter().find(|e| e.port_num == 1))
+    // Create Queue Pair (QP) and connect it to itself in loopback mode, routing from the port's
+    // routable GID.
+    let gid_index = ctx
+        .routable_gid(1)
+        .unwrap()
         .expect("no GID available")
         .gid_index;
     let prepared_qp = pd
@@ -114,9 +111,7 @@ fn main() {
     let mut receive_completed = false;
 
     while !chain_completed || !receive_completed {
-        let Some(mut completions) = cq.poll().unwrap() else {
-            continue;
-        };
+        let mut completions = cq.poll().unwrap();
         while let Some(wc) = completions.next() {
             println!(
                 "Polled WC: wr_id={}, status={:?}, opcode={:?}",

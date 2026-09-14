@@ -35,12 +35,11 @@ fn main() {
 fn wait_for(cq: &CompletionQueue, wr_id: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(mut completions) = cq.poll().expect("poll cq") {
-            while let Some(wc) = completions.next() {
-                wc.ok().expect("work completion failed");
-                if wc.wr_id() == wr_id {
-                    return;
-                }
+        let mut completions = cq.poll().expect("poll cq");
+        while let Some(wc) = completions.next() {
+            wc.ok().expect("work completion failed");
+            if wc.wr_id() == wr_id {
+                return;
             }
         }
         assert!(

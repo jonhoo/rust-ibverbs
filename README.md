@@ -23,11 +23,12 @@ fn main() -> ibverbs::Result<()> {
     let cq = ctx.create_cq(16).build()?;
     let pd = ctx.alloc_pd()?;
 
-    // A reliable-connection (RC) queue pair on port 1. On RoCE, routing needs a GID; pick the
-    // index of a suitable entry from `ctx.gid_table()?`.
+    // A reliable-connection (RC) queue pair on port 1. On RoCE, routing needs a GID; take the
+    // port's routable entry (its IPv4 RoCE v2 one, when there is one).
+    let gid = ctx.routable_gid(1)?.expect("no GID on port 1");
     let prepared = pd
         .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
-        .set_gid_index(1)
+        .set_gid_index(gid.gid_index)
         .build()?;
 
     // Exchange endpoints with the peer out of band (`endpoint.to_bytes()` is the wire
@@ -47,11 +48,10 @@ fn main() -> ibverbs::Result<()> {
 
     let mut pending = 2;
     while pending > 0 {
-        if let Some(mut completions) = cq.poll()? {
-            while let Some(wc) = completions.next() {
-                wc.ok().expect("work request failed");
-                pending -= 1;
-            }
+        let mut completions = cq.poll()?;
+        while let Some(wc) = completions.next() {
+            wc.ok().expect("work request failed");
+            pending -= 1;
         }
     }
     assert_eq!(&recv.bytes_mut()[..5], b"hello");

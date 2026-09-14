@@ -9,9 +9,7 @@
 
 use std::time::Duration;
 
-use ibverbs::{
-    AccessFlags, CompletionQueue, GidType, ProtectionDomain, QueuePair, Rc, RecvRequest,
-};
+use ibverbs::{AccessFlags, CompletionQueue, ProtectionDomain, QueuePair, Rc, RecvRequest};
 
 /// Build a reliable-connected queue pair on `cq` and connect it to itself (see the loopback
 /// example for the GID selection).
@@ -36,12 +34,9 @@ fn main() {
         .unwrap();
     let pd = ctx.alloc_pd().unwrap();
 
-    let gids = ctx.gid_table().unwrap();
-    let gid_index = gids
-        .iter()
-        .filter(|e| e.port_num == 1)
-        .find(|e| e.gid_type == GidType::RoceV2 && e.gid.is_ipv4_mapped())
-        .or_else(|| gids.iter().find(|e| e.port_num == 1))
+    let gid_index = ctx
+        .routable_gid(1)
+        .unwrap()
         .expect("no GID available")
         .gid_index;
 
@@ -102,16 +97,15 @@ fn main() {
             _ => unreachable!(),
         };
         cq.req_notify(false).unwrap();
-        if let Some(mut completions) = cq.poll().unwrap() {
-            while let Some(wc) = completions.next() {
-                wc.ok().expect("work request failed");
-                println!(
-                    "queue {} completed work request {}",
-                    if fired == PING { "ping" } else { "pong" },
-                    wc.wr_id()
-                );
-                outstanding -= 1;
-            }
+        let mut completions = cq.poll().unwrap();
+        while let Some(wc) = completions.next() {
+            wc.ok().expect("work request failed");
+            println!(
+                "queue {} completed work request {}",
+                if fired == PING { "ping" } else { "pong" },
+                wc.wr_id()
+            );
+            outstanding -= 1;
         }
     }
     assert_eq!(&recv_ping.bytes_mut()[..4], b"ping");

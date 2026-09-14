@@ -8,7 +8,6 @@
 //! has not been run on EFA hardware; validate before relying on it.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    const GID_INDEX: u32 = 0;
     const QKEY: u32 = 0x1111_2222;
 
     let device = ibverbs::devices()?
@@ -18,17 +17,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open()?;
     let cq = device.create_cq(16).build()?;
     let pd = device.alloc_pd()?;
+    let gid_index = device.routable_gid(1)?.ok_or("no GID on port 1")?.gid_index;
 
     // Two SRD queue pairs. SRD is connectionless, so each is just brought to ready with a Q_Key.
     let mut sender = pd
         .create_srd_qp(&cq, &cq, 1)?
-        .set_gid_index(GID_INDEX)
+        .set_gid_index(gid_index)
         .build()?
         .activate(QKEY)?;
 
     let receiver_prepared = pd
         .create_srd_qp(&cq, &cq, 1)?
-        .set_gid_index(GID_INDEX)
+        .set_gid_index(gid_index)
         .build()?;
     let receiver_endpoint = receiver_prepared.endpoint()?;
     let mut receiver = receiver_prepared.activate(QKEY)?;
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Address the receiver by its GID.
     let receiver_gid = receiver_endpoint.gid.ok_or("EFA requires a GID")?;
     let mut ah_attr = ibverbs::AddressHandleAttribute::new(1);
-    ah_attr.set_grh(receiver_gid, GID_INDEX as u8, 64, 0);
+    ah_attr.set_grh(receiver_gid, gid_index as u8, 64, 0);
     let ah = pd.create_address_handle(&ah_attr)?;
 
     let mut send_buf = pd.allocate(64, ibverbs::AccessFlags::PERMISSIVE)?;
@@ -56,9 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut recv_len = None;
     let mut got_send = false;
     while recv_len.is_none() || !got_send {
-        let Some(mut completions) = cq.poll()? else {
-            continue;
-        };
+        let mut completions = cq.poll()?;
         while let Some(wc) = completions.next() {
             if let Err(e) = wc.ok() {
                 return Err(format!("work request {} failed: {e}", wc.wr_id()).into());

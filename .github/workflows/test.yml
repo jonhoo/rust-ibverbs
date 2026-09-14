@@ -139,6 +139,14 @@ jobs:
           # librdmacm reaches the kernel connection manager through rdma_ucm; load it explicitly
           # rather than relying on the first rdma_cm open to autoload it.
           sudo modprobe rdma_ucm
+          # The runner's own NIC is an RDMA device as well (a Mellanox VF or a MANA adapter,
+          # depending on the VM generation). A MANA one shares eth0, and so its IP, with the rxe
+          # device attached below, and the connection manager then resolves connections onto it
+          # instead of rxe0 (its provider has no extended verbs). Unbind both from RDMA so rxe0 is
+          # the only device; networking stays up on the netdev drivers.
+          for module in mana_ib mlx5_ib; do
+            sudo modprobe -r "$module" 2>/dev/null || true
+          done
           netdev=$(ip -o -4 route show to default | awk '{print $5; exit}')
           echo "Attaching rxe0 to $netdev"
           sudo rdma link add rxe0 type rxe netdev "$netdev"
