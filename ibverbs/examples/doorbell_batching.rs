@@ -111,9 +111,7 @@ fn main() {
     let mut receive_completed = false;
 
     while !chain_completed || !receive_completed {
-        let Some(mut completions) = cq.poll().unwrap() else {
-            continue;
-        };
+        let mut completions = cq.poll().unwrap();
         while let Some(wc) = completions.next() {
             println!(
                 "Polled WC: wr_id={}, status={:?}, opcode={:?}",

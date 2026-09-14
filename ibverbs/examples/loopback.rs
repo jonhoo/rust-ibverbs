@@ -49,9 +49,7 @@ fn main() {
     let mut sent = false;
     let mut received = false;
     while !sent || !received {
-        let Some(mut completions) = cq.poll().unwrap() else {
-            continue;
-        };
+        let mut completions = cq.poll().unwrap();
         while let Some(wc) = completions.next() {
             wc.ok().expect("work request failed");
             match wc.wr_id() {

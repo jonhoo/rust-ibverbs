@@ -145,17 +145,16 @@ fn drain(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     let deadline = Instant::now() + Duration::from_secs(5);
 
     loop {
-        if let Some(mut completions) = cq.poll().expect("failed to poll CQ") {
-            while let Some(wc) = completions.next() {
-                if let Err(e) = wc.ok() {
-                    panic!("work request {} failed: {e}", wc.wr_id());
-                }
-                observed.push(Completed {
-                    wr_id: wc.wr_id(),
-                    len: wc.len(),
-                    imm_data: wc.imm_data(),
-                });
+        let mut completions = cq.poll().expect("failed to poll CQ");
+        while let Some(wc) = completions.next() {
+            if let Err(e) = wc.ok() {
+                panic!("work request {} failed: {e}", wc.wr_id());
             }
+            observed.push(Completed {
+                wr_id: wc.wr_id(),
+                len: wc.len(),
+                imm_data: wc.imm_data(),
+            });
         }
         if observed.len() >= n {
             return observed;
@@ -610,11 +609,15 @@ fn wait_for_completion() {
         // Arm first, then drain: polling after arming closes the race where a completion lands
         // between the drain and the arm (its notification then just wakes the wait immediately).
         cq.req_notify(false).expect("failed to arm");
-        if let Some(mut completions) = cq.poll().expect("poll failed") {
-            while let Some(wc) = completions.next() {
-                assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
-                ids.push(wc.wr_id());
-            }
+        let drained = ids.len();
+        let mut completions = cq.poll().expect("poll failed");
+        while let Some(wc) = completions.next() {
+            assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
+            ids.push(wc.wr_id());
+        }
+        // Release the poll before blocking: a live `Completions` holds the queue's poll lock.
+        drop(completions);
+        if ids.len() > drained {
             continue;
         }
         match channel
@@ -1374,11 +1377,10 @@ fn completion_timestamps() {
     let mut stamps = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while stamps.len() < 2 {
-        if let Some(mut comps) = cq.poll().expect("failed to poll CQ") {
-            while let Some(wc) = comps.next() {
-                wc.ok().expect("work request failed");
-                stamps.push(wc.completion_timestamp());
-            }
+        let mut comps = cq.poll().expect("failed to poll CQ");
+        while let Some(wc) = comps.next() {
+            wc.ok().expect("work request failed");
+            stamps.push(wc.completion_timestamp());
         }
         assert!(
             Instant::now() < deadline,
@@ -1440,16 +1442,15 @@ fn extended_wc_fields() {
     let mut seen = 0;
     let deadline = Instant::now() + Duration::from_secs(5);
     while seen < 2 {
-        if let Some(mut comps) = cq.poll().expect("failed to poll CQ") {
-            while let Some(wc) = comps.next() {
-                wc.ok().expect("work request failed");
-                let _ = wc.wc_flags();
-                let _ = wc.has_grh();
-                let _ = wc.slid();
-                let _ = wc.sl();
-                let _ = wc.dlid_path_bits();
-                seen += 1;
-            }
+        let mut comps = cq.poll().expect("failed to poll CQ");
+        while let Some(wc) = comps.next() {
+            wc.ok().expect("work request failed");
+            let _ = wc.wc_flags();
+            let _ = wc.has_grh();
+            let _ = wc.slid();
+            let _ = wc.sl();
+            let _ = wc.dlid_path_bits();
+            seen += 1;
         }
         assert!(
             Instant::now() < deadline,
@@ -1881,11 +1882,10 @@ fn shared_completion_channel() {
                 };
                 // Re-arm before draining so a completion racing in is not missed.
                 cq.req_notify(false).expect("re-arm");
-                if let Some(mut completions) = cq.poll().expect("poll") {
-                    while let Some(wc) = completions.next() {
-                        assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
-                        ids.insert(wc.wr_id());
-                    }
+                let mut completions = cq.poll().expect("poll");
+                while let Some(wc) = completions.next() {
+                    assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
+                    ids.insert(wc.wr_id());
                 }
             }
         }

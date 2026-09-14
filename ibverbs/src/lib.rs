@@ -54,11 +54,10 @@
 //! // Poll the completion queue until both work requests have completed.
 //! let mut pending = 2;
 //! while pending > 0 {
-//!     if let Some(mut completions) = cq.poll()? {
-//!         while let Some(wc) = completions.next() {
-//!             wc.ok().expect("work request failed");
-//!             pending -= 1;
-//!         }
+//!     let mut completions = cq.poll()?;
+//!     while let Some(wc) = completions.next() {
+//!         wc.ok().expect("work request failed");
+//!         pending -= 1;
 //!     }
 //! }
 //! assert_eq!(&recv.bytes_mut()[..5], b"hello");

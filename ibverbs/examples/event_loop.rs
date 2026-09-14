@@ -97,16 +97,15 @@ fn main() {
             _ => unreachable!(),
         };
         cq.req_notify(false).unwrap();
-        if let Some(mut completions) = cq.poll().unwrap() {
-            while let Some(wc) = completions.next() {
-                wc.ok().expect("work request failed");
-                println!(
-                    "queue {} completed work request {}",
-                    if fired == PING { "ping" } else { "pong" },
-                    wc.wr_id()
-                );
-                outstanding -= 1;
-            }
+        let mut completions = cq.poll().unwrap();
+        while let Some(wc) = completions.next() {
+            wc.ok().expect("work request failed");
+            println!(
+                "queue {} completed work request {}",
+                if fired == PING { "ping" } else { "pong" },
+                wc.wr_id()
+            );
+            outstanding -= 1;
         }
     }
     assert_eq!(&recv_ping.bytes_mut()[..4], b"ping");

@@ -56,13 +56,12 @@ fn device_ipv4(ctx: &Context) -> Ipv4Addr {
 fn wait_for(cq: &CompletionQueue, wr_id: u64) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if let Some(mut completions) = cq.poll().expect("failed to poll CQ") {
-            while let Some(wc) = completions.next() {
-                wc.ok()
-                    .unwrap_or_else(|e| panic!("work request {} failed: {e}", wc.wr_id()));
-                if wc.wr_id() == wr_id {
-                    return;
-                }
+        let mut completions = cq.poll().expect("failed to poll CQ");
+        while let Some(wc) = completions.next() {
+            wc.ok()
+                .unwrap_or_else(|e| panic!("work request {} failed: {e}", wc.wr_id()));
+            if wc.wr_id() == wr_id {
+                return;
             }
         }
         assert!(
@@ -869,11 +868,10 @@ fn disconnect_flushes_outstanding_receives() {
     // The receive never got a message; disconnecting flushes it with an error completion.
     let deadline = Instant::now() + Duration::from_secs(5);
     let status = 'flushed: loop {
-        if let Some(mut completions) = cq.poll().expect("poll") {
-            while let Some(wc) = completions.next() {
-                if wc.wr_id() == 7 {
-                    break 'flushed wc.ok().map_err(|e| e.status);
-                }
+        let mut completions = cq.poll().expect("poll");
+        while let Some(wc) = completions.next() {
+            if wc.wr_id() == 7 {
+                break 'flushed wc.ok().map_err(|e| e.status);
             }
         }
         assert!(

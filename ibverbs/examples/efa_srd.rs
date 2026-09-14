@@ -56,9 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut recv_len = None;
     let mut got_send = false;
     while recv_len.is_none() || !got_send {
-        let Some(mut completions) = cq.poll()? else {
-            continue;
-        };
+        let mut completions = cq.poll()?;
         while let Some(wc) = completions.next() {
             if let Err(e) = wc.ok() {
                 return Err(format!("work request {} failed: {e}", wc.wr_id()).into());
