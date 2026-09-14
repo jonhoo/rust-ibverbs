@@ -992,7 +992,7 @@ fn advise_mr() {
     {
         // Either the device prefetched, or it does not implement advise_mr / on-demand paging.
         Ok(()) => {}
-        Err(ibverbs::Error::Unsupported) => {}
+        Err(ibverbs::Error::Unsupported { .. }) => {}
         Err(e) => panic!("advise_mr returned an unexpected error: {e}"),
     }
 }
@@ -1332,7 +1332,7 @@ fn completion_timestamps() {
         Ok(clock) => {
             let _ticks: u64 = clock.ticks();
         }
-        Err(ibverbs::Error::Unsupported) => {
+        Err(ibverbs::Error::Unsupported { .. }) => {
             eprintln!("device does not support query_rt_values_ex; skipping that check");
         }
         Err(e) => panic!("query_rt_values_ex failed: {e}"),
@@ -1344,7 +1344,7 @@ fn completion_timestamps() {
         .build()
     {
         Ok(cq) => cq,
-        Err(ibverbs::Error::Unsupported) => {
+        Err(ibverbs::Error::Unsupported { .. }) => {
             eprintln!("device does not support completion timestamps; skipping");
             return;
         }
@@ -1407,7 +1407,7 @@ fn extended_wc_fields() {
         .build()
     {
         Ok(cq) => cq,
-        Err(ibverbs::Error::Unsupported) => {
+        Err(ibverbs::Error::Unsupported { .. }) => {
             eprintln!("device does not support these completion fields; skipping");
             return;
         }

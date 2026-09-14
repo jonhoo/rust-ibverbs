@@ -23,9 +23,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Error {
     /// The device or provider does not support the requested operation or work-completion field
-    /// (`EOPNOTSUPP`).
-    #[error("operation not supported by the device")]
-    Unsupported,
+    /// (`EOPNOTSUPP`); `operation` names the verb that was declined.
+    #[error("{operation} is not supported by the device or provider")]
+    Unsupported {
+        /// The verb (or the capability it asked for) the device or provider declined.
+        operation: &'static str,
+    },
 
     /// The device port is not in the `ACTIVE` or `ARMED` state, so its GID table and routing are
     /// unusable.
@@ -237,18 +240,119 @@ pub enum Error {
 }
 
 impl Error {
-    /// Build an [`Error`] from an OS error, promoting `EOPNOTSUPP` to [`Error::Unsupported`] and
-    /// otherwise tagging it with `wrap` (the variant identifying the operation that failed).
+    /// The operating-system error (`errno`) underlying this error, for the variants that wrap one:
+    /// the uniform way to branch on `ENOMEM`, `EINVAL`, and friends without matching every
+    /// variant. `None` for the errors this crate diagnoses itself.
+    pub fn os_error(&self) -> Option<&io::Error> {
+        std::error::Error::source(self)?.downcast_ref::<io::Error>()
+    }
+
+    /// The verb (or step) this error came from, as [`Unsupported`](Self::Unsupported) names it.
+    pub(crate) fn operation(&self) -> &'static str {
+        match self {
+            Error::Unsupported { operation } => operation,
+            Error::PortNotActive(_) => "port activation",
+            Error::GidMismatch => "GID routing",
+            Error::DeviceIndexUnavailable => "the device index",
+            Error::GetDeviceList(_) => "ibv_get_device_list",
+            Error::OpenDevice(_) => "ibv_open_device",
+            Error::DeviceGuid(_) => "ibv_get_device_guid",
+            Error::QueryDevice(_) => "ibv_query_device",
+            Error::QueryPort { .. } => "ibv_query_port",
+            Error::QueryGid { .. } => "ibv_query_gid",
+            Error::QueryGidTable(_) => "ibv_query_gid_table",
+            Error::QueryRealTimeValues(_) => "ibv_query_rt_values_ex",
+            Error::AllocProtectionDomain(_) => "ibv_alloc_pd",
+            Error::RegisterMemoryRegion(_) => "ibv_reg_mr",
+            Error::AdviseMemoryRegion(_) => "ibv_advise_mr",
+            Error::CreateCompletionChannel(_) => "ibv_create_comp_channel",
+            Error::CreateCompletionQueue(_) => "ibv_create_cq_ex",
+            Error::CreateQueuePair(_) => "ibv_create_qp_ex",
+            Error::ModifyQueuePair(_)
+            | Error::InvalidQueuePairTransition { .. }
+            | Error::InvalidQueuePairAttributeMask { .. } => "ibv_modify_qp",
+            Error::QueryQueuePair(_) => "ibv_query_qp",
+            Error::CreateAddressHandle(_) => "ibv_create_ah",
+            Error::CreateSharedReceiveQueue(_) => "ibv_create_srq",
+            Error::PostSend(_) => "ibv_wr_complete",
+            Error::PostReceive(_) => "ibv_post_recv",
+            Error::PollCompletionQueue(_) => "completion-queue polling",
+            Error::AsyncEvent(_) => "ibv_get_async_event",
+            Error::MalformedWireFormat => "wire-format decoding",
+            #[cfg(feature = "rdmacm")]
+            Error::TimedOut => "the connection-manager wait",
+            #[cfg(feature = "rdmacm")]
+            Error::ConnectionManager { .. } => "the connection manager",
+            #[cfg(feature = "rdmacm")]
+            Error::BindAddress(_) => "rdma_bind_addr",
+            #[cfg(feature = "rdmacm")]
+            Error::ResolveAddress(_) => "rdma_resolve_addr",
+            #[cfg(feature = "rdmacm")]
+            Error::ResolveRoute(_) => "rdma_resolve_route",
+            #[cfg(feature = "rdmacm")]
+            Error::Connect(_) => "rdma_connect",
+            #[cfg(feature = "rdmacm")]
+            Error::Accept(_) => "rdma_accept",
+            #[cfg(feature = "rdmacm")]
+            Error::ConnectionSetup(_) => "connection-manager setup",
+        }
+    }
+
+    /// Build an [`Error`] from an OS error, promoting `EOPNOTSUPP` to [`Error::Unsupported`]
+    /// (naming the operation `wrap` identifies) and otherwise tagging it with `wrap` (the variant
+    /// identifying the operation that failed).
     pub(crate) fn os(err: io::Error, wrap: impl FnOnce(io::Error) -> Error) -> Error {
-        if err.raw_os_error() == Some(nix::libc::EOPNOTSUPP) {
-            Error::Unsupported
+        let unsupported = err.raw_os_error() == Some(nix::libc::EOPNOTSUPP);
+        let wrapped = wrap(err);
+        if unsupported {
+            Error::Unsupported {
+                operation: wrapped.operation(),
+            }
         } else {
-            wrap(err)
+            wrapped
         }
     }
 
     /// As [`os`](Error::os), but from a raw `errno`.
     pub(crate) fn errno(errno: i32, wrap: impl FnOnce(io::Error) -> Error) -> Error {
         Error::os(io::Error::from_raw_os_error(errno), wrap)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eopnotsupp_is_promoted_naming_the_operation() {
+        let err = Error::os(
+            io::Error::from_raw_os_error(nix::libc::EOPNOTSUPP),
+            Error::CreateQueuePair,
+        );
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported {
+                    operation: "ibv_create_qp_ex"
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(err.os_error().is_none());
+        assert_eq!(
+            err.to_string(),
+            "ibv_create_qp_ex is not supported by the device or provider"
+        );
+    }
+
+    #[test]
+    fn other_errnos_keep_their_variant_and_expose_the_os_error() {
+        let err = Error::errno(nix::libc::ENOMEM, Error::CreateQueuePair);
+        assert!(matches!(err, Error::CreateQueuePair(_)), "{err:?}");
+        assert_eq!(
+            err.os_error().and_then(io::Error::raw_os_error),
+            Some(nix::libc::ENOMEM)
+        );
+        assert!(Error::GidMismatch.os_error().is_none());
     }
 }
