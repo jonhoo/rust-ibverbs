@@ -77,6 +77,7 @@ impl Drop for MemoryRegionInner {
 /// Created by [`ProtectionDomain::allocate`](crate::ProtectionDomain::allocate) (the returned
 /// region owns its buffer), or by [`register_from_raw`](crate::ProtectionDomain::register_from_raw) /
 /// [`register_dmabuf`](crate::ProtectionDomain::register_dmabuf) for memory managed elsewhere.
+#[must_use = "the memory region is deregistered when dropped"]
 pub struct MemoryRegion<O> {
     pub(crate) inner: MemoryRegionInner,
     pub(crate) owner: O,

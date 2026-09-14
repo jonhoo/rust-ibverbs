@@ -1143,6 +1143,7 @@ impl ConnectionParameter {
 
 /// Active-side blocking connection setup. Created by [`Connector::new`]; drives address and route
 /// resolution, then yields a [`Resolved`] from which you build a queue pair and connect.
+#[must_use]
 pub struct Connector {
     id: CmId,
 }
@@ -1178,6 +1179,7 @@ impl Connector {
 
 /// A resolved active connection, ready for its queue pair to be built and connected. Returned by
 /// [`Connector::resolve`].
+#[must_use = "a resolved connection is abandoned when dropped; finish it with `connect`"]
 pub struct Resolved {
     id: CmId,
 }
@@ -1234,6 +1236,7 @@ impl Resolved {
 
 /// Passive-side blocking connection setup. Created by [`Acceptor::bind`]; listens for and accepts
 /// incoming connections.
+#[must_use]
 pub struct Acceptor {
     listener: CmId,
 }
@@ -1303,6 +1306,7 @@ impl Acceptor {
 /// An incoming connection request, ready for its queue pair to be built and accepted (or
 /// rejected). Returned by [`Acceptor::accept`]. It carries its own event channel, so it is
 /// self-contained and can be handed to another thread. Dropping it declines the request.
+#[must_use = "dropping an incoming request declines it; `accept` or `reject` it"]
 pub struct Incoming {
     id: CmId,
     private_data: Vec<u8>,
@@ -1382,6 +1386,7 @@ impl Incoming {
 /// Dropping it disconnects (the peer sees [`CmEventType::Disconnected`]) and destroys the queue
 /// pair; [`disconnect`](Self::disconnect) does the same while keeping the queue pair around to
 /// reap the flushed completions.
+#[must_use = "dropping a connection disconnects it"]
 pub struct Connection {
     id: CmId,
     qp: QueuePair<Rc>,

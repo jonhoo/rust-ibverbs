@@ -40,6 +40,7 @@ pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
 /// Cloning is cheap (reference counted); the channel is destroyed once the last clone and every queue
 /// built on it are dropped.
 #[derive(Clone)]
+#[must_use]
 pub struct CompletionChannel {
     inner: Arc<CompletionChannelInner>,
 }

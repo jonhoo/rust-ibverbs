@@ -492,6 +492,7 @@ impl std::fmt::Display for RnrTimer {
 /// [`Transport`]). See also [RDMAmojo] for many more details.
 ///
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
+#[must_use = "a queue-pair builder creates nothing until `build` is called"]
 pub struct QueuePairBuilder<T: Transport> {
     pub(crate) ctx: isize,
     pub(crate) pd: Arc<ProtectionDomainInner>,
@@ -968,6 +969,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
 /// `examples/loopback.rs`; `examples/rdmacm_connect.rs` shows the same bring-up driven by the
 /// connection manager instead. Datagram transports (UD and SRD) are connectionless and are
 /// brought up with `activate` instead of `handshake`.
+#[must_use = "a prepared queue pair is destroyed when dropped; connect it with `handshake` or `activate`"]
 pub struct PreparedQueuePair<T: Transport> {
     pub(crate) qp: QueuePair<T>,
     /// port local identifier
@@ -1519,6 +1521,7 @@ impl<T: Transport> Drop for SendBatch<'_, T> {
 /// [`solicited`](Self::solicited), [`imm`](Self::imm)) and finish with an opcode method (`send`,
 /// `write`, ...), which posts the request immediately. The opcodes exist only on the transports
 /// that support them (see [`Transport`]); `send` and `write` take any [`Payload`].
+#[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
 pub struct SendOp<'b, 'qp, T: Transport> {
     batch: &'b mut SendBatch<'qp, T>,
     flags: u32,
@@ -1714,6 +1717,7 @@ impl<T: Reliable> SendOp<'_, '_, T> {
 /// [`solicited`](Self::solicited), [`imm`](Self::imm)) and finish with an opcode method, which
 /// posts the request immediately. UD supports SEND (with any [`Payload`]); SRD (behind the `efa`
 /// feature) additionally supports RDMA write and read.
+#[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
 pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
     pub(crate) op: SendOp<'b, 'qp, T>,
 }

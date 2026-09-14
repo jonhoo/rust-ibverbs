@@ -27,6 +27,7 @@ impl Drop for SharedReceiveQueueInner {
 /// A shared receive queue (SRQ) that allows sharing receive buffers across multiple queue pairs.
 /// Created by [`ProtectionDomain::create_srq`](crate::ProtectionDomain::create_srq).
 #[derive(Clone)]
+#[must_use = "the shared receive queue is destroyed when dropped"]
 pub struct SharedReceiveQueue {
     pub(crate) inner: Arc<SharedReceiveQueueInner>,
 }
