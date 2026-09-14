@@ -757,8 +757,21 @@ fn srq_limit_reached_async_event() {
 
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    // Arm the low watermark at creation: dropping below 2 posted receives raises the event.
-    let srq = pd.create_srq(16, 1, 2).expect("failed to create SRQ");
+    // Arm the low watermark after creation: dropping below 2 posted receives raises the event.
+    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    srq.set_limit(2).expect("failed to arm the SRQ limit");
+    let attrs = srq.query().expect("failed to query the SRQ");
+    assert!(attrs.max_wr() >= 16, "{attrs:?}");
+    assert!(attrs.max_sge() >= 1, "{attrs:?}");
+    assert_eq!(attrs.limit(), 2, "{attrs:?}");
+    // Resizing is provider-dependent; where it works, the queue reports the larger capacity.
+    match srq.set_max_wr(32) {
+        Ok(()) => {
+            let grown = srq.query().expect("failed to query the SRQ");
+            assert!(grown.max_wr() >= 32, "{grown:?}");
+        }
+        Err(e) => eprintln!("SRQ resize not available here: {e}"),
+    }
 
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)

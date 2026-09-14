@@ -24,6 +24,33 @@ impl Drop for SharedReceiveQueueInner {
     }
 }
 
+/// The attributes of a [`SharedReceiveQueue`], read with [`SharedReceiveQueue::query`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SrqAttributes {
+    max_wr: u32,
+    max_sge: u32,
+    limit: u32,
+}
+
+impl SrqAttributes {
+    /// The number of receives the queue can hold: the capacity the device granted, at least what
+    /// was asked at creation or in the last [`set_max_wr`](SharedReceiveQueue::set_max_wr).
+    pub fn max_wr(&self) -> u32 {
+        self.max_wr
+    }
+
+    /// The number of scatter/gather entries a receive may carry.
+    pub fn max_sge(&self) -> u32 {
+        self.max_sge
+    }
+
+    /// The low-watermark limit currently armed with [`set_limit`](SharedReceiveQueue::set_limit),
+    /// or 0 when none is.
+    pub fn limit(&self) -> u32 {
+        self.limit
+    }
+}
+
 /// A shared receive queue (SRQ) that allows sharing receive buffers across multiple queue pairs.
 /// Created by [`ProtectionDomain::create_srq`](crate::ProtectionDomain::create_srq).
 #[derive(Clone)]
@@ -39,6 +66,70 @@ impl SharedReceiveQueue {
     /// [`SharedReceiveQueue`] and stays valid only while it is alive; do not destroy it.
     pub fn as_raw(&self) -> *mut ffi::ibv_srq {
         self.inner.srq
+    }
+
+    /// The queue's current attributes (`ibv_query_srq`): its capacity, the scatter/gather entries
+    /// per receive, and the armed limit.
+    ///
+    /// # Errors
+    ///
+    ///  - [`QuerySharedReceiveQueue`](Error::QuerySharedReceiveQueue): `ibv_query_srq` failed.
+    pub fn query(&self) -> Result<SrqAttributes> {
+        let mut attr = ffi::ibv_srq_attr::default();
+        let errno = unsafe { ffi::ibv_query_srq(self.inner.srq, &mut attr) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::QuerySharedReceiveQueue));
+        }
+        Ok(SrqAttributes {
+            max_wr: attr.max_wr,
+            max_sge: attr.max_sge,
+            limit: attr.srq_limit,
+        })
+    }
+
+    /// Arm the low-watermark event (`ibv_modify_srq` with `IBV_SRQ_LIMIT`): once fewer than
+    /// `limit` receives remain posted, the device raises
+    /// [`AsyncEventType::SrqLimitReached`](crate::AsyncEventType::SrqLimitReached) once and
+    /// disarms, so re-arm to be told again. A `limit` of 0 disarms. The limit must be below the
+    /// queue's capacity ([`SrqAttributes::max_wr`]).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifySharedReceiveQueue`](Error::ModifySharedReceiveQueue): `ibv_modify_srq` failed
+    ///    (`EINVAL` for a limit the queue cannot hold).
+    ///  - [`Unsupported`](Error::Unsupported): the provider does not support the limit event.
+    pub fn set_limit(&self, limit: u32) -> Result<()> {
+        let mut attr = ffi::ibv_srq_attr {
+            srq_limit: limit,
+            ..Default::default()
+        };
+        self.modify(&mut attr, ffi::ibv_srq_attr_mask::IBV_SRQ_LIMIT)
+    }
+
+    /// Resize the queue to hold `max_wr` receives (`ibv_modify_srq` with `IBV_SRQ_MAX_WR`),
+    /// keeping the receives already posted. The device may grant more than asked; read the result
+    /// with [`query`](Self::query).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifySharedReceiveQueue`](Error::ModifySharedReceiveQueue): `ibv_modify_srq` failed
+    ///    (`EINVAL` for a size the device cannot provide, or fewer entries than are posted).
+    ///  - [`Unsupported`](Error::Unsupported): the provider does not support resizing.
+    pub fn set_max_wr(&self, max_wr: u32) -> Result<()> {
+        let mut attr = ffi::ibv_srq_attr {
+            max_wr,
+            ..Default::default()
+        };
+        self.modify(&mut attr, ffi::ibv_srq_attr_mask::IBV_SRQ_MAX_WR)
+    }
+
+    /// `ibv_modify_srq` for the attributes `mask` selects in `attr`.
+    fn modify(&self, attr: &mut ffi::ibv_srq_attr, mask: ffi::ibv_srq_attr_mask) -> Result<()> {
+        let errno = unsafe { ffi::ibv_modify_srq(self.inner.srq, attr, mask as i32) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::ModifySharedReceiveQueue));
+        }
+        Ok(())
     }
 
     /// Posts a batch of receive Work Requests to this Shared Receive Queue (SRQ) with a single
