@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, MrAdvice,
-    MrAdviseFlags, PortState, ProtectionDomain, QueuePair, QueuePairAttribute,
+    MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair, QueuePairAttribute,
     QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, TransportType, Uc, Ud, WcFields,
 };
 
@@ -419,7 +419,8 @@ fn rdma_write_with_imm() {
     batch
         .op()
         .signaled()
-        .write_imm(11, &[src.slice(..4)], remote, imm);
+        .imm(imm)
+        .write(11, &[src.slice(..4)], remote);
     unsafe { batch.submit() }.expect("write failed");
 
     let comps = drain(&lb.cq, 2);
@@ -1241,7 +1242,7 @@ fn inline_send() {
         .expect("failed to register recv MR");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }.expect("post_recv failed");
     let mut batch = qp.start_send();
-    batch.op().signaled().send_inline(2, b"inrun");
+    batch.op().signaled().send(2, Payload::Inline(b"inrun"));
     unsafe { batch.submit() }.expect("inline send submit failed");
     let comps = drain(&cq, 2);
     assert!(comps.iter().any(|c| c.wr_id() == 1), "missing recv");
@@ -1254,7 +1255,10 @@ fn inline_send() {
         .expect("failed to register dst MR");
     let remote = dst.remote().slice(..4);
     let mut batch = qp.start_send();
-    batch.op().signaled().write_inline(3, b"wxyz", remote);
+    batch
+        .op()
+        .signaled()
+        .write(3, Payload::Inline(b"wxyz"), remote);
     unsafe { batch.submit() }.expect("inline write submit failed");
     let comps = drain(&cq, 1);
     assert_eq!(comps[0].wr_id(), 3);
@@ -1674,7 +1678,7 @@ fn inline_send_list() {
         IoSlice::new(b"fghi"),
     ];
     let mut batch = qp.start_send();
-    batch.op().signaled().send_inline_list(2, &bufs);
+    batch.op().signaled().send(2, Payload::InlineList(&bufs));
     unsafe { batch.submit() }.expect("inline send-list submit failed");
     let comps = drain(&cq, 2);
     let recv_len = comps
@@ -1704,7 +1708,10 @@ fn inline_send_list() {
     let remote = dst.remote().slice(..6);
     let parts = [IoSlice::new(b"uvw"), IoSlice::new(b"xyz")];
     let mut batch = qp.start_send();
-    batch.op().signaled().write_inline_list(3, &parts, remote);
+    batch
+        .op()
+        .signaled()
+        .write(3, Payload::InlineList(&parts), remote);
     unsafe { batch.submit() }.expect("inline write-list submit failed");
     let comps = drain(&cq, 1);
     assert_eq!(comps[0].wr_id(), 3);

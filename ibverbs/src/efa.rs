@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
 use crate::qp::{
-    sealed, AddressedSendOp, Datagram, PreparedQueuePair, QueuePair, QueuePairBuilder,
+    sealed, AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
     QueuePairType, Transport,
 };
 
@@ -163,32 +163,25 @@ impl PreparedQueuePair<Srd> {
 }
 
 impl AddressedSendOp<'_, '_, Srd> {
-    /// Post an RDMA WRITE into `remote`.
+    /// Post an RDMA WRITE of `payload` into `remote`, with the immediate set by
+    /// [`imm`](Self::imm) if any.
     #[inline]
-    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.op.build(wr_id, local, move |q| unsafe {
-            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
-        })
-    }
-
-    /// Post an RDMA WRITE into `remote` carrying a 32-bit immediate (host byte order).
-    #[inline]
-    pub fn write_imm(
-        self,
-        wr_id: u64,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        imm: u32,
-    ) {
-        self.op.build(wr_id, local, move |q| unsafe {
-            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+    pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
+        let imm = self.op.imm;
+        self.op.build(wr_id, payload.into(), move |q| unsafe {
+            match imm {
+                Some(imm) => {
+                    (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+                }
+                None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
+            }
         })
     }
 
     /// Post an RDMA READ from `remote` into `local`.
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.op.build(wr_id, local, move |q| unsafe {
+        self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {
             (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
         })
     }

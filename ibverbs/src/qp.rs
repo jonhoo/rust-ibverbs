@@ -712,7 +712,7 @@ impl<T: Transport> QueuePairBuilder<T> {
 
     /// Set the maximum size, in bytes, of inline data that may be posted on the send queue.
     ///
-    /// Inline sends (see [`SendOp::send_inline`]) copy their payload directly into the work request
+    /// Inline sends (see [`Payload::Inline`]) copy their payload directly into the work request
     /// rather than referencing a registered memory region, which lowers latency for small messages.
     /// A send queue must reserve this capacity up front; the actual value granted by the device can
     /// be larger than requested and is reported by [`QueuePair::query`] (see
@@ -1439,6 +1439,7 @@ impl<'qp, T: Connected> SendBatch<'qp, T> {
         SendOp {
             batch: self,
             flags: 0,
+            imm: None,
             dest: None,
         }
     }
@@ -1468,6 +1469,7 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
             op: SendOp {
                 batch: self,
                 flags: 0,
+                imm: None,
                 dest: Some((ah.as_ptr(), remote_qpn, remote_qkey)),
             },
         }
@@ -1514,12 +1516,13 @@ impl<T: Transport> Drop for SendBatch<'_, T> {
 /// [`SendBatch::to`], which yields an [`AddressedSendOp`] instead).
 ///
 /// Chain the modifiers ([`signaled`](Self::signaled), [`fenced`](Self::fenced),
-/// [`solicited`](Self::solicited)) and finish with an opcode method (`send`, `write`, ...), which
-/// posts the request immediately. The opcodes exist only on the transports that support them (see
-/// [`Transport`]).
+/// [`solicited`](Self::solicited), [`imm`](Self::imm)) and finish with an opcode method (`send`,
+/// `write`, ...), which posts the request immediately. The opcodes exist only on the transports
+/// that support them (see [`Transport`]); `send` and `write` take any [`Payload`].
 pub struct SendOp<'b, 'qp, T: Transport> {
     batch: &'b mut SendBatch<'qp, T>,
     flags: u32,
+    pub(crate) imm: Option<u32>,
     dest: Option<(*mut ffi::ibv_ah, u32, u32)>,
 }
 
@@ -1549,215 +1552,119 @@ impl<T: Transport> SendOp<'_, '_, T> {
         self
     }
 
+    /// Attach a 32-bit immediate (host byte order) to the SEND or RDMA WRITE this request posts.
+    ///
+    /// The receiver reads it from the work completion ([`WorkCompletion::imm_data`](crate::WorkCompletion::imm_data)). An RDMA
+    /// WRITE with an immediate consumes a receive on the remote side, like a SEND does, which is
+    /// how the writer signals the write's arrival. Ignored by the operations that cannot carry one
+    /// (RDMA READ and the atomics).
+    #[inline]
+    pub fn imm(mut self, imm: u32) -> Self {
+        self.imm = Some(imm);
+        self
+    }
+
     /// Post one work request: set id and flags, run the opcode builder, then the optional datagram
-    /// address, then the scatter list.
+    /// address, then the payload.
     #[inline]
     pub(crate) fn build(
         self,
         wr_id: u64,
-        local: &[LocalMemorySlice],
+        payload: Payload<'_>,
         op: impl FnOnce(*mut ffi::ibv_qp_ex),
     ) {
         let qpx = self.batch.qpx;
         unsafe {
             (*qpx).wr_id = wr_id;
-            (*qpx).wr_flags = self.flags;
+            (*qpx).wr_flags = match payload {
+                Payload::Sges(_) => self.flags,
+                // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline; it
+                // is what the legacy `ibv_post_send` ABI carries, and rdma-core's generic doorbell
+                // emulation (used by providers such as Soft-RoCE) sets it when translating
+                // `wr_set_inline_data`. Native doorbell providers key off the `wr_set_inline_data`
+                // call itself, so the flag is redundant but harmless there.
+                Payload::Inline(_) | Payload::InlineList(_) => {
+                    self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0
+                }
+            };
             op(qpx);
             if let Some((ah, qpn, qkey)) = self.dest {
                 (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
             }
-            (*qpx).wr_set_sge_list.unwrap()(
-                qpx,
-                local.len(),
-                local.as_ptr() as *const ffi::ibv_sge,
-            );
+            match payload {
+                Payload::Sges(local) => (*qpx).wr_set_sge_list.unwrap()(
+                    qpx,
+                    local.len(),
+                    local.as_ptr() as *const ffi::ibv_sge,
+                ),
+                // The bytes are copied during this call, so the payload need not outlive the work
+                // completion.
+                Payload::Inline(data) => (*qpx).wr_set_inline_data.unwrap()(
+                    qpx,
+                    data.as_ptr() as *mut c_void,
+                    data.len(),
+                ),
+                // `std::io::IoSlice` is guaranteed ABI-compatible with `struct iovec` on Unix (the
+                // only platform rdma-core targets), and `ibv_data_buf` has the same layout as
+                // `iovec` (an address and a length), so the buffer list passes straight through
+                // without copying it into a temporary array.
+                Payload::InlineList(bufs) => (*qpx).wr_set_inline_data_list.unwrap()(
+                    qpx,
+                    bufs.len(),
+                    bufs.as_ptr() as *const ffi::ibv_data_buf,
+                ),
+            }
         }
     }
 
-    /// Like [`build`](Self::build), but copies `data` inline into the work request instead of
-    /// referencing a registered memory region. The bytes are copied during this call, so `data` need
-    /// not outlive the work completion.
+    /// The opcode builder for a SEND, with or without the immediate set by [`imm`](Self::imm).
     #[inline]
-    fn build_inline(self, wr_id: u64, data: &[u8], op: impl FnOnce(*mut ffi::ibv_qp_ex)) {
-        let qpx = self.batch.qpx;
-        unsafe {
-            (*qpx).wr_id = wr_id;
-            // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline; it is what
-            // the legacy `ibv_post_send` ABI carries, and rdma-core's generic doorbell emulation
-            // (used by providers such as Soft-RoCE) sets it when translating `wr_set_inline_data`.
-            // Native doorbell providers key off the `wr_set_inline_data` call itself, so the flag is
-            // redundant but harmless there.
-            (*qpx).wr_flags = self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0;
-            op(qpx);
-            if let Some((ah, qpn, qkey)) = self.dest {
-                (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
+    fn send_op(imm: Option<u32>) -> impl FnOnce(*mut ffi::ibv_qp_ex) {
+        move |q| unsafe {
+            match imm {
+                Some(imm) => (*q).wr_send_imm.unwrap()(q, imm.to_be()),
+                None => (*q).wr_send.unwrap()(q),
             }
-            (*qpx).wr_set_inline_data.unwrap()(qpx, data.as_ptr() as *mut c_void, data.len());
         }
     }
 
-    /// Like [`build_inline`](Self::build_inline), but gathers several buffers into the inline payload
-    /// of a single work request (`wr_set_inline_data_list`). The bytes are copied during this call,
-    /// so none of the `bufs` need outlive the work completion.
+    /// The opcode builder for an RDMA WRITE into `remote`, with or without the immediate set by
+    /// [`imm`](Self::imm).
     #[inline]
-    fn build_inline_list(
-        self,
-        wr_id: u64,
-        bufs: &[io::IoSlice<'_>],
-        op: impl FnOnce(*mut ffi::ibv_qp_ex),
-    ) {
-        let qpx = self.batch.qpx;
-        unsafe {
-            (*qpx).wr_id = wr_id;
-            (*qpx).wr_flags = self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0;
-            op(qpx);
-            if let Some((ah, qpn, qkey)) = self.dest {
-                (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
+    fn write_op(imm: Option<u32>, remote: RemoteMemorySlice) -> impl FnOnce(*mut ffi::ibv_qp_ex) {
+        move |q| unsafe {
+            match imm {
+                Some(imm) => {
+                    (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+                }
+                None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
             }
-            // `std::io::IoSlice` is guaranteed ABI-compatible with `struct iovec` on Unix (the only
-            // platform rdma-core targets), and `ibv_data_buf` has the same layout as `iovec` (an
-            // address and a length), so the buffer list passes straight through without copying it
-            // into a temporary array.
-            (*qpx).wr_set_inline_data_list.unwrap()(
-                qpx,
-                bufs.len(),
-                bufs.as_ptr() as *const ffi::ibv_data_buf,
-            );
         }
     }
 }
 
 impl<T: Connected> SendOp<'_, '_, T> {
-    /// Post a SEND.
-    #[inline]
-    pub fn send(self, wr_id: u64, local: &[LocalMemorySlice]) {
-        self.build(wr_id, local, |q| unsafe { (*q).wr_send.unwrap()(q) })
-    }
-
-    /// Post a SEND whose payload is carried inline in the work request.
+    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
     ///
-    /// Inline data is copied into the work request rather than referenced through a memory region,
-    /// which lowers latency for small messages and lets `data` be reused or dropped right away. The
-    /// queue pair must have been built with enough inline capacity (see
-    /// [`QueuePairBuilder::set_max_inline_data`]) or the [`submit`](SendBatch::submit) fails with
-    /// `EINVAL`.
+    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
+    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
+    /// requirements of each.
     #[inline]
-    pub fn send_inline(self, wr_id: u64, data: &[u8]) {
-        self.build_inline(wr_id, data, |q| unsafe { (*q).wr_send.unwrap()(q) })
+    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
+        let imm = self.imm;
+        self.build(wr_id, payload.into(), Self::send_op(imm))
     }
 
-    /// Post a SEND carrying an inline payload and a 32-bit immediate (host byte order).
+    /// Post an RDMA WRITE of `payload` into `remote`, with the immediate set by [`imm`](Self::imm)
+    /// if any.
     ///
-    /// See [`send_inline`](Self::send_inline) for the inline-data requirements.
+    /// Registered memory converts implicitly (`write(id, &[mr.slice(..)], remote)`); inline data
+    /// is spelled out (`write(id, Payload::Inline(b"ping"), remote)`). See [`Payload`] for the
+    /// lifetime and capacity requirements of each.
     #[inline]
-    pub fn send_imm_inline(self, wr_id: u64, data: &[u8], imm: u32) {
-        self.build_inline(wr_id, data, move |q| unsafe {
-            (*q).wr_send_imm.unwrap()(q, imm.to_be())
-        })
-    }
-
-    /// Post an RDMA WRITE into `remote` whose payload is carried inline in the work request.
-    ///
-    /// See [`send_inline`](Self::send_inline) for the inline-data requirements.
-    #[inline]
-    pub fn write_inline(self, wr_id: u64, data: &[u8], remote: RemoteMemorySlice) {
-        self.build_inline(wr_id, data, move |q| unsafe {
-            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
-        })
-    }
-
-    /// Post an RDMA WRITE into `remote` carrying an inline payload and a 32-bit immediate (host byte
-    /// order).
-    ///
-    /// See [`send_inline`](Self::send_inline) for the inline-data requirements.
-    #[inline]
-    pub fn write_imm_inline(self, wr_id: u64, data: &[u8], remote: RemoteMemorySlice, imm: u32) {
-        self.build_inline(wr_id, data, move |q| unsafe {
-            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
-        })
-    }
-
-    /// Post a SEND whose inline payload is gathered from several buffers.
-    ///
-    /// Like [`send_inline`](Self::send_inline), but concatenates `bufs` into one inline payload
-    /// (saving a copy into a contiguous buffer first), so the queue pair must have enough inline
-    /// capacity for their combined length. See [`send_inline`](Self::send_inline) for the
-    /// inline-data requirements.
-    #[inline]
-    pub fn send_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>]) {
-        self.build_inline_list(wr_id, bufs, |q| unsafe { (*q).wr_send.unwrap()(q) })
-    }
-
-    /// Post a SEND carrying a gathered inline payload and a 32-bit immediate (host byte order).
-    ///
-    /// See [`send_inline_list`](Self::send_inline_list) for the gathering behavior.
-    #[inline]
-    pub fn send_imm_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>], imm: u32) {
-        self.build_inline_list(wr_id, bufs, move |q| unsafe {
-            (*q).wr_send_imm.unwrap()(q, imm.to_be())
-        })
-    }
-
-    /// Post an RDMA WRITE into `remote` whose inline payload is gathered from several buffers.
-    ///
-    /// See [`send_inline_list`](Self::send_inline_list) for the gathering behavior.
-    #[inline]
-    pub fn write_inline_list(
-        self,
-        wr_id: u64,
-        bufs: &[io::IoSlice<'_>],
-        remote: RemoteMemorySlice,
-    ) {
-        self.build_inline_list(wr_id, bufs, move |q| unsafe {
-            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
-        })
-    }
-
-    /// Post an RDMA WRITE into `remote` carrying a gathered inline payload and a 32-bit immediate
-    /// (host byte order).
-    ///
-    /// See [`send_inline_list`](Self::send_inline_list) for the gathering behavior.
-    #[inline]
-    pub fn write_imm_inline_list(
-        self,
-        wr_id: u64,
-        bufs: &[io::IoSlice<'_>],
-        remote: RemoteMemorySlice,
-        imm: u32,
-    ) {
-        self.build_inline_list(wr_id, bufs, move |q| unsafe {
-            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
-        })
-    }
-
-    /// Post a SEND carrying a 32-bit immediate (host byte order).
-    #[inline]
-    pub fn send_imm(self, wr_id: u64, local: &[LocalMemorySlice], imm: u32) {
-        self.build(wr_id, local, move |q| unsafe {
-            (*q).wr_send_imm.unwrap()(q, imm.to_be())
-        })
-    }
-
-    /// Post an RDMA WRITE into `remote`.
-    #[inline]
-    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.build(wr_id, local, move |q| unsafe {
-            (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr)
-        })
-    }
-
-    /// Post an RDMA WRITE carrying a 32-bit immediate (host byte order).
-    #[inline]
-    pub fn write_imm(
-        self,
-        wr_id: u64,
-        local: &[LocalMemorySlice],
-        remote: RemoteMemorySlice,
-        imm: u32,
-    ) {
-        self.build(wr_id, local, move |q| unsafe {
-            (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
-        })
+    pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
+        let imm = self.imm;
+        self.build(wr_id, payload.into(), Self::write_op(imm, remote))
     }
 }
 
@@ -1765,7 +1672,7 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     /// Post an RDMA READ from `remote` into `local`.
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.build(wr_id, local, move |q| unsafe {
+        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
             (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
         })
     }
@@ -1780,7 +1687,7 @@ impl<T: Reliable> SendOp<'_, '_, T> {
         compare: u64,
         swap: u64,
     ) {
-        self.build(wr_id, local, move |q| unsafe {
+        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
             (*q).wr_atomic_cmp_swp.unwrap()(q, remote.rkey, remote.addr, compare, swap)
         })
     }
@@ -1794,7 +1701,7 @@ impl<T: Reliable> SendOp<'_, '_, T> {
         remote: RemoteMemorySlice,
         add: u64,
     ) {
-        self.build(wr_id, local, move |q| unsafe {
+        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
             (*q).wr_atomic_fetch_add.unwrap()(q, remote.rkey, remote.addr, add)
         })
     }
@@ -1804,9 +1711,9 @@ impl<T: Reliable> SendOp<'_, '_, T> {
 /// creation by [`SendBatch::to`].
 ///
 /// Chain the modifiers ([`signaled`](Self::signaled), [`fenced`](Self::fenced),
-/// [`solicited`](Self::solicited)) and finish with an opcode method, which posts the request
-/// immediately. UD supports the two-sided sends (including the inline variants); SRD (behind the
-/// `efa` feature) additionally supports RDMA write (with immediate) and read.
+/// [`solicited`](Self::solicited), [`imm`](Self::imm)) and finish with an opcode method, which
+/// posts the request immediately. UD supports SEND (with any [`Payload`]); SRD (behind the `efa`
+/// feature) additionally supports RDMA write and read.
 pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
     pub(crate) op: SendOp<'b, 'qp, T>,
 }
@@ -1840,50 +1747,61 @@ impl<T: Datagram> AddressedSendOp<'_, '_, T> {
         }
     }
 
-    /// Post a SEND.
+    /// Attach a 32-bit immediate (host byte order) to the SEND this request posts, delivered to
+    /// the receiver in its work completion ([`WorkCompletion::imm_data`](crate::WorkCompletion::imm_data)).
     #[inline]
-    pub fn send(self, wr_id: u64, local: &[LocalMemorySlice]) {
+    pub fn imm(self, imm: u32) -> Self {
+        AddressedSendOp {
+            op: self.op.imm(imm),
+        }
+    }
+
+    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
+    ///
+    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
+    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
+    /// requirements of each.
+    #[inline]
+    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
+        let imm = self.op.imm;
         self.op
-            .build(wr_id, local, |q| unsafe { (*q).wr_send.unwrap()(q) })
+            .build(wr_id, payload.into(), SendOp::<T>::send_op(imm))
     }
+}
 
-    /// Post a SEND carrying a 32-bit immediate (host byte order).
-    #[inline]
-    pub fn send_imm(self, wr_id: u64, local: &[LocalMemorySlice], imm: u32) {
-        self.op.build(wr_id, local, move |q| unsafe {
-            (*q).wr_send_imm.unwrap()(q, imm.to_be())
-        })
+/// The data a SEND or RDMA WRITE carries: registered memory the device reads after the request is
+/// posted, or bytes copied into the work request as it is posted.
+///
+/// [`Sges`](Self::Sges) references memory regions through scatter/gather entries, so the buffers
+/// must stay valid until the work completion is reaped (the [`submit`](SendBatch::submit)
+/// contract). The inline variants copy the bytes into the work request during the opcode call,
+/// which lowers latency for small messages and lets the bytes be reused or dropped right away;
+/// they need a queue pair built with enough inline capacity
+/// ([`QueuePairBuilder::set_max_inline_data`]) or the batch fails to submit with `EINVAL`.
+///
+/// A scatter/gather list converts implicitly, so `batch.op().send(id, &[mr.slice(..)])` reads
+/// naturally; inline payloads are spelled out: `batch.op().send(id, Payload::Inline(b"ping"))`.
+#[derive(Clone, Copy)]
+pub enum Payload<'a> {
+    /// Registered memory, as scatter/gather entries.
+    Sges(&'a [LocalMemorySlice]),
+    /// Bytes copied into the work request.
+    Inline(&'a [u8]),
+    /// Several buffers concatenated into one inline payload (`wr_set_inline_data_list`), saving
+    /// the copy into a contiguous buffer first; the queue pair needs inline capacity for their
+    /// combined length.
+    InlineList(&'a [io::IoSlice<'a>]),
+}
+
+impl<'a> From<&'a [LocalMemorySlice]> for Payload<'a> {
+    fn from(local: &'a [LocalMemorySlice]) -> Self {
+        Payload::Sges(local)
     }
+}
 
-    /// Post a SEND whose payload is carried inline in the work request (see
-    /// [`QueuePairBuilder::set_max_inline_data`]).
-    #[inline]
-    pub fn send_inline(self, wr_id: u64, data: &[u8]) {
-        self.op
-            .build_inline(wr_id, data, |q| unsafe { (*q).wr_send.unwrap()(q) })
-    }
-
-    /// Post a SEND carrying an inline payload and a 32-bit immediate (host byte order).
-    #[inline]
-    pub fn send_imm_inline(self, wr_id: u64, data: &[u8], imm: u32) {
-        self.op.build_inline(wr_id, data, move |q| unsafe {
-            (*q).wr_send_imm.unwrap()(q, imm.to_be())
-        })
-    }
-
-    /// Post a SEND whose inline payload is gathered from several buffers.
-    #[inline]
-    pub fn send_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>]) {
-        self.op
-            .build_inline_list(wr_id, bufs, |q| unsafe { (*q).wr_send.unwrap()(q) })
-    }
-
-    /// Post a SEND carrying a gathered inline payload and a 32-bit immediate (host byte order).
-    #[inline]
-    pub fn send_imm_inline_list(self, wr_id: u64, bufs: &[io::IoSlice<'_>], imm: u32) {
-        self.op.build_inline_list(wr_id, bufs, move |q| unsafe {
-            (*q).wr_send_imm.unwrap()(q, imm.to_be())
-        })
+impl<'a, const N: usize> From<&'a [LocalMemorySlice; N]> for Payload<'a> {
+    fn from(local: &'a [LocalMemorySlice; N]) -> Self {
+        Payload::Sges(local)
     }
 }
 
