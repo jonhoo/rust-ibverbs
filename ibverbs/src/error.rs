@@ -161,6 +161,14 @@ pub enum Error {
     #[error("failed to create a shared receive queue")]
     CreateSharedReceiveQueue(#[source] io::Error),
 
+    /// Modifying a shared receive queue failed (`ibv_modify_srq`).
+    #[error("failed to modify the shared receive queue")]
+    ModifySharedReceiveQueue(#[source] io::Error),
+
+    /// Querying a shared receive queue failed (`ibv_query_srq`).
+    #[error("failed to query the shared receive queue")]
+    QuerySharedReceiveQueue(#[source] io::Error),
+
     /// Posting a send work request failed.
     #[error("failed to post a send work request")]
     PostSend(#[source] io::Error),
@@ -274,6 +282,8 @@ impl Error {
             Error::QueryQueuePair(_) => "ibv_query_qp",
             Error::CreateAddressHandle(_) => "ibv_create_ah",
             Error::CreateSharedReceiveQueue(_) => "ibv_create_srq",
+            Error::ModifySharedReceiveQueue(_) => "ibv_modify_srq",
+            Error::QuerySharedReceiveQueue(_) => "ibv_query_srq",
             Error::PostSend(_) => "ibv_wr_complete",
             Error::PostReceive(_) => "ibv_post_recv",
             Error::PollCompletionQueue(_) => "completion-queue polling",

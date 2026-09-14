@@ -82,7 +82,9 @@ use std::time::{Duration, Instant};
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
 
 use crate::qp::QueuePairState;
-use crate::{Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Rc, Result};
+use crate::{
+    AckTimeout, Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Rc, Result,
+};
 
 /// The port space a connection-manager identifier lives in: which namespace its port numbers are
 /// allocated from, and which transport its connections use. Passed to [`Connector::new`],
@@ -801,6 +803,85 @@ impl CmId {
         Ok(())
     }
 
+    /// Set an `RDMA_OPTION_ID`-level option (`rdma_set_option`) to `value`.
+    fn set_id_option<T>(&self, option: c_int, mut value: T) -> Result<()> {
+        let ret = unsafe {
+            ffi::rdma_set_option(
+                self.inner.id,
+                ffi::RDMA_OPTION_ID as c_int,
+                option,
+                (&mut value as *mut T).cast::<c_void>(),
+                std::mem::size_of::<T>(),
+            )
+        };
+        if ret != 0 {
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
+    /// Set the type of service of this id's traffic: the IP DSCP/ToS byte (RFC 2474) its packets
+    /// carry, which the network maps to a priority or a lossless class. Set it before resolving
+    /// the address (active side) or binding (passive side).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    pub fn set_tos(&self, tos: u8) -> Result<()> {
+        self.set_id_option(ffi::RDMA_OPTION_ID_TOS as c_int, tos)
+    }
+
+    /// Allow the local address to be shared, like `SO_REUSEADDR`: another id with the same
+    /// setting may bind the same address and port. Set it before binding.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    pub fn set_reuse_addr(&self, reuse: bool) -> Result<()> {
+        self.set_id_option(ffi::RDMA_OPTION_ID_REUSEADDR as c_int, c_int::from(reuse))
+    }
+
+    /// Restrict an id bound to an IPv6 address to IPv6 peers, like `IPV6_V6ONLY`, instead of
+    /// also serving IPv4 ones through IPv4-mapped addresses. Set it before binding.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    pub fn set_af_only(&self, only: bool) -> Result<()> {
+        self.set_id_option(ffi::RDMA_OPTION_ID_AFONLY as c_int, c_int::from(only))
+    }
+
+    /// Set the ACK timeout of the connection's queue pair, overriding the one the connection
+    /// manager derives from the route. Set it before connecting or accepting.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    pub fn set_ack_timeout(&self, timeout: AckTimeout) -> Result<()> {
+        self.set_id_option(ffi::RDMA_OPTION_ID_ACK_TIMEOUT as c_int, timeout.exponent())
+    }
+
+    /// Tell the connection manager that the queue pair saw the peer's first message arrive
+    /// (`rdma_notify` with `IBV_EVENT_COMM_EST`).
+    ///
+    /// With an external queue pair, the device reports that arrival as an `IBV_EVENT_COMM_EST`
+    /// asynchronous event on the queue pair ([`Context::wait_async_event`]), which the connection
+    /// manager cannot see on its own; forwarding it here lets the passive side treat the
+    /// connection as established when the peer's ready-to-use message was lost.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_notify` failed (for example
+    ///    `EISCONN` when the connection is already established).
+    pub fn notify_established(&self) -> Result<()> {
+        let ret =
+            unsafe { ffi::rdma_notify(self.inner.id, ffi::ibv_event_type::IBV_EVENT_COMM_EST) };
+        if ret != 0 {
+            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
+        }
+        Ok(())
+    }
+
     /// The IP address and port of the remote end of this id, or `None` while the destination has
     /// not been resolved yet (or its address family is neither IPv4 nor IPv6).
     pub fn peer_addr(&self) -> Option<SocketAddr> {
@@ -1163,6 +1244,12 @@ impl Connector {
         })
     }
 
+    /// The underlying id, for options that must be set before resolving ([`CmId::set_tos`],
+    /// [`CmId::set_ack_timeout`]).
+    pub fn cm_id(&self) -> &CmId {
+        &self.id
+    }
+
     /// Resolves the destination address and route (blocking until both complete), then returns a
     /// handle to build the queue pair on the resolved device. `timeout` bounds each of the two
     /// resolution steps (it is enforced by the kernel, which reports expiry as a failure event).
@@ -1189,6 +1276,12 @@ impl Resolved {
     /// domain and completion queue) on this context, then pass it to [`connect`](Self::connect).
     pub fn context(&self) -> Result<Context> {
         self.id.context()
+    }
+
+    /// The underlying id: the resolved route's addresses, and the options that must be set before
+    /// connecting ([`CmId::set_ack_timeout`]).
+    pub fn cm_id(&self) -> &CmId {
+        &self.id
     }
 
     /// Connects to the remote (blocking) using `qp`, returning the established [`Connection`]. The
@@ -1254,11 +1347,33 @@ impl Acceptor {
     ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed, for example because no
     ///    RDMA device answers to `addr`.
     pub fn bind(addr: SocketAddr, port_space: PortSpace, backlog: u32) -> Result<Self> {
+        Self::bind_with(addr, port_space, backlog, |_| Ok(()))
+    }
+
+    /// As [`bind`](Self::bind), running `configure` on the listener's id before it binds: the
+    /// place for the options that must precede binding ([`CmId::set_reuse_addr`],
+    /// [`CmId::set_af_only`], [`CmId::set_tos`]).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`bind`](Self::bind), plus whatever `configure` returns.
+    pub fn bind_with(
+        addr: SocketAddr,
+        port_space: PortSpace,
+        backlog: u32,
+        configure: impl FnOnce(&CmId) -> Result<()>,
+    ) -> Result<Self> {
         require_connected_port_space(port_space, "Acceptor")?;
         let listener = CmId::create(port_space)?;
+        configure(&listener)?;
         listener.bind_addr(addr)?;
         listener.listen(backlog)?;
         Ok(Acceptor { listener })
+    }
+
+    /// The listening id.
+    pub fn cm_id(&self) -> &CmId {
+        &self.listener
     }
 
     /// The local address the acceptor listens on: the address passed to [`bind`](Self::bind),
@@ -1317,6 +1432,12 @@ impl Incoming {
     /// [`accept`](Self::accept).
     pub fn context(&self) -> Result<Context> {
         self.id.context()
+    }
+
+    /// The request's id: the peer's address, and the options that must be set before accepting
+    /// ([`CmId::set_ack_timeout`]).
+    pub fn cm_id(&self) -> &CmId {
+        &self.id
     }
 
     /// The private data the peer attached to its request
@@ -1399,6 +1520,13 @@ impl Connection {
     /// you built it with.
     pub fn queue_pair(&mut self) -> &mut QueuePair<Rc> {
         &mut self.qp
+    }
+
+    /// The connection's id, to watch what happens to it after establishment — the peer
+    /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
+    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`].
+    pub fn cm_id(&self) -> &CmId {
+        &self.id
     }
 
     /// The private data the peer attached to its connection request (on the accepting side) or

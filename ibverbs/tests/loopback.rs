@@ -10,7 +10,7 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, MrAdvice,
+    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh, MrAdvice,
     MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair, QueuePairAttribute,
     QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, TransportType, Uc,
     Ud, WcFields,
@@ -757,8 +757,21 @@ fn srq_limit_reached_async_event() {
 
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    // Arm the low watermark at creation: dropping below 2 posted receives raises the event.
-    let srq = pd.create_srq(16, 1, 2).expect("failed to create SRQ");
+    // Arm the low watermark after creation: dropping below 2 posted receives raises the event.
+    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    srq.set_limit(2).expect("failed to arm the SRQ limit");
+    let attrs = srq.query().expect("failed to query the SRQ");
+    assert!(attrs.max_wr() >= 16, "{attrs:?}");
+    assert!(attrs.max_sge() >= 1, "{attrs:?}");
+    assert_eq!(attrs.limit(), 2, "{attrs:?}");
+    // Resizing is provider-dependent; where it works, the queue reports the larger capacity.
+    match srq.set_max_wr(32) {
+        Ok(()) => {
+            let grown = srq.query().expect("failed to query the SRQ");
+            assert!(grown.max_wr() >= 32, "{grown:?}");
+        }
+        Err(e) => eprintln!("SRQ resize not available here: {e}"),
+    }
 
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
@@ -1450,12 +1463,60 @@ fn extended_wc_fields() {
             let _ = wc.slid();
             let _ = wc.sl();
             let _ = wc.dlid_path_bits();
+            assert_eq!(
+                wc.invalidated_rkey(),
+                None,
+                "a plain send invalidates nothing"
+            );
+            let raw = wc.as_raw();
+            assert!(!raw.is_null());
+            assert_eq!(unsafe { (*raw).wr_id }, wc.wr_id());
             seen += 1;
         }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for completions"
         );
+    }
+    assert!(
+        cq.capacity() >= 16,
+        "the device grants at least what was asked"
+    );
+
+    // The packet-classification fields exist only on hardware that classifies; read them where
+    // the device offers them, and accept a refusal elsewhere (Soft-RoCE has none).
+    match ctx
+        .create_cq(16)
+        .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
+        .build()
+    {
+        Ok(cq) => {
+            let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
+            unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
+                .expect("post_recv failed");
+            let mut batch = qp.start_send();
+            batch.op().signaled().send(2, &[send.slice(..4)]);
+            unsafe { batch.submit() }.expect("send failed");
+            let mut seen = 0;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while seen < 2 {
+                let mut comps = cq.poll().expect("failed to poll CQ");
+                while let Some(wc) = comps.next() {
+                    wc.ok().expect("work request failed");
+                    let _ = wc.cvlan();
+                    let _ = wc.flow_tag();
+                    seen += 1;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for completions"
+                );
+            }
+        }
+        Err(ibverbs::Error::Unsupported { .. }) => {
+            eprintln!("device does not classify packets (no VLAN/flow-tag fields); skipping");
+        }
+        Err(e) => panic!("create_cq failed: {e}"),
     }
 }
 
@@ -2070,4 +2131,115 @@ fn send_ops_subset() {
     unsafe { batch.submit() }.expect("send failed");
     drain(&cq, 2);
     assert_eq!(&recv.bytes()[..4], b"only");
+}
+
+/// A UD queue pair answers a datagram through the route derived from the receive completion and
+/// its GRH, in both completion forms: the classic `ibv_wc` from `poll_into`, and the lazily read
+/// `WorkCompletion` from `poll`.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn reply_through_address_handle_from_wc() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    const QKEY: u32 = 0x1234_5678;
+
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build()
+        .expect("failed to build UD QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.activate(QKEY).expect("failed to activate UD QP");
+
+    // The "request" goes to our own GID through an explicitly built address handle.
+    let my_gid = endpoint.gid.expect("RoCE requires a GID");
+    let mut request_attr = AddressHandleAttribute::new(1);
+    request_attr.set_grh(my_gid, gid_index as u8, 64, 0);
+    let request_ah = pd
+        .create_address_handle(&request_attr)
+        .expect("failed to create the request's address handle");
+
+    let recv = pd
+        .allocate(2 * (Grh::LEN + 16), AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(32, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"ask?");
+    send.bytes_mut()[16..20].copy_from_slice(b"yes!");
+    let (first, second) = (Grh::LEN + 16, 2 * (Grh::LEN + 16));
+
+    // Round 1: request in, its completion read the classic way, reply out through the derived
+    // route.
+    unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..first)])]) }.expect("post_recv");
+    let mut batch = qp.start_send();
+    batch
+        .to(&request_ah, endpoint.qp_num, QKEY)
+        .signaled()
+        .send(2, &[send.slice(..4)]);
+    unsafe { batch.submit() }.expect("UD send failed");
+    let mut wcs = [ibverbs::ffi::ibv_wc::default(); 4];
+    let mut request_wc = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while request_wc.is_none() {
+        for wc in cq.poll_into(&mut wcs).expect("poll_into failed") {
+            assert!(wc.is_valid(), "work request {} failed", wc.wr_id());
+            if wc.wr_id() == 1 {
+                request_wc = Some(*wc);
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the request"
+        );
+    }
+    let request_wc = request_wc.unwrap();
+    assert_eq!(&recv.bytes()[Grh::LEN..Grh::LEN + 4], b"ask?");
+    let grh = Grh::from_bytes(recv.bytes()[..Grh::LEN].try_into().unwrap());
+    assert_eq!(grh.dgid(), my_gid, "the datagram was addressed to our GID");
+    assert_eq!(grh.sgid(), my_gid, "and sent from it too (loopback)");
+    let reply_attr = AddressHandleAttribute::from_wc(&ctx, 1, &request_wc, Some(&grh))
+        .expect("failed to derive the reply route");
+    let reply_ah = pd
+        .create_address_handle(&reply_attr)
+        .expect("failed to create the reply's address handle");
+
+    // Round 2: the reply arrives through that route; derive the next route from the lazily read
+    // completion this time.
+    unsafe { qp.post_recv([RecvRequest::new(3, &[recv.slice(first..second)])]) }
+        .expect("post_recv");
+    let mut batch = qp.start_send();
+    batch
+        .to(&reply_ah, request_wc.src_qp, QKEY)
+        .signaled()
+        .send(4, &[send.slice(16..20)]);
+    unsafe { batch.submit() }.expect("UD reply failed");
+    let mut next_attr = None;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while next_attr.is_none() {
+        let mut completions = cq.poll().expect("poll failed");
+        while let Some(wc) = completions.next() {
+            wc.ok().expect("work request failed");
+            if wc.wr_id() == 3 {
+                assert!(wc.has_grh(), "a UD receive on RoCE carries a GRH");
+                let grh =
+                    Grh::from_bytes(recv.bytes()[first..first + Grh::LEN].try_into().unwrap());
+                next_attr = Some(
+                    AddressHandleAttribute::from_completion(&ctx, 1, &wc, Some(&grh))
+                        .expect("failed to derive a route from the lazy completion"),
+                );
+            }
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for the reply");
+    }
+    assert_eq!(
+        &recv.bytes()[first + Grh::LEN..first + Grh::LEN + 4],
+        b"yes!"
+    );
+    let _next_ah = pd
+        .create_address_handle(&next_attr.unwrap())
+        .expect("the derived route makes a valid address handle");
 }

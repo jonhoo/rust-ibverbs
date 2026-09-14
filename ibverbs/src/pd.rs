@@ -440,9 +440,9 @@ impl ProtectionDomain {
     /// does; this crate's test suite relies on that), arms the low-watermark event: once fewer
     /// receives than the limit remain posted, the device raises
     /// [`AsyncEventType::SrqLimitReached`](crate::AsyncEventType::SrqLimitReached) once. The
-    /// `ibv_create_srq` man page considers the field irrelevant at creation, so portable arming
-    /// requires `ibv_modify_srq`, which this crate does not wrap (reachable via
-    /// [`as_raw`](SharedReceiveQueue::as_raw)). Pass 0 for no limit.
+    /// `ibv_create_srq` man page considers the field irrelevant at creation, so arm it portably
+    /// (and re-arm it after it fires) with [`SharedReceiveQueue::set_limit`]. Pass 0 for no
+    /// limit.
     ///
     /// # Errors
     ///
