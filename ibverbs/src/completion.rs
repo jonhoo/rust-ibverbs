@@ -881,6 +881,28 @@ impl WorkCompletion<'_> {
                 .expect("completion queue did not request the DLID path bits")(self.cq)
         }
     }
+
+    /// The addressing fields of this completion as a classic `ibv_wc`, for deriving the route
+    /// back to a datagram's sender: the flags, the source and local queue pair numbers, and — when
+    /// the queue requested them — the source LID, service level, and path bits (zero otherwise).
+    pub(crate) fn addressing(&self) -> ffi::ibv_wc {
+        let mut wc = ffi::ibv_wc::default();
+        wc.wc_flags = self.wc_flags().into();
+        wc.src_qp = self.src_qp();
+        wc.qp_num = self.qp_num();
+        unsafe {
+            if let Some(read_slid) = (*self.cq).read_slid {
+                wc.slid = read_slid(self.cq) as u16;
+            }
+            if let Some(read_sl) = (*self.cq).read_sl {
+                wc.sl = read_sl(self.cq);
+            }
+            if let Some(read_dlid_path_bits) = (*self.cq).read_dlid_path_bits {
+                wc.dlid_path_bits = read_dlid_path_bits(self.cq);
+            }
+        }
+        wc
+    }
 }
 
 /// One poll of a [`CompletionQueue`]: the work completions that were ready when it started,
