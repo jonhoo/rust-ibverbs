@@ -157,7 +157,9 @@ fn main() {
         builder = builder
             .header_contents("rdmacm_wrapper.h", "#include <rdma/rdma_cma.h>")
             .allowlist_function("rdma_.*")
-            .allowlist_type("rdma_.*");
+            .allowlist_type("rdma_.*")
+            // the `rdma_set_option` levels and option names are anonymous enums
+            .allowlist_var("RDMA_OPTION_.*");
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");

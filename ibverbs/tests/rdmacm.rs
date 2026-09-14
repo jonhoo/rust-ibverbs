@@ -17,7 +17,7 @@ use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
-    AccessFlags, CompletionQueue, Context, Error, GidType, QueuePairAttributeMask,
+    AccessFlags, AckTimeout, CompletionQueue, Context, Error, GidType, QueuePairAttributeMask,
     QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice, WcStatus,
 };
 
@@ -976,4 +976,100 @@ fn blocking_helpers_need_a_connected_port_space() {
 #[should_panic(expected = "limited to 196 bytes")]
 fn private_data_beyond_any_limit_panics() {
     let _ = ConnectionParameter::default().set_private_data(&[0; 197]);
+}
+
+/// The id options and the `cm_id` accessors of the blocking helpers: reuse-address lets bound ids
+/// share a port, and the type of service and ACK timeout set on a connector before resolving
+/// survive a connection round trip.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn cm_id_options_and_accessors() {
+    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+
+    // Two bound ids share a port when both allow reuse; a third without the option is refused.
+    let first = bind_listener(ip);
+    let addr = first.local_addr().expect("bound address");
+    // `bind_listener` binds before any option can be set, so bind a fresh id with reuse first.
+    drop(first);
+    let first = CmId::create(PortSpace::Tcp).expect("first id");
+    first.set_reuse_addr(true).expect("set_reuse_addr");
+    first.bind_addr(addr).expect("first bind");
+    let second = CmId::create(PortSpace::Tcp).expect("second id");
+    second.set_reuse_addr(true).expect("set_reuse_addr");
+    second
+        .bind_addr(addr)
+        .expect("a second id shares the port with reuse-address set");
+    let third = CmId::create(PortSpace::Tcp).expect("third id");
+    match third.bind_addr(addr) {
+        Err(Error::BindAddress(e)) => {
+            assert_eq!(e.raw_os_error(), Some(nix::libc::EADDRINUSE), "{e}");
+        }
+        other => panic!("expected EADDRINUSE without reuse-address, got {other:?}"),
+    }
+    drop((first, second, third));
+
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let acceptor = Acceptor::bind_with(SocketAddr::new(ip, 0), PortSpace::Tcp, 1, |id| {
+            id.set_tos(0x08)?;
+            id.set_reuse_addr(true)
+        })
+        .expect("bind_with");
+        let addr = acceptor.cm_id().local_addr().expect("listen address");
+        assert_eq!(acceptor.local_addr(), Some(addr));
+        ready_tx.send(addr).expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        assert_eq!(incoming.cm_id().local_addr(), Some(addr));
+        assert!(incoming.cm_id().peer_addr().is_some());
+        incoming
+            .cm_id()
+            .set_ack_timeout(AckTimeout::from_exponent(14))
+            .expect("set_ack_timeout before accepting");
+        let ctx = incoming.context().expect("server device context");
+        let pd = ctx.alloc_pd().expect("server pd");
+        let cq = ctx.create_cq(16).build().expect("server cq");
+        let qp = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("server qp builder")
+            .build()
+            .expect("server qp");
+        let conn = incoming
+            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+            .expect("accept");
+        assert_eq!(conn.cm_id().peer_addr(), conn.peer_addr());
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client done");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let connector = Connector::new(PortSpace::Tcp).expect("connector");
+    connector
+        .cm_id()
+        .set_tos(0x08)
+        .expect("set_tos before resolving");
+    connector
+        .cm_id()
+        .set_ack_timeout(AckTimeout::from_exponent(14))
+        .expect("set_ack_timeout before resolving");
+    let resolved = connector
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    assert_eq!(resolved.cm_id().peer_addr(), Some(addr));
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    let conn = resolved
+        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .expect("connect");
+    assert_eq!(conn.cm_id().peer_addr(), Some(addr));
+    assert_eq!(conn.cm_id().local_addr(), conn.local_addr());
+    done_tx.send(()).expect("signal done");
+    server.join().expect("server thread");
 }
