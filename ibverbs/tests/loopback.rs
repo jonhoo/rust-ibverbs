@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, MrAdvice,
     MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair, QueuePairAttribute,
-    QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, RnrTimer, TransportType, Uc, Ud,
-    WcFields,
+    QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, TransportType, Uc,
+    Ud, WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -2031,4 +2031,43 @@ fn manual_bringup_from_handshake_attributes() {
     unsafe { batch.submit() }.expect("send");
     drain(&cq, 2);
     assert_eq!(&recv.bytes()[..4], b"attr");
+}
+
+/// A queue pair created with only SEND requested (no RDMA or atomics) still moves two-sided
+/// traffic, and the builder reports the effective set of operations.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn send_ops_subset() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut builder = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP");
+    let default = builder.send_ops();
+    assert!(
+        default.contains(SendOps::SEND | SendOps::RDMA_READ | SendOps::ATOMIC_FETCH_AND_ADD),
+        "an RC queue pair requests the full set by default: {default:?}"
+    );
+    builder
+        .set_gid_index(gid_index(&ctx))
+        .set_send_ops(SendOps::SEND);
+    assert_eq!(builder.send_ops(), SendOps::SEND);
+    let prepared = builder.build().expect("failed to build a send-only QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+
+    let recv = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"only");
+    unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
+    let mut batch = qp.start_send();
+    batch.op().signaled().send(2, &[send.slice(..4)]);
+    unsafe { batch.submit() }.expect("send failed");
+    drain(&cq, 2);
+    assert_eq!(&recv.bytes()[..4], b"only");
 }

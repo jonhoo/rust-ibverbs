@@ -65,13 +65,9 @@ impl QueuePairBuilder<Srd> {
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): `efadv_create_qp_ex` failed (`EINVAL` for
     ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
-        use ffi::ibv_qp_create_send_ops_flags as SendOps;
-        // SRD supports send and one-sided RDMA, including the immediate variants.
-        let send_ops_flags = SendOps::IBV_QP_EX_WITH_SEND.0
-            | SendOps::IBV_QP_EX_WITH_SEND_WITH_IMM.0
-            | SendOps::IBV_QP_EX_WITH_RDMA_WRITE.0
-            | SendOps::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0
-            | SendOps::IBV_QP_EX_WITH_RDMA_READ.0;
+        // SRD supports send and one-sided RDMA, including the immediate variants (the transport's
+        // default set), or whatever the builder was told to request instead.
+        let send_ops_flags = self.send_ops().0;
 
         // As in the generic `build_impl` in qp.rs: zero the storage and write only the fields the
         // driver reads, handing the pointer to C without `assume_init` (the `qp_type` enum has no

@@ -485,6 +485,58 @@ impl std::fmt::Display for RnrTimer {
     }
 }
 
+flags_newtype! {
+    /// The send operations a queue pair is created with (`ibv_qp_create_send_ops_flags`): the
+    /// doorbell opcodes its send queue will accept. Set with [`QueuePairBuilder::set_send_ops`];
+    /// the builder's default depends on the transport (see [`QueuePairBuilder::send_ops`]).
+    pub struct SendOps(ffi::ibv_qp_create_send_ops_flags) {
+        /// RDMA WRITE.
+        RDMA_WRITE = IBV_QP_EX_WITH_RDMA_WRITE;
+        /// RDMA WRITE with an immediate.
+        RDMA_WRITE_WITH_IMM = IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM;
+        /// SEND.
+        SEND = IBV_QP_EX_WITH_SEND;
+        /// SEND with an immediate.
+        SEND_WITH_IMM = IBV_QP_EX_WITH_SEND_WITH_IMM;
+        /// RDMA READ.
+        RDMA_READ = IBV_QP_EX_WITH_RDMA_READ;
+        /// Atomic compare-and-swap.
+        ATOMIC_CMP_AND_SWP = IBV_QP_EX_WITH_ATOMIC_CMP_AND_SWP;
+        /// Atomic fetch-and-add.
+        ATOMIC_FETCH_AND_ADD = IBV_QP_EX_WITH_ATOMIC_FETCH_AND_ADD;
+        /// Local invalidation of a memory key.
+        LOCAL_INV = IBV_QP_EX_WITH_LOCAL_INV;
+        /// Memory-window bind.
+        BIND_MW = IBV_QP_EX_WITH_BIND_MW;
+        /// SEND with invalidate.
+        SEND_WITH_INV = IBV_QP_EX_WITH_SEND_WITH_INV;
+        /// TCP segmentation offload (raw-packet queue pairs).
+        TSO = IBV_QP_EX_WITH_TSO;
+        /// Flush.
+        FLUSH = IBV_QP_EX_WITH_FLUSH;
+        /// Atomic write.
+        ATOMIC_WRITE = IBV_QP_EX_WITH_ATOMIC_WRITE;
+    }
+}
+
+/// The send operations a queue pair of `qp_type` is created with unless the builder says
+/// otherwise: SEND on every transport, RDMA WRITE on the connected transports and SRD, RDMA READ
+/// on RC and SRD, and the atomics on RC only.
+fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
+    use ffi::ibv_qp_type::{IBV_QPT_DRIVER, IBV_QPT_RC, IBV_QPT_UC};
+    let mut ops = SendOps::SEND | SendOps::SEND_WITH_IMM;
+    if matches!(qp_type, IBV_QPT_RC | IBV_QPT_UC | IBV_QPT_DRIVER) {
+        ops |= SendOps::RDMA_WRITE | SendOps::RDMA_WRITE_WITH_IMM;
+    }
+    if matches!(qp_type, IBV_QPT_RC | IBV_QPT_DRIVER) {
+        ops |= SendOps::RDMA_READ;
+    }
+    if qp_type == IBV_QPT_RC {
+        ops |= SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
+    }
+    ops
+}
+
 /// An unconfigured `QueuePair`. Created by [`ProtectionDomain::create_qp`].
 ///
 /// A `QueuePairBuilder` is used to configure a `QueuePair` before it is allocated and initialized.
@@ -509,6 +561,8 @@ pub struct QueuePairBuilder<T: Transport> {
     pub(crate) max_send_sge: u32,
     pub(crate) max_recv_sge: u32,
     pub(crate) max_inline_data: u32,
+    /// the send operations to request at creation, or the transport's default set
+    pub(crate) send_ops: Option<SendOps>,
 
     qp_type: ffi::ibv_qp_type,
 
@@ -582,6 +636,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             max_send_sge,
             max_recv_sge,
             max_inline_data: 0,
+            send_ops: None,
 
             qp_type,
 
@@ -726,26 +781,36 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
+    /// Set the send operations the queue pair is created with, replacing the transport's default
+    /// set (see [`send_ops`](Self::send_ops)).
+    ///
+    /// The device must support every operation requested, or [`build`](Self::build) fails with
+    /// [`Unsupported`](Error::Unsupported): a device without extended atomics, for example, can
+    /// still create a send-only RC queue pair this way. Conversely, an opcode method whose
+    /// operation was not requested fails at [`submit`](SendBatch::submit). Operations beyond
+    /// the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`, `FLUSH`,
+    /// `ATOMIC_WRITE`) are reachable through [`as_raw_ex`](QueuePair::as_raw_ex).
+    pub fn set_send_ops(&mut self, ops: SendOps) -> &mut Self {
+        self.send_ops = Some(ops);
+        self
+    }
+
+    /// The send operations the queue pair will be created with: the set given to
+    /// [`set_send_ops`](Self::set_send_ops), or else the transport's default — SEND (with and
+    /// without an immediate) everywhere, plus RDMA WRITE on RC, UC, and SRD, RDMA READ on RC and
+    /// SRD, and the atomics on RC. Start from it to add an operation:
+    /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
+    pub fn send_ops(&self) -> SendOps {
+        self.send_ops
+            .unwrap_or_else(|| default_send_ops(self.qp_type))
+    }
+
     /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
     /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
     fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
-        use ffi::ibv_qp_create_send_ops_flags as SendOps;
-        use ffi::ibv_qp_type::{IBV_QPT_RC, IBV_QPT_UC};
-
-        // Enable the extended send operations we drive through the doorbell post API. SEND is
-        // available on every transport; one-sided RDMA needs a connected QP (RC/UC), and RDMA read
-        // plus atomics are RC-only.
-        let mut send_ops_flags =
-            SendOps::IBV_QP_EX_WITH_SEND.0 | SendOps::IBV_QP_EX_WITH_SEND_WITH_IMM.0;
-        if matches!(self.qp_type, IBV_QPT_RC | IBV_QPT_UC) {
-            send_ops_flags |= SendOps::IBV_QP_EX_WITH_RDMA_WRITE.0
-                | SendOps::IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM.0;
-        }
-        if self.qp_type == IBV_QPT_RC {
-            send_ops_flags |= SendOps::IBV_QP_EX_WITH_RDMA_READ.0
-                | SendOps::IBV_QP_EX_WITH_ATOMIC_CMP_AND_SWP.0
-                | SendOps::IBV_QP_EX_WITH_ATOMIC_FETCH_AND_ADD.0;
-        }
+        // The extended send operations driven through the doorbell post API: the transport's
+        // default set, or whatever the builder was told to request instead.
+        let send_ops_flags = self.send_ops().0;
 
         // `ibv_qp_init_attr_ex` has a `qp_type` field with no zero variant plus fields we never use
         // (XRC, TSO, RX hashing). Zero the storage, write only the fields the driver reads, and hand
