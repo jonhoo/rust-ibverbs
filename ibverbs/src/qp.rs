@@ -1121,204 +1121,178 @@ impl<T: Transport> PreparedQueuePair<T> {
             psn: self.psn,
         })
     }
+}
 
-    /// The connectionless `INIT` -> `RTR` -> `RTS` bring-up with a Q_Key, shared by the
-    /// datagram transports' `activate` (UD here, SRD in `efa.rs`).
+impl<T: Datagram> PreparedQueuePair<T> {
+    /// The attributes [`activate`](PreparedQueuePair::activate) applies, in order: `INIT` on the
+    /// queue pair's port with `qkey` (a datagram queue pair has no access flags), `RTR` (no path
+    /// or destination: datagrams are addressed per send), and `RTS` starting the send queue at
+    /// the builder's PSN.
+    ///
+    /// Exposed so a manual bring-up ([`into_queue_pair`](Self::into_queue_pair) plus
+    /// [`QueuePair::modify`]) can start from what `activate` would do and adjust it.
+    pub fn activate_attributes(&self, qkey: u32) -> [QueuePairAttribute; 3] {
+        let mut init = QueuePairAttribute::new();
+        init.set_state(QueuePairState::Init)
+            .set_pkey_index(0)
+            .set_port(self.port_num)
+            .set_qkey(qkey);
+        let mut rtr = QueuePairAttribute::new();
+        rtr.set_state(QueuePairState::ReadyToReceive);
+        let mut rts = QueuePairAttribute::new();
+        rts.set_state(QueuePairState::ReadyToSend)
+            .set_sq_psn(self.psn);
+        [init, rtr, rts]
+    }
+
+    /// The connectionless bring-up shared by the datagram transports' `activate` (UD here, SRD in
+    /// `efa.rs`): applies [`activate_attributes`](Self::activate_attributes) in order.
     pub(crate) fn activate_impl(self, qkey: u32) -> Result<QueuePair<T>> {
-        // INIT: associate with the port and set the Q_Key. UD has no access flags.
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
-            pkey_index: 0,
-            port_num: self.port_num,
-            qkey,
-            ..Default::default()
-        };
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
-            | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
-            | ffi::ibv_qp_attr_mask::IBV_QP_PORT
-            | ffi::ibv_qp_attr_mask::IBV_QP_QKEY;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
+        let attributes = self.activate_attributes(qkey);
+        let mut qp = self.qp;
+        for attr in &attributes {
+            qp.modify(attr)?;
         }
-
-        // RTR: a UD queue pair needs no path or destination information.
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-            ..Default::default()
-        };
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-
-        // RTS: start the send queue at the configured PSN.
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
-            sq_psn: self.psn,
-            ..Default::default()
-        };
-        let mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-
-        Ok(self.qp)
+        Ok(qp)
     }
 }
 
 impl<T: Connected> PreparedQueuePair<T> {
+    /// The attributes [`handshake`](Self::handshake) applies to reach `INIT`: the queue pair's
+    /// port, partition-key index 0, and the builder's access flags.
+    ///
+    /// The three `*_attributes` methods are exposed so a manual bring-up
+    /// ([`into_queue_pair`](Self::into_queue_pair) plus [`QueuePair::modify`]) can start from
+    /// exactly what the handshake would do and adjust it — a partition key, an alternate path, a
+    /// timer — instead of rebuilding the address vector by hand.
+    pub fn init_attributes(&self) -> QueuePairAttribute {
+        let mut attr = QueuePairAttribute::new();
+        attr.set_state(QueuePairState::Init)
+            .set_pkey_index(0)
+            .set_port(self.port_num);
+        if let Some(access) = self.access {
+            attr.set_access_flags(access.into());
+        }
+        attr
+    }
+
+    /// The attributes [`handshake`](Self::handshake) applies to reach `RTR` for `remote`: the
+    /// address vector to it (a global route through the builder's GID index when `remote` carries
+    /// a GID, with a hop limit of `0xff` and the builder's traffic class and service level), its
+    /// queue pair number and starting PSN, and the builder's path MTU, RNR timer, and
+    /// responder-side RDMA limit.
+    ///
+    /// # Errors
+    ///
+    ///  - [`GidMismatch`](Error::GidMismatch): `remote` carries a GID, but no `gid_index` was
+    ///    set on the builder to route from.
+    pub fn rtr_attributes(&self, remote: &QueuePairEndpoint) -> Result<QueuePairAttribute> {
+        let mut path = AddressHandleAttribute::new(self.port_num);
+        path.set_dest_lid(remote.lid)
+            .set_service_level(self.service_level);
+        if let Some(gid) = remote.gid {
+            let sgid_index = self.gid_index.ok_or(Error::GidMismatch)?;
+            path.set_grh(gid, sgid_index as u8, 0xff, self.traffic_class);
+        }
+        let mut attr = QueuePairAttribute::new();
+        attr.set_state(QueuePairState::ReadyToReceive)
+            .set_address_vector(&path)
+            .set_dest_qp_num(remote.qp_num)
+            // The receive queue starts at the PSN the peer's send queue starts at.
+            .set_rq_psn(remote.psn);
+        if let Some(max_dest_rd_atomic) = self.max_dest_rd_atomic {
+            attr.set_max_dest_rd_atomic(max_dest_rd_atomic);
+        }
+        if let Some(min_rnr_timer) = self.min_rnr_timer {
+            attr.set_min_rnr_timer(RnrTimer::from_encoding(min_rnr_timer));
+        }
+        if let Some(path_mtu) = self.path_mtu {
+            attr.set_path_mtu(path_mtu.into());
+        }
+        Ok(attr)
+    }
+
+    /// The attributes [`handshake`](Self::handshake) applies to reach `RTS`: the send queue's
+    /// starting PSN (the one [`endpoint`](Self::endpoint) advertises) and the builder's ACK
+    /// timeout, retry counts, and initiator-side RDMA limit.
+    pub fn rts_attributes(&self) -> QueuePairAttribute {
+        let mut attr = QueuePairAttribute::new();
+        attr.set_state(QueuePairState::ReadyToSend)
+            .set_sq_psn(self.psn);
+        if let Some(timeout) = self.timeout {
+            attr.set_timeout(AckTimeout::from_exponent(timeout));
+        }
+        if let Some(retry_count) = self.retry_count {
+            attr.set_retry_count(retry_count);
+        }
+        if let Some(rnr_retry) = self.rnr_retry {
+            attr.set_rnr_retry(rnr_retry);
+        }
+        if let Some(max_rd_atomic) = self.max_rd_atomic {
+            attr.set_max_rd_atomic(max_rd_atomic);
+        }
+        attr
+    }
+
     /// Set up the `QueuePair` such that it is ready to exchange packets with a remote `QueuePair`.
     ///
-    /// Internally, this uses `ibv_modify_qp` to mark the `QueuePair` as initialized
-    /// (`IBV_QPS_INIT`), ready to receive (`IBV_QPS_RTR`), and ready to send (`IBV_QPS_RTS`),
-    /// applying the attributes configured on the builder (access flags, timeouts, path MTU,
-    /// service level, and so on) at the appropriate steps. Further discussion of the protocol can
-    /// be found on [RDMAmojo]. Use [`into_queue_pair`](Self::into_queue_pair) to drive the state
-    /// machine yourself instead.
+    /// Applies [`init_attributes`](Self::init_attributes),
+    /// [`rtr_attributes`](Self::rtr_attributes), and [`rts_attributes`](Self::rts_attributes) in
+    /// turn with [`QueuePair::modify`], moving the queue pair through `INIT`, `RTR`, and `RTS`
+    /// with the settings configured on the builder. Further discussion of the protocol can be
+    /// found on [RDMAmojo]. Use [`into_queue_pair`](Self::into_queue_pair) to drive the state
+    /// machine yourself instead, starting from those same attributes if you like.
     ///
-    /// If the endpoint contains a Gid, the routing will be global. This means:
-    /// ```text
-    /// ah_attr.is_global = 1;
-    /// ah_attr.grh.hop_limit = 0xff;
-    /// ```
-    ///
+    /// If the endpoint contains a GID, the routing is global (`is_global = 1`, hop limit `0xff`).
     /// The packet sequence numbers pair up through the endpoints: the local send queue starts at
     /// this queue pair's PSN ([`QueuePairBuilder::set_sq_psn`], carried to the peer by
     /// [`endpoint`](Self::endpoint)), and the local receive queue starts at the PSN in `remote`.
-    ///
-    /// The queue pair is associated with the port chosen when it was created (see
-    /// [`ProtectionDomain::create_qp`]). The handshake also sets the following parameters,
-    /// which are currently not configurable:
-    ///
-    /// ```text
-    /// pkey_index = 0;
-    /// ah_attr.src_path_bits = 0;
-    /// ```
+    /// The partition-key index and the source path bits are 0.
     ///
     /// # Errors
     ///
     ///  - [`GidMismatch`](Error::GidMismatch): the remote endpoint carries a GID, but no
     ///    `gid_index` was set on the builder to route from.
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed
-    ///    (`ibv_modify_qp`), for example because an attribute is invalid for this queue pair's
-    ///    type or the remote endpoint is unreachable.
+    ///  - The errors of [`QueuePair::modify`]: [`ModifyQueuePair`](Error::ModifyQueuePair) when
+    ///    a transition fails (for example because the remote endpoint is unreachable — on RoCE,
+    ///    the error spells out the route that failed), or its typed diagnoses of a rejected
+    ///    attribute set.
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
     pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair<T>> {
-        // init and associate with port
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_INIT,
-            pkey_index: 0,
-            port_num: self.port_num,
-            ..Default::default()
-        };
-        let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
-            | ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX
-            | ffi::ibv_qp_attr_mask::IBV_QP_PORT;
-        if let Some(access) = self.access {
-            attr.qp_access_flags = access.0;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS;
-        }
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-
-        // set ready to receive; the destination and path are meaningful because this bring-up
-        // only exists on the connected transports (RC and UC)
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_RTR,
-            dest_qp_num: remote.qp_num,
-            ah_attr: ffi::ibv_ah_attr {
-                dlid: remote.lid,
-                sl: self.service_level,
-                src_path_bits: 0,
-                port_num: self.port_num,
-                grh: Default::default(),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        if let Some(gid) = remote.gid {
-            attr.ah_attr.is_global = 1;
-            attr.ah_attr.grh.dgid = gid.into();
-            attr.ah_attr.grh.hop_limit = 0xff;
-            attr.ah_attr.grh.sgid_index = self.gid_index.ok_or(Error::GidMismatch)? as u8;
-            attr.ah_attr.grh.traffic_class = self.traffic_class;
-        }
-        let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE
-            | ffi::ibv_qp_attr_mask::IBV_QP_AV
-            | ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN;
-        if let Some(max_dest_rd_atomic) = self.max_dest_rd_atomic {
-            attr.max_dest_rd_atomic = max_dest_rd_atomic;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC;
-        }
-        if let Some(min_rnr_timer) = self.min_rnr_timer {
-            attr.min_rnr_timer = min_rnr_timer;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
-        }
-        if let Some(path_mtu) = self.path_mtu {
-            attr.path_mtu = path_mtu;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU;
-        }
-        // The receive queue starts at the PSN the peer's send queue starts at.
-        attr.rq_psn = remote.psn;
-        mask |= ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN;
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
+        let init = self.init_attributes();
+        let rtr = self.rtr_attributes(&remote)?;
+        let rts = self.rts_attributes();
+        let mut qp = self.qp;
+        qp.modify(&init)?;
+        if let Err(err) = qp.modify(&rtr) {
             // On RoCE, the provider resolves the route to the remote GID during this transition,
             // and reports a GID that does not answer as a timeout or unreachable network. Spell
             // that out: it is the most common RoCE bring-up failure, and "connection timed out"
             // alone sends people looking at the wrong layer.
-            if remote.gid.is_some()
-                && (errno == nix::libc::ETIMEDOUT || errno == nix::libc::ENETUNREACH)
-            {
-                let source = io::Error::from_raw_os_error(errno);
-                return Err(Error::ModifyQueuePair(io::Error::new(
-                    source.kind(),
-                    format!(
-                        "resolving the route to the remote GID failed ({source}); on RoCE this \
-                         usually means the remote GID does not answer on the network of the \
-                         local GID at index {}, or a firewall drops RoCE (UDP 4791) traffic",
-                        attr.ah_attr.grh.sgid_index,
-                    ),
-                )));
-            }
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
+            return Err(match err {
+                Error::ModifyQueuePair(source)
+                    if remote.gid.is_some()
+                        && matches!(
+                            source.raw_os_error(),
+                            Some(nix::libc::ETIMEDOUT | nix::libc::ENETUNREACH)
+                        ) =>
+                {
+                    Error::ModifyQueuePair(io::Error::new(
+                        source.kind(),
+                        format!(
+                            "resolving the route to the remote GID failed ({source}); on RoCE this \
+                             usually means the remote GID does not answer on the network of the \
+                             local GID at index {}, or a firewall drops RoCE (UDP 4791) traffic",
+                            rtr.as_raw().ah_attr.grh.sgid_index,
+                        ),
+                    ))
+                }
+                other => other,
+            });
         }
-
-        // set ready to send, starting the send queue at the PSN advertised in our endpoint
-        let mut attr = ffi::ibv_qp_attr {
-            qp_state: ffi::ibv_qp_state::IBV_QPS_RTS,
-            sq_psn: self.psn,
-            ..Default::default()
-        };
-        let mut mask = ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
-        if let Some(timeout) = self.timeout {
-            attr.timeout = timeout;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT;
-        }
-        if let Some(retry_count) = self.retry_count {
-            attr.retry_cnt = retry_count;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT;
-        }
-        if let Some(rnr_retry) = self.rnr_retry {
-            attr.rnr_retry = rnr_retry;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY;
-        }
-        if let Some(max_rd_atomic) = self.max_rd_atomic {
-            attr.max_rd_atomic = max_rd_atomic;
-            mask |= ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC;
-        }
-        let errno = unsafe { ffi::ibv_modify_qp(self.qp.qp, &mut attr as *mut _, mask.0 as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifyQueuePair));
-        }
-
-        Ok(self.qp)
+        qp.modify(&rts)?;
+        Ok(qp)
     }
 }
 
@@ -1937,29 +1911,52 @@ impl QueuePairAttribute {
         self
     }
 
-    /// Set the minimum RNR-NAK timer (see [`RnrTimer`] for the typed form).
-    pub fn set_min_rnr_timer(&mut self, min_rnr_timer: u8) -> &mut Self {
-        self.attr.min_rnr_timer = min_rnr_timer;
+    /// Set the minimum RNR-NAK timer: the delay this queue pair demands of its peer, in each
+    /// receiver-not-ready NAK, before the peer retries a send that found no receive posted (RC
+    /// only). The same knob as [`QueuePairBuilder::set_min_rnr_timer`].
+    pub fn set_min_rnr_timer(&mut self, timer: RnrTimer) -> &mut Self {
+        self.attr.min_rnr_timer = timer.encoding();
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER;
         self
     }
 
-    /// Set the ACK timeout (see [`AckTimeout`] for the typed form).
-    pub fn set_timeout(&mut self, timeout: u8) -> &mut Self {
-        self.attr.timeout = timeout;
+    /// Set the ACK timeout: how long to wait for an ACK/NACK before retransmitting (RC only). The
+    /// same knob as [`QueuePairBuilder::set_timeout`].
+    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
+        self.attr.timeout = timeout.exponent();
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT;
         self
     }
 
-    /// Set the retry count for the primary path.
+    /// Set the retry count for the primary path (RC only): how many times to resend before
+    /// reporting an error because the remote side does not answer. The same knob as
+    /// [`QueuePairBuilder::set_retry_count`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `retry_count > 7` (the field is 3 bits).
     pub fn set_retry_count(&mut self, retry_count: u8) -> &mut Self {
+        assert!(
+            retry_count <= 7,
+            "the retry count is 3 bits, got {retry_count}"
+        );
         self.attr.retry_cnt = retry_count;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT;
         self
     }
 
-    /// Set the RNR retry count (see [`QueuePairBuilder::set_rnr_retry`] for the encoding).
+    /// Set the RNR retry count (RC only): how many times to resend after a receiver-not-ready
+    /// NAK before reporting an error, where `7` retries indefinitely. The same knob as
+    /// [`QueuePairBuilder::set_rnr_retry`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rnr_retry > 7` (the field is 3 bits).
     pub fn set_rnr_retry(&mut self, rnr_retry: u8) -> &mut Self {
+        assert!(
+            rnr_retry <= 7,
+            "the RNR retry count is 3 bits, got {rnr_retry}"
+        );
         self.attr.rnr_retry = rnr_retry;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY;
         self
@@ -2030,13 +2027,13 @@ impl QueuePairAttribute {
     }
 
     /// The minimum RNR-NAK timer.
-    pub fn min_rnr_timer(&self) -> u8 {
-        self.attr.min_rnr_timer
+    pub fn min_rnr_timer(&self) -> RnrTimer {
+        RnrTimer::from_encoding(self.attr.min_rnr_timer & 0x1f)
     }
 
     /// The ACK timeout.
-    pub fn timeout(&self) -> u8 {
-        self.attr.timeout
+    pub fn timeout(&self) -> AckTimeout {
+        AckTimeout::from_exponent(self.attr.timeout & 0x1f)
     }
 
     /// The primary-path retry count.

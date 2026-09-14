@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, MrAdvice,
     MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair, QueuePairAttribute,
-    QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, TransportType, Uc, Ud, WcFields,
+    QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, RnrTimer, TransportType, Uc, Ud,
+    WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -1970,4 +1971,64 @@ fn routable_gid() {
         .routable_gid(250)
         .expect("failed to read the GID table")
         .is_none());
+}
+
+/// The attributes `handshake` applies are exposed, so a manual bring-up can start from them,
+/// adjust one, and still reach a working queue pair.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn manual_bringup_from_handshake_attributes() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut builder = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP");
+    builder
+        .set_gid_index(gid_index(&ctx))
+        .set_access(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE);
+    let prepared = builder.build().expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+
+    let init = prepared.init_attributes();
+    assert_eq!(init.state(), QueuePairState::Init);
+    assert!(init.mask().contains(QueuePairAttributeMask::ACCESS_FLAGS));
+    let mut rtr = prepared.rtr_attributes(&endpoint).expect("rtr attributes");
+    assert_eq!(rtr.dest_qp_num(), endpoint.qp_num);
+    assert_eq!(rtr.rq_psn(), endpoint.psn);
+    // Adjust one attribute on the way: a shorter RNR timer than the builder's default.
+    rtr.set_min_rnr_timer(RnrTimer::at_least(Duration::from_micros(10)));
+    let mut rts = prepared.rts_attributes();
+    assert_eq!(rts.sq_psn(), endpoint.psn);
+    rts.set_retry_count(3);
+
+    let mut qp = prepared.into_queue_pair();
+    for attr in [&init, &rtr, &rts] {
+        qp.modify(attr).expect("manual transition");
+    }
+    let (attr, _) = qp
+        .query(
+            QueuePairAttributeMask::STATE
+                | QueuePairAttributeMask::RETRY_CNT
+                | QueuePairAttributeMask::MIN_RNR_TIMER,
+        )
+        .expect("query");
+    assert_eq!(attr.state(), QueuePairState::ReadyToSend);
+    assert_eq!(attr.retry_count(), 3);
+    assert_eq!(attr.min_rnr_timer().duration(), Duration::from_micros(10));
+
+    // And the result moves data.
+    let recv = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"attr");
+    unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv");
+    let mut batch = qp.start_send();
+    batch.op().signaled().send(2, &[send.slice(..4)]);
+    unsafe { batch.submit() }.expect("send");
+    drain(&cq, 2);
+    assert_eq!(&recv.bytes()[..4], b"attr");
 }
