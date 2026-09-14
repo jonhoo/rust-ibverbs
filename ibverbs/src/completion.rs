@@ -882,6 +882,72 @@ impl WorkCompletion<'_> {
         }
     }
 
+    /// The remote key a SEND-with-invalidate invalidated, if this completion reports one
+    /// ([`WcFlags::WITH_INV`]). It shares its field with the immediate data, so a completion
+    /// carries at most one of the two.
+    #[inline]
+    pub fn invalidated_rkey(&self) -> Option<u32> {
+        if self.ok().is_ok() && self.wc_flags().contains(WcFlags::WITH_INV) {
+            Some(unsafe { (*self.cq).read_imm_data.unwrap()(self.cq) })
+        } else {
+            None
+        }
+    }
+
+    /// The customer VLAN tag (802.1Q) of the incoming packet.
+    ///
+    /// Only valid on a completion queue that requested [`WcFields::CVLAN`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    #[inline]
+    pub fn cvlan(&self) -> u16 {
+        unsafe {
+            (*self.cq)
+                .read_cvlan
+                .expect("completion queue did not request the customer VLAN")(self.cq)
+        }
+    }
+
+    /// The flow tag the device's steering rules attached to the incoming packet.
+    ///
+    /// Only valid on a completion queue that requested [`WcFields::FLOW_TAG`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    #[inline]
+    pub fn flow_tag(&self) -> u32 {
+        unsafe {
+            (*self.cq)
+                .read_flow_tag
+                .expect("completion queue did not request the flow tag")(self.cq)
+        }
+    }
+
+    /// The tag-matching information of a tag-matching receive: the tag and the opaque user data
+    /// from the tag-matching header.
+    ///
+    /// Only valid on a completion queue that requested [`WcFields::TM_INFO`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    #[inline]
+    pub fn tag_matching(&self) -> TagMatchingInfo {
+        let mut info = ffi::ibv_wc_tm_info::default();
+        unsafe {
+            (*self.cq)
+                .read_tm_info
+                .expect("completion queue did not request the tag-matching information")(
+                self.cq, &mut info,
+            )
+        };
+        TagMatchingInfo {
+            tag: info.tag,
+            private: info.priv_,
+        }
+    }
+
+    /// The raw extended completion queue, positioned on this entry: the escape hatch for the
+    /// `ibv_wc_read_*` readers this crate does not wrap. The position is only valid for this
+    /// entry, so do not keep the pointer past the [`WorkCompletion`].
+    pub fn as_raw(&self) -> *mut ffi::ibv_cq_ex {
+        self.cq
+    }
+
     /// The addressing fields of this completion as a classic `ibv_wc`, for deriving the route
     /// back to a datagram's sender: the flags, the source and local queue pair numbers, and — when
     /// the queue requested them — the source LID, service level, and path bits (zero otherwise).
@@ -903,6 +969,16 @@ impl WorkCompletion<'_> {
         }
         wc
     }
+}
+
+/// The tag-matching information of a receive on a tag-matching queue, read with
+/// [`WorkCompletion::tag_matching`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TagMatchingInfo {
+    /// The tag from the tag-matching header.
+    pub tag: u64,
+    /// The opaque user data from the tag-matching header.
+    pub private: u32,
 }
 
 /// One poll of a [`CompletionQueue`]: the work completions that were ready when it started,
@@ -990,9 +1066,9 @@ impl CompletionQueue {
     /// The returned [`Completions`] is a lending iterator whose [`WorkCompletion`]s read their
     /// fields lazily, so you only pay for the fields you read; it is empty when the queue is.
     ///
-    /// Callers must ensure the CQ does not overrun (exceed its capacity), as this triggers an
-    /// `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do this by limiting the
-    /// number of inflight work requests.
+    /// Callers must ensure the CQ does not overrun (exceed its [`capacity`](Self::capacity)), as
+    /// this triggers an `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do
+    /// this by limiting the number of inflight work requests.
     ///
     /// `poll` does not block or cause a context switch; to block until completions arrive, build
     /// the queue on a [`CompletionChannel`] and wait there instead of spinning on `poll` (see
@@ -1132,6 +1208,14 @@ impl CompletionQueue {
     /// ([`CompletionQueueBuilder::set_comp_channel`]).
     pub fn comp_channel(&self) -> Option<&CompletionChannel> {
         self.inner.cc.as_ref()
+    }
+
+    /// The number of completions the queue can hold: the capacity the device granted, which is at
+    /// least the `min_cq_entries` asked of [`Context::create_cq`]. Keep fewer signaled work
+    /// requests in flight across the queue pairs sharing this queue, or it overruns
+    /// (`IBV_EVENT_CQ_ERR`) and stops working.
+    pub fn capacity(&self) -> u32 {
+        unsafe { (*self.inner.cq_ex).cqe }.max(0) as u32
     }
 
     /// Returns the underlying `ibv_cq` pointer.

@@ -1450,12 +1450,60 @@ fn extended_wc_fields() {
             let _ = wc.slid();
             let _ = wc.sl();
             let _ = wc.dlid_path_bits();
+            assert_eq!(
+                wc.invalidated_rkey(),
+                None,
+                "a plain send invalidates nothing"
+            );
+            let raw = wc.as_raw();
+            assert!(!raw.is_null());
+            assert_eq!(unsafe { (*raw).wr_id }, wc.wr_id());
             seen += 1;
         }
         assert!(
             Instant::now() < deadline,
             "timed out waiting for completions"
         );
+    }
+    assert!(
+        cq.capacity() >= 16,
+        "the device grants at least what was asked"
+    );
+
+    // The packet-classification fields exist only on hardware that classifies; read them where
+    // the device offers them, and accept a refusal elsewhere (Soft-RoCE has none).
+    match ctx
+        .create_cq(16)
+        .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
+        .build()
+    {
+        Ok(cq) => {
+            let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
+            unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
+                .expect("post_recv failed");
+            let mut batch = qp.start_send();
+            batch.op().signaled().send(2, &[send.slice(..4)]);
+            unsafe { batch.submit() }.expect("send failed");
+            let mut seen = 0;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while seen < 2 {
+                let mut comps = cq.poll().expect("failed to poll CQ");
+                while let Some(wc) = comps.next() {
+                    wc.ok().expect("work request failed");
+                    let _ = wc.cvlan();
+                    let _ = wc.flow_tag();
+                    seen += 1;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for completions"
+                );
+            }
+        }
+        Err(ibverbs::Error::Unsupported { .. }) => {
+            eprintln!("device does not classify packets (no VLAN/flow-tag fields); skipping");
+        }
+        Err(e) => panic!("create_cq failed: {e}"),
     }
 }
 
