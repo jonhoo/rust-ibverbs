@@ -849,7 +849,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             ))
         } else {
             let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-            Ok(PreparedQueuePair {
+            let prepared = PreparedQueuePair {
                 lid: self.port_attr.lid,
                 port_num: self.port_num,
                 qp: QueuePair {
@@ -873,7 +873,16 @@ impl<T: Transport> QueuePairBuilder<T> {
                 path_mtu: self.path_mtu,
                 psn: self.psn,
                 service_level: self.service_level,
-            })
+            };
+            // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
+            // work-request table; one that accepted the send-operations mask without doing so has
+            // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
+            if qp_ex.is_null() {
+                return Err(Error::Unsupported {
+                    operation: "ibv_qp_to_qp_ex",
+                });
+            }
+            Ok(prepared)
         }
     }
 }
@@ -909,6 +918,9 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
     ///    device does not support this Transport Service Type; `EPERM` without enough permissions
     ///    to create a QP with this Transport Service Type).
+    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
+    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
+    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
     pub fn build(&self) -> Result<PreparedQueuePair<T>> {
         self.build_impl()
     }
@@ -926,6 +938,9 @@ impl QueuePairBuilder<Ud> {
     ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
     ///    device does not support this Transport Service Type; `EPERM` without enough permissions
     ///    to create a QP with this Transport Service Type).
+    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
+    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
+    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
     pub fn build(&self) -> Result<PreparedQueuePair<Ud>> {
         self.build_impl()
     }
