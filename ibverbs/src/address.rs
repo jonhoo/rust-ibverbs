@@ -531,9 +531,10 @@ impl AddressHandleAttribute {
     /// `wc` is the receive's completion in the classic form ([`CompletionQueue::poll_into`]), and
     /// `port_num` the local port the datagram arrived on, which the reply leaves through. `grh` is
     /// the header from the front of the receive buffer ([`Grh::from_bytes`]); it is required when
-    /// the completion reports one ([`WcFlags::GRH`], always the case on RoCE) and ignored
-    /// otherwise. The route is global exactly when a header was present, sourced from the local
-    /// GID the datagram was addressed to.
+    /// the completion reports one ([`WcFlags::GRH`], always the case on RoCE) and not read
+    /// otherwise (a LID-routed InfiniBand datagram carries none, and its route comes from the
+    /// completion alone). The route is global exactly when a header was present, sourced from the
+    /// local GID the datagram was addressed to.
     ///
     /// # Errors
     ///
@@ -550,26 +551,22 @@ impl AddressHandleAttribute {
     ) -> Result<Self> {
         let mut wc = *wc;
         let has_grh = (wc.wc_flags & ffi::ibv_wc_flags::IBV_WC_GRH).0 != 0;
+        // `ibv_init_ah_from_wc` reads the header's first word (the flow label) before it checks
+        // `IBV_WC_GRH`, so it must always be handed a header: the caller's when the completion
+        // reports one, and an all-zero one (no flow label) when it does not.
         let mut grh = match (has_grh, grh) {
-            (false, _) => None,
-            (true, Some(grh)) => Some(grh.raw()),
+            (true, Some(grh)) => grh.raw(),
             (true, None) => {
                 return Err(Error::CreateAddressHandle(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "the completion reports a GRH, but none was given to derive the route from",
                 )));
             }
+            (false, _) => ffi::ibv_grh::default(),
         };
         let mut attr = ffi::ibv_ah_attr::default();
         let ret = unsafe {
-            ffi::ibv_init_ah_from_wc(
-                context.as_raw(),
-                port_num,
-                &mut wc,
-                grh.as_mut()
-                    .map_or(std::ptr::null_mut(), |grh| grh as *mut _),
-                &mut attr,
-            )
+            ffi::ibv_init_ah_from_wc(context.as_raw(), port_num, &mut wc, &mut grh, &mut attr)
         };
         if ret != 0 {
             // libibverbs reports the one failure it can hit — the header's destination GID not
