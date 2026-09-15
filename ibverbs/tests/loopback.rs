@@ -2243,3 +2243,21 @@ fn reply_through_address_handle_from_wc() {
         .create_address_handle(&next_attr.unwrap())
         .expect("the derived route makes a valid address handle");
 }
+
+/// A completion without a GRH (a LID-routed InfiniBand datagram) still yields a route: libibverbs
+/// reads the header before checking whether the completion reports one, so the crate must hand it
+/// a header either way rather than a null pointer.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn address_handle_from_completion_without_grh() {
+    let ctx = open_test_device();
+    // A default completion reports no flags, so no GRH.
+    let mut wc = ibverbs::ffi::ibv_wc::default();
+    wc.slid = 7;
+    wc.sl = 3;
+    AddressHandleAttribute::from_wc(&ctx, 1, &wc, None)
+        .expect("a completion without a GRH derives a local route");
+    let unread = Grh::from_bytes(&[0; Grh::LEN]);
+    AddressHandleAttribute::from_wc(&ctx, 1, &wc, Some(&unread))
+        .expect("a header given alongside a GRH-less completion is left unread");
+}

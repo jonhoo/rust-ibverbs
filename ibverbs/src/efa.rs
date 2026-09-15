@@ -64,6 +64,9 @@ impl QueuePairBuilder<Srd> {
     ///
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): `efadv_create_qp_ex` failed (`EINVAL` for
     ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
+    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
+    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
+    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
         // SRD supports send and one-sided RDMA, including the immediate variants (the transport's
         // default set), or whatever the builder was told to request instead.
@@ -114,7 +117,7 @@ impl QueuePairBuilder<Srd> {
             ));
         }
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-        Ok(PreparedQueuePair {
+        let prepared = PreparedQueuePair {
             lid: self.port_attr.lid,
             port_num: self.port_num,
             qp: QueuePair {
@@ -138,7 +141,16 @@ impl QueuePairBuilder<Srd> {
             path_mtu: None,
             psn: self.psn,
             service_level: self.service_level,
-        })
+        };
+        // As in qp.rs: a provider that accepted the send-operations mask without installing the
+        // work-request table leaves `ibv_qp_to_qp_ex` returning NULL. Dropping `prepared` destroys
+        // the queue pair.
+        if qp_ex.is_null() {
+            return Err(Error::Unsupported {
+                operation: "ibv_qp_to_qp_ex",
+            });
+        }
+        Ok(prepared)
     }
 }
 
