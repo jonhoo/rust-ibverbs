@@ -329,18 +329,12 @@ flags_newtype! {
     /// Optional work-completion fields to request when building a completion queue (the
     /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
     ///
-    /// The byte length, immediate data, QP number, and source QP are always requested; these flags
-    /// add fields on top, at the cost of a larger completion entry. Fields with an accessor on
-    /// [`WorkCompletion`] panic when read if they were not requested.
+    /// The byte length, immediate data, QP number, and source QP ([`WorkCompletion::len`],
+    /// [`imm_data`](WorkCompletion::imm_data), [`qp_num`](WorkCompletion::qp_num),
+    /// [`src_qp`](WorkCompletion::src_qp)) are always requested and have no flag here; these
+    /// flags add fields on top, at the cost of a larger completion entry. Fields with an accessor
+    /// on [`WorkCompletion`] panic when read if they were not requested.
     pub struct WcFields(ffi::ibv_create_cq_wc_flags) {
-        /// The number of bytes transferred ([`WorkCompletion::len`]; always requested).
-        BYTE_LEN = IBV_WC_EX_WITH_BYTE_LEN;
-        /// The immediate data ([`WorkCompletion::imm_data`]; always requested).
-        IMM = IBV_WC_EX_WITH_IMM;
-        /// The local QP number ([`WorkCompletion::qp_num`]; always requested).
-        QP_NUM = IBV_WC_EX_WITH_QP_NUM;
-        /// The source QP number ([`WorkCompletion::src_qp`]; always requested).
-        SRC_QP = IBV_WC_EX_WITH_SRC_QP;
         /// The source LID ([`WorkCompletion::slid`]).
         SLID = IBV_WC_EX_WITH_SLID;
         /// The service level ([`WorkCompletion::sl`]).
@@ -718,10 +712,9 @@ pub struct TagMatchingInfo {
 ///
 /// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
-/// call (which is why it cannot implement [`Iterator`]); [`for_each`](Self::for_each) runs a
-/// closure over the rest instead. The provider holds the queue's poll lock from the poll's start
-/// until the `Completions` is dropped (`ibv_end_poll`), so keep it short-lived; a poll of an
-/// empty queue holds nothing.
+/// call (which is why it cannot implement [`Iterator`]). The provider holds the queue's poll lock
+/// from the poll's start until the `Completions` is dropped (`ibv_end_poll`), so keep it
+/// short-lived; a poll of an empty queue holds nothing.
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
@@ -762,17 +755,6 @@ impl Completions<'_> {
             cq: self.cq,
             _iter: std::marker::PhantomData,
         })
-    }
-
-    /// Run `f` on each remaining work completion, then release the queue.
-    ///
-    /// The closure form of the `while let` loop over [`next`](Self::next):
-    /// `cq.poll()?.for_each(|wc| ..)`.
-    #[inline]
-    pub fn for_each(mut self, mut f: impl FnMut(WorkCompletion<'_>)) {
-        while let Some(wc) = self.next() {
-            f(wc);
-        }
     }
 }
 
@@ -827,8 +809,6 @@ impl CompletionQueue {
     ///         eprintln!("work request {}: {e}", wc.wr_id());
     ///     }
     /// }
-    /// // Or, as a closure over the batch:
-    /// cq.poll()?.for_each(|wc| println!("work request {} completed", wc.wr_id()));
     /// # Ok(())
     /// # }
     /// ```

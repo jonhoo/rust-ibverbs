@@ -21,29 +21,16 @@ impl Drop for SharedReceiveQueueInner {
 
 /// The attributes of a [`SharedReceiveQueue`], read with [`SharedReceiveQueue::query`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SrqAttributes {
-    max_wr: u32,
-    max_sge: u32,
-    limit: u32,
-}
-
-impl SrqAttributes {
     /// The number of receives the queue can hold: the capacity the device granted, at least what
     /// was asked at creation or in the last [`set_max_wr`](SharedReceiveQueue::set_max_wr).
-    pub fn max_wr(&self) -> u32 {
-        self.max_wr
-    }
-
+    pub max_wr: u32,
     /// The number of scatter/gather entries a receive may carry.
-    pub fn max_sge(&self) -> u32 {
-        self.max_sge
-    }
-
+    pub max_sge: u32,
     /// The low-watermark limit currently armed with [`set_limit`](SharedReceiveQueue::set_limit),
     /// or 0 when none is.
-    pub fn limit(&self) -> u32 {
-        self.limit
-    }
+    pub limit: u32,
 }
 
 /// A shared receive queue (SRQ) that allows sharing receive buffers across multiple queue pairs.

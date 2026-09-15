@@ -249,15 +249,11 @@ impl ProtectionDomain {
         }
         Ok(QueuePairBuilder::new(
             self.clone(),
-            *port_attr.as_raw(),
             port_num,
+            port_attr.as_raw().lid,
+            port_attr.active_mtu(),
             send.clone(),
-            1,
             recv.clone(),
-            1,
-            T::TYPE.into(),
-            1,
-            1,
         ))
     }
 

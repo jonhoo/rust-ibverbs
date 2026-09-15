@@ -502,9 +502,10 @@ struct BringUp {
 pub struct QueuePairBuilder<T: Transport> {
     ctx: isize,
     pd: ProtectionDomain,
-    port_attr: ffi::ibv_port_attr,
     /// the device port this queue pair is associated with (numbered from 1)
     port_num: u8,
+    /// the port's LID, read when the builder was created
+    lid: u16,
 
     send: CompletionQueue,
     max_send_wr: u32,
@@ -527,44 +528,33 @@ pub struct QueuePairBuilder<T: Transport> {
 }
 
 impl<T: Transport> QueuePairBuilder<T> {
-    /// Prepare a new `QueuePair` builder.
-    ///
-    /// `max_send_wr` is the maximum number of outstanding Work Requests that can be posted to the
-    /// Send Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`. Some devices
-    /// support fewer outstanding work requests for specific transport types than the maximum
-    /// reported value.
-    ///
-    /// Similarly, `max_recv_wr` is the maximum number of outstanding Work Requests that can be
-    /// posted to the Receive Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`.
-    /// Some devices support fewer outstanding work requests for specific transport types than the
-    /// maximum reported value. This value is ignored if the Queue Pair is associated with an SRQ.
-    #[allow(clippy::too_many_arguments)]
+    /// Prepare a new `QueuePair` builder for a queue pair on `port_num` of `pd`'s device, whose
+    /// LID and active MTU are `lid` and `active_mtu`, with completions delivered to `send` and
+    /// `recv`. The queue and scatter/gather capacities default to 1 each.
     pub(crate) fn new(
         pd: ProtectionDomain,
-        port_attr: ffi::ibv_port_attr,
         port_num: u8,
+        lid: u16,
+        active_mtu: Mtu,
         send: CompletionQueue,
-        max_send_wr: u32,
         recv: CompletionQueue,
-        max_recv_wr: u32,
-        qp_type: ffi::ibv_qp_type,
-        max_send_sge: u32,
-        max_recv_sge: u32,
     ) -> QueuePairBuilder<T> {
+        let qp_type: ffi::ibv_qp_type = T::TYPE.into();
         let reliable = qp_type == ffi::ibv_qp_type::IBV_QPT_RC;
         let connected = reliable || qp_type == ffi::ibv_qp_type::IBV_QPT_UC;
         QueuePairBuilder {
             ctx: 0,
             pd,
             port_num,
+            lid,
 
             send,
-            max_send_wr,
+            max_send_wr: 1,
             recv,
-            max_recv_wr,
+            max_recv_wr: 1,
 
-            max_send_sge,
-            max_recv_sge,
+            max_send_sge: 1,
+            max_recv_sge: 1,
             max_inline_data: 0,
             send_ops: None,
 
@@ -580,11 +570,10 @@ impl<T: Transport> QueuePairBuilder<T> {
                 min_rnr_timer: reliable.then_some(RnrTimer::from_encoding(16)),
                 max_rd_atomic: reliable.then_some(1),
                 max_dest_rd_atomic: reliable.then_some(1),
-                path_mtu: connected.then_some(port_attr.active_mtu.into()),
+                path_mtu: connected.then_some(active_mtu),
                 psn: 0,
                 service_level: 0,
             },
-            port_attr,
             srq: None,
             _transport: std::marker::PhantomData,
         }
@@ -654,7 +643,10 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the maximum number of send requests in the work queue.
+    /// Set the maximum number of outstanding work requests the send queue holds.
+    ///
+    /// The value must be in `[0..dev_cap.max_qp_wr]`; some devices support fewer outstanding work
+    /// requests for specific transport types than the maximum reported value.
     ///
     /// Defaults to 1.
     pub fn set_max_send_wr(&mut self, max_send_wr: u32) -> &mut Self {
@@ -675,7 +667,11 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the maximum number of receive requests in the work queue.
+    /// Set the maximum number of outstanding work requests the receive queue holds.
+    ///
+    /// The value must be in `[0..dev_cap.max_qp_wr]`; some devices support fewer outstanding work
+    /// requests for specific transport types than the maximum reported value. It is ignored if
+    /// the queue pair is associated with an SRQ.
     ///
     /// Defaults to 1.
     pub fn set_max_recv_wr(&mut self, max_recv_wr: u32) -> &mut Self {
@@ -804,7 +800,7 @@ impl<T: Transport> QueuePairBuilder<T> {
         })?;
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         let prepared = PreparedQueuePair {
-            lid: self.port_attr.lid,
+            lid: self.lid,
             port_num: self.port_num,
             qp: QueuePair {
                 pd: self.pd.clone(),
@@ -1982,41 +1978,21 @@ impl QueuePairAttribute {
     }
 }
 
-/// The configured capacities of a queue pair, as returned by [`QueuePair::query`].
+/// The configured capacities of a queue pair, as returned by [`QueuePair::query`]: the values the
+/// device granted, at least what the builder asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct QueuePairInitAttribute {
-    init_attr: ffi::ibv_qp_init_attr,
-}
-
-impl QueuePairInitAttribute {
     /// The maximum number of outstanding send work requests.
-    pub fn max_send_wr(&self) -> u32 {
-        self.init_attr.cap.max_send_wr
-    }
-
+    pub max_send_wr: u32,
     /// The maximum number of outstanding receive work requests.
-    pub fn max_recv_wr(&self) -> u32 {
-        self.init_attr.cap.max_recv_wr
-    }
-
+    pub max_recv_wr: u32,
     /// The maximum number of scatter-gather entries per send work request.
-    pub fn max_send_sge(&self) -> u32 {
-        self.init_attr.cap.max_send_sge
-    }
-
+    pub max_send_sge: u32,
     /// The maximum number of scatter-gather entries per receive work request.
-    pub fn max_recv_sge(&self) -> u32 {
-        self.init_attr.cap.max_recv_sge
-    }
-
+    pub max_recv_sge: u32,
     /// The maximum amount of inline data, in bytes.
-    pub fn max_inline_data(&self) -> u32 {
-        self.init_attr.cap.max_inline_data
-    }
-
-    /// The underlying `ibv_qp_init_attr`. Escape hatch for fields this crate does not wrap.
-    pub fn as_raw(&self) -> &ffi::ibv_qp_init_attr {
-        &self.init_attr
-    }
+    pub max_inline_data: u32,
 }
 
 /// The required and optional attribute-mask bits for a `cur -> next` transition of a queue pair of
@@ -2250,10 +2226,16 @@ impl<T: Transport> QueuePair<T> {
             )
         };
         raw::errno(errno, Error::QueryQueuePair)?;
-        let init_attr = unsafe { init_attr.assume_init() };
+        let cap = unsafe { init_attr.assume_init() }.cap;
         Ok((
             QueuePairAttribute { attr, mask },
-            QueuePairInitAttribute { init_attr },
+            QueuePairInitAttribute {
+                max_send_wr: cap.max_send_wr,
+                max_recv_wr: cap.max_recv_wr,
+                max_send_sge: cap.max_send_sge,
+                max_recv_sge: cap.max_recv_sge,
+                max_inline_data: cap.max_inline_data,
+            },
         ))
     }
 

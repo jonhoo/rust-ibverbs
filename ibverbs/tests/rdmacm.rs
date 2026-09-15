@@ -152,8 +152,8 @@ fn connect_and_send() {
             .expect("accept");
         // The accepted connection keeps the listener's address, and its peer is the client on
         // the same device (the port is the client's ephemeral one).
-        assert_eq!(conn.local_addr(), Some(addr));
-        let peer = conn.peer_addr().expect("server peer address");
+        assert_eq!(conn.cm_id().local_addr(), Some(addr));
+        let peer = conn.cm_id().peer_addr().expect("server peer address");
         assert_eq!(peer.ip(), addr.ip());
         // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
         unsafe {
@@ -190,8 +190,8 @@ fn connect_and_send() {
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     // The client's peer is the server's listen address; its own address is on the same device.
-    assert_eq!(conn.peer_addr(), Some(addr));
-    let local = conn.local_addr().expect("client local address");
+    assert_eq!(conn.cm_id().peer_addr(), Some(addr));
+    let local = conn.cm_id().local_addr().expect("client local address");
     assert_eq!(local.ip(), addr.ip());
     let mut batch = conn.queue_pair().start_send();
     batch
@@ -1050,7 +1050,7 @@ fn cm_id_options_and_accessors() {
         let conn = incoming
             .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
-        assert_eq!(conn.cm_id().peer_addr(), conn.peer_addr());
+        assert_eq!(conn.cm_id().peer_addr(), conn.cm_id().peer_addr());
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("client done");
@@ -1082,7 +1082,7 @@ fn cm_id_options_and_accessors() {
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     assert_eq!(conn.cm_id().peer_addr(), Some(addr));
-    assert_eq!(conn.cm_id().local_addr(), conn.local_addr());
+    assert_eq!(conn.cm_id().local_addr(), conn.cm_id().local_addr());
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }

@@ -953,9 +953,10 @@ impl Deref for DeviceAttr {
 
 /// Extended device-wide attributes and capabilities, as returned by [`Context::query_device_ex`].
 ///
-/// Dereferences to the raw [`ffi::ibv_device_attr_ex`], so every field is accessible; the inherent
-/// methods add typed accessors for the most useful extended capabilities, and [`orig`] returns the
-/// base attributes that [`Context::query_device`] reports.
+/// Dereferences to the raw [`ffi::ibv_device_attr_ex`], so every field is accessible (the PCI
+/// atomic, packet-pacing, and raw-packet capabilities among them); the inherent methods add typed
+/// accessors for the most useful extended capabilities, and [`orig`] returns the base attributes
+/// that [`Context::query_device`] reports.
 ///
 /// [`orig`]: DeviceAttrEx::orig
 #[derive(Clone)]
@@ -965,16 +966,6 @@ impl DeviceAttrEx {
     /// The base device attributes, the same set [`Context::query_device`] returns.
     pub fn orig(&self) -> DeviceAttr {
         DeviceAttr(self.0.orig_attr)
-    }
-
-    /// The node GUID of the device.
-    pub fn node_guid(&self) -> Guid {
-        Guid::from_be64(self.0.orig_attr.node_guid)
-    }
-
-    /// The system-image GUID, shared by the ports of the same physical device.
-    pub fn sys_image_guid(&self) -> Guid {
-        Guid::from_be64(self.0.orig_attr.sys_image_guid)
     }
 
     /// The mask that bounds the device's completion timestamps: the free-running HCA clock that
@@ -988,24 +979,6 @@ impl DeviceAttrEx {
     /// [`Context::query_rt_values_ex`] this relates raw completion timestamps to host time.
     pub fn hca_core_clock_khz(&self) -> u64 {
         self.0.hca_core_clock
-    }
-
-    /// The device's PCI atomic capabilities. Each field (`fetch_add`, `swap`, `compare_swap`) is a
-    /// bitmask of the operand sizes, in bytes, the device can operate on atomically across PCIe.
-    pub fn pci_atomic_caps(&self) -> ffi::ibv_pci_atomic_caps {
-        self.0.pci_atomic_caps
-    }
-
-    /// The packet-pacing (rate-limit) capabilities: the supported rate range in kbps and the
-    /// queue-pair types that can be rate limited. The minimum and maximum rate are zero if the
-    /// device does not support packet pacing.
-    pub fn packet_pacing_caps(&self) -> ffi::ibv_packet_pacing_caps {
-        self.0.packet_pacing_caps
-    }
-
-    /// The raw-packet capability flags (`IBV_RAW_PACKET_CAP_*`) the device supports.
-    pub fn raw_packet_caps(&self) -> u32 {
-        self.0.raw_packet_caps
     }
 
     /// The maximum size, in bytes, of a single device-memory allocation, or zero if the device has
@@ -1029,11 +1002,11 @@ impl fmt::Debug for DeviceAttrEx {
                 &format_args!("{:#x}", self.completion_timestamp_mask()),
             )
             .field("hca_core_clock_khz", &self.hca_core_clock_khz())
-            .field("pci_atomic_caps", &self.pci_atomic_caps())
-            .field("packet_pacing_caps", &self.packet_pacing_caps())
+            .field("pci_atomic_caps", &self.0.pci_atomic_caps)
+            .field("packet_pacing_caps", &self.0.packet_pacing_caps)
             .field(
                 "raw_packet_caps",
-                &format_args!("{:#x}", self.raw_packet_caps()),
+                &format_args!("{:#x}", self.0.raw_packet_caps),
             )
             .field("max_device_memory", &self.max_device_memory())
             .finish_non_exhaustive()

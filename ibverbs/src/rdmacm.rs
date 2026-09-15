@@ -1385,18 +1385,6 @@ impl Connection {
         error.set_state(QueuePairState::Error);
         self.qp.modify(&error)
     }
-
-    /// The IP address and port of the remote end of this connection, or `None` if its address
-    /// family is neither IPv4 nor IPv6.
-    pub fn peer_addr(&self) -> Option<SocketAddr> {
-        self.id.peer_addr()
-    }
-
-    /// The local IP address and port of this connection, or `None` if its address family is
-    /// neither IPv4 nor IPv6.
-    pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.id.local_addr()
-    }
 }
 
 impl Drop for Connection {
