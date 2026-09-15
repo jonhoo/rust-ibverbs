@@ -1995,122 +1995,158 @@ pub struct QueuePairInitAttribute {
     pub max_inline_data: u32,
 }
 
+/// The attribute-mask bits, as `u32`s usable in the table below.
+mod mask {
+    use ffi::ibv_qp_attr_mask as m;
+
+    pub(super) const STATE: u32 = m::IBV_QP_STATE.0;
+    pub(super) const CUR_STATE: u32 = m::IBV_QP_CUR_STATE.0;
+    pub(super) const SQD_ASYNC: u32 = m::IBV_QP_EN_SQD_ASYNC_NOTIFY.0;
+    pub(super) const ACCESS: u32 = m::IBV_QP_ACCESS_FLAGS.0;
+    pub(super) const PKEY: u32 = m::IBV_QP_PKEY_INDEX.0;
+    pub(super) const PORT: u32 = m::IBV_QP_PORT.0;
+    pub(super) const QKEY: u32 = m::IBV_QP_QKEY.0;
+    pub(super) const AV: u32 = m::IBV_QP_AV.0;
+    pub(super) const PATH_MTU: u32 = m::IBV_QP_PATH_MTU.0;
+    pub(super) const TIMEOUT: u32 = m::IBV_QP_TIMEOUT.0;
+    pub(super) const RETRY: u32 = m::IBV_QP_RETRY_CNT.0;
+    pub(super) const RNR_RETRY: u32 = m::IBV_QP_RNR_RETRY.0;
+    pub(super) const RQ_PSN: u32 = m::IBV_QP_RQ_PSN.0;
+    pub(super) const MAX_RD: u32 = m::IBV_QP_MAX_QP_RD_ATOMIC.0;
+    pub(super) const ALT_PATH: u32 = m::IBV_QP_ALT_PATH.0;
+    pub(super) const MIN_RNR: u32 = m::IBV_QP_MIN_RNR_TIMER.0;
+    pub(super) const SQ_PSN: u32 = m::IBV_QP_SQ_PSN.0;
+    pub(super) const MAX_DEST_RD: u32 = m::IBV_QP_MAX_DEST_RD_ATOMIC.0;
+    pub(super) const MIG: u32 = m::IBV_QP_PATH_MIG_STATE.0;
+    pub(super) const DEST_QPN: u32 = m::IBV_QP_DEST_QPN.0;
+    pub(super) const RATE_LIMIT: u32 = m::IBV_QP_RATE_LIMIT.0;
+}
+
+/// One row of the queue-pair state table: the attribute-mask bits a `cur -> next` transition of
+/// a `qp_type` queue pair requires, and the ones it accepts on top. Mirrors the kernel's
+/// `qp_state_table` (drivers/infiniband/core/verbs.c), which also always accepts `IBV_QP_STATE`
+/// and `IBV_QP_RATE_LIMIT`; a valid transition with no row for the type takes no bits.
+struct Transition {
+    qp_type: ffi::ibv_qp_type,
+    cur: ffi::ibv_qp_state,
+    next: ffi::ibv_qp_state,
+    required: u32,
+    optional: u32,
+}
+
+/// The `(cur, next)` pairs the kernel accepts for every queue-pair type.
+const VALID_TRANSITIONS: &[(ffi::ibv_qp_state, ffi::ibv_qp_state)] = {
+    use ffi::ibv_qp_state::*;
+    &[
+        (IBV_QPS_RESET, IBV_QPS_RESET),
+        (IBV_QPS_RESET, IBV_QPS_INIT),
+        (IBV_QPS_INIT, IBV_QPS_RESET),
+        (IBV_QPS_INIT, IBV_QPS_ERR),
+        (IBV_QPS_INIT, IBV_QPS_INIT),
+        (IBV_QPS_INIT, IBV_QPS_RTR),
+        (IBV_QPS_RTR, IBV_QPS_RESET),
+        (IBV_QPS_RTR, IBV_QPS_ERR),
+        (IBV_QPS_RTR, IBV_QPS_RTS),
+        (IBV_QPS_RTS, IBV_QPS_RESET),
+        (IBV_QPS_RTS, IBV_QPS_ERR),
+        (IBV_QPS_RTS, IBV_QPS_RTS),
+        (IBV_QPS_RTS, IBV_QPS_SQD),
+        (IBV_QPS_SQD, IBV_QPS_RESET),
+        (IBV_QPS_SQD, IBV_QPS_ERR),
+        (IBV_QPS_SQD, IBV_QPS_RTS),
+        (IBV_QPS_SQD, IBV_QPS_SQD),
+        (IBV_QPS_SQE, IBV_QPS_RESET),
+        (IBV_QPS_SQE, IBV_QPS_ERR),
+        (IBV_QPS_SQE, IBV_QPS_RTS),
+        (IBV_QPS_ERR, IBV_QPS_RESET),
+        (IBV_QPS_ERR, IBV_QPS_ERR),
+    ]
+};
+
+/// The per-type rows of the kernel's `qp_state_table`. The XRC send and receive sides are the
+/// kernel's `XRC_INI` and `XRC_TGT`.
+#[rustfmt::skip]
+const TRANSITIONS: &[Transition] = {
+    use ffi::ibv_qp_state::*;
+    use ffi::ibv_qp_type::*;
+    use mask::*;
+    macro_rules! row {
+        ($ty:ident, $cur:ident => $next:ident, required: $req:expr, optional: $opt:expr) => {
+            Transition { qp_type: $ty, cur: $cur, next: $next, required: $req, optional: $opt }
+        };
+    }
+    &[
+        // RESET -> INIT
+        row!(IBV_QPT_UD, IBV_QPS_RESET => IBV_QPS_INIT, required: PKEY | PORT | QKEY, optional: 0),
+        row!(IBV_QPT_RAW_PACKET, IBV_QPS_RESET => IBV_QPS_INIT, required: PORT, optional: 0),
+        row!(IBV_QPT_UC, IBV_QPS_RESET => IBV_QPS_INIT, required: PKEY | PORT | ACCESS, optional: 0),
+        row!(IBV_QPT_RC, IBV_QPS_RESET => IBV_QPS_INIT, required: PKEY | PORT | ACCESS, optional: 0),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_RESET => IBV_QPS_INIT, required: PKEY | PORT | ACCESS, optional: 0),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_RESET => IBV_QPS_INIT, required: PKEY | PORT | ACCESS, optional: 0),
+        // INIT -> INIT
+        row!(IBV_QPT_UD, IBV_QPS_INIT => IBV_QPS_INIT, required: 0, optional: PKEY | PORT | QKEY),
+        row!(IBV_QPT_UC, IBV_QPS_INIT => IBV_QPS_INIT, required: 0, optional: PKEY | PORT | ACCESS),
+        row!(IBV_QPT_RC, IBV_QPS_INIT => IBV_QPS_INIT, required: 0, optional: PKEY | PORT | ACCESS),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_INIT => IBV_QPS_INIT, required: 0, optional: PKEY | PORT | ACCESS),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_INIT => IBV_QPS_INIT, required: 0, optional: PKEY | PORT | ACCESS),
+        // INIT -> RTR
+        row!(IBV_QPT_UD, IBV_QPS_INIT => IBV_QPS_RTR, required: 0, optional: PKEY | QKEY),
+        row!(IBV_QPT_UC, IBV_QPS_INIT => IBV_QPS_RTR, required: AV | PATH_MTU | DEST_QPN | RQ_PSN, optional: ALT_PATH | ACCESS | PKEY),
+        row!(IBV_QPT_RC, IBV_QPS_INIT => IBV_QPS_RTR, required: AV | PATH_MTU | DEST_QPN | RQ_PSN | MAX_DEST_RD | MIN_RNR, optional: ALT_PATH | ACCESS | PKEY),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_INIT => IBV_QPS_RTR, required: AV | PATH_MTU | DEST_QPN | RQ_PSN, optional: ALT_PATH | ACCESS | PKEY),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_INIT => IBV_QPS_RTR, required: AV | PATH_MTU | DEST_QPN | RQ_PSN | MAX_DEST_RD | MIN_RNR, optional: ALT_PATH | ACCESS | PKEY),
+        // RTR -> RTS
+        row!(IBV_QPT_UD, IBV_QPS_RTR => IBV_QPS_RTS, required: SQ_PSN, optional: CUR_STATE | QKEY),
+        row!(IBV_QPT_UC, IBV_QPS_RTR => IBV_QPS_RTS, required: SQ_PSN, optional: CUR_STATE | ALT_PATH | ACCESS | MIG),
+        row!(IBV_QPT_RC, IBV_QPS_RTR => IBV_QPS_RTS, required: TIMEOUT | RETRY | RNR_RETRY | SQ_PSN | MAX_RD, optional: CUR_STATE | ALT_PATH | ACCESS | MIN_RNR | MIG),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_RTR => IBV_QPS_RTS, required: TIMEOUT | RETRY | RNR_RETRY | SQ_PSN | MAX_RD, optional: CUR_STATE | ALT_PATH | ACCESS | MIG),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_RTR => IBV_QPS_RTS, required: TIMEOUT | SQ_PSN, optional: CUR_STATE | ALT_PATH | ACCESS | MIN_RNR | MIG),
+        // RTS -> RTS
+        row!(IBV_QPT_UD, IBV_QPS_RTS => IBV_QPS_RTS, required: 0, optional: CUR_STATE | QKEY),
+        row!(IBV_QPT_UC, IBV_QPS_RTS => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ACCESS | ALT_PATH | MIG),
+        row!(IBV_QPT_RC, IBV_QPS_RTS => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ACCESS | ALT_PATH | MIG | MIN_RNR),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_RTS => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ACCESS | ALT_PATH | MIG),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_RTS => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ACCESS | ALT_PATH | MIG | MIN_RNR),
+        // RTS -> SQD
+        row!(IBV_QPT_UD, IBV_QPS_RTS => IBV_QPS_SQD, required: 0, optional: SQD_ASYNC),
+        row!(IBV_QPT_UC, IBV_QPS_RTS => IBV_QPS_SQD, required: 0, optional: SQD_ASYNC),
+        row!(IBV_QPT_RC, IBV_QPS_RTS => IBV_QPS_SQD, required: 0, optional: SQD_ASYNC),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_RTS => IBV_QPS_SQD, required: 0, optional: SQD_ASYNC),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_RTS => IBV_QPS_SQD, required: 0, optional: SQD_ASYNC),
+        // SQD -> RTS
+        row!(IBV_QPT_UD, IBV_QPS_SQD => IBV_QPS_RTS, required: 0, optional: CUR_STATE | QKEY),
+        row!(IBV_QPT_UC, IBV_QPS_SQD => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ALT_PATH | ACCESS | MIG),
+        row!(IBV_QPT_RC, IBV_QPS_SQD => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ALT_PATH | ACCESS | MIN_RNR | MIG),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_SQD => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ALT_PATH | ACCESS | MIG),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_SQD => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ALT_PATH | ACCESS | MIN_RNR | MIG),
+        // SQD -> SQD
+        row!(IBV_QPT_UD, IBV_QPS_SQD => IBV_QPS_SQD, required: 0, optional: PKEY | QKEY),
+        row!(IBV_QPT_UC, IBV_QPS_SQD => IBV_QPS_SQD, required: 0, optional: AV | ALT_PATH | ACCESS | PKEY | MIG),
+        row!(IBV_QPT_RC, IBV_QPS_SQD => IBV_QPS_SQD, required: 0, optional: PORT | AV | TIMEOUT | RETRY | RNR_RETRY | MAX_RD | MAX_DEST_RD | ALT_PATH | ACCESS | PKEY | MIN_RNR | MIG),
+        row!(IBV_QPT_XRC_SEND, IBV_QPS_SQD => IBV_QPS_SQD, required: 0, optional: PORT | AV | TIMEOUT | RETRY | RNR_RETRY | MAX_RD | ALT_PATH | ACCESS | PKEY | MIG),
+        row!(IBV_QPT_XRC_RECV, IBV_QPS_SQD => IBV_QPS_SQD, required: 0, optional: PORT | AV | TIMEOUT | MAX_DEST_RD | ALT_PATH | ACCESS | PKEY | MIN_RNR | MIG),
+        // SQE -> RTS
+        row!(IBV_QPT_UD, IBV_QPS_SQE => IBV_QPS_RTS, required: 0, optional: CUR_STATE | QKEY),
+        row!(IBV_QPT_UC, IBV_QPS_SQE => IBV_QPS_RTS, required: 0, optional: CUR_STATE | ACCESS),
+    ]
+};
+
 /// The required and optional attribute-mask bits for a `cur -> next` transition of a queue pair of
-/// the given type, or `None` if the transition is not valid.
-///
-/// This mirrors the kernel's `qp_state_table` (drivers/infiniband/core/verbs.c): every queue pair
-/// may move to `RESET` or `ERR` from any state with only `IBV_QP_STATE`, and each type allows a
-/// specific set of forward transitions. It is used only to turn an `EINVAL` from `ibv_modify_qp`
-/// into a more precise [`Error`].
+/// the given type, or `None` if the transition is not valid. `IBV_QP_STATE` and
+/// `IBV_QP_RATE_LIMIT` are accepted by every transition and never listed (see [`Transition`]).
+/// Used only to turn an `EINVAL` from `ibv_modify_qp` into a more precise [`Error`].
 fn qp_transition_masks(
     qp_type: ffi::ibv_qp_type,
     cur: ffi::ibv_qp_state,
     next: ffi::ibv_qp_state,
 ) -> Option<(u32, u32)> {
-    use ffi::ibv_qp_state::*;
-    use ffi::ibv_qp_type::*;
-
-    let state = ffi::ibv_qp_attr_mask::IBV_QP_STATE.0;
-    let cur_state = ffi::ibv_qp_attr_mask::IBV_QP_CUR_STATE.0;
-    let pkey = ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX.0;
-    let port = ffi::ibv_qp_attr_mask::IBV_QP_PORT.0;
-    let access = ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS.0;
-    let qkey = ffi::ibv_qp_attr_mask::IBV_QP_QKEY.0;
-    let av = ffi::ibv_qp_attr_mask::IBV_QP_AV.0;
-    let path_mtu = ffi::ibv_qp_attr_mask::IBV_QP_PATH_MTU.0;
-    let timeout = ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT.0;
-    let retry = ffi::ibv_qp_attr_mask::IBV_QP_RETRY_CNT.0;
-    let rnr_retry = ffi::ibv_qp_attr_mask::IBV_QP_RNR_RETRY.0;
-    let rq_psn = ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN.0;
-    let max_rd = ffi::ibv_qp_attr_mask::IBV_QP_MAX_QP_RD_ATOMIC.0;
-    let alt_path = ffi::ibv_qp_attr_mask::IBV_QP_ALT_PATH.0;
-    let min_rnr = ffi::ibv_qp_attr_mask::IBV_QP_MIN_RNR_TIMER.0;
-    let sq_psn = ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN.0;
-    let max_dest_rd = ffi::ibv_qp_attr_mask::IBV_QP_MAX_DEST_RD_ATOMIC.0;
-    let mig = ffi::ibv_qp_attr_mask::IBV_QP_PATH_MIG_STATE.0;
-    let dest_qpn = ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN.0;
-    let rate = ffi::ibv_qp_attr_mask::IBV_QP_RATE_LIMIT.0;
-    let sqd_async = ffi::ibv_qp_attr_mask::IBV_QP_EN_SQD_ASYNC_NOTIFY.0;
-
-    // Any state may move to RESET or ERR with only IBV_QP_STATE.
-    if let IBV_QPS_RESET | IBV_QPS_ERR = next {
-        return Some((state, 0));
+    if !VALID_TRANSITIONS.contains(&(cur, next)) {
+        return None;
     }
-
-    match qp_type {
-        IBV_QPT_RC | IBV_QPT_XRC_SEND | IBV_QPT_XRC_RECV => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | access)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((
-                state | av | path_mtu | dest_qpn | rq_psn | max_dest_rd | min_rnr,
-                pkey | access | alt_path,
-            )),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((
-                state | sq_psn | timeout | retry | rnr_retry | max_rd,
-                cur_state | access | min_rnr | alt_path | mig,
-            )),
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | access | min_rnr | alt_path | mig)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => {
-                Some((state, cur_state | access | min_rnr | alt_path | mig))
-            }
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((
-                0,
-                pkey | port
-                    | access
-                    | av
-                    | max_rd
-                    | min_rnr
-                    | alt_path
-                    | timeout
-                    | retry
-                    | rnr_retry
-                    | max_dest_rd
-                    | mig,
-            )),
-            _ => None,
-        },
-        IBV_QPT_UC => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | access)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((
-                state | av | path_mtu | dest_qpn | rq_psn,
-                pkey | access | alt_path,
-            )),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => {
-                Some((state | sq_psn, cur_state | access | alt_path | mig))
-            }
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | access | alt_path | mig)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, cur_state | access | alt_path | mig)),
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, pkey | port | access | av | alt_path | mig)),
-            _ => None,
-        },
-        IBV_QPT_UD => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | qkey, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | qkey)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((state, pkey | qkey)),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((state | sq_psn, cur_state | qkey)),
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | qkey)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, cur_state | qkey)),
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, pkey | port | qkey)),
-            (IBV_QPS_SQE, IBV_QPS_RTS) => Some((state, cur_state | qkey)),
-            _ => None,
-        },
-        IBV_QPT_RAW_PACKET => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | port, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, port)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((state, 0)),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((state, rate)),
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, rate)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, rate)),
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, port | rate)),
-            _ => None,
-        },
-        _ => None,
-    }
+    let row = TRANSITIONS
+        .iter()
+        .find(|t| t.qp_type == qp_type && t.cur == cur && t.next == next);
+    Some(row.map_or((0, 0), |t| (t.required, t.optional)))
 }
 
 /// A fully initialized and ready `QueuePair`. Created by the connected transports'
@@ -2262,7 +2298,7 @@ impl<T: Transport> QueuePair<T> {
                 next: next.into(),
             },
             Some((required, optional)) => {
-                let invalid = mask.0 & !(required | optional);
+                let invalid = mask.0 & !(required | optional | mask::STATE | mask::RATE_LIMIT);
                 let needed = required & !mask.0;
                 if invalid == 0 && needed == 0 {
                     raw()
@@ -2579,38 +2615,94 @@ mod test_timers {
 mod test_qp_transitions {
     use super::*;
     use ffi::ibv_qp_state::*;
-    use ffi::ibv_qp_type::IBV_QPT_RC;
-
-    fn bit(m: ffi::ibv_qp_attr_mask) -> u32 {
-        m.0
-    }
+    use ffi::ibv_qp_type::*;
 
     #[test]
     fn reset_to_init_requires_pkey_port_access() {
-        let (required, _optional) =
+        let (required, optional) =
             qp_transition_masks(IBV_QPT_RC, IBV_QPS_RESET, IBV_QPS_INIT).unwrap();
-        let expected = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE)
-            | bit(ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX)
-            | bit(ffi::ibv_qp_attr_mask::IBV_QP_PORT)
-            | bit(ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS);
-        assert_eq!(required, expected);
+        assert_eq!(required, mask::PKEY | mask::PORT | mask::ACCESS);
+        assert_eq!(optional, 0);
+        // A datagram queue pair takes a Q_Key instead of access flags.
+        let (required, _) = qp_transition_masks(IBV_QPT_UD, IBV_QPS_RESET, IBV_QPS_INIT).unwrap();
+        assert_eq!(required, mask::PKEY | mask::PORT | mask::QKEY);
     }
 
     #[test]
     fn init_to_rts_is_not_a_valid_transition() {
         assert!(qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RTS).is_none());
+        assert!(qp_transition_masks(IBV_QPT_UD, IBV_QPS_RESET, IBV_QPS_RTR).is_none());
+        // The kernel's table has no RESET -> ERR cell.
+        assert!(qp_transition_masks(IBV_QPT_RC, IBV_QPS_RESET, IBV_QPS_ERR).is_none());
     }
 
     #[test]
-    fn any_state_to_reset_or_err_needs_only_state() {
-        let state = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE);
+    fn reset_and_err_take_no_bits() {
+        for ty in [
+            IBV_QPT_RC,
+            IBV_QPT_UC,
+            IBV_QPT_UD,
+            IBV_QPT_RAW_PACKET,
+            IBV_QPT_XRC_SEND,
+        ] {
+            assert_eq!(
+                qp_transition_masks(ty, IBV_QPS_RTS, IBV_QPS_ERR),
+                Some((0, 0))
+            );
+            assert_eq!(
+                qp_transition_masks(ty, IBV_QPS_INIT, IBV_QPS_RESET),
+                Some((0, 0))
+            );
+        }
+    }
+
+    #[test]
+    fn xrc_sides_differ_from_rc() {
+        // The XRC initiator has no responder resources to configure at RTR, and the target no
+        // retries to configure at RTS.
+        let (rc_rtr, _) = qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RTR).unwrap();
+        let (ini_rtr, _) =
+            qp_transition_masks(IBV_QPT_XRC_SEND, IBV_QPS_INIT, IBV_QPS_RTR).unwrap();
+        assert_eq!(ini_rtr, rc_rtr & !(mask::MAX_DEST_RD | mask::MIN_RNR));
+        let (tgt_rts, _) = qp_transition_masks(IBV_QPT_XRC_RECV, IBV_QPS_RTR, IBV_QPS_RTS).unwrap();
+        assert_eq!(tgt_rts, mask::TIMEOUT | mask::SQ_PSN);
+    }
+
+    #[test]
+    fn unreliable_connection_recovers_from_sqe() {
         assert_eq!(
-            qp_transition_masks(IBV_QPT_RC, IBV_QPS_RTS, IBV_QPS_ERR),
-            Some((state, 0))
+            qp_transition_masks(IBV_QPT_UC, IBV_QPS_SQE, IBV_QPS_RTS),
+            Some((0, mask::CUR_STATE | mask::ACCESS))
         );
-        assert_eq!(
-            qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RESET),
-            Some((state, 0))
-        );
+    }
+
+    #[test]
+    fn table_rows_are_consistent() {
+        for (i, row) in TRANSITIONS.iter().enumerate() {
+            assert!(
+                VALID_TRANSITIONS.contains(&(row.cur, row.next)),
+                "row {i} names an invalid transition"
+            );
+            assert_eq!(
+                row.required & row.optional,
+                0,
+                "row {i} lists a bit as both"
+            );
+            assert_eq!(
+                row.required & (mask::STATE | mask::RATE_LIMIT),
+                0,
+                "row {i} lists STATE"
+            );
+            assert_eq!(
+                row.optional & (mask::STATE | mask::RATE_LIMIT),
+                0,
+                "row {i} lists STATE"
+            );
+            let duplicates = TRANSITIONS
+                .iter()
+                .filter(|t| t.qp_type == row.qp_type && t.cur == row.cur && t.next == row.next)
+                .count();
+            assert_eq!(duplicates, 1, "row {i} is listed twice");
+        }
     }
 }
