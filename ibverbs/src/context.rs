@@ -111,8 +111,10 @@ impl Context {
                 ownership: ContextOwnership::Borrowed(owner),
             }),
         };
-        // The async-event descriptor is shared with every other borrow of this device context;
-        // setting it non-blocking is idempotent, so doing it once per borrow is harmless.
+        // The async-event descriptor belongs to librdmacm's per-device context, which every
+        // connection-manager id on this device in the process shares: making it non-blocking is
+        // a process-wide side effect on that context (needed for `poll_async_event`), and setting
+        // the flag again on a later borrow is idempotent.
         context.set_async_fd_nonblocking()?;
         Ok(context)
     }
@@ -196,8 +198,9 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
     pub fn poll_async_event(&self) -> Result<Option<AsyncEvent<'_>>> {
-        // `ibv_async_event` embeds an enum with no zero variant inside a union, so let
-        // `ibv_get_async_event` initialize the storage before a Rust value is formed.
+        // Let `ibv_get_async_event` fill the storage before a Rust value is formed: which member
+        // of the `element` union is valid depends on `event_type`, so no zeroed value would be
+        // meaningful.
         let mut event = std::mem::MaybeUninit::<ffi::ibv_async_event>::uninit();
         let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, event.as_mut_ptr()) };
         if rc != 0 {

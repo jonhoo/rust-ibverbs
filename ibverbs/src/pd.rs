@@ -213,17 +213,17 @@ impl ProtectionDomain {
     ///
     /// The transport is chosen at compile time by the marker `T` (for example
     /// `pd.create_qp::<Rc>(&send, &recv, 1)` for a reliable connection); the resulting queue-pair
-    /// family only offers the operations that transport supports. The types without a marker
-    /// (raw packet, XRC, and driver-specific types other than EFA's SRD) are not usable through
-    /// the portable wrapper anyway; if that changes, they will get their own markers.
+    /// family only offers the operations that transport supports. The types without a marker are
+    /// not usable through the portable wrapper anyway (see [`QueuePairType`](crate::QueuePairType)).
     ///
     /// `send` and `recv` are the [`CompletionQueue`]s that completions for the send and receive
     /// queues are delivered to, respectively. They may refer to the same queue.
     ///
     /// `port_num` is the device port this queue pair uses; ports are numbered from 1.
     ///
-    /// Note that both this protection domain, *and* both provided completion queues, must outlive
-    /// the resulting `QueuePair`.
+    /// The queue pair keeps this protection domain and both completion queues alive, so they may
+    /// be dropped in any order. The port's LID and active MTU are read now and carried by the
+    /// builder; create the builder again after the subnet manager reconfigures the port.
     ///
     /// # Errors
     ///

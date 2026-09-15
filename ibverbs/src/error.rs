@@ -187,6 +187,12 @@ pub enum Error {
     AsyncEvent(#[source] io::Error),
 
     /// A blocking connection-manager helper reached its timeout before the awaited event arrived.
+    ///
+    /// The helpers wait for a *resource* (a request, a connection) and report its absence this
+    /// way; the event waits ([`CompletionChannel::wait`](crate::CompletionChannel::wait),
+    /// [`Context::wait_async_event`](crate::Context::wait_async_event), and
+    /// [`CmId::wait_cm_event`](crate::rdmacm::CmId::wait_cm_event)) report an elapsed timeout as
+    /// `Ok(None)` instead.
     #[cfg(feature = "rdmacm")]
     #[error("the connection-manager operation timed out")]
     TimedOut,

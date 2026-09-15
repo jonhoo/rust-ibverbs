@@ -305,7 +305,8 @@ struct CompletionQueueInner {
 impl CompletionQueueInner {
     /// The underlying `ibv_cq`. An `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this is
     /// just a pointer cast (exactly what `ibv_cq_ex_to_cq` does in C). Used for the verbs that still
-    /// take a plain `ibv_cq`: queue-pair creation, completion-event notification, and teardown.
+    /// take a plain `ibv_cq`: queue-pair creation, the classic poll and notification requests, and
+    /// teardown.
     #[inline]
     fn cq(&self) -> *mut ffi::ibv_cq {
         self.cq_ex as *mut ffi::ibv_cq

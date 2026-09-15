@@ -112,9 +112,8 @@
 //! RDMA read/write, and atomics; [`Uc`] sends and RDMA writes; [`Ud`] (and, behind the `efa`
 //! feature, `Srd`) datagram sends addressed through an [`AddressHandle`]. Transport-specific
 //! operations only exist on the matching types, so using one on the wrong transport is a compile
-//! error. The queue-pair types without a marker (raw packet, XRC, and driver-specific types other
-//! than EFA's SRD) are not usable through the portable wrapper anyway; if that changes, they will
-//! get their own markers.
+//! error. The queue-pair types without a marker are not usable through the portable wrapper
+//! anyway (see [`QueuePairType`]).
 //!
 //! # Thread safety
 //!

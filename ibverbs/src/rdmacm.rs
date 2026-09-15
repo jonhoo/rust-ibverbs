@@ -150,9 +150,9 @@ c_enum! {
         /// The connection left the timewait state; its queue pair may be reused.
         TimewaitExit = RDMA_CM_EVENT_TIMEWAIT_EXIT => "TIMEWAIT_EXIT";
         /// Address information resolved (`rdma_getaddrinfo`-style resolution).
-        AddressInfoResolved = RDMA_CM_EVENT_ADDRINFO_RESOLVED => "ADDR_INFO_RESOLVED";
+        AddressInfoResolved = RDMA_CM_EVENT_ADDRINFO_RESOLVED => "ADDRINFO_RESOLVED";
         /// Resolving address information failed.
-        AddressInfoError = RDMA_CM_EVENT_ADDRINFO_ERROR => "ADDR_INFO_ERROR";
+        AddressInfoError = RDMA_CM_EVENT_ADDRINFO_ERROR => "ADDRINFO_ERROR";
         /// A user-generated event.
         User = RDMA_CM_EVENT_USER => "USER";
         /// An internal event.
@@ -1157,7 +1157,16 @@ impl Connector {
 
     /// Resolves the destination address and route (blocking until both complete), then returns a
     /// handle to build the queue pair on the resolved device. `timeout` bounds each of the two
-    /// resolution steps (it is enforced by the kernel, which reports expiry as a failure event).
+    /// resolution steps; the kernel enforces it and reports expiry as a failure event, not as
+    /// [`TimedOut`](Error::TimedOut).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ResolveAddress`](Error::ResolveAddress) / [`ResolveRoute`](Error::ResolveRoute): a
+    ///    resolution could not be started.
+    ///  - [`ConnectionManager`](Error::ConnectionManager): a resolution failed or timed out (the
+    ///    event is [`AddressError`](CmEventType::AddressError) or
+    ///    [`RouteError`](CmEventType::RouteError), with status `-ETIMEDOUT` on expiry).
     pub fn resolve(self, dst: SocketAddr, timeout: Duration) -> Result<Resolved> {
         self.id.resolve_addr(dst, timeout)?;
         // The kernel delivers AddressError/RouteError once `timeout` expires, so these waits

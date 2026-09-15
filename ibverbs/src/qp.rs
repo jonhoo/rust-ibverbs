@@ -962,7 +962,7 @@ pub struct PreparedQueuePair<T: Transport> {
 /// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
 /// rdmacm connection request's `private_data`.
 ///
-/// Internally, this contains the `QueuePair`'s `qp_num`, the context's `lid` and `gid`, and the
+/// Internally, this contains the `QueuePair`'s `qp_num`, the port's `lid` and `gid`, and the
 /// packet sequence number the queue pair's send queue starts at.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct QueuePairEndpoint {
