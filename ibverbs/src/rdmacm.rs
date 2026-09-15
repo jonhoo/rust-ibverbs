@@ -50,10 +50,10 @@
 //! while they drive the connection-manager state machine, so they cannot be integrated with an event
 //! loop or async runtime. For full control, drive the state machine yourself with a
 //! [`CmId`]: it exposes every step ([`resolve_addr`], route resolution,
-//! [`connect`], [`accept`], …), hands back each [`CmEvent`] as it arrives,
-//! and can be put into non-blocking mode ([`set_nonblocking`]) so you wait on its file descriptor
-//! ([`AsRawFd`] / [`AsFd`]) with `epoll`, `poll`, a `tokio` `AsyncFd`, or any other reactor and pump
-//! events with [`poll_cm_event`]. You build the queue pair on the
+//! [`connect`], [`accept`], …) and hands back each [`CmEvent`] as it arrives: block for the next
+//! one with [`wait_cm_event`], or — its event channel being non-blocking — wait on its file
+//! descriptor ([`AsRawFd`] / [`AsFd`]) with `epoll`, `poll`, a `tokio` `AsyncFd`, or any other
+//! reactor and pump events with [`poll_cm_event`]. You build the queue pair on the
 //! [`context`](CmId::context) the id resolves to and transition it with
 //! [`init_qp_attr`](CmId::init_qp_attr) plus
 //! [`QueuePair::modify`](crate::QueuePair::modify): on the active side `Init` before [`connect`],
@@ -66,7 +66,7 @@
 //! [`resolve_addr`]: CmId::resolve_addr
 //! [`connect`]: CmId::connect
 //! [`accept`]: CmId::accept
-//! [`set_nonblocking`]: CmId::set_nonblocking
+//! [`wait_cm_event`]: CmId::wait_cm_event
 //! [`poll_cm_event`]: CmId::poll_cm_event
 //! [`AsRawFd`]: std::os::fd::AsRawFd
 //! [`AsFd`]: std::os::fd::AsFd
@@ -81,6 +81,7 @@ use std::time::{Duration, Instant};
 
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
 
+use crate::fd;
 use crate::qp::QueuePairState;
 use crate::raw;
 use crate::{
@@ -274,19 +275,31 @@ fn is_failure(event: CmEventType) -> bool {
 }
 
 /// An rdma_cm event channel. Owned 1:1 by the [`CmId`] whose events it carries; it is created with
-/// the id and destroyed after it.
+/// the id and destroyed after it. Its descriptor is non-blocking, so reading it reports an empty
+/// channel instead of blocking; the blocking waits `poll(2)` the descriptor first.
 struct EventChannel {
     chan: *mut ffi::rdma_event_channel,
 }
 
 impl EventChannel {
-    /// Opens a new event channel.
+    /// Opens a new event channel, non-blocking.
     fn new() -> Result<EventChannel> {
         let chan = raw::nonnull(
             unsafe { ffi::rdma_create_event_channel() },
             Error::ConnectionSetup,
         )?;
-        Ok(EventChannel { chan })
+        // If this fails, `channel` drops here and destroys the half-created channel.
+        let channel = EventChannel { chan };
+        fd::set_nonblocking(channel.as_fd()).map_err(Error::ConnectionSetup)?;
+        Ok(channel)
+    }
+}
+
+impl AsFd for EventChannel {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the channel fd lives as long as this `EventChannel`, and the borrow is tied to
+        // `&self`.
+        unsafe { BorrowedFd::borrow_raw((*self.chan).fd) }
     }
 }
 
@@ -323,7 +336,7 @@ impl Drop for CmIdInner {
 /// [module-level docs](self#low-level-control) for the overall flow. A typical active-side sequence
 /// is [`resolve_addr`](Self::resolve_addr), [`resolve_route`](Self::resolve_route),
 /// [`connect`](Self::connect), [`establish`](Self::establish), pumping for the matching
-/// [`CmEvent`] after each with [`get_cm_event`](Self::get_cm_event) (blocking) or
+/// [`CmEvent`] after each with [`wait_cm_event`](Self::wait_cm_event) (blocking) or
 /// [`poll_cm_event`](Self::poll_cm_event) (non-blocking); the queue pair is built on
 /// [`context`](Self::context) and transitioned with [`init_qp_attr`](Self::init_qp_attr).
 ///
@@ -358,31 +371,11 @@ impl CmId {
         })
     }
 
-    /// Blocks until the next event on this id's channel is available and returns it.
-    ///
-    /// The event is acknowledged automatically when the returned [`CmEvent`] drops. If the channel
-    /// has been put into non-blocking mode with [`set_nonblocking`](Self::set_nonblocking), use
-    /// [`poll_cm_event`](Self::poll_cm_event) instead, which reports an empty channel as `None`
-    /// rather than erroring.
-    pub fn get_cm_event(&self) -> Result<CmEvent> {
-        let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
-        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
-        raw::os(ret, Error::ConnectionSetup)?;
-        Ok(CmEvent {
-            event,
-            _id: self.clone(),
-            taken: false,
-        })
-    }
-
     /// Returns the next event on this id's channel, or `None` if none is currently pending.
     ///
-    /// Intended for non-blocking, event-loop use: put the channel into non-blocking mode with
-    /// [`set_nonblocking`](Self::set_nonblocking), wait for the file descriptor from
-    /// [`AsRawFd`]/[`AsFd`] to become readable with your
-    /// reactor of choice, then drain pending events with this method (acknowledged on drop). On a
-    /// blocking channel it behaves like [`get_cm_event`](Self::get_cm_event), only ever returning
-    /// `Some`.
+    /// The non-blocking form, for event-loop use: wait for the file descriptor from
+    /// [`AsRawFd`]/[`AsFd`] to become readable with your reactor of choice, then drain pending
+    /// events with this method. Each event is acknowledged automatically when it drops.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
         let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
@@ -400,21 +393,34 @@ impl CmId {
         }))
     }
 
-    /// Switches this id's event channel between blocking and non-blocking delivery.
+    /// Blocks until the next event on this id's channel arrives (up to `timeout`) and returns it.
+    /// Returns `None` only if `timeout` elapses first; with no timeout it waits indefinitely.
     ///
-    /// In non-blocking mode [`get_cm_event`](Self::get_cm_event) and the underlying file descriptor
-    /// no longer block; pair it with [`poll_cm_event`](Self::poll_cm_event) and a reactor watching
-    /// the [`AsRawFd`]/[`AsFd`] descriptor to integrate
-    /// connection setup with an event loop.
-    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
-        let fd = self.as_fd();
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-        let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
-        flags.set(nix::fcntl::OFlag::O_NONBLOCK, nonblocking);
-        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags))
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-        Ok(())
+    /// The blocking form of [`poll_cm_event`](Self::poll_cm_event): it waits on the channel's
+    /// file descriptor for you rather than requiring an external reactor. The event is
+    /// acknowledged automatically when it drops.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the descriptor (`poll`) or
+    ///    reading the event (`rdma_get_cm_event`) failed.
+    pub fn wait_cm_event(&self, timeout: Option<Duration>) -> Result<Option<CmEvent>> {
+        self.wait_cm_event_until(fd::deadline(timeout))
+    }
+
+    /// [`wait_cm_event`](Self::wait_cm_event) against an absolute deadline, for the blocking
+    /// helpers to share one deadline across several waits.
+    fn wait_cm_event_until(&self, deadline: Option<Instant>) -> Result<Option<CmEvent>> {
+        loop {
+            if !fd::wait_readable(self.as_fd(), deadline).map_err(Error::ConnectionSetup)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the event first;
+            // if so, go back to waiting for the next one.
+            if let Some(event) = self.poll_cm_event()? {
+                return Ok(Some(event));
+            }
+        }
     }
 
     /// The device the connection manager has bound this id to. Build the queue pair (and its
@@ -455,34 +461,6 @@ impl CmId {
         ))
     }
 
-    /// Blocks until the next event arrives (up to `deadline`) and returns it, or `None` if the
-    /// deadline passes first. Implements the blocking setup helpers' timeouts: the event channel
-    /// stays in blocking mode, but its file descriptor is `poll(2)`ed with the remaining time
-    /// before each read, so the read itself never blocks past the deadline.
-    fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<Option<CmEvent>> {
-        if let Some(deadline) = deadline {
-            let remaining = crate::completion::ceil_to_millis(
-                deadline.saturating_duration_since(Instant::now()),
-            );
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                nix::poll::PollTimeout::try_from(remaining).map_err(|_| {
-                    Error::ConnectionSetup(io::Error::other(
-                        "failed to convert timeout to PollTimeout",
-                    ))
-                })?,
-            )
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {}
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
-            }
-        }
-        Ok(Some(self.get_cm_event()?))
-    }
-
     /// Blocks until an `expected` event arrives (up to `deadline`) and returns it, acknowledging
     /// and skipping any others, and returning an error on a failure event or on an expired
     /// deadline. Drives the blocking setup helpers.
@@ -491,7 +469,7 @@ impl CmId {
             // This blocks on the channel's fd until an event arrives — it does not spin. The loop
             // only goes around to skip a non-matching event, re-blocking on the next read. Each
             // skipped event is acknowledged when it drops at the iteration end.
-            let Some(event) = self.get_cm_event_deadline(deadline)? else {
+            let Some(event) = self.wait_cm_event_until(deadline)? else {
                 return Err(Error::TimedOut);
             };
             let kind = event.event_type();
@@ -817,23 +795,21 @@ impl CmId {
 }
 
 impl AsRawFd for CmId {
-    /// The raw file descriptor of this id's event channel. Pair with
-    /// [`set_nonblocking`](CmId::set_nonblocking) and a reactor to drive connection setup without
-    /// blocking; it becomes readable when a connection-manager event is pending.
+    /// The raw file descriptor of this id's event channel. It is non-blocking: hand it to a
+    /// reactor to drive connection setup without blocking, draining events with
+    /// [`poll_cm_event`](CmId::poll_cm_event) once it becomes readable.
     fn as_raw_fd(&self) -> RawFd {
-        unsafe { (*self.inner.channel.chan).fd }
+        self.inner.channel.as_fd().as_raw_fd()
     }
 }
 
 impl AsFd for CmId {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: the channel fd lives as long as this `CmId` (its inner `channel` field), and the
-        // borrow is tied to `&self`.
-        unsafe { BorrowedFd::borrow_raw((*self.inner.channel.chan).fd) }
+        self.inner.channel.as_fd()
     }
 }
 
-/// A connection-manager event, retrieved with [`CmId::get_cm_event`]/[`CmId::poll_cm_event`] and
+/// A connection-manager event, retrieved with [`CmId::wait_cm_event`]/[`CmId::poll_cm_event`] and
 /// acknowledged automatically when dropped.
 ///
 /// The event keeps the id whose channel delivered it alive: `rdma_destroy_id` blocks until every
@@ -1159,7 +1135,7 @@ impl Resolved {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         let mut qp = self.id.init_qp(qp)?;
         let param = param.set_qp_num(qp.qp_num());
         self.id.connect(&param)?;
@@ -1251,9 +1227,9 @@ impl Acceptor {
     ///    device was removed).
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         loop {
-            let Some(event) = self.listener.get_cm_event_deadline(deadline)? else {
+            let Some(event) = self.listener.wait_cm_event_until(deadline)? else {
                 return Err(Error::TimedOut);
             };
             let kind = event.event_type();
@@ -1326,7 +1302,7 @@ impl Incoming {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         let mut qp = self.id.init_qp(qp)?;
         let responder_resources = (param.param.responder_resources != RDMA_MAX_RESP_RES)
             .then_some(param.param.responder_resources);
@@ -1379,7 +1355,7 @@ impl Connection {
 
     /// The connection's id, to watch what happens to it after establishment — the peer
     /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
-    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`].
+    /// with [`CmId::wait_cm_event`] or, non-blocking, [`CmId::poll_cm_event`].
     pub fn cm_id(&self) -> &CmId {
         &self.id
     }

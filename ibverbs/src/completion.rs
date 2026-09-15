@@ -4,20 +4,15 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::context::{ContextInner, HcaClock};
 use crate::error::{Error, Result};
+use crate::fd;
 use crate::raw;
 
 #[cfg(doc)]
 use crate::Context;
-
-/// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
-/// granularity) lasts at least the requested duration instead of returning fractionally early.
-pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
-    Duration::from_millis(remaining.as_nanos().div_ceil(1_000_000) as u64)
-}
 
 /// A completion channel: the file descriptor that delivers completion-queue notifications.
 /// Created by [`Context::create_comp_channel`].
@@ -85,15 +80,7 @@ impl CompletionChannel {
 
     /// Set this channel's file descriptor to non-blocking.
     fn set_nonblocking(&self) -> Result<()> {
-        // SAFETY: the channel owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.cc).fd) };
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        Ok(())
+        fd::set_nonblocking(self.as_fd()).map_err(Error::CreateCompletionChannel)
     }
 
     /// Consume one pending notification from the channel, returning the context value of the
@@ -143,33 +130,15 @@ impl CompletionChannel {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): waiting on the descriptor (`poll`)
     ///    or consuming the notification failed.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         loop {
-            let remaining = deadline
-                .map(|deadline| ceil_to_millis(deadline.saturating_duration_since(Instant::now())));
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::PollCompletionQueue(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::PollCompletionQueue(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // notification first; if so, go back to waiting for the next one.
-                    if let Some(context) = self.get_event()? {
-                        return Ok(Some(context));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !fd::wait_readable(self.as_fd(), deadline).map_err(Error::PollCompletionQueue)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the notification
+            // first; if so, go back to waiting for the next one.
+            if let Some(context) = self.get_event()? {
+                return Ok(Some(context));
             }
         }
     }

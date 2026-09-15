@@ -313,6 +313,7 @@ mod completion;
 mod context;
 mod device;
 mod error;
+mod fd;
 mod mr;
 mod pd;
 mod qp;

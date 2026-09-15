@@ -6,12 +6,13 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
 use crate::error::{Error, Result};
+use crate::fd;
 use crate::pd::{ProtectionDomain, ProtectionDomainInner};
 use crate::raw;
 
@@ -154,15 +155,7 @@ impl Context {
     /// [`poll_async_event`](Self::poll_async_event) reports an empty event queue instead of
     /// blocking.
     fn set_async_fd_nonblocking(&self) -> Result<()> {
-        // SAFETY: the context owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.ctx).async_fd) };
-        let flags =
-            nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(|e| Error::OpenDevice(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::OpenDevice(e.into()))?;
-        Ok(())
+        fd::set_nonblocking(self.async_fd()).map_err(Error::OpenDevice)
     }
 
     /// Begin building a completion queue (CQ) with room for at least `min_cq_entries` entries.
@@ -273,36 +266,15 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
     pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         loop {
-            let remaining = deadline.map(|deadline| {
-                crate::completion::ceil_to_millis(
-                    deadline.saturating_duration_since(Instant::now()),
-                )
-            });
-            let pollfd = nix::poll::PollFd::new(self.async_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::AsyncEvent(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::AsyncEvent(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // event first; if so, go back to waiting for the next one.
-                    if let Some(event) = self.poll_async_event()? {
-                        return Ok(Some(event));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !fd::wait_readable(self.async_fd(), deadline).map_err(Error::AsyncEvent)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the event first;
+            // if so, go back to waiting for the next one.
+            if let Some(event) = self.poll_async_event()? {
+                return Ok(Some(event));
             }
         }
     }
