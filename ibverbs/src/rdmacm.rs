@@ -54,14 +54,15 @@
 //! one with [`wait_cm_event`], or — its event channel being non-blocking — wait on its file
 //! descriptor ([`AsRawFd`] / [`AsFd`]) with `epoll`, `poll`, a `tokio` `AsyncFd`, or any other
 //! reactor and pump events with [`poll_cm_event`]. You build the queue pair on the
-//! [`context`](CmId::context) the id resolves to and transition it with
-//! [`init_qp_attr`](CmId::init_qp_attr) plus
-//! [`QueuePair::modify`](crate::QueuePair::modify): on the active side `Init` before [`connect`],
-//! then — once the [`ConnectResponse`](CmEventType::ConnectResponse) has arrived — `Init` again
-//! (the attributes computed before the connection existed carry no remote-access flags),
-//! `ReadyToReceive`, `ReadyToSend`, and [`establish`](CmId::establish); on the passive side
-//! `Init`, `ReadyToReceive`, and `ReadyToSend` before [`accept`]. The blocking helpers are written
-//! on top of this same API.
+//! [`context`](CmId::context) the id resolves to and move it through its states with
+//! [`transition`](CmId::transition) and [`ready`](CmId::ready) (the connection manager's
+//! attributes for each state, applied with [`QueuePair::modify`](crate::QueuePair::modify)): on
+//! the active side `Init` before [`connect`], then — once the
+//! [`ConnectResponse`](CmEventType::ConnectResponse) has arrived — `Init` again (the attributes
+//! computed before the connection existed carry no remote-access flags), `ready`, and
+//! [`establish`](CmId::establish); on the passive side `Init` and `ready` before [`accept`]. The
+//! blocking helpers are written on top of this same API, and a connection set up this way can be
+//! wrapped in a [`Connection`] with [`Connection::from_parts`].
 //!
 //! [`resolve_addr`]: CmId::resolve_addr
 //! [`connect`]: CmId::connect
@@ -388,7 +389,7 @@ impl CmId {
         }
         Ok(Some(CmEvent {
             event,
-            _id: self.clone(),
+            id: self.clone(),
             taken: false,
         }))
     }
@@ -763,12 +764,22 @@ impl CmId {
         Ok(qp)
     }
 
-    /// Moves `qp` from `INIT` through `RTR` to `RTS`, completing the connection-manager transition.
+    /// Moves `qp` from `INIT` through `RTR` to `RTS` with the attributes the connection manager
+    /// computes ([`transition`](Self::transition) for both states): on the passive side before
+    /// [`accept`](Self::accept), on the active side after the
+    /// [`ConnectResponse`](CmEventType::ConnectResponse) and a second `Init`, before
+    /// [`establish`](Self::establish).
     ///
     /// Like librdmacm, `responder_resources` and `initiator_depth` override the outstanding-RDMA
     /// limits the connection manager computed (`max_dest_rd_atomic` at `RTR`, `max_rd_atomic` at
-    /// `RTS`), so the queue pair is configured with the values this side advertises in its reply.
-    fn ready(
+    /// `RTS`), so the queue pair is configured with the values this side advertises in its reply;
+    /// `None` keeps the computed values.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): computing the attributes or a transition
+    ///    failed (or its typed diagnoses of a rejected attribute set).
+    pub fn ready(
         &self,
         qp: &mut QueuePair<Rc>,
         responder_resources: Option<u8>,
@@ -788,8 +799,14 @@ impl CmId {
 
     /// Transitions `qp` to `state` using the attributes the connection manager computes from the
     /// resolved route and negotiated parameters ([`init_qp_attr`](Self::init_qp_attr)), applied with
-    /// [`QueuePair::modify`].
-    fn transition(&self, qp: &mut QueuePair<Rc>, state: QueuePairState) -> Result<()> {
+    /// [`QueuePair::modify`]: the step the blocking helpers take at each point of the setup (see
+    /// the [module docs](self#low-level-control)), for driving it from an event loop.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): computing the attributes or the transition
+    ///    failed (or its typed diagnoses of a rejected attribute set).
+    pub fn transition(&self, qp: &mut QueuePair<Rc>, state: QueuePairState) -> Result<()> {
         qp.modify(&self.init_qp_attr(state)?)
     }
 }
@@ -820,7 +837,7 @@ impl AsFd for CmId {
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
     /// The id whose channel delivered the event (the listener, for a connection request).
-    _id: CmId,
+    id: CmId,
     /// Whether a connection request's new id has been taken over by
     /// [`connection_request`](Self::connection_request).
     taken: bool,
@@ -838,6 +855,12 @@ impl CmEvent {
             status: self.status(),
             private_data: self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
         }
+    }
+
+    /// The id whose channel delivered this event (for a connection request, the listener; the new
+    /// connection's id is taken with [`connection_request`](Self::connection_request)).
+    pub fn id(&self) -> &CmId {
+        &self.id
     }
 
     /// The kind of event. Match on the [`CmEventType`] to decide what to do next; see [`CmId`] for
@@ -1053,6 +1076,57 @@ impl ConnectionParameter {
     }
 }
 
+/// The options and addresses of a connection-manager id that one of the blocking helpers is
+/// driving: what [`Connector::cm_id`], [`Resolved::cm_id`], [`Acceptor::cm_id`], and
+/// [`Incoming::cm_id`] hand out. It leaves out the event pump and the state-machine steps, which
+/// the helper is driving itself; to drive those, use a [`CmId`] directly.
+#[derive(Clone, Copy)]
+pub struct CmIdOptions<'a> {
+    id: &'a CmId,
+}
+
+impl CmIdOptions<'_> {
+    /// Set the type of service of the id's traffic ([`CmId::set_tos`]).
+    pub fn set_tos(&self, tos: u8) -> Result<()> {
+        self.id.set_tos(tos)
+    }
+
+    /// Allow the local address to be shared ([`CmId::set_reuse_addr`]).
+    pub fn set_reuse_addr(&self, reuse: bool) -> Result<()> {
+        self.id.set_reuse_addr(reuse)
+    }
+
+    /// Restrict an IPv6-bound id to IPv6 peers ([`CmId::set_af_only`]).
+    pub fn set_af_only(&self, only: bool) -> Result<()> {
+        self.id.set_af_only(only)
+    }
+
+    /// Override the ACK timeout the connection manager derives ([`CmId::set_ack_timeout`]).
+    pub fn set_ack_timeout(&self, timeout: AckTimeout) -> Result<()> {
+        self.id.set_ack_timeout(timeout)
+    }
+
+    /// Report the peer's first message as received ([`CmId::notify_established`]).
+    pub fn notify_established(&self) -> Result<()> {
+        self.id.notify_established()
+    }
+
+    /// The remote address, once resolved ([`CmId::peer_addr`]).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.id.peer_addr()
+    }
+
+    /// The local address, once bound or resolved ([`CmId::local_addr`]).
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.id.local_addr()
+    }
+
+    /// The underlying `rdma_cm_id` pointer ([`CmId::as_raw`]).
+    pub fn as_raw(&self) -> *mut ffi::rdma_cm_id {
+        self.id.as_raw()
+    }
+}
+
 /// Active-side blocking connection setup. Created by [`Connector::new`]; drives address and route
 /// resolution, then yields a [`Resolved`] from which you build a queue pair and connect.
 #[must_use]
@@ -1075,10 +1149,10 @@ impl Connector {
         })
     }
 
-    /// The underlying id, for options that must be set before resolving ([`CmId::set_tos`],
-    /// [`CmId::set_ack_timeout`]).
-    pub fn cm_id(&self) -> &CmId {
-        &self.id
+    /// The underlying id's options, for the ones that must be set before resolving
+    /// ([`set_tos`](CmIdOptions::set_tos), [`set_ack_timeout`](CmIdOptions::set_ack_timeout)).
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.id }
     }
 
     /// Resolves the destination address and route (blocking until both complete), then returns a
@@ -1109,10 +1183,10 @@ impl Resolved {
         self.id.context()
     }
 
-    /// The underlying id: the resolved route's addresses, and the options that must be set before
-    /// connecting ([`CmId::set_ack_timeout`]).
-    pub fn cm_id(&self) -> &CmId {
-        &self.id
+    /// The underlying id's options: the resolved route's addresses, and the ones that must be set
+    /// before connecting ([`set_ack_timeout`](CmIdOptions::set_ack_timeout)).
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.id }
     }
 
     /// Connects to the remote (blocking) using `qp`, returning the established [`Connection`]. The
@@ -1202,9 +1276,9 @@ impl Acceptor {
         Ok(Acceptor { listener })
     }
 
-    /// The listening id.
-    pub fn cm_id(&self) -> &CmId {
-        &self.listener
+    /// The listening id's options and addresses.
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.listener }
     }
 
     /// The local address the acceptor listens on: the address passed to [`bind`](Self::bind),
@@ -1265,10 +1339,10 @@ impl Incoming {
         self.id.context()
     }
 
-    /// The request's id: the peer's address, and the options that must be set before accepting
-    /// ([`CmId::set_ack_timeout`]).
-    pub fn cm_id(&self) -> &CmId {
-        &self.id
+    /// The request's id's options: the peer's address, and the ones that must be set before
+    /// accepting ([`set_ack_timeout`](CmIdOptions::set_ack_timeout)).
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.id }
     }
 
     /// The private data the peer attached to its request
@@ -1347,6 +1421,32 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Assemble a connection from its parts — an established id, the queue pair connected through
+    /// it, and the private data the peer sent — so a connection set up by driving a [`CmId`]
+    /// yourself disconnects on drop like the ones the blocking helpers return.
+    pub fn from_parts(id: CmId, qp: QueuePair<Rc>, peer_private_data: Vec<u8>) -> Connection {
+        Connection {
+            id,
+            qp,
+            private_data: peer_private_data,
+        }
+    }
+
+    /// Take the connection apart without disconnecting: the id, the queue pair, and the peer's
+    /// private data. Dropping the id later destroys it (which also tears the connection down); the
+    /// queue pair is destroyed on its own when dropped.
+    pub fn into_parts(self) -> (CmId, QueuePair<Rc>, Vec<u8>) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: each field is moved out exactly once, and `this` is never dropped.
+        unsafe {
+            (
+                ptr::read(&this.id),
+                ptr::read(&this.qp),
+                ptr::read(&this.private_data),
+            )
+        }
+    }
+
     /// The connected queue pair, for posting work requests. Poll completions on the completion queue
     /// you built it with.
     pub fn queue_pair(&mut self) -> &mut QueuePair<Rc> {

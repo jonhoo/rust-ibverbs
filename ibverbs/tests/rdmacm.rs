@@ -14,7 +14,7 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use ibverbs::rdmacm::{
-    Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
+    Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
     AccessFlags, AckTimeout, CompletionQueue, Context, Error, GidType, QueuePairAttributeMask,
@@ -1050,7 +1050,12 @@ fn cm_id_options_and_accessors() {
         let conn = incoming
             .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
-        assert_eq!(conn.cm_id().peer_addr(), conn.cm_id().peer_addr());
+        assert!(conn.cm_id().peer_addr().is_some());
+        // Taking the connection apart and reassembling it hands back the same connection, still
+        // disconnecting on drop.
+        let (id, qp, data) = conn.into_parts();
+        let conn = Connection::from_parts(id, qp, data);
+        assert!(conn.cm_id().peer_addr().is_some());
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("client done");
@@ -1082,7 +1087,6 @@ fn cm_id_options_and_accessors() {
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     assert_eq!(conn.cm_id().peer_addr(), Some(addr));
-    assert_eq!(conn.cm_id().local_addr(), conn.cm_id().local_addr());
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }
