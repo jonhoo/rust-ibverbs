@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::pd::ProtectionDomainInner;
+use crate::pd::ProtectionDomain;
 use crate::qp::{post_linked, RecvRequest};
 use crate::raw;
 
 pub(crate) struct SharedReceiveQueueInner {
-    pub(crate) _pd: Arc<ProtectionDomainInner>,
+    pub(crate) _pd: ProtectionDomain,
     pub(crate) srq: *mut ffi::ibv_srq,
 }
 

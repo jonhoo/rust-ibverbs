@@ -4,16 +4,13 @@ use std::sync::Arc;
 
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
-use crate::context::ContextInner;
+use crate::context::{Context, PortState};
 use crate::error::{Error, Result};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
 use crate::qp::{QueuePairBuilder, Transport};
 use crate::raw;
 
 use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
-
-#[cfg(doc)]
-use crate::Context;
 
 c_enum! {
     /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
@@ -108,9 +105,9 @@ impl From<MrAdviseFlags> for u32 {
     }
 }
 
-pub(crate) struct ProtectionDomainInner {
-    pub(crate) ctx: Arc<ContextInner>,
-    pub(crate) pd: *mut ffi::ibv_pd,
+struct ProtectionDomainInner {
+    ctx: Context,
+    pd: *mut ffi::ibv_pd,
 }
 
 impl Drop for ProtectionDomainInner {
@@ -126,10 +123,29 @@ unsafe impl Send for ProtectionDomainInner {}
 #[must_use]
 #[derive(Clone)]
 pub struct ProtectionDomain {
-    pub(crate) inner: Arc<ProtectionDomainInner>,
+    inner: Arc<ProtectionDomainInner>,
 }
 
 impl ProtectionDomain {
+    /// Allocate a protection domain on `ctx` (for [`Context::alloc_pd`]).
+    pub(crate) fn alloc(ctx: &Context) -> Result<ProtectionDomain> {
+        let pd = raw::nonnull(
+            unsafe { ffi::ibv_alloc_pd(ctx.as_raw()) },
+            Error::AllocProtectionDomain,
+        )?;
+        Ok(ProtectionDomain {
+            inner: Arc::new(ProtectionDomainInner {
+                ctx: ctx.clone(),
+                pd,
+            }),
+        })
+    }
+
+    /// The device context this protection domain was allocated on.
+    pub fn context(&self) -> &Context {
+        &self.inner.ctx
+    }
+
     /// Returns the underlying `ibv_pd` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
@@ -155,7 +171,7 @@ impl ProtectionDomain {
             Error::CreateAddressHandle,
         )?;
         Ok(AddressHandle {
-            _pd: self.inner.clone(),
+            _pd: self.clone(),
             ah,
         })
     }
@@ -221,13 +237,23 @@ impl ProtectionDomain {
         port_num: u8,
     ) -> Result<QueuePairBuilder<T>> {
         let port_attr = self.inner.ctx.query_port(port_num)?;
+        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
+        //
+        //   The content of the GID table is valid only when the port_attr.state is either
+        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
+        //   table is indeterminate.
+        //
+        match port_attr.state() {
+            PortState::Active | PortState::Armed => {}
+            _ => return Err(Error::PortNotActive(port_num)),
+        }
         Ok(QueuePairBuilder::new(
-            self.inner.clone(),
-            port_attr,
+            self.clone(),
+            *port_attr.as_raw(),
             port_num,
-            send.inner.clone(),
+            send.clone(),
             1,
-            recv.inner.clone(),
+            recv.clone(),
             1,
             T::TYPE.into(),
             1,
@@ -254,7 +280,7 @@ impl ProtectionDomain {
             Error::RegisterMemoryRegion,
         )?;
         Ok(MemoryRegionInner {
-            _pd: self.inner.clone(),
+            _pd: self.clone(),
             mr,
             addr: ptr as u64,
         })
@@ -383,7 +409,7 @@ impl ProtectionDomain {
             Error::RegisterMemoryRegion,
         )?;
         let inner = MemoryRegionInner {
-            _pd: self.inner.clone(),
+            _pd: self.clone(),
             mr,
             addr: iova,
         };
@@ -435,7 +461,7 @@ impl ProtectionDomain {
         )?;
         Ok(SharedReceiveQueue {
             inner: Arc::new(SharedReceiveQueueInner {
-                _pd: self.inner.clone(),
+                _pd: self.clone(),
                 srq,
             }),
         })

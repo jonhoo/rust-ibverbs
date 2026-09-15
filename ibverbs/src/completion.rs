@@ -6,13 +6,10 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::context::{ContextInner, HcaClock};
+use crate::context::{Context, HcaClock};
 use crate::error::{Error, Result};
 use crate::fd;
 use crate::raw;
-
-#[cfg(doc)]
-use crate::Context;
 
 /// A completion channel: the file descriptor that delivers completion-queue notifications.
 /// Created by [`Context::create_comp_channel`].
@@ -43,7 +40,7 @@ pub struct CompletionChannel {
 
 struct CompletionChannelInner {
     // Kept so the device outlives the channel.
-    _ctx: Arc<ContextInner>,
+    _ctx: Context,
     cc: *mut ffi::ibv_comp_channel,
 }
 
@@ -62,9 +59,9 @@ impl CompletionChannel {
     /// Create a completion channel on `ctx` (for [`Context::create_comp_channel`]), with its file
     /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
     /// instead of blocking.
-    pub(crate) fn new(ctx: &Arc<ContextInner>) -> Result<CompletionChannel> {
+    pub(crate) fn new(ctx: &Context) -> Result<CompletionChannel> {
         let cc = raw::nonnull(
-            unsafe { ffi::ibv_create_comp_channel(ctx.ctx) },
+            unsafe { ffi::ibv_create_comp_channel(ctx.as_raw()) },
             Error::CreateCompletionChannel,
         )?;
         let channel = CompletionChannel {
@@ -177,17 +174,30 @@ impl AsFd for CompletionChannel {
 /// [`build`](Self::build) to create the queue.
 #[must_use]
 pub struct CompletionQueueBuilder {
-    pub(crate) ctx: Arc<ContextInner>,
-    pub(crate) min_cq_entries: u32,
-    pub(crate) cq_context: u64,
-    pub(crate) comp_vector: u32,
+    ctx: Context,
+    min_cq_entries: u32,
+    cq_context: u64,
+    comp_vector: u32,
     /// extra work-completion fields requested on top of the always-present standard set
-    pub(crate) wc_flags: u32,
+    wc_flags: u32,
     /// the completion channel to deliver notifications on, if any
-    pub(crate) comp_channel: Option<CompletionChannel>,
+    comp_channel: Option<CompletionChannel>,
 }
 
 impl CompletionQueueBuilder {
+    /// The builder behind [`Context::create_cq`]: a plain polled queue of at least
+    /// `min_cq_entries` entries on `ctx`.
+    pub(crate) fn new(ctx: Context, min_cq_entries: u32) -> Self {
+        CompletionQueueBuilder {
+            ctx,
+            min_cq_entries,
+            cq_context: 0,
+            comp_vector: 0,
+            wc_flags: 0,
+            comp_channel: None,
+        }
+    }
+
     /// Set an opaque context value associated with the completion queue.
     ///
     /// Defaults to 0.
@@ -273,12 +283,12 @@ impl CompletionQueueBuilder {
             (*p).wc_flags = wc_flags as u64;
         }
         let cq_ex = raw::nonnull(
-            unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, cq_attr.as_mut_ptr()) },
+            unsafe { ffi::ibv_create_cq_ex(self.ctx.as_raw(), cq_attr.as_mut_ptr()) },
             Error::CreateCompletionQueue,
         )?;
         Ok(CompletionQueue {
             inner: Arc::new(CompletionQueueInner {
-                _ctx: self.ctx.clone(),
+                ctx: self.ctx.clone(),
                 cc,
                 cq_ex,
             }),
@@ -286,8 +296,8 @@ impl CompletionQueueBuilder {
     }
 }
 
-pub(crate) struct CompletionQueueInner {
-    _ctx: Arc<ContextInner>,
+struct CompletionQueueInner {
+    ctx: Context,
     cq_ex: *mut ffi::ibv_cq_ex,
     cc: Option<CompletionChannel>,
 }
@@ -297,7 +307,7 @@ impl CompletionQueueInner {
     /// just a pointer cast (exactly what `ibv_cq_ex_to_cq` does in C). Used for the verbs that still
     /// take a plain `ibv_cq`: queue-pair creation, completion-event notification, and teardown.
     #[inline]
-    pub(crate) fn cq(&self) -> *mut ffi::ibv_cq {
+    fn cq(&self) -> *mut ffi::ibv_cq {
         self.cq_ex as *mut ffi::ibv_cq
     }
 }
@@ -779,10 +789,15 @@ impl Drop for Completions<'_> {
 #[must_use]
 #[derive(Clone)]
 pub struct CompletionQueue {
-    pub(crate) inner: Arc<CompletionQueueInner>,
+    inner: Arc<CompletionQueueInner>,
 }
 
 impl CompletionQueue {
+    /// The device context this queue was created on.
+    pub fn context(&self) -> &Context {
+        &self.inner.ctx
+    }
+
     /// Poll for the work completions that are ready, through the extended interface.
     ///
     /// The returned [`Completions`] is a lending iterator whose [`WorkCompletion`]s read their

@@ -13,14 +13,14 @@ use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
 use crate::error::{Error, Result};
 use crate::fd;
-use crate::pd::{ProtectionDomain, ProtectionDomainInner};
+use crate::pd::ProtectionDomain;
 use crate::raw;
 
 #[cfg(doc)]
 use crate::{Device, QueuePairBuilder, WorkCompletion};
 
-pub(crate) struct ContextInner {
-    pub(crate) ctx: *mut ffi::ibv_context,
+struct ContextInner {
+    ctx: *mut ffi::ibv_context,
     ownership: ContextOwnership,
 }
 
@@ -35,40 +35,6 @@ enum ContextOwnership {
     #[cfg(feature = "rdmacm")]
     #[allow(dead_code)]
     Borrowed(Arc<dyn Send + Sync>),
-}
-
-impl ContextInner {
-    pub(crate) fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr> {
-        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
-        //
-        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
-        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
-        //   recommended avoiding saving the result of this query, or to flush them when a new SM
-        //   (re)configures the subnet.
-        //
-        let mut port_attr = ffi::ibv_port_attr::default();
-        // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
-        // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
-        let errno = unsafe { ffi::___ibv_query_port(self.ctx, port_num, &mut port_attr) };
-        raw::errno(errno, |e| Error::QueryPort {
-            port_num,
-            source: e,
-        })?;
-
-        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
-        //
-        //   The content of the GID table is valid only when the port_attr.state is either
-        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
-        //   table is indeterminate.
-        //
-        match port_attr.state {
-            ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
-            _ => {
-                return Err(Error::PortNotActive(port_num));
-            }
-        }
-        Ok(port_attr)
-    }
 }
 
 impl Drop for ContextInner {
@@ -185,14 +151,7 @@ impl Context {
     /// # }
     /// ```
     pub fn create_cq(&self, min_cq_entries: u32) -> CompletionQueueBuilder {
-        CompletionQueueBuilder {
-            ctx: self.inner.clone(),
-            min_cq_entries,
-            cq_context: 0,
-            comp_vector: 0,
-            wc_flags: 0,
-            comp_channel: None,
-        }
+        CompletionQueueBuilder::new(self.clone(), min_cq_entries)
     }
 
     /// Create a completion channel: the file descriptor that delivers completion notifications for
@@ -209,7 +168,7 @@ impl Context {
     ///  - [`CreateCompletionChannel`](Error::CreateCompletionChannel): creating the channel or
     ///    setting its descriptor non-blocking failed.
     pub fn create_comp_channel(&self) -> Result<CompletionChannel> {
-        CompletionChannel::new(&self.inner)
+        CompletionChannel::new(self)
     }
 
     /// The file descriptor that delivers the device's asynchronous events, for handing to an
@@ -291,16 +250,7 @@ impl Context {
     ///
     ///  - [`AllocProtectionDomain`](Error::AllocProtectionDomain): `ibv_alloc_pd` failed.
     pub fn alloc_pd(&self) -> Result<ProtectionDomain> {
-        let pd = raw::nonnull(
-            unsafe { ffi::ibv_alloc_pd(self.inner.ctx) },
-            Error::AllocProtectionDomain,
-        )?;
-        Ok(ProtectionDomain {
-            inner: Arc::new(ProtectionDomainInner {
-                ctx: self.inner.clone(),
-                pd,
-            }),
-        })
+        ProtectionDomain::alloc(self)
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
