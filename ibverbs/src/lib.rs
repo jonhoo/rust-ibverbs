@@ -264,6 +264,50 @@ macro_rules! flags_newtype {
     };
 }
 
+/// Defines a crate-native enum mirroring one of the raw bindings' C enums: each variant names its
+/// raw counterpart and its display name, from which lossless conversions in both directions and a
+/// `Display` writing that name are generated.
+macro_rules! c_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident($ffi:ty) {
+            $( $(#[$vmeta:meta])* $variant:ident = $raw:ident => $display:literal; )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[non_exhaustive]
+        $vis enum $name {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl From<$ffi> for $name {
+            fn from(raw: $ffi) -> Self {
+                match raw {
+                    $( <$ffi>::$raw => $name::$variant, )+
+                }
+            }
+        }
+
+        impl From<$name> for $ffi {
+            fn from(value: $name) -> Self {
+                match value {
+                    $( $name::$variant => <$ffi>::$raw, )+
+                }
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                let name = match self {
+                    $( $name::$variant => $display, )+
+                };
+                f.write_str(name)
+            }
+        }
+    };
+}
+
 mod address;
 mod completion;
 mod context;

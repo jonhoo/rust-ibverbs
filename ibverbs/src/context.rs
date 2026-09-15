@@ -623,148 +623,62 @@ impl fmt::Debug for AsyncEvent<'_> {
     }
 }
 
-/// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
-///
-/// The events fall into three scopes: affiliated errors and state changes on a completion queue,
-/// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which),
-/// port-level changes (with [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AsyncEventType {
-    /// An error occurred on a completion queue (overrun or protection fault); the queue and the
-    /// queue pairs attached to it are unusable.
-    CqError,
-    /// An error occurred on a queue pair that its completion queues could not report; the queue
-    /// pair moved to the error state.
-    QpFatal,
-    /// The transport detected an invalid request on the queue pair while it was the responder.
-    QpRequestError,
-    /// The transport detected an access violation on the queue pair while it was the responder.
-    QpAccessError,
-    /// The first message arrived on a queue pair still in `RTR` (communication is established).
-    CommEstablished,
-    /// The send queue finished draining after a transition to `SQD`.
-    SqDrained,
-    /// The connection migrated to its alternate path.
-    PathMigrated,
-    /// The connection failed to migrate to its alternate path.
-    PathMigrationError,
-    /// The device is in a fatal state; all of its resources are unusable.
-    DeviceFatal,
-    /// The port's logical state became active.
-    PortActive,
-    /// The port's logical state left active.
-    PortError,
-    /// The subnet manager changed the port's LID.
-    LidChange,
-    /// The port's partition-key (P_Key) table changed.
-    PkeyChange,
-    /// A new subnet manager took over the port.
-    SmChange,
-    /// An error occurred on a shared receive queue.
-    SrqError,
-    /// The number of receives posted to a shared receive queue dropped below its low watermark
-    /// (the `srq_limit` of [`ProtectionDomain::create_srq`]).
-    SrqLimitReached,
-    /// The last work request reached a queue pair, attached to a shared receive queue, that is in
-    /// the error state: no more receives will be consumed from the SRQ by this queue pair.
-    QpLastWqeReached,
-    /// The subnet manager asked the port's clients to reregister their subscriptions.
-    ClientReregister,
-    /// The port's GID table changed.
-    GidChange,
-    /// An error occurred on a work queue.
-    WqFatal,
-    /// The device's link speed changed.
-    DeviceSpeedChange,
-}
-
-impl From<ffi::ibv_event_type> for AsyncEventType {
-    fn from(event: ffi::ibv_event_type) -> Self {
-        use ffi::ibv_event_type::*;
-        match event {
-            IBV_EVENT_CQ_ERR => AsyncEventType::CqError,
-            IBV_EVENT_QP_FATAL => AsyncEventType::QpFatal,
-            IBV_EVENT_QP_REQ_ERR => AsyncEventType::QpRequestError,
-            IBV_EVENT_QP_ACCESS_ERR => AsyncEventType::QpAccessError,
-            IBV_EVENT_COMM_EST => AsyncEventType::CommEstablished,
-            IBV_EVENT_SQ_DRAINED => AsyncEventType::SqDrained,
-            IBV_EVENT_PATH_MIG => AsyncEventType::PathMigrated,
-            IBV_EVENT_PATH_MIG_ERR => AsyncEventType::PathMigrationError,
-            IBV_EVENT_DEVICE_FATAL => AsyncEventType::DeviceFatal,
-            IBV_EVENT_PORT_ACTIVE => AsyncEventType::PortActive,
-            IBV_EVENT_PORT_ERR => AsyncEventType::PortError,
-            IBV_EVENT_LID_CHANGE => AsyncEventType::LidChange,
-            IBV_EVENT_PKEY_CHANGE => AsyncEventType::PkeyChange,
-            IBV_EVENT_SM_CHANGE => AsyncEventType::SmChange,
-            IBV_EVENT_SRQ_ERR => AsyncEventType::SrqError,
-            IBV_EVENT_SRQ_LIMIT_REACHED => AsyncEventType::SrqLimitReached,
-            IBV_EVENT_QP_LAST_WQE_REACHED => AsyncEventType::QpLastWqeReached,
-            IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
-            IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
-            IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
-            IBV_EVENT_DEVICE_SPEED_CHANGE => AsyncEventType::DeviceSpeedChange,
-        }
-    }
-}
-
-impl From<AsyncEventType> for ffi::ibv_event_type {
-    fn from(event: AsyncEventType) -> Self {
-        use ffi::ibv_event_type::*;
-        match event {
-            AsyncEventType::CqError => IBV_EVENT_CQ_ERR,
-            AsyncEventType::QpFatal => IBV_EVENT_QP_FATAL,
-            AsyncEventType::QpRequestError => IBV_EVENT_QP_REQ_ERR,
-            AsyncEventType::QpAccessError => IBV_EVENT_QP_ACCESS_ERR,
-            AsyncEventType::CommEstablished => IBV_EVENT_COMM_EST,
-            AsyncEventType::SqDrained => IBV_EVENT_SQ_DRAINED,
-            AsyncEventType::PathMigrated => IBV_EVENT_PATH_MIG,
-            AsyncEventType::PathMigrationError => IBV_EVENT_PATH_MIG_ERR,
-            AsyncEventType::DeviceFatal => IBV_EVENT_DEVICE_FATAL,
-            AsyncEventType::PortActive => IBV_EVENT_PORT_ACTIVE,
-            AsyncEventType::PortError => IBV_EVENT_PORT_ERR,
-            AsyncEventType::LidChange => IBV_EVENT_LID_CHANGE,
-            AsyncEventType::PkeyChange => IBV_EVENT_PKEY_CHANGE,
-            AsyncEventType::SmChange => IBV_EVENT_SM_CHANGE,
-            AsyncEventType::SrqError => IBV_EVENT_SRQ_ERR,
-            AsyncEventType::SrqLimitReached => IBV_EVENT_SRQ_LIMIT_REACHED,
-            AsyncEventType::QpLastWqeReached => IBV_EVENT_QP_LAST_WQE_REACHED,
-            AsyncEventType::ClientReregister => IBV_EVENT_CLIENT_REREGISTER,
-            AsyncEventType::GidChange => IBV_EVENT_GID_CHANGE,
-            AsyncEventType::WqFatal => IBV_EVENT_WQ_FATAL,
-            AsyncEventType::DeviceSpeedChange => IBV_EVENT_DEVICE_SPEED_CHANGE,
-        }
-    }
-}
-
-impl std::fmt::Display for AsyncEventType {
-    /// Formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
+c_enum! {
+    /// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
+    ///
+    /// The events fall into three scopes: affiliated errors and state changes on a completion queue,
+    /// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which),
+    /// port-level changes (with [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
+    ///
+    /// `Display` formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
     /// [`SrqLimitReached`](Self::SrqLimitReached).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            AsyncEventType::CqError => "CQ_ERR",
-            AsyncEventType::QpFatal => "QP_FATAL",
-            AsyncEventType::QpRequestError => "QP_REQ_ERR",
-            AsyncEventType::QpAccessError => "QP_ACCESS_ERR",
-            AsyncEventType::CommEstablished => "COMM_EST",
-            AsyncEventType::SqDrained => "SQ_DRAINED",
-            AsyncEventType::PathMigrated => "PATH_MIG",
-            AsyncEventType::PathMigrationError => "PATH_MIG_ERR",
-            AsyncEventType::DeviceFatal => "DEVICE_FATAL",
-            AsyncEventType::PortActive => "PORT_ACTIVE",
-            AsyncEventType::PortError => "PORT_ERR",
-            AsyncEventType::LidChange => "LID_CHANGE",
-            AsyncEventType::PkeyChange => "PKEY_CHANGE",
-            AsyncEventType::SmChange => "SM_CHANGE",
-            AsyncEventType::SrqError => "SRQ_ERR",
-            AsyncEventType::SrqLimitReached => "SRQ_LIMIT_REACHED",
-            AsyncEventType::QpLastWqeReached => "QP_LAST_WQE_REACHED",
-            AsyncEventType::ClientReregister => "CLIENT_REREGISTER",
-            AsyncEventType::GidChange => "GID_CHANGE",
-            AsyncEventType::WqFatal => "WQ_FATAL",
-            AsyncEventType::DeviceSpeedChange => "DEVICE_SPEED_CHANGE",
-        };
-        f.write_str(name)
+    pub enum AsyncEventType(ffi::ibv_event_type) {
+        /// An error occurred on a completion queue (overrun or protection fault); the queue and the
+        /// queue pairs attached to it are unusable.
+        CqError = IBV_EVENT_CQ_ERR => "CQ_ERR";
+        /// An error occurred on a queue pair that its completion queues could not report; the queue
+        /// pair moved to the error state.
+        QpFatal = IBV_EVENT_QP_FATAL => "QP_FATAL";
+        /// The transport detected an invalid request on the queue pair while it was the responder.
+        QpRequestError = IBV_EVENT_QP_REQ_ERR => "QP_REQ_ERR";
+        /// The transport detected an access violation on the queue pair while it was the responder.
+        QpAccessError = IBV_EVENT_QP_ACCESS_ERR => "QP_ACCESS_ERR";
+        /// The first message arrived on a queue pair still in `RTR` (communication is established).
+        CommEstablished = IBV_EVENT_COMM_EST => "COMM_EST";
+        /// The send queue finished draining after a transition to `SQD`.
+        SqDrained = IBV_EVENT_SQ_DRAINED => "SQ_DRAINED";
+        /// The connection migrated to its alternate path.
+        PathMigrated = IBV_EVENT_PATH_MIG => "PATH_MIG";
+        /// The connection failed to migrate to its alternate path.
+        PathMigrationError = IBV_EVENT_PATH_MIG_ERR => "PATH_MIG_ERR";
+        /// The device is in a fatal state; all of its resources are unusable.
+        DeviceFatal = IBV_EVENT_DEVICE_FATAL => "DEVICE_FATAL";
+        /// The port's logical state became active.
+        PortActive = IBV_EVENT_PORT_ACTIVE => "PORT_ACTIVE";
+        /// The port's logical state left active.
+        PortError = IBV_EVENT_PORT_ERR => "PORT_ERR";
+        /// The subnet manager changed the port's LID.
+        LidChange = IBV_EVENT_LID_CHANGE => "LID_CHANGE";
+        /// The port's partition-key (P_Key) table changed.
+        PkeyChange = IBV_EVENT_PKEY_CHANGE => "PKEY_CHANGE";
+        /// A new subnet manager took over the port.
+        SmChange = IBV_EVENT_SM_CHANGE => "SM_CHANGE";
+        /// An error occurred on a shared receive queue.
+        SrqError = IBV_EVENT_SRQ_ERR => "SRQ_ERR";
+        /// The number of receives posted to a shared receive queue dropped below its low watermark
+        /// (the `srq_limit` of [`ProtectionDomain::create_srq`]).
+        SrqLimitReached = IBV_EVENT_SRQ_LIMIT_REACHED => "SRQ_LIMIT_REACHED";
+        /// The last work request reached a queue pair, attached to a shared receive queue, that is in
+        /// the error state: no more receives will be consumed from the SRQ by this queue pair.
+        QpLastWqeReached = IBV_EVENT_QP_LAST_WQE_REACHED => "QP_LAST_WQE_REACHED";
+        /// The subnet manager asked the port's clients to reregister their subscriptions.
+        ClientReregister = IBV_EVENT_CLIENT_REREGISTER => "CLIENT_REREGISTER";
+        /// The port's GID table changed.
+        GidChange = IBV_EVENT_GID_CHANGE => "GID_CHANGE";
+        /// An error occurred on a work queue.
+        WqFatal = IBV_EVENT_WQ_FATAL => "WQ_FATAL";
+        /// The device's link speed changed.
+        DeviceSpeedChange = IBV_EVENT_DEVICE_SPEED_CHANGE => "DEVICE_SPEED_CHANGE";
     }
 }
 
@@ -796,23 +710,25 @@ impl std::ops::Sub for HcaClock {
     }
 }
 
-/// A path or port MTU (maximum transfer unit), the message fragment size on the wire.
-///
-/// Returned by [`PortAttr::active_mtu`] / [`PortAttr::max_mtu`], and set on a queue pair with
-/// [`QueuePairBuilder::set_path_mtu`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Mtu {
-    /// 256 bytes.
-    Mtu256,
-    /// 512 bytes.
-    Mtu512,
-    /// 1024 bytes.
-    Mtu1024,
-    /// 2048 bytes.
-    Mtu2048,
-    /// 4096 bytes.
-    Mtu4096,
+c_enum! {
+    /// A path or port MTU (maximum transfer unit), the message fragment size on the wire.
+    ///
+    /// Returned by [`PortAttr::active_mtu`] / [`PortAttr::max_mtu`], and set on a queue pair with
+    /// [`QueuePairBuilder::set_path_mtu`].
+    ///
+    /// `Display` writes the size in bytes.
+    pub enum Mtu(ffi::ibv_mtu) {
+        /// 256 bytes.
+        Mtu256 = IBV_MTU_256 => "256";
+        /// 512 bytes.
+        Mtu512 = IBV_MTU_512 => "512";
+        /// 1024 bytes.
+        Mtu1024 = IBV_MTU_1024 => "1024";
+        /// 2048 bytes.
+        Mtu2048 = IBV_MTU_2048 => "2048";
+        /// 4096 bytes.
+        Mtu4096 = IBV_MTU_4096 => "4096";
+    }
 }
 
 impl Mtu {
@@ -828,91 +744,21 @@ impl Mtu {
     }
 }
 
-impl From<ffi::ibv_mtu> for Mtu {
-    fn from(mtu: ffi::ibv_mtu) -> Self {
-        match mtu {
-            ffi::ibv_mtu::IBV_MTU_256 => Mtu::Mtu256,
-            ffi::ibv_mtu::IBV_MTU_512 => Mtu::Mtu512,
-            ffi::ibv_mtu::IBV_MTU_1024 => Mtu::Mtu1024,
-            ffi::ibv_mtu::IBV_MTU_2048 => Mtu::Mtu2048,
-            ffi::ibv_mtu::IBV_MTU_4096 => Mtu::Mtu4096,
-        }
-    }
-}
-
-impl From<Mtu> for ffi::ibv_mtu {
-    fn from(mtu: Mtu) -> Self {
-        match mtu {
-            Mtu::Mtu256 => ffi::ibv_mtu::IBV_MTU_256,
-            Mtu::Mtu512 => ffi::ibv_mtu::IBV_MTU_512,
-            Mtu::Mtu1024 => ffi::ibv_mtu::IBV_MTU_1024,
-            Mtu::Mtu2048 => ffi::ibv_mtu::IBV_MTU_2048,
-            Mtu::Mtu4096 => ffi::ibv_mtu::IBV_MTU_4096,
-        }
-    }
-}
-
-impl fmt::Display for Mtu {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.bytes())
-    }
-}
-
-/// The logical state of a port. Returned by [`PortAttr::state`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PortState {
-    /// Reserved value (no state change).
-    Nop,
-    /// The port is down.
-    Down,
-    /// The port is initializing: the link is up, but the subnet manager has not configured it yet.
-    Init,
-    /// The port is armed: it may receive, but not yet transmit, data packets.
-    Armed,
-    /// The port is active and may send and receive packets.
-    Active,
-    /// The port is active, but temporarily deferring packet transmission.
-    ActiveDefer,
-}
-
-impl From<ffi::ibv_port_state> for PortState {
-    fn from(state: ffi::ibv_port_state) -> Self {
-        match state {
-            ffi::ibv_port_state::IBV_PORT_NOP => PortState::Nop,
-            ffi::ibv_port_state::IBV_PORT_DOWN => PortState::Down,
-            ffi::ibv_port_state::IBV_PORT_INIT => PortState::Init,
-            ffi::ibv_port_state::IBV_PORT_ARMED => PortState::Armed,
-            ffi::ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
-            ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
-        }
-    }
-}
-
-impl From<PortState> for ffi::ibv_port_state {
-    fn from(state: PortState) -> Self {
-        match state {
-            PortState::Nop => ffi::ibv_port_state::IBV_PORT_NOP,
-            PortState::Down => ffi::ibv_port_state::IBV_PORT_DOWN,
-            PortState::Init => ffi::ibv_port_state::IBV_PORT_INIT,
-            PortState::Armed => ffi::ibv_port_state::IBV_PORT_ARMED,
-            PortState::Active => ffi::ibv_port_state::IBV_PORT_ACTIVE,
-            PortState::ActiveDefer => ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER,
-        }
-    }
-}
-
-impl fmt::Display for PortState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            PortState::Nop => "Nop",
-            PortState::Down => "Down",
-            PortState::Init => "Init",
-            PortState::Armed => "Armed",
-            PortState::Active => "Active",
-            PortState::ActiveDefer => "ActiveDefer",
-        };
-        f.write_str(name)
+c_enum! {
+    /// The logical state of a port. Returned by [`PortAttr::state`].
+    pub enum PortState(ffi::ibv_port_state) {
+        /// Reserved value (no state change).
+        Nop = IBV_PORT_NOP => "Nop";
+        /// The port is down.
+        Down = IBV_PORT_DOWN => "Down";
+        /// The port is initializing: the link is up, but the subnet manager has not configured it yet.
+        Init = IBV_PORT_INIT => "Init";
+        /// The port is armed: it may receive, but not yet transmit, data packets.
+        Armed = IBV_PORT_ARMED => "Armed";
+        /// The port is active and may send and receive packets.
+        Active = IBV_PORT_ACTIVE => "Active";
+        /// The port is active, but temporarily deferring packet transmission.
+        ActiveDefer = IBV_PORT_ACTIVE_DEFER => "ActiveDefer";
     }
 }
 

@@ -86,192 +86,74 @@ use crate::{
     AckTimeout, Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Rc, Result,
 };
 
-/// The port space a connection-manager identifier lives in: which namespace its port numbers are
-/// allocated from, and which transport its connections use. Passed to [`Connector::new`],
-/// [`Acceptor::bind`], and [`CmId::create`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PortSpace {
-    /// IP over InfiniBand.
-    Ipoib,
-    /// TCP port space: reliable connections (RC). The usual choice.
-    Tcp,
-    /// UDP port space: unreliable datagrams (UD).
-    Udp,
-    /// The InfiniBand port space, for any port number.
-    Ib,
-}
-
-impl From<ffi::rdma_port_space> for PortSpace {
-    fn from(port_space: ffi::rdma_port_space) -> Self {
-        use ffi::rdma_port_space::*;
-        match port_space {
-            RDMA_PS_IPOIB => PortSpace::Ipoib,
-            RDMA_PS_TCP => PortSpace::Tcp,
-            RDMA_PS_UDP => PortSpace::Udp,
-            RDMA_PS_IB => PortSpace::Ib,
-        }
-    }
-}
-
-impl From<PortSpace> for ffi::rdma_port_space {
-    fn from(port_space: PortSpace) -> Self {
-        use ffi::rdma_port_space::*;
-        match port_space {
-            PortSpace::Ipoib => RDMA_PS_IPOIB,
-            PortSpace::Tcp => RDMA_PS_TCP,
-            PortSpace::Udp => RDMA_PS_UDP,
-            PortSpace::Ib => RDMA_PS_IB,
-        }
-    }
-}
-
-/// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
-/// the sequence in which the events arrive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CmEventType {
-    /// The destination address resolved to an RDMA device.
-    AddressResolved,
-    /// Resolving the destination address failed.
-    AddressError,
-    /// The route to the destination resolved.
-    RouteResolved,
-    /// Resolving the route failed.
-    RouteError,
-    /// An incoming connection request arrived on a listener (take its id with
-    /// [`CmEvent::connection_request`]).
-    ConnectRequest,
-    /// The remote accepted a connection whose queue pair the connection manager does not manage;
-    /// finish with [`CmId::establish`].
-    ConnectResponse,
-    /// Establishing the connection failed.
-    ConnectError,
-    /// The remote is unreachable.
-    Unreachable,
-    /// The remote rejected the connection request.
-    Rejected,
-    /// The connection is established.
-    Established,
-    /// The connection was disconnected.
-    Disconnected,
-    /// The device backing the id was removed.
-    DeviceRemoval,
-    /// A multicast join completed.
-    MulticastJoin,
-    /// A multicast join failed or the group errored.
-    MulticastError,
-    /// The id's network address changed.
-    AddressChange,
-    /// The connection left the timewait state; its queue pair may be reused.
-    TimewaitExit,
-    /// Address information resolved (`rdma_getaddrinfo`-style resolution).
-    AddressInfoResolved,
-    /// Resolving address information failed.
-    AddressInfoError,
-    /// A user-generated event.
-    User,
-    /// An internal event.
-    Internal,
-}
-
-impl From<ffi::rdma_cm_event_type> for CmEventType {
-    fn from(event: ffi::rdma_cm_event_type) -> Self {
-        use ffi::rdma_cm_event_type::*;
-        match event {
-            RDMA_CM_EVENT_ADDR_RESOLVED => CmEventType::AddressResolved,
-            RDMA_CM_EVENT_ADDR_ERROR => CmEventType::AddressError,
-            RDMA_CM_EVENT_ROUTE_RESOLVED => CmEventType::RouteResolved,
-            RDMA_CM_EVENT_ROUTE_ERROR => CmEventType::RouteError,
-            RDMA_CM_EVENT_CONNECT_REQUEST => CmEventType::ConnectRequest,
-            RDMA_CM_EVENT_CONNECT_RESPONSE => CmEventType::ConnectResponse,
-            RDMA_CM_EVENT_CONNECT_ERROR => CmEventType::ConnectError,
-            RDMA_CM_EVENT_UNREACHABLE => CmEventType::Unreachable,
-            RDMA_CM_EVENT_REJECTED => CmEventType::Rejected,
-            RDMA_CM_EVENT_ESTABLISHED => CmEventType::Established,
-            RDMA_CM_EVENT_DISCONNECTED => CmEventType::Disconnected,
-            RDMA_CM_EVENT_DEVICE_REMOVAL => CmEventType::DeviceRemoval,
-            RDMA_CM_EVENT_MULTICAST_JOIN => CmEventType::MulticastJoin,
-            RDMA_CM_EVENT_MULTICAST_ERROR => CmEventType::MulticastError,
-            RDMA_CM_EVENT_ADDR_CHANGE => CmEventType::AddressChange,
-            RDMA_CM_EVENT_TIMEWAIT_EXIT => CmEventType::TimewaitExit,
-            RDMA_CM_EVENT_ADDRINFO_RESOLVED => CmEventType::AddressInfoResolved,
-            RDMA_CM_EVENT_ADDRINFO_ERROR => CmEventType::AddressInfoError,
-            RDMA_CM_EVENT_USER => CmEventType::User,
-            RDMA_CM_EVENT_INTERNAL => CmEventType::Internal,
-        }
-    }
-}
-
-impl From<CmEventType> for ffi::rdma_cm_event_type {
-    fn from(event: CmEventType) -> Self {
-        use ffi::rdma_cm_event_type::*;
-        match event {
-            CmEventType::AddressResolved => RDMA_CM_EVENT_ADDR_RESOLVED,
-            CmEventType::AddressError => RDMA_CM_EVENT_ADDR_ERROR,
-            CmEventType::RouteResolved => RDMA_CM_EVENT_ROUTE_RESOLVED,
-            CmEventType::RouteError => RDMA_CM_EVENT_ROUTE_ERROR,
-            CmEventType::ConnectRequest => RDMA_CM_EVENT_CONNECT_REQUEST,
-            CmEventType::ConnectResponse => RDMA_CM_EVENT_CONNECT_RESPONSE,
-            CmEventType::ConnectError => RDMA_CM_EVENT_CONNECT_ERROR,
-            CmEventType::Unreachable => RDMA_CM_EVENT_UNREACHABLE,
-            CmEventType::Rejected => RDMA_CM_EVENT_REJECTED,
-            CmEventType::Established => RDMA_CM_EVENT_ESTABLISHED,
-            CmEventType::Disconnected => RDMA_CM_EVENT_DISCONNECTED,
-            CmEventType::DeviceRemoval => RDMA_CM_EVENT_DEVICE_REMOVAL,
-            CmEventType::MulticastJoin => RDMA_CM_EVENT_MULTICAST_JOIN,
-            CmEventType::MulticastError => RDMA_CM_EVENT_MULTICAST_ERROR,
-            CmEventType::AddressChange => RDMA_CM_EVENT_ADDR_CHANGE,
-            CmEventType::TimewaitExit => RDMA_CM_EVENT_TIMEWAIT_EXIT,
-            CmEventType::AddressInfoResolved => RDMA_CM_EVENT_ADDRINFO_RESOLVED,
-            CmEventType::AddressInfoError => RDMA_CM_EVENT_ADDRINFO_ERROR,
-            CmEventType::User => RDMA_CM_EVENT_USER,
-            CmEventType::Internal => RDMA_CM_EVENT_INTERNAL,
-        }
-    }
-}
-
-impl std::fmt::Display for PortSpace {
-    /// Formats the port space as it is named in the C headers, for example `TCP` for
+c_enum! {
+    /// The port space a connection-manager identifier lives in: which namespace its port numbers are
+    /// allocated from, and which transport its connections use. Passed to [`Connector::new`],
+    /// [`Acceptor::bind`], and [`CmId::create`].
+    ///
+    /// `Display` formats the port space as it is named in the C headers, for example `TCP` for
     /// [`Tcp`](Self::Tcp).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            PortSpace::Ipoib => "IPOIB",
-            PortSpace::Tcp => "TCP",
-            PortSpace::Udp => "UDP",
-            PortSpace::Ib => "IB",
-        };
-        f.write_str(name)
+    pub enum PortSpace(ffi::rdma_port_space) {
+        /// IP over InfiniBand.
+        Ipoib = RDMA_PS_IPOIB => "IPOIB";
+        /// TCP port space: reliable connections (RC). The usual choice.
+        Tcp = RDMA_PS_TCP => "TCP";
+        /// UDP port space: unreliable datagrams (UD).
+        Udp = RDMA_PS_UDP => "UDP";
+        /// The InfiniBand port space, for any port number.
+        Ib = RDMA_PS_IB => "IB";
     }
 }
 
-impl std::fmt::Display for CmEventType {
-    /// Formats the event as it is named in the C headers, for example `CONNECT_REQUEST` for
+c_enum! {
+    /// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
+    /// the sequence in which the events arrive.
+    ///
+    /// `Display` formats the event as it is named in the C headers, for example `CONNECT_REQUEST` for
     /// [`ConnectRequest`](Self::ConnectRequest).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            CmEventType::AddressResolved => "ADDR_RESOLVED",
-            CmEventType::AddressError => "ADDR_ERROR",
-            CmEventType::RouteResolved => "ROUTE_RESOLVED",
-            CmEventType::RouteError => "ROUTE_ERROR",
-            CmEventType::ConnectRequest => "CONNECT_REQUEST",
-            CmEventType::ConnectResponse => "CONNECT_RESPONSE",
-            CmEventType::ConnectError => "CONNECT_ERROR",
-            CmEventType::Unreachable => "UNREACHABLE",
-            CmEventType::Rejected => "REJECTED",
-            CmEventType::Established => "ESTABLISHED",
-            CmEventType::Disconnected => "DISCONNECTED",
-            CmEventType::DeviceRemoval => "DEVICE_REMOVAL",
-            CmEventType::MulticastJoin => "MULTICAST_JOIN",
-            CmEventType::MulticastError => "MULTICAST_ERROR",
-            CmEventType::AddressChange => "ADDR_CHANGE",
-            CmEventType::TimewaitExit => "TIMEWAIT_EXIT",
-            CmEventType::AddressInfoResolved => "ADDR_INFO_RESOLVED",
-            CmEventType::AddressInfoError => "ADDR_INFO_ERROR",
-            CmEventType::User => "USER",
-            CmEventType::Internal => "INTERNAL",
-        };
-        f.write_str(name)
+    pub enum CmEventType(ffi::rdma_cm_event_type) {
+        /// The destination address resolved to an RDMA device.
+        AddressResolved = RDMA_CM_EVENT_ADDR_RESOLVED => "ADDR_RESOLVED";
+        /// Resolving the destination address failed.
+        AddressError = RDMA_CM_EVENT_ADDR_ERROR => "ADDR_ERROR";
+        /// The route to the destination resolved.
+        RouteResolved = RDMA_CM_EVENT_ROUTE_RESOLVED => "ROUTE_RESOLVED";
+        /// Resolving the route failed.
+        RouteError = RDMA_CM_EVENT_ROUTE_ERROR => "ROUTE_ERROR";
+        /// An incoming connection request arrived on a listener (take its id with
+        /// [`CmEvent::connection_request`]).
+        ConnectRequest = RDMA_CM_EVENT_CONNECT_REQUEST => "CONNECT_REQUEST";
+        /// The remote accepted a connection whose queue pair the connection manager does not manage;
+        /// finish with [`CmId::establish`].
+        ConnectResponse = RDMA_CM_EVENT_CONNECT_RESPONSE => "CONNECT_RESPONSE";
+        /// Establishing the connection failed.
+        ConnectError = RDMA_CM_EVENT_CONNECT_ERROR => "CONNECT_ERROR";
+        /// The remote is unreachable.
+        Unreachable = RDMA_CM_EVENT_UNREACHABLE => "UNREACHABLE";
+        /// The remote rejected the connection request.
+        Rejected = RDMA_CM_EVENT_REJECTED => "REJECTED";
+        /// The connection is established.
+        Established = RDMA_CM_EVENT_ESTABLISHED => "ESTABLISHED";
+        /// The connection was disconnected.
+        Disconnected = RDMA_CM_EVENT_DISCONNECTED => "DISCONNECTED";
+        /// The device backing the id was removed.
+        DeviceRemoval = RDMA_CM_EVENT_DEVICE_REMOVAL => "DEVICE_REMOVAL";
+        /// A multicast join completed.
+        MulticastJoin = RDMA_CM_EVENT_MULTICAST_JOIN => "MULTICAST_JOIN";
+        /// A multicast join failed or the group errored.
+        MulticastError = RDMA_CM_EVENT_MULTICAST_ERROR => "MULTICAST_ERROR";
+        /// The id's network address changed.
+        AddressChange = RDMA_CM_EVENT_ADDR_CHANGE => "ADDR_CHANGE";
+        /// The connection left the timewait state; its queue pair may be reused.
+        TimewaitExit = RDMA_CM_EVENT_TIMEWAIT_EXIT => "TIMEWAIT_EXIT";
+        /// Address information resolved (`rdma_getaddrinfo`-style resolution).
+        AddressInfoResolved = RDMA_CM_EVENT_ADDRINFO_RESOLVED => "ADDR_INFO_RESOLVED";
+        /// Resolving address information failed.
+        AddressInfoError = RDMA_CM_EVENT_ADDRINFO_ERROR => "ADDR_INFO_ERROR";
+        /// A user-generated event.
+        User = RDMA_CM_EVENT_USER => "USER";
+        /// An internal event.
+        Internal = RDMA_CM_EVENT_INTERNAL => "INTERNAL";
     }
 }
 

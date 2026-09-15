@@ -413,160 +413,64 @@ flags_newtype! {
     }
 }
 
-/// The completion status of a work request, reported by [`WorkCompletion::ok`] (as the
-/// [`WcError::status`] of a failed completion).
-///
-/// Anything other than [`Success`](Self::Success) means the work request failed (and, on a
-/// connected queue pair, that the queue pair has moved to the error state); once one work request
-/// fails, the ones behind it complete as [`WorkRequestFlushed`](Self::WorkRequestFlushed).
-/// `Display` gives the human-readable message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WcStatus {
-    /// The work request completed successfully.
-    Success,
-    /// A posted buffer was too small for the data (local length error).
-    LocalLengthError,
-    /// An internal queue-pair consistency error was detected locally.
-    LocalQpOperationError,
-    /// An internal EE-context consistency error was detected locally (RD only).
-    LocalEecOperationError,
-    /// A posted buffer did not have valid protection (local protection error).
-    LocalProtectionError,
-    /// The work request was flushed because the queue pair entered the error state before (or
-    /// while) processing it.
-    WorkRequestFlushed,
-    /// A memory-window bind operation failed.
-    MemoryWindowBindError,
-    /// The responder returned a malformed response.
-    BadResponse,
-    /// A local access violation while responding to an incoming operation.
-    LocalAccessError,
-    /// The remote side rejected the request as invalid for its queue pair.
-    RemoteInvalidRequest,
-    /// The remote side reported an access violation for the targeted region.
-    RemoteAccessError,
-    /// The remote side could not complete the operation.
-    RemoteOperationError,
-    /// The transport retry counter was exceeded without a response from the remote side.
-    RetryExceeded,
-    /// The receiver-not-ready retry counter was exceeded.
-    RnrRetryExceeded,
-    /// A local RD domain violation (RD only).
-    LocalRddViolation,
-    /// The remote side rejected an RD read request as invalid (RD only).
-    RemoteInvalidRdRequest,
-    /// The remote side aborted the operation (RD only).
-    RemoteAborted,
-    /// An invalid EE context number was detected (RD only).
-    InvalidEecn,
-    /// An invalid EE context state was detected (RD only).
-    InvalidEecState,
-    /// A fatal transport error occurred; further use of the device is undefined.
-    Fatal,
-    /// The response timer expired before a response arrived.
-    ResponseTimeout,
-    /// An error not covered by the other statuses.
-    GeneralError,
-    /// A tag-matching error occurred.
-    TagMatchingError,
-    /// A tag-matching rendezvous transfer did not complete.
-    TagMatchingRendezvousIncomplete,
-}
-
-impl From<ffi::ibv_wc_status> for WcStatus {
-    fn from(status: ffi::ibv_wc_status) -> Self {
-        use ffi::ibv_wc_status::*;
-        match status {
-            IBV_WC_SUCCESS => WcStatus::Success,
-            IBV_WC_LOC_LEN_ERR => WcStatus::LocalLengthError,
-            IBV_WC_LOC_QP_OP_ERR => WcStatus::LocalQpOperationError,
-            IBV_WC_LOC_EEC_OP_ERR => WcStatus::LocalEecOperationError,
-            IBV_WC_LOC_PROT_ERR => WcStatus::LocalProtectionError,
-            IBV_WC_WR_FLUSH_ERR => WcStatus::WorkRequestFlushed,
-            IBV_WC_MW_BIND_ERR => WcStatus::MemoryWindowBindError,
-            IBV_WC_BAD_RESP_ERR => WcStatus::BadResponse,
-            IBV_WC_LOC_ACCESS_ERR => WcStatus::LocalAccessError,
-            IBV_WC_REM_INV_REQ_ERR => WcStatus::RemoteInvalidRequest,
-            IBV_WC_REM_ACCESS_ERR => WcStatus::RemoteAccessError,
-            IBV_WC_REM_OP_ERR => WcStatus::RemoteOperationError,
-            IBV_WC_RETRY_EXC_ERR => WcStatus::RetryExceeded,
-            IBV_WC_RNR_RETRY_EXC_ERR => WcStatus::RnrRetryExceeded,
-            IBV_WC_LOC_RDD_VIOL_ERR => WcStatus::LocalRddViolation,
-            IBV_WC_REM_INV_RD_REQ_ERR => WcStatus::RemoteInvalidRdRequest,
-            IBV_WC_REM_ABORT_ERR => WcStatus::RemoteAborted,
-            IBV_WC_INV_EECN_ERR => WcStatus::InvalidEecn,
-            IBV_WC_INV_EEC_STATE_ERR => WcStatus::InvalidEecState,
-            IBV_WC_FATAL_ERR => WcStatus::Fatal,
-            IBV_WC_RESP_TIMEOUT_ERR => WcStatus::ResponseTimeout,
-            IBV_WC_GENERAL_ERR => WcStatus::GeneralError,
-            IBV_WC_TM_ERR => WcStatus::TagMatchingError,
-            IBV_WC_TM_RNDV_INCOMPLETE => WcStatus::TagMatchingRendezvousIncomplete,
-        }
-    }
-}
-
-impl From<WcStatus> for ffi::ibv_wc_status {
-    fn from(status: WcStatus) -> Self {
-        use ffi::ibv_wc_status::*;
-        match status {
-            WcStatus::Success => IBV_WC_SUCCESS,
-            WcStatus::LocalLengthError => IBV_WC_LOC_LEN_ERR,
-            WcStatus::LocalQpOperationError => IBV_WC_LOC_QP_OP_ERR,
-            WcStatus::LocalEecOperationError => IBV_WC_LOC_EEC_OP_ERR,
-            WcStatus::LocalProtectionError => IBV_WC_LOC_PROT_ERR,
-            WcStatus::WorkRequestFlushed => IBV_WC_WR_FLUSH_ERR,
-            WcStatus::MemoryWindowBindError => IBV_WC_MW_BIND_ERR,
-            WcStatus::BadResponse => IBV_WC_BAD_RESP_ERR,
-            WcStatus::LocalAccessError => IBV_WC_LOC_ACCESS_ERR,
-            WcStatus::RemoteInvalidRequest => IBV_WC_REM_INV_REQ_ERR,
-            WcStatus::RemoteAccessError => IBV_WC_REM_ACCESS_ERR,
-            WcStatus::RemoteOperationError => IBV_WC_REM_OP_ERR,
-            WcStatus::RetryExceeded => IBV_WC_RETRY_EXC_ERR,
-            WcStatus::RnrRetryExceeded => IBV_WC_RNR_RETRY_EXC_ERR,
-            WcStatus::LocalRddViolation => IBV_WC_LOC_RDD_VIOL_ERR,
-            WcStatus::RemoteInvalidRdRequest => IBV_WC_REM_INV_RD_REQ_ERR,
-            WcStatus::RemoteAborted => IBV_WC_REM_ABORT_ERR,
-            WcStatus::InvalidEecn => IBV_WC_INV_EECN_ERR,
-            WcStatus::InvalidEecState => IBV_WC_INV_EEC_STATE_ERR,
-            WcStatus::Fatal => IBV_WC_FATAL_ERR,
-            WcStatus::ResponseTimeout => IBV_WC_RESP_TIMEOUT_ERR,
-            WcStatus::GeneralError => IBV_WC_GENERAL_ERR,
-            WcStatus::TagMatchingError => IBV_WC_TM_ERR,
-            WcStatus::TagMatchingRendezvousIncomplete => IBV_WC_TM_RNDV_INCOMPLETE,
-        }
-    }
-}
-
-impl fmt::Display for WcStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self {
-            WcStatus::Success => "success",
-            WcStatus::LocalLengthError => "local length error",
-            WcStatus::LocalQpOperationError => "local QP operation error",
-            WcStatus::LocalEecOperationError => "local EE context operation error",
-            WcStatus::LocalProtectionError => "local protection error",
-            WcStatus::WorkRequestFlushed => "work request flushed",
-            WcStatus::MemoryWindowBindError => "memory window bind error",
-            WcStatus::BadResponse => "bad response from remote",
-            WcStatus::LocalAccessError => "local access error",
-            WcStatus::RemoteInvalidRequest => "remote rejected the request as invalid",
-            WcStatus::RemoteAccessError => "remote access error",
-            WcStatus::RemoteOperationError => "remote operation error",
-            WcStatus::RetryExceeded => "transport retry counter exceeded",
-            WcStatus::RnrRetryExceeded => "receiver-not-ready retry counter exceeded",
-            WcStatus::LocalRddViolation => "local RDD violation",
-            WcStatus::RemoteInvalidRdRequest => "remote rejected the RD request as invalid",
-            WcStatus::RemoteAborted => "remote aborted the operation",
-            WcStatus::InvalidEecn => "invalid EE context number",
-            WcStatus::InvalidEecState => "invalid EE context state",
-            WcStatus::Fatal => "fatal transport error",
-            WcStatus::ResponseTimeout => "response timeout",
-            WcStatus::GeneralError => "general error",
-            WcStatus::TagMatchingError => "tag matching error",
-            WcStatus::TagMatchingRendezvousIncomplete => "tag matching rendezvous incomplete",
-        };
-        f.write_str(msg)
+c_enum! {
+    /// The completion status of a work request, reported by [`WorkCompletion::ok`] (as the
+    /// [`WcError::status`] of a failed completion).
+    ///
+    /// Anything other than [`Success`](Self::Success) means the work request failed (and, on a
+    /// connected queue pair, that the queue pair has moved to the error state); once one work request
+    /// fails, the ones behind it complete as [`WorkRequestFlushed`](Self::WorkRequestFlushed).
+    /// `Display` gives the human-readable message.
+    pub enum WcStatus(ffi::ibv_wc_status) {
+        /// The work request completed successfully.
+        Success = IBV_WC_SUCCESS => "success";
+        /// A posted buffer was too small for the data (local length error).
+        LocalLengthError = IBV_WC_LOC_LEN_ERR => "local length error";
+        /// An internal queue-pair consistency error was detected locally.
+        LocalQpOperationError = IBV_WC_LOC_QP_OP_ERR => "local QP operation error";
+        /// An internal EE-context consistency error was detected locally (RD only).
+        LocalEecOperationError = IBV_WC_LOC_EEC_OP_ERR => "local EE context operation error";
+        /// A posted buffer did not have valid protection (local protection error).
+        LocalProtectionError = IBV_WC_LOC_PROT_ERR => "local protection error";
+        /// The work request was flushed because the queue pair entered the error state before (or
+        /// while) processing it.
+        WorkRequestFlushed = IBV_WC_WR_FLUSH_ERR => "work request flushed";
+        /// A memory-window bind operation failed.
+        MemoryWindowBindError = IBV_WC_MW_BIND_ERR => "memory window bind error";
+        /// The responder returned a malformed response.
+        BadResponse = IBV_WC_BAD_RESP_ERR => "bad response from remote";
+        /// A local access violation while responding to an incoming operation.
+        LocalAccessError = IBV_WC_LOC_ACCESS_ERR => "local access error";
+        /// The remote side rejected the request as invalid for its queue pair.
+        RemoteInvalidRequest = IBV_WC_REM_INV_REQ_ERR => "remote rejected the request as invalid";
+        /// The remote side reported an access violation for the targeted region.
+        RemoteAccessError = IBV_WC_REM_ACCESS_ERR => "remote access error";
+        /// The remote side could not complete the operation.
+        RemoteOperationError = IBV_WC_REM_OP_ERR => "remote operation error";
+        /// The transport retry counter was exceeded without a response from the remote side.
+        RetryExceeded = IBV_WC_RETRY_EXC_ERR => "transport retry counter exceeded";
+        /// The receiver-not-ready retry counter was exceeded.
+        RnrRetryExceeded = IBV_WC_RNR_RETRY_EXC_ERR => "receiver-not-ready retry counter exceeded";
+        /// A local RD domain violation (RD only).
+        LocalRddViolation = IBV_WC_LOC_RDD_VIOL_ERR => "local RDD violation";
+        /// The remote side rejected an RD read request as invalid (RD only).
+        RemoteInvalidRdRequest = IBV_WC_REM_INV_RD_REQ_ERR => "remote rejected the RD request as invalid";
+        /// The remote side aborted the operation (RD only).
+        RemoteAborted = IBV_WC_REM_ABORT_ERR => "remote aborted the operation";
+        /// An invalid EE context number was detected (RD only).
+        InvalidEecn = IBV_WC_INV_EECN_ERR => "invalid EE context number";
+        /// An invalid EE context state was detected (RD only).
+        InvalidEecState = IBV_WC_INV_EEC_STATE_ERR => "invalid EE context state";
+        /// A fatal transport error occurred; further use of the device is undefined.
+        Fatal = IBV_WC_FATAL_ERR => "fatal transport error";
+        /// The response timer expired before a response arrived.
+        ResponseTimeout = IBV_WC_RESP_TIMEOUT_ERR => "response timeout";
+        /// An error not covered by the other statuses.
+        GeneralError = IBV_WC_GENERAL_ERR => "general error";
+        /// A tag-matching error occurred.
+        TagMatchingError = IBV_WC_TM_ERR => "tag matching error";
+        /// A tag-matching rendezvous transfer did not complete.
+        TagMatchingRendezvousIncomplete = IBV_WC_TM_RNDV_INCOMPLETE => "tag matching rendezvous incomplete";
     }
 }
 
@@ -592,135 +496,52 @@ impl fmt::Display for WcError {
 
 impl std::error::Error for WcError {}
 
-/// The kind of operation a work completion reports on. Returned by [`WorkCompletion::opcode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WcOpcode {
-    /// A SEND completed.
-    Send,
-    /// An RDMA write completed.
-    RdmaWrite,
-    /// An RDMA read completed.
-    RdmaRead,
-    /// An atomic compare-and-swap completed.
-    CompSwap,
-    /// An atomic fetch-and-add completed.
-    FetchAdd,
-    /// A memory-window bind completed.
-    BindMw,
-    /// A local invalidate completed.
-    LocalInv,
-    /// A TCP segmentation offload send completed.
-    Tso,
-    /// A memory flush completed.
-    Flush,
-    /// An atomic write completed.
-    AtomicWrite,
-    /// An incoming message was received.
-    Recv,
-    /// An incoming RDMA-write-with-immediate consumed a receive.
-    RecvRdmaWithImm,
-    /// A tag-matching entry was added.
-    TmAdd,
-    /// A tag-matching entry was deleted.
-    TmDel,
-    /// A tag-matching list synchronization completed.
-    TmSync,
-    /// A tag-matching receive completed.
-    TmRecv,
-    /// An unexpected (untagged) tag-matching receive completed.
-    TmNoTag,
-    /// Provider-specific operation 1.
-    Driver1,
-    /// Provider-specific operation 2.
-    Driver2,
-    /// Provider-specific operation 3.
-    Driver3,
-}
-
-impl From<ffi::ibv_wc_opcode> for WcOpcode {
-    fn from(opcode: ffi::ibv_wc_opcode) -> Self {
-        use ffi::ibv_wc_opcode::*;
-        match opcode {
-            IBV_WC_SEND => WcOpcode::Send,
-            IBV_WC_RDMA_WRITE => WcOpcode::RdmaWrite,
-            IBV_WC_RDMA_READ => WcOpcode::RdmaRead,
-            IBV_WC_COMP_SWAP => WcOpcode::CompSwap,
-            IBV_WC_FETCH_ADD => WcOpcode::FetchAdd,
-            IBV_WC_BIND_MW => WcOpcode::BindMw,
-            IBV_WC_LOCAL_INV => WcOpcode::LocalInv,
-            IBV_WC_TSO => WcOpcode::Tso,
-            IBV_WC_FLUSH => WcOpcode::Flush,
-            IBV_WC_ATOMIC_WRITE => WcOpcode::AtomicWrite,
-            IBV_WC_RECV => WcOpcode::Recv,
-            IBV_WC_RECV_RDMA_WITH_IMM => WcOpcode::RecvRdmaWithImm,
-            IBV_WC_TM_ADD => WcOpcode::TmAdd,
-            IBV_WC_TM_DEL => WcOpcode::TmDel,
-            IBV_WC_TM_SYNC => WcOpcode::TmSync,
-            IBV_WC_TM_RECV => WcOpcode::TmRecv,
-            IBV_WC_TM_NO_TAG => WcOpcode::TmNoTag,
-            IBV_WC_DRIVER1 => WcOpcode::Driver1,
-            IBV_WC_DRIVER2 => WcOpcode::Driver2,
-            IBV_WC_DRIVER3 => WcOpcode::Driver3,
-        }
-    }
-}
-
-impl From<WcOpcode> for ffi::ibv_wc_opcode {
-    fn from(opcode: WcOpcode) -> Self {
-        use ffi::ibv_wc_opcode::*;
-        match opcode {
-            WcOpcode::Send => IBV_WC_SEND,
-            WcOpcode::RdmaWrite => IBV_WC_RDMA_WRITE,
-            WcOpcode::RdmaRead => IBV_WC_RDMA_READ,
-            WcOpcode::CompSwap => IBV_WC_COMP_SWAP,
-            WcOpcode::FetchAdd => IBV_WC_FETCH_ADD,
-            WcOpcode::BindMw => IBV_WC_BIND_MW,
-            WcOpcode::LocalInv => IBV_WC_LOCAL_INV,
-            WcOpcode::Tso => IBV_WC_TSO,
-            WcOpcode::Flush => IBV_WC_FLUSH,
-            WcOpcode::AtomicWrite => IBV_WC_ATOMIC_WRITE,
-            WcOpcode::Recv => IBV_WC_RECV,
-            WcOpcode::RecvRdmaWithImm => IBV_WC_RECV_RDMA_WITH_IMM,
-            WcOpcode::TmAdd => IBV_WC_TM_ADD,
-            WcOpcode::TmDel => IBV_WC_TM_DEL,
-            WcOpcode::TmSync => IBV_WC_TM_SYNC,
-            WcOpcode::TmRecv => IBV_WC_TM_RECV,
-            WcOpcode::TmNoTag => IBV_WC_TM_NO_TAG,
-            WcOpcode::Driver1 => IBV_WC_DRIVER1,
-            WcOpcode::Driver2 => IBV_WC_DRIVER2,
-            WcOpcode::Driver3 => IBV_WC_DRIVER3,
-        }
-    }
-}
-
-impl std::fmt::Display for WcOpcode {
-    /// Formats the opcode as it is named in the C headers, for example `RDMA_WRITE` for
+c_enum! {
+    /// The kind of operation a work completion reports on. Returned by [`WorkCompletion::opcode`].
+    ///
+    /// `Display` formats the opcode as it is named in the C headers, for example `RDMA_WRITE` for
     /// [`RdmaWrite`](Self::RdmaWrite).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            WcOpcode::Send => "SEND",
-            WcOpcode::RdmaWrite => "RDMA_WRITE",
-            WcOpcode::RdmaRead => "RDMA_READ",
-            WcOpcode::CompSwap => "COMP_SWAP",
-            WcOpcode::FetchAdd => "FETCH_ADD",
-            WcOpcode::BindMw => "BIND_MW",
-            WcOpcode::LocalInv => "LOCAL_INV",
-            WcOpcode::Tso => "TSO",
-            WcOpcode::Flush => "FLUSH",
-            WcOpcode::AtomicWrite => "ATOMIC_WRITE",
-            WcOpcode::Recv => "RECV",
-            WcOpcode::RecvRdmaWithImm => "RECV_RDMA_WITH_IMM",
-            WcOpcode::TmAdd => "TM_ADD",
-            WcOpcode::TmDel => "TM_DEL",
-            WcOpcode::TmSync => "TM_SYNC",
-            WcOpcode::TmRecv => "TM_RECV",
-            WcOpcode::TmNoTag => "TM_NO_TAG",
-            WcOpcode::Driver1 => "DRIVER1",
-            WcOpcode::Driver2 => "DRIVER2",
-            WcOpcode::Driver3 => "DRIVER3",
-        };
-        f.write_str(name)
+    pub enum WcOpcode(ffi::ibv_wc_opcode) {
+        /// A SEND completed.
+        Send = IBV_WC_SEND => "SEND";
+        /// An RDMA write completed.
+        RdmaWrite = IBV_WC_RDMA_WRITE => "RDMA_WRITE";
+        /// An RDMA read completed.
+        RdmaRead = IBV_WC_RDMA_READ => "RDMA_READ";
+        /// An atomic compare-and-swap completed.
+        CompSwap = IBV_WC_COMP_SWAP => "COMP_SWAP";
+        /// An atomic fetch-and-add completed.
+        FetchAdd = IBV_WC_FETCH_ADD => "FETCH_ADD";
+        /// A memory-window bind completed.
+        BindMw = IBV_WC_BIND_MW => "BIND_MW";
+        /// A local invalidate completed.
+        LocalInv = IBV_WC_LOCAL_INV => "LOCAL_INV";
+        /// A TCP segmentation offload send completed.
+        Tso = IBV_WC_TSO => "TSO";
+        /// A memory flush completed.
+        Flush = IBV_WC_FLUSH => "FLUSH";
+        /// An atomic write completed.
+        AtomicWrite = IBV_WC_ATOMIC_WRITE => "ATOMIC_WRITE";
+        /// An incoming message was received.
+        Recv = IBV_WC_RECV => "RECV";
+        /// An incoming RDMA-write-with-immediate consumed a receive.
+        RecvRdmaWithImm = IBV_WC_RECV_RDMA_WITH_IMM => "RECV_RDMA_WITH_IMM";
+        /// A tag-matching entry was added.
+        TmAdd = IBV_WC_TM_ADD => "TM_ADD";
+        /// A tag-matching entry was deleted.
+        TmDel = IBV_WC_TM_DEL => "TM_DEL";
+        /// A tag-matching list synchronization completed.
+        TmSync = IBV_WC_TM_SYNC => "TM_SYNC";
+        /// A tag-matching receive completed.
+        TmRecv = IBV_WC_TM_RECV => "TM_RECV";
+        /// An unexpected (untagged) tag-matching receive completed.
+        TmNoTag = IBV_WC_TM_NO_TAG => "TM_NO_TAG";
+        /// Provider-specific operation 1.
+        Driver1 = IBV_WC_DRIVER1 => "DRIVER1";
+        /// Provider-specific operation 2.
+        Driver2 = IBV_WC_DRIVER2 => "DRIVER2";
+        /// Provider-specific operation 3.
+        Driver3 = IBV_WC_DRIVER3 => "DRIVER3";
     }
 }
 

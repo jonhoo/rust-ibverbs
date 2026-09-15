@@ -18,77 +18,32 @@ use crate::srq::SharedReceiveQueue;
 #[cfg(doc)]
 use crate::{CompletionQueue, ProtectionDomain};
 
-/// The transport service type of a queue pair.
-///
-/// At creation the type is derived from the transport marker (see [`Transport`] and
-/// [`ProtectionDomain::create_qp`]); this enum names the types on the wire and in queries. The
-/// types without a marker ([`RawPacket`](Self::RawPacket), the XRC pair, and
-/// [`Driver`](Self::Driver) other than EFA's SRD) are not usable through the portable wrapper;
-/// when they become so, they will get their own markers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum QueuePairType {
-    /// Reliable connection ("RC"): connected to exactly one peer, with in-order, reliable
-    /// delivery. Supports sends, RDMA read/write, and atomics.
-    ReliableConnection,
-    /// Unreliable connection ("UC"): connected to exactly one peer, in order but without
-    /// delivery guarantees. Supports sends and RDMA writes.
-    UnreliableConnection,
-    /// Unreliable datagram ("UD"): connectionless; each send is addressed individually with an
-    /// [`AddressHandle`], and each message fits in one MTU.
-    UnreliableDatagram,
-    /// Raw packet ("raw Ethernet"): sends and receives whole L2 frames, bypassing the transport.
-    RawPacket,
-    /// The sending side of an extended reliable connection ("XRC send").
-    XrcSend,
-    /// The receiving side of an extended reliable connection ("XRC recv").
-    XrcRecv,
-    /// A provider-specific ("driver") queue pair, such as EFA's SRD.
-    Driver,
-}
-
-impl From<ffi::ibv_qp_type> for QueuePairType {
-    fn from(qp_type: ffi::ibv_qp_type) -> Self {
-        use ffi::ibv_qp_type::*;
-        match qp_type {
-            IBV_QPT_RC => QueuePairType::ReliableConnection,
-            IBV_QPT_UC => QueuePairType::UnreliableConnection,
-            IBV_QPT_UD => QueuePairType::UnreliableDatagram,
-            IBV_QPT_RAW_PACKET => QueuePairType::RawPacket,
-            IBV_QPT_XRC_SEND => QueuePairType::XrcSend,
-            IBV_QPT_XRC_RECV => QueuePairType::XrcRecv,
-            IBV_QPT_DRIVER => QueuePairType::Driver,
-        }
-    }
-}
-
-impl From<QueuePairType> for ffi::ibv_qp_type {
-    fn from(qp_type: QueuePairType) -> Self {
-        use ffi::ibv_qp_type::*;
-        match qp_type {
-            QueuePairType::ReliableConnection => IBV_QPT_RC,
-            QueuePairType::UnreliableConnection => IBV_QPT_UC,
-            QueuePairType::UnreliableDatagram => IBV_QPT_UD,
-            QueuePairType::RawPacket => IBV_QPT_RAW_PACKET,
-            QueuePairType::XrcSend => IBV_QPT_XRC_SEND,
-            QueuePairType::XrcRecv => IBV_QPT_XRC_RECV,
-            QueuePairType::Driver => IBV_QPT_DRIVER,
-        }
-    }
-}
-
-impl std::fmt::Display for QueuePairType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            QueuePairType::ReliableConnection => "RC",
-            QueuePairType::UnreliableConnection => "UC",
-            QueuePairType::UnreliableDatagram => "UD",
-            QueuePairType::RawPacket => "raw packet",
-            QueuePairType::XrcSend => "XRC send",
-            QueuePairType::XrcRecv => "XRC recv",
-            QueuePairType::Driver => "driver",
-        };
-        f.write_str(name)
+c_enum! {
+    /// The transport service type of a queue pair.
+    ///
+    /// At creation the type is derived from the transport marker (see [`Transport`] and
+    /// [`ProtectionDomain::create_qp`]); this enum names the types on the wire and in queries. The
+    /// types without a marker ([`RawPacket`](Self::RawPacket), the XRC pair, and
+    /// [`Driver`](Self::Driver) other than EFA's SRD) are not usable through the portable wrapper;
+    /// when they become so, they will get their own markers.
+    pub enum QueuePairType(ffi::ibv_qp_type) {
+        /// Reliable connection ("RC"): connected to exactly one peer, with in-order, reliable
+        /// delivery. Supports sends, RDMA read/write, and atomics.
+        ReliableConnection = IBV_QPT_RC => "RC";
+        /// Unreliable connection ("UC"): connected to exactly one peer, in order but without
+        /// delivery guarantees. Supports sends and RDMA writes.
+        UnreliableConnection = IBV_QPT_UC => "UC";
+        /// Unreliable datagram ("UD"): connectionless; each send is addressed individually with an
+        /// [`AddressHandle`], and each message fits in one MTU.
+        UnreliableDatagram = IBV_QPT_UD => "UD";
+        /// Raw packet ("raw Ethernet"): sends and receives whole L2 frames, bypassing the transport.
+        RawPacket = IBV_QPT_RAW_PACKET => "raw packet";
+        /// The sending side of an extended reliable connection ("XRC send").
+        XrcSend = IBV_QPT_XRC_SEND => "XRC send";
+        /// The receiving side of an extended reliable connection ("XRC recv").
+        XrcRecv = IBV_QPT_XRC_RECV => "XRC recv";
+        /// A provider-specific ("driver") queue pair, such as EFA's SRD.
+        Driver = IBV_QPT_DRIVER => "driver";
     }
 }
 
@@ -195,81 +150,34 @@ impl sealed::Sealed for Ud {
 impl Transport for Ud {}
 impl Datagram for Ud {}
 
-/// The state of a queue pair's state machine.
-///
-/// Set through [`QueuePairAttribute::set_state`] + [`QueuePair::modify`] and read back by
-/// [`QueuePair::query`]. [`PreparedQueuePair::handshake`] and friends drive the
-/// `Reset -> Init -> ReadyToReceive -> ReadyToSend` bring-up for you.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum QueuePairState {
-    /// The newly created queue pair: posting work requests is an error.
-    Reset,
-    /// Initialized: receives can be posted, but nothing is processed yet.
-    Init,
-    /// Ready to receive ("RTR"): incoming messages are processed.
-    ReadyToReceive,
-    /// Ready to send ("RTS"): the fully operational state.
-    ReadyToSend,
-    /// The send queue is draining ("SQD"): posted sends finish, new ones wait.
-    SendQueueDrain,
-    /// The send queue errored ("SQE"): receives still work, sends are flushed (UD and similar
-    /// transports only; RC moves straight to [`Error`](Self::Error)).
-    SendQueueError,
-    /// The error state: outstanding and new work requests are flushed with
-    /// [`WcStatus::WorkRequestFlushed`](crate::WcStatus::WorkRequestFlushed).
-    Error,
-    /// The state cannot be determined.
-    Unknown,
-}
-
-impl From<ffi::ibv_qp_state> for QueuePairState {
-    fn from(state: ffi::ibv_qp_state) -> Self {
-        use ffi::ibv_qp_state::*;
-        match state {
-            IBV_QPS_RESET => QueuePairState::Reset,
-            IBV_QPS_INIT => QueuePairState::Init,
-            IBV_QPS_RTR => QueuePairState::ReadyToReceive,
-            IBV_QPS_RTS => QueuePairState::ReadyToSend,
-            IBV_QPS_SQD => QueuePairState::SendQueueDrain,
-            IBV_QPS_SQE => QueuePairState::SendQueueError,
-            IBV_QPS_ERR => QueuePairState::Error,
-            IBV_QPS_UNKNOWN => QueuePairState::Unknown,
-        }
-    }
-}
-
-impl From<QueuePairState> for ffi::ibv_qp_state {
-    fn from(state: QueuePairState) -> Self {
-        use ffi::ibv_qp_state::*;
-        match state {
-            QueuePairState::Reset => IBV_QPS_RESET,
-            QueuePairState::Init => IBV_QPS_INIT,
-            QueuePairState::ReadyToReceive => IBV_QPS_RTR,
-            QueuePairState::ReadyToSend => IBV_QPS_RTS,
-            QueuePairState::SendQueueDrain => IBV_QPS_SQD,
-            QueuePairState::SendQueueError => IBV_QPS_SQE,
-            QueuePairState::Error => IBV_QPS_ERR,
-            QueuePairState::Unknown => IBV_QPS_UNKNOWN,
-        }
-    }
-}
-
-impl std::fmt::Display for QueuePairState {
-    /// Formats the state as it is named in the InfiniBand specification (and the C headers), for
+c_enum! {
+    /// The state of a queue pair's state machine.
+    ///
+    /// Set through [`QueuePairAttribute::set_state`] + [`QueuePair::modify`] and read back by
+    /// [`QueuePair::query`]. [`PreparedQueuePair::handshake`] and friends drive the
+    /// `Reset -> Init -> ReadyToReceive -> ReadyToSend` bring-up for you.
+    ///
+    /// `Display` formats the state as it is named in the InfiniBand specification (and the C headers), for
     /// example `RTS` for [`ReadyToSend`](Self::ReadyToSend).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            QueuePairState::Reset => "RESET",
-            QueuePairState::Init => "INIT",
-            QueuePairState::ReadyToReceive => "RTR",
-            QueuePairState::ReadyToSend => "RTS",
-            QueuePairState::SendQueueDrain => "SQD",
-            QueuePairState::SendQueueError => "SQE",
-            QueuePairState::Error => "ERR",
-            QueuePairState::Unknown => "UNKNOWN",
-        };
-        f.write_str(name)
+    pub enum QueuePairState(ffi::ibv_qp_state) {
+        /// The newly created queue pair: posting work requests is an error.
+        Reset = IBV_QPS_RESET => "RESET";
+        /// Initialized: receives can be posted, but nothing is processed yet.
+        Init = IBV_QPS_INIT => "INIT";
+        /// Ready to receive ("RTR"): incoming messages are processed.
+        ReadyToReceive = IBV_QPS_RTR => "RTR";
+        /// Ready to send ("RTS"): the fully operational state.
+        ReadyToSend = IBV_QPS_RTS => "RTS";
+        /// The send queue is draining ("SQD"): posted sends finish, new ones wait.
+        SendQueueDrain = IBV_QPS_SQD => "SQD";
+        /// The send queue errored ("SQE"): receives still work, sends are flushed (UD and similar
+        /// transports only; RC moves straight to [`Error`](Self::Error)).
+        SendQueueError = IBV_QPS_SQE => "SQE";
+        /// The error state: outstanding and new work requests are flushed with
+        /// [`WcStatus::WorkRequestFlushed`](crate::WcStatus::WorkRequestFlushed).
+        Error = IBV_QPS_ERR => "ERR";
+        /// The state cannot be determined.
+        Unknown = IBV_QPS_UNKNOWN => "UNKNOWN";
     }
 }
 

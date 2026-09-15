@@ -15,38 +15,18 @@ use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
 #[cfg(doc)]
 use crate::Context;
 
-/// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MrAdvice {
-    /// Prefetch the pages for read access (a best-effort hint; the ranges must allow local read).
-    Prefetch,
-    /// Prefetch the pages for write access (a best-effort hint; the ranges must allow local
-    /// write).
-    PrefetchWrite,
-    /// Prefetch without faulting: pre-load what is already resident, never a page fault.
-    PrefetchNoFault,
-}
-
-impl From<ffi::ib_uverbs_advise_mr_advice> for MrAdvice {
-    fn from(advice: ffi::ib_uverbs_advise_mr_advice) -> Self {
-        use ffi::ib_uverbs_advise_mr_advice::*;
-        match advice {
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH => MrAdvice::Prefetch,
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE => MrAdvice::PrefetchWrite,
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT => MrAdvice::PrefetchNoFault,
-        }
-    }
-}
-
-impl From<MrAdvice> for ffi::ib_uverbs_advise_mr_advice {
-    fn from(advice: MrAdvice) -> Self {
-        use ffi::ib_uverbs_advise_mr_advice::*;
-        match advice {
-            MrAdvice::Prefetch => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
-            MrAdvice::PrefetchWrite => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE,
-            MrAdvice::PrefetchNoFault => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT,
-        }
+c_enum! {
+    /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
+    ///
+    /// `Display` writes the advice as the C headers name it, for example `PREFETCH_WRITE`.
+    pub enum MrAdvice(ffi::ib_uverbs_advise_mr_advice) {
+        /// Prefetch the pages for read access (a best-effort hint; the ranges must allow local read).
+        Prefetch = IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH => "PREFETCH";
+        /// Prefetch the pages for write access (a best-effort hint; the ranges must allow local
+        /// write).
+        PrefetchWrite = IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE => "PREFETCH_WRITE";
+        /// Prefetch without faulting: pre-load what is already resident, never a page fault.
+        PrefetchNoFault = IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT => "PREFETCH_NO_FAULT";
     }
 }
 
