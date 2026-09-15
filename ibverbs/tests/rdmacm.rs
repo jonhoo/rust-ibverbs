@@ -14,7 +14,7 @@ use std::sync::{mpsc, Arc, Barrier};
 use std::time::{Duration, Instant};
 
 use ibverbs::rdmacm::{
-    Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
+    Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
     AccessFlags, AckTimeout, CompletionQueue, Context, Error, GidType, QueuePairAttributeMask,
@@ -152,8 +152,8 @@ fn connect_and_send() {
             .expect("accept");
         // The accepted connection keeps the listener's address, and its peer is the client on
         // the same device (the port is the client's ephemeral one).
-        assert_eq!(conn.local_addr(), Some(addr));
-        let peer = conn.peer_addr().expect("server peer address");
+        assert_eq!(conn.cm_id().local_addr(), Some(addr));
+        let peer = conn.cm_id().peer_addr().expect("server peer address");
         assert_eq!(peer.ip(), addr.ip());
         // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
         unsafe {
@@ -190,8 +190,8 @@ fn connect_and_send() {
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     // The client's peer is the server's listen address; its own address is on the same device.
-    assert_eq!(conn.peer_addr(), Some(addr));
-    let local = conn.local_addr().expect("client local address");
+    assert_eq!(conn.cm_id().peer_addr(), Some(addr));
+    let local = conn.cm_id().local_addr().expect("client local address");
     assert_eq!(local.ip(), addr.ip());
     let mut batch = conn.queue_pair().start_send();
     batch
@@ -326,7 +326,7 @@ fn two_connections() {
 /// Pump events on `id` in non-blocking mode until the wanted one arrives (returning it, still
 /// unacknowledged), ignoring (acknowledging) others. Mirrors how a reactor would drive the
 /// connection manager: poll, and only sleep when the channel is empty. Exercises
-/// [`CmId::poll_cm_event`] and [`CmId::set_nonblocking`].
+/// [`CmId::poll_cm_event`] on the channel's non-blocking descriptor.
 fn pump_until(id: &CmId, want: CmEventType) -> CmEvent {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -359,7 +359,7 @@ const SERVER_PDATA: &[u8] =
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn low_level_connect_and_send() {
     // Drive the connection-manager state machine directly with `CmId`, instead of the blocking
-    // `Connector`/`Acceptor` helpers: the passive side blocks on `get_cm_event`, while the active
+    // `Connector`/`Acceptor` helpers: the passive side blocks on `wait_cm_event`, while the active
     // side runs its channel non-blocking and pumps events off the file descriptor the way an event
     // loop would. Proves the low-level escape hatch can set up a working connection, and that
     // private data crosses it in both directions.
@@ -375,7 +375,10 @@ fn low_level_connect_and_send() {
         ready_tx.send(addr).expect("signal ready");
 
         let request = loop {
-            let event = listener.get_cm_event().expect("listener event");
+            let event = listener
+                .wait_cm_event(None)
+                .expect("listener event")
+                .expect("no timeout");
             if event.event_type() == CmEventType::ConnectRequest {
                 // The client sent its queue-pair endpoint's wire encoding as private data (the
                 // in-band bootstrap the fixed format enables). The transport pads the payload, so
@@ -424,7 +427,10 @@ fn low_level_connect_and_send() {
             .set_private_data(SERVER_PDATA);
         request.accept(&param).expect("accept");
         loop {
-            let event = request.get_cm_event().expect("server event");
+            let event = request
+                .wait_cm_event(None)
+                .expect("server event")
+                .expect("no timeout");
             if event.event_type() == CmEventType::Established {
                 break;
             }
@@ -442,7 +448,6 @@ fn low_level_connect_and_send() {
         id.as_raw_fd() >= 0,
         "the event channel exposes a file descriptor"
     );
-    id.set_nonblocking(true).expect("set_nonblocking");
 
     id.resolve_addr(addr, Duration::from_secs(5))
         .expect("resolve_addr");
@@ -537,7 +542,10 @@ fn accept_low_level(request: &CmId, qp: &mut ibverbs::QueuePair<Rc>) {
     let param = ConnectionParameter::default().set_qp_num(qp.qp_num());
     request.accept(&param).expect("accept");
     loop {
-        let event = request.get_cm_event().expect("server event");
+        let event = request
+            .wait_cm_event(None)
+            .expect("server event")
+            .expect("no timeout");
         if event.event_type() == CmEventType::Established {
             break;
         }
@@ -772,7 +780,10 @@ fn dropped_connect_request_is_rejected() {
         ready_tx
             .send(listener.local_addr().expect("listen address"))
             .expect("signal ready");
-        let event = listener.get_cm_event().expect("listener event");
+        let event = listener
+            .wait_cm_event(None)
+            .expect("listener event")
+            .expect("no timeout");
         assert_eq!(event.event_type(), CmEventType::ConnectRequest);
         drop(event);
         done_rx
@@ -899,7 +910,10 @@ fn dropping_connection_disconnects_peer() {
             .send(listener.local_addr().expect("listen address"))
             .expect("signal ready");
         let request = loop {
-            let event = listener.get_cm_event().expect("listener event");
+            let event = listener
+                .wait_cm_event(None)
+                .expect("listener event")
+                .expect("no timeout");
             if event.event_type() == CmEventType::ConnectRequest {
                 break event.connection_request().expect("connection request");
             }
@@ -915,7 +929,6 @@ fn dropping_connection_disconnects_peer() {
             .into_queue_pair();
         accept_low_level(&request, &mut qp);
         // Then watch for the peer going away.
-        request.set_nonblocking(true).expect("set_nonblocking");
         pump_until(&request, CmEventType::Disconnected);
     });
 
@@ -1037,7 +1050,12 @@ fn cm_id_options_and_accessors() {
         let conn = incoming
             .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
-        assert_eq!(conn.cm_id().peer_addr(), conn.peer_addr());
+        assert!(conn.cm_id().peer_addr().is_some());
+        // Taking the connection apart and reassembling it hands back the same connection, still
+        // disconnecting on drop.
+        let (id, qp, data) = conn.into_parts();
+        let conn = Connection::from_parts(id, qp, data);
+        assert!(conn.cm_id().peer_addr().is_some());
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("client done");
@@ -1069,7 +1087,6 @@ fn cm_id_options_and_accessors() {
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     assert_eq!(conn.cm_id().peer_addr(), Some(addr));
-    assert_eq!(conn.cm_id().local_addr(), conn.local_addr());
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }

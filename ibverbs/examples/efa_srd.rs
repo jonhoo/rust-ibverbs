@@ -69,7 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // A datagram receive is prefixed by the 40-byte GRH, so the payload starts at offset 40.
+    // A datagram receive is prefixed by the 40-byte GRH, so the payload starts at offset 40 (as
+    // on UD; not yet verified on EFA hardware, see the header).
     let len = recv_len.unwrap();
     println!("received {len} bytes: {:?}", &recv_buf.bytes()[40..len]);
     Ok(())

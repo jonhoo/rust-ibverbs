@@ -761,14 +761,14 @@ fn srq_limit_reached_async_event() {
     let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
     srq.set_limit(2).expect("failed to arm the SRQ limit");
     let attrs = srq.query().expect("failed to query the SRQ");
-    assert!(attrs.max_wr() >= 16, "{attrs:?}");
-    assert!(attrs.max_sge() >= 1, "{attrs:?}");
-    assert_eq!(attrs.limit(), 2, "{attrs:?}");
+    assert!(attrs.max_wr >= 16, "{attrs:?}");
+    assert!(attrs.max_sge >= 1, "{attrs:?}");
+    assert_eq!(attrs.limit, 2, "{attrs:?}");
     // Resizing is provider-dependent; where it works, the queue reports the larger capacity.
     match srq.set_max_wr(32) {
         Ok(()) => {
             let grown = srq.query().expect("failed to query the SRQ");
-            assert!(grown.max_wr() >= 32, "{grown:?}");
+            assert!(grown.max_wr >= 32, "{grown:?}");
         }
         Err(e) => eprintln!("SRQ resize not available here: {e}"),
     }
@@ -1650,7 +1650,7 @@ fn modify_and_query_queue_pair() {
     let (attr, init) = lb.qp.query(mask).expect("failed to query the queue pair");
     assert_eq!(attr.state(), QueuePairState::ReadyToSend);
     assert_eq!(attr.dest_qp_num(), lb.qp.qp_num());
-    assert!(init.max_send_wr() >= 16);
+    assert!(init.max_send_wr >= 16);
 
     // An illegal transition (RTS -> INIT) is reported precisely.
     let mut to_init = QueuePairAttribute::new();
@@ -1808,16 +1808,16 @@ fn query_device_extended() {
 
     // The base attributes carried by `orig()` match the plain query.
     assert_eq!(ex.orig().node_guid(), basic.node_guid());
-    assert_eq!(ex.node_guid(), basic.node_guid());
+    assert_eq!(ex.orig().sys_image_guid(), basic.sys_image_guid());
     assert_eq!(ex.orig().max_qp, basic.max_qp);
 
     // The extended accessors decode without panicking; they read back zero on a provider that does
     // not implement the extended verb (the C inline's legacy fallback fills only the base fields).
     let _ = ex.completion_timestamp_mask();
     let _ = ex.hca_core_clock_khz();
-    let _ = ex.pci_atomic_caps();
-    let _ = ex.packet_pacing_caps();
-    let _ = ex.raw_packet_caps();
+    let _ = ex.pci_atomic_caps;
+    let _ = ex.packet_pacing_caps;
+    let _ = ex.raw_packet_caps;
     let _ = ex.max_device_memory();
 
     // The Debug impl renders the wrapper and its nested base attributes.

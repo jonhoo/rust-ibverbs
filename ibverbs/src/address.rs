@@ -2,15 +2,15 @@ use std::convert::TryInto;
 use std::ffi::CStr;
 use std::fmt;
 use std::io;
-use std::sync::Arc;
 
 use crate::completion::WorkCompletion;
 use crate::context::Context;
 use crate::error::{Error, Result};
-use crate::pd::ProtectionDomainInner;
+use crate::pd::ProtectionDomain;
+use crate::raw;
 
 #[cfg(doc)]
-use crate::{ProtectionDomain, QueuePairBuilder};
+use crate::QueuePairBuilder;
 
 /// A Global identifier (GID) for an RDMA device port.
 ///
@@ -27,10 +27,8 @@ use crate::{ProtectionDomain, QueuePairBuilder};
 /// };
 /// ```
 ///
-/// The `global` view is a convenience; the raw bytes are authoritative.
-/// For continuity, the methods `subnet_prefix` and `interface_id` are provided.
-/// These methods read the array as big endian, regardless of native CPU
-/// endianness.
+/// The `global` view is a convenience; the raw bytes are authoritative, and convert to and from
+/// `[u8; 16]` and [`Ipv6Addr`](std::net::Ipv6Addr) (whose `segments` give the halves).
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct Gid {
@@ -38,20 +36,6 @@ pub struct Gid {
 }
 
 impl Gid {
-    /// Expose the subnet_prefix component of the `Gid` as a u64. This is
-    /// equivalent to accessing the `global.subnet_prefix` component of the
-    /// `ffi::ibv_gid` union.
-    pub fn subnet_prefix(&self) -> u64 {
-        u64::from_be_bytes(self.raw[..8].try_into().unwrap())
-    }
-
-    /// Expose the interface_id component of the `Gid` as a u64. This is
-    /// equivalent to accessing the `global.interface_id` component of the
-    /// `ffi::ibv_gid` union.
-    pub fn interface_id(&self) -> u64 {
-        u64::from_be_bytes(self.raw[8..].try_into().unwrap())
-    }
-
     /// Whether this GID holds an IPv4-mapped address (`::ffff:a.b.c.d`).
     ///
     /// On RoCE, the GIDs of a port mirror the IP addresses of its network interface, so the entry
@@ -229,8 +213,9 @@ mod test_wire {
 
         let encoded = qpe.to_bytes();
         let decoded = QueuePairEndpoint::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded.gid.unwrap().subnet_prefix(), 87);
-        assert_eq!(decoded.gid.unwrap().interface_id(), 192);
+        let raw = <[u8; 16]>::from(decoded.gid.unwrap());
+        assert_eq!(u64::from_be_bytes(raw[..8].try_into().unwrap()), 87);
+        assert_eq!(u64::from_be_bytes(raw[8..].try_into().unwrap()), 192);
         assert_eq!(qpe, decoded);
     }
 
@@ -294,8 +279,9 @@ mod test {
         let gid = Gid::from("::ffff:192.0.2.1".parse::<std::net::Ipv6Addr>().unwrap());
         assert!(gid.is_ipv4_mapped());
         assert_eq!(gid.to_string(), "::ffff:192.0.2.1");
-        assert_eq!(gid.subnet_prefix(), 0);
-        assert_eq!(gid.interface_id() >> 32, 0xffff);
+        let segments = std::net::Ipv6Addr::from(gid).segments();
+        assert_eq!(segments[..5], [0, 0, 0, 0, 0]);
+        assert_eq!(segments[5], 0xffff);
     }
 
     #[test]
@@ -609,7 +595,7 @@ impl AddressHandleAttribute {
 #[must_use = "the address handle is destroyed when dropped"]
 pub struct AddressHandle {
     // Keeps the protection domain (and so its context) alive until the handle is destroyed.
-    pub(crate) _pd: Arc<ProtectionDomainInner>,
+    pub(crate) _pd: ProtectionDomain,
     pub(crate) ah: *mut ffi::ibv_ah,
 }
 
@@ -633,11 +619,7 @@ impl AddressHandle {
 
 impl Drop for AddressHandle {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_ah(self.ah) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_ah failed: {e}");
-        }
+        raw::destroyed("ibv_destroy_ah", unsafe { ffi::ibv_destroy_ah(self.ah) });
     }
 }
 

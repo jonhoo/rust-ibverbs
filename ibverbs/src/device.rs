@@ -4,6 +4,7 @@ use std::io;
 
 use crate::context::Context;
 use crate::error::{Error, Result};
+use crate::raw;
 
 /// Returns the list of available RDMA devices.
 ///
@@ -13,11 +14,10 @@ use crate::error::{Error, Result};
 ///    permission is denied, `ENOMEM` if out of memory, `ENOSYS` without kernel support for RDMA).
 pub fn devices() -> Result<DeviceList> {
     let mut n = 0i32;
-    let devices = unsafe { ffi::ibv_get_device_list(&mut n as *mut _) };
-
-    if devices.is_null() {
-        return Err(Error::os(io::Error::last_os_error(), Error::GetDeviceList));
-    }
+    let devices = raw::nonnull(
+        unsafe { ffi::ibv_get_device_list(&mut n as *mut _) },
+        Error::GetDeviceList,
+    )?;
 
     let devices = unsafe {
         use std::slice;
@@ -277,61 +277,21 @@ impl<'devlist> Device<'devlist> {
     }
 }
 
-/// The transport a device speaks. Returned by [`Device::transport_type`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum TransportType {
-    /// The transport could not be determined.
-    Unknown,
-    /// InfiniBand (also reported by RoCE devices: RoCE is InfiniBand transport over Ethernet).
-    Ib,
-    /// iWARP (RDMA over TCP).
-    Iwarp,
-    /// Cisco usNIC.
-    Usnic,
-    /// Cisco usNIC over UDP.
-    UsnicUdp,
-    /// The transport is unspecified.
-    Unspecified,
-}
-
-impl From<ffi::ibv_transport_type> for TransportType {
-    fn from(transport: ffi::ibv_transport_type) -> Self {
-        match transport {
-            ffi::ibv_transport_type::IBV_TRANSPORT_UNKNOWN => TransportType::Unknown,
-            ffi::ibv_transport_type::IBV_TRANSPORT_IB => TransportType::Ib,
-            ffi::ibv_transport_type::IBV_TRANSPORT_IWARP => TransportType::Iwarp,
-            ffi::ibv_transport_type::IBV_TRANSPORT_USNIC => TransportType::Usnic,
-            ffi::ibv_transport_type::IBV_TRANSPORT_USNIC_UDP => TransportType::UsnicUdp,
-            ffi::ibv_transport_type::IBV_TRANSPORT_UNSPECIFIED => TransportType::Unspecified,
-        }
-    }
-}
-
-impl From<TransportType> for ffi::ibv_transport_type {
-    fn from(transport: TransportType) -> Self {
-        match transport {
-            TransportType::Unknown => ffi::ibv_transport_type::IBV_TRANSPORT_UNKNOWN,
-            TransportType::Ib => ffi::ibv_transport_type::IBV_TRANSPORT_IB,
-            TransportType::Iwarp => ffi::ibv_transport_type::IBV_TRANSPORT_IWARP,
-            TransportType::Usnic => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC,
-            TransportType::UsnicUdp => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC_UDP,
-            TransportType::Unspecified => ffi::ibv_transport_type::IBV_TRANSPORT_UNSPECIFIED,
-        }
-    }
-}
-
-impl fmt::Display for TransportType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            TransportType::Unknown => "unknown",
-            TransportType::Ib => "InfiniBand",
-            TransportType::Iwarp => "iWARP",
-            TransportType::Usnic => "usNIC",
-            TransportType::UsnicUdp => "usNIC UDP",
-            TransportType::Unspecified => "unspecified",
-        };
-        f.write_str(name)
+c_enum! {
+    /// The transport a device speaks. Returned by [`Device::transport_type`].
+    pub enum TransportType(ffi::ibv_transport_type) {
+        /// The transport could not be determined.
+        Unknown = IBV_TRANSPORT_UNKNOWN => "unknown";
+        /// InfiniBand (also reported by RoCE devices: RoCE is InfiniBand transport over Ethernet).
+        Ib = IBV_TRANSPORT_IB => "InfiniBand";
+        /// iWARP (RDMA over TCP).
+        Iwarp = IBV_TRANSPORT_IWARP => "iWARP";
+        /// Cisco usNIC.
+        Usnic = IBV_TRANSPORT_USNIC => "usNIC";
+        /// Cisco usNIC over UDP.
+        UsnicUdp = IBV_TRANSPORT_USNIC_UDP => "usNIC UDP";
+        /// The transport is unspecified.
+        Unspecified = IBV_TRANSPORT_UNSPECIFIED => "unspecified";
     }
 }
 

@@ -1,13 +1,12 @@
-use std::io;
-use std::ptr;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::pd::ProtectionDomainInner;
-use crate::qp::RecvRequest;
+use crate::pd::ProtectionDomain;
+use crate::qp::{post_linked, RecvRequest};
+use crate::raw;
 
 pub(crate) struct SharedReceiveQueueInner {
-    pub(crate) _pd: Arc<ProtectionDomainInner>,
+    pub(crate) _pd: ProtectionDomain,
     pub(crate) srq: *mut ffi::ibv_srq,
 }
 
@@ -16,39 +15,22 @@ unsafe impl Send for SharedReceiveQueueInner {}
 
 impl Drop for SharedReceiveQueueInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_srq(self.srq) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_srq failed: {e}");
-        }
+        raw::destroyed("ibv_destroy_srq", unsafe { ffi::ibv_destroy_srq(self.srq) });
     }
 }
 
 /// The attributes of a [`SharedReceiveQueue`], read with [`SharedReceiveQueue::query`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SrqAttributes {
-    max_wr: u32,
-    max_sge: u32,
-    limit: u32,
-}
-
-impl SrqAttributes {
     /// The number of receives the queue can hold: the capacity the device granted, at least what
     /// was asked at creation or in the last [`set_max_wr`](SharedReceiveQueue::set_max_wr).
-    pub fn max_wr(&self) -> u32 {
-        self.max_wr
-    }
-
+    pub max_wr: u32,
     /// The number of scatter/gather entries a receive may carry.
-    pub fn max_sge(&self) -> u32 {
-        self.max_sge
-    }
-
+    pub max_sge: u32,
     /// The low-watermark limit currently armed with [`set_limit`](SharedReceiveQueue::set_limit),
     /// or 0 when none is.
-    pub fn limit(&self) -> u32 {
-        self.limit
-    }
+    pub limit: u32,
 }
 
 /// A shared receive queue (SRQ) that allows sharing receive buffers across multiple queue pairs.
@@ -77,9 +59,7 @@ impl SharedReceiveQueue {
     pub fn query(&self) -> Result<SrqAttributes> {
         let mut attr = ffi::ibv_srq_attr::default();
         let errno = unsafe { ffi::ibv_query_srq(self.inner.srq, &mut attr) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QuerySharedReceiveQueue));
-        }
+        raw::errno(errno, Error::QuerySharedReceiveQueue)?;
         Ok(SrqAttributes {
             max_wr: attr.max_wr,
             max_sge: attr.max_sge,
@@ -126,10 +106,7 @@ impl SharedReceiveQueue {
     /// `ibv_modify_srq` for the attributes `mask` selects in `attr`.
     fn modify(&self, attr: &mut ffi::ibv_srq_attr, mask: ffi::ibv_srq_attr_mask) -> Result<()> {
         let errno = unsafe { ffi::ibv_modify_srq(self.inner.srq, attr, mask as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::ModifySharedReceiveQueue));
-        }
-        Ok(())
+        raw::errno(errno, Error::ModifySharedReceiveQueue)
     }
 
     /// Posts a batch of receive Work Requests to this Shared Receive Queue (SRQ) with a single
@@ -164,31 +141,11 @@ impl SharedReceiveQueue {
     /// [1]: https://www.rdmamojo.com/2013/02/08/ibv_post_srq_recv/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_post_srq_recv.3.html
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
-        let recvs = recvs.as_mut();
-        if recvs.is_empty() {
-            return Ok(());
-        }
-        // Link the requests into the list `ibv_post_srq_recv` expects.
-        for i in 0..recvs.len() - 1 {
-            let next = &mut recvs[i + 1].wr as *mut ffi::ibv_recv_wr;
-            recvs[i].wr.next = next;
-        }
-        recvs.last_mut().unwrap().wr.next = ptr::null_mut();
-
-        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let ctx = unsafe { *self.inner.srq }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_srq_recv.as_mut().unwrap()(
-                self.inner.srq,
-                &mut recvs[0].wr as *mut _,
-                &mut bad_wr as *mut _,
-            )
-        };
-        if errno != 0 {
-            Err(Error::errno(errno, Error::PostReceive))
-        } else {
-            Ok(())
+        let srq = self.inner.srq;
+        unsafe {
+            post_linked(recvs.as_mut(), |wr, bad_wr| {
+                ffi::ibv_post_srq_recv(srq, wr, bad_wr)
+            })
         }
     }
 }

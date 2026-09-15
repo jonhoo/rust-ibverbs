@@ -112,9 +112,8 @@
 //! RDMA read/write, and atomics; [`Uc`] sends and RDMA writes; [`Ud`] (and, behind the `efa`
 //! feature, `Srd`) datagram sends addressed through an [`AddressHandle`]. Transport-specific
 //! operations only exist on the matching types, so using one on the wrong transport is a compile
-//! error. The queue-pair types without a marker (raw packet, XRC, and driver-specific types other
-//! than EFA's SRD) are not usable through the portable wrapper anyway; if that changes, they will
-//! get their own markers.
+//! error. The queue-pair types without a marker are not usable through the portable wrapper
+//! anyway (see [`QueuePairType`]).
 //!
 //! # Thread safety
 //!
@@ -264,14 +263,60 @@ macro_rules! flags_newtype {
     };
 }
 
+/// Defines a crate-native enum mirroring one of the raw bindings' C enums: each variant names its
+/// raw counterpart and its display name, from which lossless conversions in both directions and a
+/// `Display` writing that name are generated.
+macro_rules! c_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident($ffi:ty) {
+            $( $(#[$vmeta:meta])* $variant:ident = $raw:ident => $display:literal; )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[non_exhaustive]
+        $vis enum $name {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl From<$ffi> for $name {
+            fn from(raw: $ffi) -> Self {
+                match raw {
+                    $( <$ffi>::$raw => $name::$variant, )+
+                }
+            }
+        }
+
+        impl From<$name> for $ffi {
+            fn from(value: $name) -> Self {
+                match value {
+                    $( $name::$variant => <$ffi>::$raw, )+
+                }
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                let name = match self {
+                    $( $name::$variant => $display, )+
+                };
+                f.write_str(name)
+            }
+        }
+    };
+}
+
 mod address;
 mod completion;
 mod context;
 mod device;
 mod error;
+mod fd;
 mod mr;
 mod pd;
 mod qp;
+mod raw;
 mod srq;
 
 #[cfg(feature = "efa")]

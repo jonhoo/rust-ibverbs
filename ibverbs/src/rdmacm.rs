@@ -50,23 +50,24 @@
 //! while they drive the connection-manager state machine, so they cannot be integrated with an event
 //! loop or async runtime. For full control, drive the state machine yourself with a
 //! [`CmId`]: it exposes every step ([`resolve_addr`], route resolution,
-//! [`connect`], [`accept`], …), hands back each [`CmEvent`] as it arrives,
-//! and can be put into non-blocking mode ([`set_nonblocking`]) so you wait on its file descriptor
-//! ([`AsRawFd`] / [`AsFd`]) with `epoll`, `poll`, a `tokio` `AsyncFd`, or any other reactor and pump
-//! events with [`poll_cm_event`]. You build the queue pair on the
-//! [`context`](CmId::context) the id resolves to and transition it with
-//! [`init_qp_attr`](CmId::init_qp_attr) plus
-//! [`QueuePair::modify`](crate::QueuePair::modify): on the active side `Init` before [`connect`],
-//! then — once the [`ConnectResponse`](CmEventType::ConnectResponse) has arrived — `Init` again
-//! (the attributes computed before the connection existed carry no remote-access flags),
-//! `ReadyToReceive`, `ReadyToSend`, and [`establish`](CmId::establish); on the passive side
-//! `Init`, `ReadyToReceive`, and `ReadyToSend` before [`accept`]. The blocking helpers are written
-//! on top of this same API.
+//! [`connect`], [`accept`], …) and hands back each [`CmEvent`] as it arrives: block for the next
+//! one with [`wait_cm_event`], or — its event channel being non-blocking — wait on its file
+//! descriptor ([`AsRawFd`] / [`AsFd`]) with `epoll`, `poll`, a `tokio` `AsyncFd`, or any other
+//! reactor and pump events with [`poll_cm_event`]. You build the queue pair on the
+//! [`context`](CmId::context) the id resolves to and move it through its states with
+//! [`transition`](CmId::transition) and [`ready`](CmId::ready) (the connection manager's
+//! attributes for each state, applied with [`QueuePair::modify`](crate::QueuePair::modify)): on
+//! the active side `Init` before [`connect`], then — once the
+//! [`ConnectResponse`](CmEventType::ConnectResponse) has arrived — `Init` again (the attributes
+//! computed before the connection existed carry no remote-access flags), `ready`, and
+//! [`establish`](CmId::establish); on the passive side `Init` and `ready` before [`accept`]. The
+//! blocking helpers are written on top of this same API, and a connection set up this way can be
+//! wrapped in a [`Connection`] with [`Connection::from_parts`].
 //!
 //! [`resolve_addr`]: CmId::resolve_addr
 //! [`connect`]: CmId::connect
 //! [`accept`]: CmId::accept
-//! [`set_nonblocking`]: CmId::set_nonblocking
+//! [`wait_cm_event`]: CmId::wait_cm_event
 //! [`poll_cm_event`]: CmId::poll_cm_event
 //! [`AsRawFd`]: std::os::fd::AsRawFd
 //! [`AsFd`]: std::os::fd::AsFd
@@ -81,197 +82,81 @@ use std::time::{Duration, Instant};
 
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
 
+use crate::fd;
 use crate::qp::QueuePairState;
+use crate::raw;
 use crate::{
     AckTimeout, Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Rc, Result,
 };
 
-/// The port space a connection-manager identifier lives in: which namespace its port numbers are
-/// allocated from, and which transport its connections use. Passed to [`Connector::new`],
-/// [`Acceptor::bind`], and [`CmId::create`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PortSpace {
-    /// IP over InfiniBand.
-    Ipoib,
-    /// TCP port space: reliable connections (RC). The usual choice.
-    Tcp,
-    /// UDP port space: unreliable datagrams (UD).
-    Udp,
-    /// The InfiniBand port space, for any port number.
-    Ib,
-}
-
-impl From<ffi::rdma_port_space> for PortSpace {
-    fn from(port_space: ffi::rdma_port_space) -> Self {
-        use ffi::rdma_port_space::*;
-        match port_space {
-            RDMA_PS_IPOIB => PortSpace::Ipoib,
-            RDMA_PS_TCP => PortSpace::Tcp,
-            RDMA_PS_UDP => PortSpace::Udp,
-            RDMA_PS_IB => PortSpace::Ib,
-        }
-    }
-}
-
-impl From<PortSpace> for ffi::rdma_port_space {
-    fn from(port_space: PortSpace) -> Self {
-        use ffi::rdma_port_space::*;
-        match port_space {
-            PortSpace::Ipoib => RDMA_PS_IPOIB,
-            PortSpace::Tcp => RDMA_PS_TCP,
-            PortSpace::Udp => RDMA_PS_UDP,
-            PortSpace::Ib => RDMA_PS_IB,
-        }
-    }
-}
-
-/// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
-/// the sequence in which the events arrive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum CmEventType {
-    /// The destination address resolved to an RDMA device.
-    AddressResolved,
-    /// Resolving the destination address failed.
-    AddressError,
-    /// The route to the destination resolved.
-    RouteResolved,
-    /// Resolving the route failed.
-    RouteError,
-    /// An incoming connection request arrived on a listener (take its id with
-    /// [`CmEvent::connection_request`]).
-    ConnectRequest,
-    /// The remote accepted a connection whose queue pair the connection manager does not manage;
-    /// finish with [`CmId::establish`].
-    ConnectResponse,
-    /// Establishing the connection failed.
-    ConnectError,
-    /// The remote is unreachable.
-    Unreachable,
-    /// The remote rejected the connection request.
-    Rejected,
-    /// The connection is established.
-    Established,
-    /// The connection was disconnected.
-    Disconnected,
-    /// The device backing the id was removed.
-    DeviceRemoval,
-    /// A multicast join completed.
-    MulticastJoin,
-    /// A multicast join failed or the group errored.
-    MulticastError,
-    /// The id's network address changed.
-    AddressChange,
-    /// The connection left the timewait state; its queue pair may be reused.
-    TimewaitExit,
-    /// Address information resolved (`rdma_getaddrinfo`-style resolution).
-    AddressInfoResolved,
-    /// Resolving address information failed.
-    AddressInfoError,
-    /// A user-generated event.
-    User,
-    /// An internal event.
-    Internal,
-}
-
-impl From<ffi::rdma_cm_event_type> for CmEventType {
-    fn from(event: ffi::rdma_cm_event_type) -> Self {
-        use ffi::rdma_cm_event_type::*;
-        match event {
-            RDMA_CM_EVENT_ADDR_RESOLVED => CmEventType::AddressResolved,
-            RDMA_CM_EVENT_ADDR_ERROR => CmEventType::AddressError,
-            RDMA_CM_EVENT_ROUTE_RESOLVED => CmEventType::RouteResolved,
-            RDMA_CM_EVENT_ROUTE_ERROR => CmEventType::RouteError,
-            RDMA_CM_EVENT_CONNECT_REQUEST => CmEventType::ConnectRequest,
-            RDMA_CM_EVENT_CONNECT_RESPONSE => CmEventType::ConnectResponse,
-            RDMA_CM_EVENT_CONNECT_ERROR => CmEventType::ConnectError,
-            RDMA_CM_EVENT_UNREACHABLE => CmEventType::Unreachable,
-            RDMA_CM_EVENT_REJECTED => CmEventType::Rejected,
-            RDMA_CM_EVENT_ESTABLISHED => CmEventType::Established,
-            RDMA_CM_EVENT_DISCONNECTED => CmEventType::Disconnected,
-            RDMA_CM_EVENT_DEVICE_REMOVAL => CmEventType::DeviceRemoval,
-            RDMA_CM_EVENT_MULTICAST_JOIN => CmEventType::MulticastJoin,
-            RDMA_CM_EVENT_MULTICAST_ERROR => CmEventType::MulticastError,
-            RDMA_CM_EVENT_ADDR_CHANGE => CmEventType::AddressChange,
-            RDMA_CM_EVENT_TIMEWAIT_EXIT => CmEventType::TimewaitExit,
-            RDMA_CM_EVENT_ADDRINFO_RESOLVED => CmEventType::AddressInfoResolved,
-            RDMA_CM_EVENT_ADDRINFO_ERROR => CmEventType::AddressInfoError,
-            RDMA_CM_EVENT_USER => CmEventType::User,
-            RDMA_CM_EVENT_INTERNAL => CmEventType::Internal,
-        }
-    }
-}
-
-impl From<CmEventType> for ffi::rdma_cm_event_type {
-    fn from(event: CmEventType) -> Self {
-        use ffi::rdma_cm_event_type::*;
-        match event {
-            CmEventType::AddressResolved => RDMA_CM_EVENT_ADDR_RESOLVED,
-            CmEventType::AddressError => RDMA_CM_EVENT_ADDR_ERROR,
-            CmEventType::RouteResolved => RDMA_CM_EVENT_ROUTE_RESOLVED,
-            CmEventType::RouteError => RDMA_CM_EVENT_ROUTE_ERROR,
-            CmEventType::ConnectRequest => RDMA_CM_EVENT_CONNECT_REQUEST,
-            CmEventType::ConnectResponse => RDMA_CM_EVENT_CONNECT_RESPONSE,
-            CmEventType::ConnectError => RDMA_CM_EVENT_CONNECT_ERROR,
-            CmEventType::Unreachable => RDMA_CM_EVENT_UNREACHABLE,
-            CmEventType::Rejected => RDMA_CM_EVENT_REJECTED,
-            CmEventType::Established => RDMA_CM_EVENT_ESTABLISHED,
-            CmEventType::Disconnected => RDMA_CM_EVENT_DISCONNECTED,
-            CmEventType::DeviceRemoval => RDMA_CM_EVENT_DEVICE_REMOVAL,
-            CmEventType::MulticastJoin => RDMA_CM_EVENT_MULTICAST_JOIN,
-            CmEventType::MulticastError => RDMA_CM_EVENT_MULTICAST_ERROR,
-            CmEventType::AddressChange => RDMA_CM_EVENT_ADDR_CHANGE,
-            CmEventType::TimewaitExit => RDMA_CM_EVENT_TIMEWAIT_EXIT,
-            CmEventType::AddressInfoResolved => RDMA_CM_EVENT_ADDRINFO_RESOLVED,
-            CmEventType::AddressInfoError => RDMA_CM_EVENT_ADDRINFO_ERROR,
-            CmEventType::User => RDMA_CM_EVENT_USER,
-            CmEventType::Internal => RDMA_CM_EVENT_INTERNAL,
-        }
-    }
-}
-
-impl std::fmt::Display for PortSpace {
-    /// Formats the port space as it is named in the C headers, for example `TCP` for
+c_enum! {
+    /// The port space a connection-manager identifier lives in: which namespace its port numbers are
+    /// allocated from, and which transport its connections use. Passed to [`Connector::new`],
+    /// [`Acceptor::bind`], and [`CmId::create`].
+    ///
+    /// `Display` formats the port space as it is named in the C headers, for example `TCP` for
     /// [`Tcp`](Self::Tcp).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            PortSpace::Ipoib => "IPOIB",
-            PortSpace::Tcp => "TCP",
-            PortSpace::Udp => "UDP",
-            PortSpace::Ib => "IB",
-        };
-        f.write_str(name)
+    pub enum PortSpace(ffi::rdma_port_space) {
+        /// IP over InfiniBand.
+        Ipoib = RDMA_PS_IPOIB => "IPOIB";
+        /// TCP port space: reliable connections (RC). The usual choice.
+        Tcp = RDMA_PS_TCP => "TCP";
+        /// UDP port space: unreliable datagrams (UD).
+        Udp = RDMA_PS_UDP => "UDP";
+        /// The InfiniBand port space, for any port number.
+        Ib = RDMA_PS_IB => "IB";
     }
 }
 
-impl std::fmt::Display for CmEventType {
-    /// Formats the event as it is named in the C headers, for example `CONNECT_REQUEST` for
+c_enum! {
+    /// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
+    /// the sequence in which the events arrive.
+    ///
+    /// `Display` formats the event as it is named in the C headers, for example `CONNECT_REQUEST` for
     /// [`ConnectRequest`](Self::ConnectRequest).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            CmEventType::AddressResolved => "ADDR_RESOLVED",
-            CmEventType::AddressError => "ADDR_ERROR",
-            CmEventType::RouteResolved => "ROUTE_RESOLVED",
-            CmEventType::RouteError => "ROUTE_ERROR",
-            CmEventType::ConnectRequest => "CONNECT_REQUEST",
-            CmEventType::ConnectResponse => "CONNECT_RESPONSE",
-            CmEventType::ConnectError => "CONNECT_ERROR",
-            CmEventType::Unreachable => "UNREACHABLE",
-            CmEventType::Rejected => "REJECTED",
-            CmEventType::Established => "ESTABLISHED",
-            CmEventType::Disconnected => "DISCONNECTED",
-            CmEventType::DeviceRemoval => "DEVICE_REMOVAL",
-            CmEventType::MulticastJoin => "MULTICAST_JOIN",
-            CmEventType::MulticastError => "MULTICAST_ERROR",
-            CmEventType::AddressChange => "ADDR_CHANGE",
-            CmEventType::TimewaitExit => "TIMEWAIT_EXIT",
-            CmEventType::AddressInfoResolved => "ADDR_INFO_RESOLVED",
-            CmEventType::AddressInfoError => "ADDR_INFO_ERROR",
-            CmEventType::User => "USER",
-            CmEventType::Internal => "INTERNAL",
-        };
-        f.write_str(name)
+    pub enum CmEventType(ffi::rdma_cm_event_type) {
+        /// The destination address resolved to an RDMA device.
+        AddressResolved = RDMA_CM_EVENT_ADDR_RESOLVED => "ADDR_RESOLVED";
+        /// Resolving the destination address failed.
+        AddressError = RDMA_CM_EVENT_ADDR_ERROR => "ADDR_ERROR";
+        /// The route to the destination resolved.
+        RouteResolved = RDMA_CM_EVENT_ROUTE_RESOLVED => "ROUTE_RESOLVED";
+        /// Resolving the route failed.
+        RouteError = RDMA_CM_EVENT_ROUTE_ERROR => "ROUTE_ERROR";
+        /// An incoming connection request arrived on a listener (take its id with
+        /// [`CmEvent::connection_request`]).
+        ConnectRequest = RDMA_CM_EVENT_CONNECT_REQUEST => "CONNECT_REQUEST";
+        /// The remote accepted a connection whose queue pair the connection manager does not manage;
+        /// finish with [`CmId::establish`].
+        ConnectResponse = RDMA_CM_EVENT_CONNECT_RESPONSE => "CONNECT_RESPONSE";
+        /// Establishing the connection failed.
+        ConnectError = RDMA_CM_EVENT_CONNECT_ERROR => "CONNECT_ERROR";
+        /// The remote is unreachable.
+        Unreachable = RDMA_CM_EVENT_UNREACHABLE => "UNREACHABLE";
+        /// The remote rejected the connection request.
+        Rejected = RDMA_CM_EVENT_REJECTED => "REJECTED";
+        /// The connection is established.
+        Established = RDMA_CM_EVENT_ESTABLISHED => "ESTABLISHED";
+        /// The connection was disconnected.
+        Disconnected = RDMA_CM_EVENT_DISCONNECTED => "DISCONNECTED";
+        /// The device backing the id was removed.
+        DeviceRemoval = RDMA_CM_EVENT_DEVICE_REMOVAL => "DEVICE_REMOVAL";
+        /// A multicast join completed.
+        MulticastJoin = RDMA_CM_EVENT_MULTICAST_JOIN => "MULTICAST_JOIN";
+        /// A multicast join failed or the group errored.
+        MulticastError = RDMA_CM_EVENT_MULTICAST_ERROR => "MULTICAST_ERROR";
+        /// The id's network address changed.
+        AddressChange = RDMA_CM_EVENT_ADDR_CHANGE => "ADDR_CHANGE";
+        /// The connection left the timewait state; its queue pair may be reused.
+        TimewaitExit = RDMA_CM_EVENT_TIMEWAIT_EXIT => "TIMEWAIT_EXIT";
+        /// Address information resolved (`rdma_getaddrinfo`-style resolution).
+        AddressInfoResolved = RDMA_CM_EVENT_ADDRINFO_RESOLVED => "ADDRINFO_RESOLVED";
+        /// Resolving address information failed.
+        AddressInfoError = RDMA_CM_EVENT_ADDRINFO_ERROR => "ADDRINFO_ERROR";
+        /// A user-generated event.
+        User = RDMA_CM_EVENT_USER => "USER";
+        /// An internal event.
+        Internal = RDMA_CM_EVENT_INTERNAL => "INTERNAL";
     }
 }
 
@@ -391,19 +276,31 @@ fn is_failure(event: CmEventType) -> bool {
 }
 
 /// An rdma_cm event channel. Owned 1:1 by the [`CmId`] whose events it carries; it is created with
-/// the id and destroyed after it.
+/// the id and destroyed after it. Its descriptor is non-blocking, so reading it reports an empty
+/// channel instead of blocking; the blocking waits `poll(2)` the descriptor first.
 struct EventChannel {
     chan: *mut ffi::rdma_event_channel,
 }
 
 impl EventChannel {
-    /// Opens a new event channel.
+    /// Opens a new event channel, non-blocking.
     fn new() -> Result<EventChannel> {
-        let chan = unsafe { ffi::rdma_create_event_channel() };
-        if chan.is_null() {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(EventChannel { chan })
+        let chan = raw::nonnull(
+            unsafe { ffi::rdma_create_event_channel() },
+            Error::ConnectionSetup,
+        )?;
+        // If this fails, `channel` drops here and destroys the half-created channel.
+        let channel = EventChannel { chan };
+        fd::set_nonblocking(channel.as_fd()).map_err(Error::ConnectionSetup)?;
+        Ok(channel)
+    }
+}
+
+impl AsFd for EventChannel {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the channel fd lives as long as this `EventChannel`, and the borrow is tied to
+        // `&self`.
+        unsafe { BorrowedFd::borrow_raw((*self.chan).fd) }
     }
 }
 
@@ -440,7 +337,7 @@ impl Drop for CmIdInner {
 /// [module-level docs](self#low-level-control) for the overall flow. A typical active-side sequence
 /// is [`resolve_addr`](Self::resolve_addr), [`resolve_route`](Self::resolve_route),
 /// [`connect`](Self::connect), [`establish`](Self::establish), pumping for the matching
-/// [`CmEvent`] after each with [`get_cm_event`](Self::get_cm_event) (blocking) or
+/// [`CmEvent`] after each with [`wait_cm_event`](Self::wait_cm_event) (blocking) or
 /// [`poll_cm_event`](Self::poll_cm_event) (non-blocking); the queue pair is built on
 /// [`context`](Self::context) and transitioned with [`init_qp_attr`](Self::init_qp_attr).
 ///
@@ -468,42 +365,18 @@ impl CmId {
                 port_space.into(),
             )
         };
-        if ret != 0 {
-            // `channel` drops here, destroying the event channel.
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        // On failure `channel` drops here, destroying the event channel.
+        raw::os(ret, Error::ConnectionSetup)?;
         Ok(CmId {
             inner: Arc::new(CmIdInner { channel, id }),
         })
     }
 
-    /// Blocks until the next event on this id's channel is available and returns it.
-    ///
-    /// The event is acknowledged automatically when the returned [`CmEvent`] drops. If the channel
-    /// has been put into non-blocking mode with [`set_nonblocking`](Self::set_nonblocking), use
-    /// [`poll_cm_event`](Self::poll_cm_event) instead, which reports an empty channel as `None`
-    /// rather than erroring.
-    pub fn get_cm_event(&self) -> Result<CmEvent> {
-        let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
-        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(CmEvent {
-            event,
-            _id: self.clone(),
-            taken: false,
-        })
-    }
-
     /// Returns the next event on this id's channel, or `None` if none is currently pending.
     ///
-    /// Intended for non-blocking, event-loop use: put the channel into non-blocking mode with
-    /// [`set_nonblocking`](Self::set_nonblocking), wait for the file descriptor from
-    /// [`AsRawFd`]/[`AsFd`] to become readable with your
-    /// reactor of choice, then drain pending events with this method (acknowledged on drop). On a
-    /// blocking channel it behaves like [`get_cm_event`](Self::get_cm_event), only ever returning
-    /// `Some`.
+    /// The non-blocking form, for event-loop use: wait for the file descriptor from
+    /// [`AsRawFd`]/[`AsFd`] to become readable with your reactor of choice, then drain pending
+    /// events with this method. Each event is acknowledged automatically when it drops.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
         let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
@@ -512,30 +385,43 @@ impl CmId {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::ConnectionSetup(e));
+            return Err(Error::os(e, Error::ConnectionSetup));
         }
         Ok(Some(CmEvent {
             event,
-            _id: self.clone(),
+            id: self.clone(),
             taken: false,
         }))
     }
 
-    /// Switches this id's event channel between blocking and non-blocking delivery.
+    /// Blocks until the next event on this id's channel arrives (up to `timeout`) and returns it.
+    /// Returns `None` only if `timeout` elapses first; with no timeout it waits indefinitely.
     ///
-    /// In non-blocking mode [`get_cm_event`](Self::get_cm_event) and the underlying file descriptor
-    /// no longer block; pair it with [`poll_cm_event`](Self::poll_cm_event) and a reactor watching
-    /// the [`AsRawFd`]/[`AsFd`] descriptor to integrate
-    /// connection setup with an event loop.
-    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
-        let fd = self.as_fd();
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-        let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
-        flags.set(nix::fcntl::OFlag::O_NONBLOCK, nonblocking);
-        nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags))
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-        Ok(())
+    /// The blocking form of [`poll_cm_event`](Self::poll_cm_event): it waits on the channel's
+    /// file descriptor for you rather than requiring an external reactor. The event is
+    /// acknowledged automatically when it drops.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the descriptor (`poll`) or
+    ///    reading the event (`rdma_get_cm_event`) failed.
+    pub fn wait_cm_event(&self, timeout: Option<Duration>) -> Result<Option<CmEvent>> {
+        self.wait_cm_event_until(fd::deadline(timeout))
+    }
+
+    /// [`wait_cm_event`](Self::wait_cm_event) against an absolute deadline, for the blocking
+    /// helpers to share one deadline across several waits.
+    fn wait_cm_event_until(&self, deadline: Option<Instant>) -> Result<Option<CmEvent>> {
+        loop {
+            if !fd::wait_readable(self.as_fd(), deadline).map_err(Error::ConnectionSetup)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the event first;
+            // if so, go back to waiting for the next one.
+            if let Some(event) = self.poll_cm_event()? {
+                return Ok(Some(event));
+            }
+        }
     }
 
     /// The device the connection manager has bound this id to. Build the queue pair (and its
@@ -569,41 +455,11 @@ impl CmId {
         };
         let mut mask: c_int = 0;
         let ret = unsafe { ffi::rdma_init_qp_attr(self.inner.id, &mut attr, &mut mask) };
-        if ret != 0 {
-            return Err(Error::ModifyQueuePair(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ModifyQueuePair)?;
         Ok(QueuePairAttribute::from_raw(
             attr,
             ffi::ibv_qp_attr_mask(mask as u32),
         ))
-    }
-
-    /// Blocks until the next event arrives (up to `deadline`) and returns it, or `None` if the
-    /// deadline passes first. Implements the blocking setup helpers' timeouts: the event channel
-    /// stays in blocking mode, but its file descriptor is `poll(2)`ed with the remaining time
-    /// before each read, so the read itself never blocks past the deadline.
-    fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<Option<CmEvent>> {
-        if let Some(deadline) = deadline {
-            let remaining = crate::completion::ceil_to_millis(
-                deadline.saturating_duration_since(Instant::now()),
-            );
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                nix::poll::PollTimeout::try_from(remaining).map_err(|_| {
-                    Error::ConnectionSetup(io::Error::other(
-                        "failed to convert timeout to PollTimeout",
-                    ))
-                })?,
-            )
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {}
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
-            }
-        }
-        Ok(Some(self.get_cm_event()?))
     }
 
     /// Blocks until an `expected` event arrives (up to `deadline`) and returns it, acknowledging
@@ -614,7 +470,7 @@ impl CmId {
             // This blocks on the channel's fd until an event arrives — it does not spin. The loop
             // only goes around to skip a non-matching event, re-blocking on the next read. Each
             // skipped event is acknowledged when it drops at the iteration end.
-            let Some(event) = self.get_cm_event_deadline(deadline)? else {
+            let Some(event) = self.wait_cm_event_until(deadline)? else {
                 return Err(Error::TimedOut);
             };
             let kind = event.event_type();
@@ -632,9 +488,7 @@ impl CmId {
     pub fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
         let addr = OsSocketAddr::new(addr);
         let ret = unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr()) };
-        if ret != 0 {
-            return Err(Error::BindAddress(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::BindAddress)?;
         Ok(())
     }
 
@@ -643,9 +497,7 @@ impl CmId {
     /// new id with [`CmEvent::connection_request`].
     pub fn listen(&self, backlog: u32) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog.min(i32::MAX as u32) as i32) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ConnectionSetup)?;
         Ok(())
     }
 
@@ -663,9 +515,7 @@ impl CmId {
                 timeout_ms(timeout),
             )
         };
-        if ret != 0 {
-            return Err(Error::ResolveAddress(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ResolveAddress)?;
         Ok(())
     }
 
@@ -674,9 +524,7 @@ impl CmId {
     /// be built and [`connect`](Self::connect) called.
     pub fn resolve_route(&self, timeout: Duration) -> Result<()> {
         let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout)) };
-        if ret != 0 {
-            return Err(Error::ResolveRoute(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ResolveRoute)?;
         Ok(())
     }
 
@@ -708,9 +556,7 @@ impl CmId {
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
         let ret = unsafe { ffi::rdma_connect(self.inner.id, &mut raw) };
-        if ret != 0 {
-            return Err(Error::Connect(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::Connect)?;
         Ok(())
     }
 
@@ -740,9 +586,7 @@ impl CmId {
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
         let ret = unsafe { ffi::rdma_accept(self.inner.id, &mut raw) };
-        if ret != 0 {
-            return Err(Error::Accept(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::Accept)?;
         Ok(())
     }
 
@@ -772,9 +616,7 @@ impl CmId {
                 private_data.len() as u8,
             )
         };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ConnectionSetup)?;
         Ok(())
     }
 
@@ -782,9 +624,7 @@ impl CmId {
     /// `RTS`, in response to a [`CmEventType::ConnectResponse`].
     pub fn establish(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_establish(self.inner.id) };
-        if ret != 0 {
-            return Err(Error::Connect(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::Connect)?;
         Ok(())
     }
 
@@ -797,9 +637,7 @@ impl CmId {
     /// [`Connection::disconnect`] does).
     pub fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.inner.id) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ConnectionSetup)?;
         Ok(())
     }
 
@@ -814,9 +652,7 @@ impl CmId {
                 std::mem::size_of::<T>(),
             )
         };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ConnectionSetup)?;
         Ok(())
     }
 
@@ -876,9 +712,7 @@ impl CmId {
     pub fn notify_established(&self) -> Result<()> {
         let ret =
             unsafe { ffi::rdma_notify(self.inner.id, ffi::ibv_event_type::IBV_EVENT_COMM_EST) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        raw::os(ret, Error::ConnectionSetup)?;
         Ok(())
     }
 
@@ -930,12 +764,22 @@ impl CmId {
         Ok(qp)
     }
 
-    /// Moves `qp` from `INIT` through `RTR` to `RTS`, completing the connection-manager transition.
+    /// Moves `qp` from `INIT` through `RTR` to `RTS` with the attributes the connection manager
+    /// computes ([`transition`](Self::transition) for both states): on the passive side before
+    /// [`accept`](Self::accept), on the active side after the
+    /// [`ConnectResponse`](CmEventType::ConnectResponse) and a second `Init`, before
+    /// [`establish`](Self::establish).
     ///
     /// Like librdmacm, `responder_resources` and `initiator_depth` override the outstanding-RDMA
     /// limits the connection manager computed (`max_dest_rd_atomic` at `RTR`, `max_rd_atomic` at
-    /// `RTS`), so the queue pair is configured with the values this side advertises in its reply.
-    fn ready(
+    /// `RTS`), so the queue pair is configured with the values this side advertises in its reply;
+    /// `None` keeps the computed values.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): computing the attributes or a transition
+    ///    failed (or its typed diagnoses of a rejected attribute set).
+    pub fn ready(
         &self,
         qp: &mut QueuePair<Rc>,
         responder_resources: Option<u8>,
@@ -955,30 +799,34 @@ impl CmId {
 
     /// Transitions `qp` to `state` using the attributes the connection manager computes from the
     /// resolved route and negotiated parameters ([`init_qp_attr`](Self::init_qp_attr)), applied with
-    /// [`QueuePair::modify`].
-    fn transition(&self, qp: &mut QueuePair<Rc>, state: QueuePairState) -> Result<()> {
+    /// [`QueuePair::modify`]: the step the blocking helpers take at each point of the setup (see
+    /// the [module docs](self#low-level-control)), for driving it from an event loop.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): computing the attributes or the transition
+    ///    failed (or its typed diagnoses of a rejected attribute set).
+    pub fn transition(&self, qp: &mut QueuePair<Rc>, state: QueuePairState) -> Result<()> {
         qp.modify(&self.init_qp_attr(state)?)
     }
 }
 
 impl AsRawFd for CmId {
-    /// The raw file descriptor of this id's event channel. Pair with
-    /// [`set_nonblocking`](CmId::set_nonblocking) and a reactor to drive connection setup without
-    /// blocking; it becomes readable when a connection-manager event is pending.
+    /// The raw file descriptor of this id's event channel. It is non-blocking: hand it to a
+    /// reactor to drive connection setup without blocking, draining events with
+    /// [`poll_cm_event`](CmId::poll_cm_event) once it becomes readable.
     fn as_raw_fd(&self) -> RawFd {
-        unsafe { (*self.inner.channel.chan).fd }
+        self.inner.channel.as_fd().as_raw_fd()
     }
 }
 
 impl AsFd for CmId {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: the channel fd lives as long as this `CmId` (its inner `channel` field), and the
-        // borrow is tied to `&self`.
-        unsafe { BorrowedFd::borrow_raw((*self.inner.channel.chan).fd) }
+        self.inner.channel.as_fd()
     }
 }
 
-/// A connection-manager event, retrieved with [`CmId::get_cm_event`]/[`CmId::poll_cm_event`] and
+/// A connection-manager event, retrieved with [`CmId::wait_cm_event`]/[`CmId::poll_cm_event`] and
 /// acknowledged automatically when dropped.
 ///
 /// The event keeps the id whose channel delivered it alive: `rdma_destroy_id` blocks until every
@@ -989,7 +837,7 @@ impl AsFd for CmId {
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
     /// The id whose channel delivered the event (the listener, for a connection request).
-    _id: CmId,
+    id: CmId,
     /// Whether a connection request's new id has been taken over by
     /// [`connection_request`](Self::connection_request).
     taken: bool,
@@ -1007,6 +855,12 @@ impl CmEvent {
             status: self.status(),
             private_data: self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
         }
+    }
+
+    /// The id whose channel delivered this event (for a connection request, the listener; the new
+    /// connection's id is taken with [`connection_request`](Self::connection_request)).
+    pub fn id(&self) -> &CmId {
+        &self.id
     }
 
     /// The kind of event. Match on the [`CmEventType`] to decide what to do next; see [`CmId`] for
@@ -1082,7 +936,7 @@ impl CmEvent {
             let err = io::Error::last_os_error();
             // The request id is ours to destroy once we abandon it; `channel` drops after.
             unsafe { ffi::rdma_destroy_id(id) };
-            return Err(Error::ConnectionSetup(err));
+            return Err(Error::os(err, Error::ConnectionSetup));
         }
         Ok(CmId {
             inner: Arc::new(CmIdInner { channel, id }),
@@ -1222,6 +1076,57 @@ impl ConnectionParameter {
     }
 }
 
+/// The options and addresses of a connection-manager id that one of the blocking helpers is
+/// driving: what [`Connector::cm_id`], [`Resolved::cm_id`], [`Acceptor::cm_id`], and
+/// [`Incoming::cm_id`] hand out. It leaves out the event pump and the state-machine steps, which
+/// the helper is driving itself; to drive those, use a [`CmId`] directly.
+#[derive(Clone, Copy)]
+pub struct CmIdOptions<'a> {
+    id: &'a CmId,
+}
+
+impl CmIdOptions<'_> {
+    /// Set the type of service of the id's traffic ([`CmId::set_tos`]).
+    pub fn set_tos(&self, tos: u8) -> Result<()> {
+        self.id.set_tos(tos)
+    }
+
+    /// Allow the local address to be shared ([`CmId::set_reuse_addr`]).
+    pub fn set_reuse_addr(&self, reuse: bool) -> Result<()> {
+        self.id.set_reuse_addr(reuse)
+    }
+
+    /// Restrict an IPv6-bound id to IPv6 peers ([`CmId::set_af_only`]).
+    pub fn set_af_only(&self, only: bool) -> Result<()> {
+        self.id.set_af_only(only)
+    }
+
+    /// Override the ACK timeout the connection manager derives ([`CmId::set_ack_timeout`]).
+    pub fn set_ack_timeout(&self, timeout: AckTimeout) -> Result<()> {
+        self.id.set_ack_timeout(timeout)
+    }
+
+    /// Report the peer's first message as received ([`CmId::notify_established`]).
+    pub fn notify_established(&self) -> Result<()> {
+        self.id.notify_established()
+    }
+
+    /// The remote address, once resolved ([`CmId::peer_addr`]).
+    pub fn peer_addr(&self) -> Option<SocketAddr> {
+        self.id.peer_addr()
+    }
+
+    /// The local address, once bound or resolved ([`CmId::local_addr`]).
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.id.local_addr()
+    }
+
+    /// The underlying `rdma_cm_id` pointer ([`CmId::as_raw`]).
+    pub fn as_raw(&self) -> *mut ffi::rdma_cm_id {
+        self.id.as_raw()
+    }
+}
+
 /// Active-side blocking connection setup. Created by [`Connector::new`]; drives address and route
 /// resolution, then yields a [`Resolved`] from which you build a queue pair and connect.
 #[must_use]
@@ -1244,15 +1149,24 @@ impl Connector {
         })
     }
 
-    /// The underlying id, for options that must be set before resolving ([`CmId::set_tos`],
-    /// [`CmId::set_ack_timeout`]).
-    pub fn cm_id(&self) -> &CmId {
-        &self.id
+    /// The underlying id's options, for the ones that must be set before resolving
+    /// ([`set_tos`](CmIdOptions::set_tos), [`set_ack_timeout`](CmIdOptions::set_ack_timeout)).
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.id }
     }
 
     /// Resolves the destination address and route (blocking until both complete), then returns a
     /// handle to build the queue pair on the resolved device. `timeout` bounds each of the two
-    /// resolution steps (it is enforced by the kernel, which reports expiry as a failure event).
+    /// resolution steps; the kernel enforces it and reports expiry as a failure event, not as
+    /// [`TimedOut`](Error::TimedOut).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ResolveAddress`](Error::ResolveAddress) / [`ResolveRoute`](Error::ResolveRoute): a
+    ///    resolution could not be started.
+    ///  - [`ConnectionManager`](Error::ConnectionManager): a resolution failed or timed out (the
+    ///    event is [`AddressError`](CmEventType::AddressError) or
+    ///    [`RouteError`](CmEventType::RouteError), with status `-ETIMEDOUT` on expiry).
     pub fn resolve(self, dst: SocketAddr, timeout: Duration) -> Result<Resolved> {
         self.id.resolve_addr(dst, timeout)?;
         // The kernel delivers AddressError/RouteError once `timeout` expires, so these waits
@@ -1278,10 +1192,10 @@ impl Resolved {
         self.id.context()
     }
 
-    /// The underlying id: the resolved route's addresses, and the options that must be set before
-    /// connecting ([`CmId::set_ack_timeout`]).
-    pub fn cm_id(&self) -> &CmId {
-        &self.id
+    /// The underlying id's options: the resolved route's addresses, and the ones that must be set
+    /// before connecting ([`set_ack_timeout`](CmIdOptions::set_ack_timeout)).
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.id }
     }
 
     /// Connects to the remote (blocking) using `qp`, returning the established [`Connection`]. The
@@ -1304,7 +1218,7 @@ impl Resolved {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         let mut qp = self.id.init_qp(qp)?;
         let param = param.set_qp_num(qp.qp_num());
         self.id.connect(&param)?;
@@ -1371,9 +1285,9 @@ impl Acceptor {
         Ok(Acceptor { listener })
     }
 
-    /// The listening id.
-    pub fn cm_id(&self) -> &CmId {
-        &self.listener
+    /// The listening id's options and addresses.
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.listener }
     }
 
     /// The local address the acceptor listens on: the address passed to [`bind`](Self::bind),
@@ -1396,9 +1310,9 @@ impl Acceptor {
     ///    device was removed).
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         loop {
-            let Some(event) = self.listener.get_cm_event_deadline(deadline)? else {
+            let Some(event) = self.listener.wait_cm_event_until(deadline)? else {
                 return Err(Error::TimedOut);
             };
             let kind = event.event_type();
@@ -1434,10 +1348,10 @@ impl Incoming {
         self.id.context()
     }
 
-    /// The request's id: the peer's address, and the options that must be set before accepting
-    /// ([`CmId::set_ack_timeout`]).
-    pub fn cm_id(&self) -> &CmId {
-        &self.id
+    /// The request's id's options: the peer's address, and the ones that must be set before
+    /// accepting ([`set_ack_timeout`](CmIdOptions::set_ack_timeout)).
+    pub fn cm_id(&self) -> CmIdOptions<'_> {
+        CmIdOptions { id: &self.id }
     }
 
     /// The private data the peer attached to its request
@@ -1471,7 +1385,7 @@ impl Incoming {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         let mut qp = self.id.init_qp(qp)?;
         let responder_resources = (param.param.responder_resources != RDMA_MAX_RESP_RES)
             .then_some(param.param.responder_resources);
@@ -1516,6 +1430,32 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// Assemble a connection from its parts — an established id, the queue pair connected through
+    /// it, and the private data the peer sent — so a connection set up by driving a [`CmId`]
+    /// yourself disconnects on drop like the ones the blocking helpers return.
+    pub fn from_parts(id: CmId, qp: QueuePair<Rc>, peer_private_data: Vec<u8>) -> Connection {
+        Connection {
+            id,
+            qp,
+            private_data: peer_private_data,
+        }
+    }
+
+    /// Take the connection apart without disconnecting: the id, the queue pair, and the peer's
+    /// private data. Dropping the id later destroys it (which also tears the connection down); the
+    /// queue pair is destroyed on its own when dropped.
+    pub fn into_parts(self) -> (CmId, QueuePair<Rc>, Vec<u8>) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: each field is moved out exactly once, and `this` is never dropped.
+        unsafe {
+            (
+                ptr::read(&this.id),
+                ptr::read(&this.qp),
+                ptr::read(&this.private_data),
+            )
+        }
+    }
+
     /// The connected queue pair, for posting work requests. Poll completions on the completion queue
     /// you built it with.
     pub fn queue_pair(&mut self) -> &mut QueuePair<Rc> {
@@ -1524,7 +1464,7 @@ impl Connection {
 
     /// The connection's id, to watch what happens to it after establishment — the peer
     /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
-    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`].
+    /// with [`CmId::wait_cm_event`] or, non-blocking, [`CmId::poll_cm_event`].
     pub fn cm_id(&self) -> &CmId {
         &self.id
     }
@@ -1553,18 +1493,6 @@ impl Connection {
         let mut error = QueuePairAttribute::new();
         error.set_state(QueuePairState::Error);
         self.qp.modify(&error)
-    }
-
-    /// The IP address and port of the remote end of this connection, or `None` if its address
-    /// family is neither IPv4 nor IPv6.
-    pub fn peer_addr(&self) -> Option<SocketAddr> {
-        self.id.peer_addr()
-    }
-
-    /// The local IP address and port of this connection, or `None` if its address family is
-    /// neither IPv4 nor IPv6.
-    pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.id.local_addr()
     }
 }
 

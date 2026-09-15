@@ -1,52 +1,29 @@
-use std::io;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
 
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
-use crate::context::ContextInner;
+use crate::context::{Context, PortState};
 use crate::error::{Error, Result};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
 use crate::qp::{QueuePairBuilder, Transport};
+use crate::raw;
 
 use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
 
-#[cfg(doc)]
-use crate::Context;
-
-/// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum MrAdvice {
-    /// Prefetch the pages for read access (a best-effort hint; the ranges must allow local read).
-    Prefetch,
-    /// Prefetch the pages for write access (a best-effort hint; the ranges must allow local
-    /// write).
-    PrefetchWrite,
-    /// Prefetch without faulting: pre-load what is already resident, never a page fault.
-    PrefetchNoFault,
-}
-
-impl From<ffi::ib_uverbs_advise_mr_advice> for MrAdvice {
-    fn from(advice: ffi::ib_uverbs_advise_mr_advice) -> Self {
-        use ffi::ib_uverbs_advise_mr_advice::*;
-        match advice {
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH => MrAdvice::Prefetch,
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE => MrAdvice::PrefetchWrite,
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT => MrAdvice::PrefetchNoFault,
-        }
-    }
-}
-
-impl From<MrAdvice> for ffi::ib_uverbs_advise_mr_advice {
-    fn from(advice: MrAdvice) -> Self {
-        use ffi::ib_uverbs_advise_mr_advice::*;
-        match advice {
-            MrAdvice::Prefetch => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
-            MrAdvice::PrefetchWrite => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE,
-            MrAdvice::PrefetchNoFault => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT,
-        }
+c_enum! {
+    /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
+    ///
+    /// `Display` writes the advice as the C headers name it, for example `PREFETCH_WRITE`.
+    pub enum MrAdvice(ffi::ib_uverbs_advise_mr_advice) {
+        /// Prefetch the pages for read access (a best-effort hint; the ranges must allow local read).
+        Prefetch = IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH => "PREFETCH";
+        /// Prefetch the pages for write access (a best-effort hint; the ranges must allow local
+        /// write).
+        PrefetchWrite = IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE => "PREFETCH_WRITE";
+        /// Prefetch without faulting: pre-load what is already resident, never a page fault.
+        PrefetchNoFault = IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT => "PREFETCH_NO_FAULT";
     }
 }
 
@@ -128,18 +105,14 @@ impl From<MrAdviseFlags> for u32 {
     }
 }
 
-pub(crate) struct ProtectionDomainInner {
-    pub(crate) ctx: Arc<ContextInner>,
-    pub(crate) pd: *mut ffi::ibv_pd,
+struct ProtectionDomainInner {
+    ctx: Context,
+    pd: *mut ffi::ibv_pd,
 }
 
 impl Drop for ProtectionDomainInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_dealloc_pd failed: {e}");
-        }
+        raw::destroyed("ibv_dealloc_pd", unsafe { ffi::ibv_dealloc_pd(self.pd) });
     }
 }
 
@@ -150,10 +123,29 @@ unsafe impl Send for ProtectionDomainInner {}
 #[must_use]
 #[derive(Clone)]
 pub struct ProtectionDomain {
-    pub(crate) inner: Arc<ProtectionDomainInner>,
+    inner: Arc<ProtectionDomainInner>,
 }
 
 impl ProtectionDomain {
+    /// Allocate a protection domain on `ctx` (for [`Context::alloc_pd`]).
+    pub(crate) fn alloc(ctx: &Context) -> Result<ProtectionDomain> {
+        let pd = raw::nonnull(
+            unsafe { ffi::ibv_alloc_pd(ctx.as_raw()) },
+            Error::AllocProtectionDomain,
+        )?;
+        Ok(ProtectionDomain {
+            inner: Arc::new(ProtectionDomainInner {
+                ctx: ctx.clone(),
+                pd,
+            }),
+        })
+    }
+
+    /// The device context this protection domain was allocated on.
+    pub fn context(&self) -> &Context {
+        &self.inner.ctx
+    }
+
     /// Returns the underlying `ibv_pd` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
@@ -174,15 +166,14 @@ impl ProtectionDomain {
     ///    for an invalid value in `attr`, `ENOMEM` when out of resources).
     pub fn create_address_handle(&self, attr: &AddressHandleAttribute) -> Result<AddressHandle> {
         let mut ah_attr = attr.attr;
-        let ah = unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) };
-        if ah.is_null() {
-            Err(Error::CreateAddressHandle(io::Error::last_os_error()))
-        } else {
-            Ok(AddressHandle {
-                _pd: self.inner.clone(),
-                ah,
-            })
-        }
+        let ah = raw::nonnull(
+            unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) },
+            Error::CreateAddressHandle,
+        )?;
+        Ok(AddressHandle {
+            _pd: self.clone(),
+            ah,
+        })
     }
 
     /// Give advice to the kernel about an address range in memory regions registered under this
@@ -215,28 +206,24 @@ impl ProtectionDomain {
                 sg_list.len() as u32,
             )
         };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(Error::errno(ret, Error::AdviseMemoryRegion))
-        }
+        raw::errno(ret, Error::AdviseMemoryRegion)
     }
 
     /// Creates a queue pair builder associated with `port_num` on this protection domain's device.
     ///
     /// The transport is chosen at compile time by the marker `T` (for example
     /// `pd.create_qp::<Rc>(&send, &recv, 1)` for a reliable connection); the resulting queue-pair
-    /// family only offers the operations that transport supports. The types without a marker
-    /// (raw packet, XRC, and driver-specific types other than EFA's SRD) are not usable through
-    /// the portable wrapper anyway; if that changes, they will get their own markers.
+    /// family only offers the operations that transport supports. The types without a marker are
+    /// not usable through the portable wrapper anyway (see [`QueuePairType`](crate::QueuePairType)).
     ///
     /// `send` and `recv` are the [`CompletionQueue`]s that completions for the send and receive
     /// queues are delivered to, respectively. They may refer to the same queue.
     ///
     /// `port_num` is the device port this queue pair uses; ports are numbered from 1.
     ///
-    /// Note that both this protection domain, *and* both provided completion queues, must outlive
-    /// the resulting `QueuePair`.
+    /// The queue pair keeps this protection domain and both completion queues alive, so they may
+    /// be dropped in any order. The port's LID and active MTU are read now and carried by the
+    /// builder; create the builder again after the subnet manager reconfigures the port.
     ///
     /// # Errors
     ///
@@ -250,17 +237,23 @@ impl ProtectionDomain {
         port_num: u8,
     ) -> Result<QueuePairBuilder<T>> {
         let port_attr = self.inner.ctx.query_port(port_num)?;
+        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
+        //
+        //   The content of the GID table is valid only when the port_attr.state is either
+        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
+        //   table is indeterminate.
+        //
+        match port_attr.state() {
+            PortState::Active | PortState::Armed => {}
+            _ => return Err(Error::PortNotActive(port_num)),
+        }
         Ok(QueuePairBuilder::new(
-            self.inner.clone(),
-            port_attr,
+            self.clone(),
             port_num,
-            send.inner.clone(),
-            1,
-            recv.inner.clone(),
-            1,
-            T::TYPE.into(),
-            1,
-            1,
+            port_attr.as_raw().lid,
+            port_attr.active_mtu(),
+            send.clone(),
+            recv.clone(),
         ))
     }
 
@@ -276,22 +269,17 @@ impl ProtectionDomain {
         len: usize,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegionInner> {
-        let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
-        // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
-        if mr.is_null() {
-            // Promotes EOPNOTSUPP (an access flag the device cannot honor) to Unsupported, like
-            // register_dmabuf and the other verbs.
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::RegisterMemoryRegion,
-            ))
-        } else {
-            Ok(MemoryRegionInner {
-                _pd: self.inner.clone(),
-                mr,
-                addr: ptr as u64,
-            })
-        }
+        // An access flag the device cannot honor is reported as EOPNOTSUPP, so registration
+        // failing that way surfaces as `Unsupported`.
+        let mr = raw::nonnull(
+            ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32),
+            Error::RegisterMemoryRegion,
+        )?;
+        Ok(MemoryRegionInner {
+            _pd: self.clone(),
+            mr,
+            addr: ptr as u64,
+        })
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`, with
@@ -408,24 +396,20 @@ impl ProtectionDomain {
         iova: u64,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
-        let mr = unsafe {
-            ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
+        // Devices and kernels without DMA-BUF support report EOPNOTSUPP, surfaced as
+        // `Unsupported`.
+        let mr = raw::nonnull(
+            unsafe {
+                ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
+            },
+            Error::RegisterMemoryRegion,
+        )?;
+        let inner = MemoryRegionInner {
+            _pd: self.clone(),
+            mr,
+            addr: iova,
         };
-
-        if mr.is_null() {
-            // Promotes the EOPNOTSUPP of devices/kernels without DMA-BUF support to Unsupported.
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::RegisterMemoryRegion,
-            ))
-        } else {
-            let inner = MemoryRegionInner {
-                _pd: self.inner.clone(),
-                mr,
-                addr: iova,
-            };
-            Ok(MemoryRegion { inner, owner: () })
-        }
+        Ok(MemoryRegion { inner, owner: () })
     }
 
     /// Creates a shared receive queue (SRQ) associated with this protection domain.
@@ -467,17 +451,16 @@ impl ProtectionDomain {
                 srq_limit,
             },
         };
-        let srq = unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) };
-        if srq.is_null() {
-            Err(Error::CreateSharedReceiveQueue(io::Error::last_os_error()))
-        } else {
-            Ok(SharedReceiveQueue {
-                inner: Arc::new(SharedReceiveQueueInner {
-                    _pd: self.inner.clone(),
-                    srq,
-                }),
-            })
-        }
+        let srq = raw::nonnull(
+            unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) },
+            Error::CreateSharedReceiveQueue,
+        )?;
+        Ok(SharedReceiveQueue {
+            inner: Arc::new(SharedReceiveQueueInner {
+                _pd: self.clone(),
+                srq,
+            }),
+        })
     }
 }
 

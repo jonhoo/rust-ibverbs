@@ -2,9 +2,6 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
-// Suppress expected warnings from bindgen-generated code.
-// See https://github.com/rust-lang/rust-bindgen/issues/1651.
-#![allow(deref_nullptr)]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 /// An ibverb work completion.
@@ -407,6 +404,107 @@ pub unsafe fn ___ibv_query_port(
             ibv_query_port(context, port_num, port_attr.cast())
         }
     }
+}
+
+// `ibv_poll_cq`, `ibv_req_notify_cq`, `ibv_post_send`, `ibv_post_recv`, and `ibv_post_srq_recv`
+// are `static inline` too, but dispatch through the context's `ibv_context_ops` table, which
+// libibverbs fills for every provider (with stubs for the verbs a provider lacks).
+
+/// Poll a completion queue for work completions (`ibv_poll_cq`): fills up to `num_entries`
+/// entries of `wc` and returns how many, or a negative value on failure (`errno` is not set).
+///
+/// # Safety
+///
+/// `cq` must be a valid completion queue and `wc` valid for `num_entries` writes.
+#[inline]
+pub unsafe fn ibv_poll_cq(
+    cq: *mut ibv_cq,
+    num_entries: ::std::os::raw::c_int,
+    wc: *mut ibv_wc,
+) -> ::std::os::raw::c_int {
+    let poll_cq = (*(*cq).context)
+        .ops
+        .poll_cq
+        .expect("libibverbs installs every context op");
+    poll_cq(cq, num_entries, wc)
+}
+
+/// Request a completion notification on the queue's channel (`ibv_req_notify_cq`). Returns 0 or
+/// an `errno` value.
+///
+/// # Safety
+///
+/// `cq` must be a valid completion queue.
+#[inline]
+pub unsafe fn ibv_req_notify_cq(
+    cq: *mut ibv_cq,
+    solicited_only: ::std::os::raw::c_int,
+) -> ::std::os::raw::c_int {
+    let req_notify_cq = (*(*cq).context)
+        .ops
+        .req_notify_cq
+        .expect("libibverbs installs every context op");
+    req_notify_cq(cq, solicited_only)
+}
+
+/// Post a linked list of send work requests (`ibv_post_send`). Returns 0 or an `errno` value,
+/// with `bad_wr` pointing at the first request that failed.
+///
+/// # Safety
+///
+/// `qp` must be a valid queue pair and `wr` a valid list whose buffers stay registered until the
+/// requests complete.
+#[inline]
+pub unsafe fn ibv_post_send(
+    qp: *mut ibv_qp,
+    wr: *mut ibv_send_wr,
+    bad_wr: *mut *mut ibv_send_wr,
+) -> ::std::os::raw::c_int {
+    let post_send = (*(*qp).context)
+        .ops
+        .post_send
+        .expect("libibverbs installs every context op");
+    post_send(qp, wr, bad_wr)
+}
+
+/// Post a linked list of receive work requests to a queue pair (`ibv_post_recv`). Returns 0 or
+/// an `errno` value, with `bad_wr` pointing at the first request that failed.
+///
+/// # Safety
+///
+/// `qp` must be a valid queue pair and `wr` a valid list whose buffers stay registered until the
+/// requests complete.
+#[inline]
+pub unsafe fn ibv_post_recv(
+    qp: *mut ibv_qp,
+    wr: *mut ibv_recv_wr,
+    bad_wr: *mut *mut ibv_recv_wr,
+) -> ::std::os::raw::c_int {
+    let post_recv = (*(*qp).context)
+        .ops
+        .post_recv
+        .expect("libibverbs installs every context op");
+    post_recv(qp, wr, bad_wr)
+}
+
+/// Post a linked list of receive work requests to a shared receive queue (`ibv_post_srq_recv`).
+/// Returns 0 or an `errno` value, with `bad_wr` pointing at the first request that failed.
+///
+/// # Safety
+///
+/// `srq` must be a valid shared receive queue and `wr` a valid list whose buffers stay
+/// registered until the requests complete.
+#[inline]
+pub unsafe fn ibv_post_srq_recv(
+    srq: *mut ibv_srq,
+    wr: *mut ibv_recv_wr,
+    bad_wr: *mut *mut ibv_recv_wr,
+) -> ::std::os::raw::c_int {
+    let post_srq_recv = (*(*srq).context)
+        .ops
+        .post_srq_recv
+        .expect("libibverbs installs every context op");
+    post_srq_recv(srq, wr, bad_wr)
 }
 
 /// Set `errno`, so the shims below can report failures the way the C inlines do (they set

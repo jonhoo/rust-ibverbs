@@ -4,19 +4,12 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use crate::context::{ContextInner, HcaClock};
+use crate::context::{Context, HcaClock};
 use crate::error::{Error, Result};
-
-#[cfg(doc)]
-use crate::Context;
-
-/// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
-/// granularity) lasts at least the requested duration instead of returning fractionally early.
-pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
-    Duration::from_millis(remaining.as_nanos().div_ceil(1_000_000) as u64)
-}
+use crate::fd;
+use crate::raw;
 
 /// A completion channel: the file descriptor that delivers completion-queue notifications.
 /// Created by [`Context::create_comp_channel`].
@@ -47,7 +40,7 @@ pub struct CompletionChannel {
 
 struct CompletionChannelInner {
     // Kept so the device outlives the channel.
-    _ctx: Arc<ContextInner>,
+    _ctx: Context,
     cc: *mut ffi::ibv_comp_channel,
 }
 
@@ -56,11 +49,9 @@ unsafe impl Sync for CompletionChannelInner {}
 
 impl Drop for CompletionChannelInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_comp_channel failed: {e}");
-        }
+        raw::destroyed("ibv_destroy_comp_channel", unsafe {
+            ffi::ibv_destroy_comp_channel(self.cc)
+        });
     }
 }
 
@@ -68,11 +59,11 @@ impl CompletionChannel {
     /// Create a completion channel on `ctx` (for [`Context::create_comp_channel`]), with its file
     /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
     /// instead of blocking.
-    pub(crate) fn new(ctx: &Arc<ContextInner>) -> Result<CompletionChannel> {
-        let cc = unsafe { ffi::ibv_create_comp_channel(ctx.ctx) };
-        if cc.is_null() {
-            return Err(Error::CreateCompletionChannel(io::Error::last_os_error()));
-        }
+    pub(crate) fn new(ctx: &Context) -> Result<CompletionChannel> {
+        let cc = raw::nonnull(
+            unsafe { ffi::ibv_create_comp_channel(ctx.as_raw()) },
+            Error::CreateCompletionChannel,
+        )?;
         let channel = CompletionChannel {
             inner: Arc::new(CompletionChannelInner {
                 _ctx: ctx.clone(),
@@ -86,15 +77,7 @@ impl CompletionChannel {
 
     /// Set this channel's file descriptor to non-blocking.
     fn set_nonblocking(&self) -> Result<()> {
-        // SAFETY: the channel owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.cc).fd) };
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        Ok(())
+        fd::set_nonblocking(self.as_fd()).map_err(Error::CreateCompletionChannel)
     }
 
     /// Consume one pending notification from the channel, returning the context value of the
@@ -120,7 +103,7 @@ impl CompletionChannel {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::PollCompletionQueue(e));
+            return Err(Error::os(e, Error::PollCompletionQueue));
         }
         // Every event from ibv_get_cq_event() must eventually be acknowledged.
         unsafe { ffi::ibv_ack_cq_events(out_cq, 1) };
@@ -144,33 +127,15 @@ impl CompletionChannel {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): waiting on the descriptor (`poll`)
     ///    or consuming the notification failed.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         loop {
-            let remaining = deadline
-                .map(|deadline| ceil_to_millis(deadline.saturating_duration_since(Instant::now())));
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::PollCompletionQueue(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::PollCompletionQueue(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // notification first; if so, go back to waiting for the next one.
-                    if let Some(context) = self.get_event()? {
-                        return Ok(Some(context));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !fd::wait_readable(self.as_fd(), deadline).map_err(Error::PollCompletionQueue)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the notification
+            // first; if so, go back to waiting for the next one.
+            if let Some(context) = self.get_event()? {
+                return Ok(Some(context));
             }
         }
     }
@@ -209,17 +174,30 @@ impl AsFd for CompletionChannel {
 /// [`build`](Self::build) to create the queue.
 #[must_use]
 pub struct CompletionQueueBuilder {
-    pub(crate) ctx: Arc<ContextInner>,
-    pub(crate) min_cq_entries: u32,
-    pub(crate) cq_context: u64,
-    pub(crate) comp_vector: u32,
+    ctx: Context,
+    min_cq_entries: u32,
+    cq_context: u64,
+    comp_vector: u32,
     /// extra work-completion fields requested on top of the always-present standard set
-    pub(crate) wc_flags: u32,
+    wc_flags: u32,
     /// the completion channel to deliver notifications on, if any
-    pub(crate) comp_channel: Option<CompletionChannel>,
+    comp_channel: Option<CompletionChannel>,
 }
 
 impl CompletionQueueBuilder {
+    /// The builder behind [`Context::create_cq`]: a plain polled queue of at least
+    /// `min_cq_entries` entries on `ctx`.
+    pub(crate) fn new(ctx: Context, min_cq_entries: u32) -> Self {
+        CompletionQueueBuilder {
+            ctx,
+            min_cq_entries,
+            cq_context: 0,
+            comp_vector: 0,
+            wc_flags: 0,
+            comp_channel: None,
+        }
+    }
+
     /// Set an opaque context value associated with the completion queue.
     ///
     /// Defaults to 0.
@@ -304,27 +282,22 @@ impl CompletionQueueBuilder {
             (*p).comp_vector = self.comp_vector;
             (*p).wc_flags = wc_flags as u64;
         }
-        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, cq_attr.as_mut_ptr()) };
-
-        if cq_ex.is_null() {
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateCompletionQueue,
-            ))
-        } else {
-            Ok(CompletionQueue {
-                inner: Arc::new(CompletionQueueInner {
-                    _ctx: self.ctx.clone(),
-                    cc,
-                    cq_ex,
-                }),
-            })
-        }
+        let cq_ex = raw::nonnull(
+            unsafe { ffi::ibv_create_cq_ex(self.ctx.as_raw(), cq_attr.as_mut_ptr()) },
+            Error::CreateCompletionQueue,
+        )?;
+        Ok(CompletionQueue {
+            inner: Arc::new(CompletionQueueInner {
+                ctx: self.ctx.clone(),
+                cc,
+                cq_ex,
+            }),
+        })
     }
 }
 
-pub(crate) struct CompletionQueueInner {
-    _ctx: Arc<ContextInner>,
+struct CompletionQueueInner {
+    ctx: Context,
     cq_ex: *mut ffi::ibv_cq_ex,
     cc: Option<CompletionChannel>,
 }
@@ -332,20 +305,17 @@ pub(crate) struct CompletionQueueInner {
 impl CompletionQueueInner {
     /// The underlying `ibv_cq`. An `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this is
     /// just a pointer cast (exactly what `ibv_cq_ex_to_cq` does in C). Used for the verbs that still
-    /// take a plain `ibv_cq`: queue-pair creation, completion-event notification, and teardown.
+    /// take a plain `ibv_cq`: queue-pair creation, the classic poll and notification requests, and
+    /// teardown.
     #[inline]
-    pub(crate) fn cq(&self) -> *mut ffi::ibv_cq {
+    fn cq(&self) -> *mut ffi::ibv_cq {
         self.cq_ex as *mut ffi::ibv_cq
     }
 }
 
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_cq(self.cq()) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_cq failed: {e}");
-        }
+        raw::destroyed("ibv_destroy_cq", unsafe { ffi::ibv_destroy_cq(self.cq()) });
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
         // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel
@@ -360,18 +330,12 @@ flags_newtype! {
     /// Optional work-completion fields to request when building a completion queue (the
     /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
     ///
-    /// The byte length, immediate data, QP number, and source QP are always requested; these flags
-    /// add fields on top, at the cost of a larger completion entry. Fields with an accessor on
-    /// [`WorkCompletion`] panic when read if they were not requested.
+    /// The byte length, immediate data, QP number, and source QP ([`WorkCompletion::len`],
+    /// [`imm_data`](WorkCompletion::imm_data), [`qp_num`](WorkCompletion::qp_num),
+    /// [`src_qp`](WorkCompletion::src_qp)) are always requested and have no flag here; these
+    /// flags add fields on top, at the cost of a larger completion entry. Fields with an accessor
+    /// on [`WorkCompletion`] panic when read if they were not requested.
     pub struct WcFields(ffi::ibv_create_cq_wc_flags) {
-        /// The number of bytes transferred ([`WorkCompletion::len`]; always requested).
-        BYTE_LEN = IBV_WC_EX_WITH_BYTE_LEN;
-        /// The immediate data ([`WorkCompletion::imm_data`]; always requested).
-        IMM = IBV_WC_EX_WITH_IMM;
-        /// The local QP number ([`WorkCompletion::qp_num`]; always requested).
-        QP_NUM = IBV_WC_EX_WITH_QP_NUM;
-        /// The source QP number ([`WorkCompletion::src_qp`]; always requested).
-        SRC_QP = IBV_WC_EX_WITH_SRC_QP;
         /// The source LID ([`WorkCompletion::slid`]).
         SLID = IBV_WC_EX_WITH_SLID;
         /// The service level ([`WorkCompletion::sl`]).
@@ -413,160 +377,64 @@ flags_newtype! {
     }
 }
 
-/// The completion status of a work request, reported by [`WorkCompletion::ok`] (as the
-/// [`WcError::status`] of a failed completion).
-///
-/// Anything other than [`Success`](Self::Success) means the work request failed (and, on a
-/// connected queue pair, that the queue pair has moved to the error state); once one work request
-/// fails, the ones behind it complete as [`WorkRequestFlushed`](Self::WorkRequestFlushed).
-/// `Display` gives the human-readable message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WcStatus {
-    /// The work request completed successfully.
-    Success,
-    /// A posted buffer was too small for the data (local length error).
-    LocalLengthError,
-    /// An internal queue-pair consistency error was detected locally.
-    LocalQpOperationError,
-    /// An internal EE-context consistency error was detected locally (RD only).
-    LocalEecOperationError,
-    /// A posted buffer did not have valid protection (local protection error).
-    LocalProtectionError,
-    /// The work request was flushed because the queue pair entered the error state before (or
-    /// while) processing it.
-    WorkRequestFlushed,
-    /// A memory-window bind operation failed.
-    MemoryWindowBindError,
-    /// The responder returned a malformed response.
-    BadResponse,
-    /// A local access violation while responding to an incoming operation.
-    LocalAccessError,
-    /// The remote side rejected the request as invalid for its queue pair.
-    RemoteInvalidRequest,
-    /// The remote side reported an access violation for the targeted region.
-    RemoteAccessError,
-    /// The remote side could not complete the operation.
-    RemoteOperationError,
-    /// The transport retry counter was exceeded without a response from the remote side.
-    RetryExceeded,
-    /// The receiver-not-ready retry counter was exceeded.
-    RnrRetryExceeded,
-    /// A local RD domain violation (RD only).
-    LocalRddViolation,
-    /// The remote side rejected an RD read request as invalid (RD only).
-    RemoteInvalidRdRequest,
-    /// The remote side aborted the operation (RD only).
-    RemoteAborted,
-    /// An invalid EE context number was detected (RD only).
-    InvalidEecn,
-    /// An invalid EE context state was detected (RD only).
-    InvalidEecState,
-    /// A fatal transport error occurred; further use of the device is undefined.
-    Fatal,
-    /// The response timer expired before a response arrived.
-    ResponseTimeout,
-    /// An error not covered by the other statuses.
-    GeneralError,
-    /// A tag-matching error occurred.
-    TagMatchingError,
-    /// A tag-matching rendezvous transfer did not complete.
-    TagMatchingRendezvousIncomplete,
-}
-
-impl From<ffi::ibv_wc_status> for WcStatus {
-    fn from(status: ffi::ibv_wc_status) -> Self {
-        use ffi::ibv_wc_status::*;
-        match status {
-            IBV_WC_SUCCESS => WcStatus::Success,
-            IBV_WC_LOC_LEN_ERR => WcStatus::LocalLengthError,
-            IBV_WC_LOC_QP_OP_ERR => WcStatus::LocalQpOperationError,
-            IBV_WC_LOC_EEC_OP_ERR => WcStatus::LocalEecOperationError,
-            IBV_WC_LOC_PROT_ERR => WcStatus::LocalProtectionError,
-            IBV_WC_WR_FLUSH_ERR => WcStatus::WorkRequestFlushed,
-            IBV_WC_MW_BIND_ERR => WcStatus::MemoryWindowBindError,
-            IBV_WC_BAD_RESP_ERR => WcStatus::BadResponse,
-            IBV_WC_LOC_ACCESS_ERR => WcStatus::LocalAccessError,
-            IBV_WC_REM_INV_REQ_ERR => WcStatus::RemoteInvalidRequest,
-            IBV_WC_REM_ACCESS_ERR => WcStatus::RemoteAccessError,
-            IBV_WC_REM_OP_ERR => WcStatus::RemoteOperationError,
-            IBV_WC_RETRY_EXC_ERR => WcStatus::RetryExceeded,
-            IBV_WC_RNR_RETRY_EXC_ERR => WcStatus::RnrRetryExceeded,
-            IBV_WC_LOC_RDD_VIOL_ERR => WcStatus::LocalRddViolation,
-            IBV_WC_REM_INV_RD_REQ_ERR => WcStatus::RemoteInvalidRdRequest,
-            IBV_WC_REM_ABORT_ERR => WcStatus::RemoteAborted,
-            IBV_WC_INV_EECN_ERR => WcStatus::InvalidEecn,
-            IBV_WC_INV_EEC_STATE_ERR => WcStatus::InvalidEecState,
-            IBV_WC_FATAL_ERR => WcStatus::Fatal,
-            IBV_WC_RESP_TIMEOUT_ERR => WcStatus::ResponseTimeout,
-            IBV_WC_GENERAL_ERR => WcStatus::GeneralError,
-            IBV_WC_TM_ERR => WcStatus::TagMatchingError,
-            IBV_WC_TM_RNDV_INCOMPLETE => WcStatus::TagMatchingRendezvousIncomplete,
-        }
-    }
-}
-
-impl From<WcStatus> for ffi::ibv_wc_status {
-    fn from(status: WcStatus) -> Self {
-        use ffi::ibv_wc_status::*;
-        match status {
-            WcStatus::Success => IBV_WC_SUCCESS,
-            WcStatus::LocalLengthError => IBV_WC_LOC_LEN_ERR,
-            WcStatus::LocalQpOperationError => IBV_WC_LOC_QP_OP_ERR,
-            WcStatus::LocalEecOperationError => IBV_WC_LOC_EEC_OP_ERR,
-            WcStatus::LocalProtectionError => IBV_WC_LOC_PROT_ERR,
-            WcStatus::WorkRequestFlushed => IBV_WC_WR_FLUSH_ERR,
-            WcStatus::MemoryWindowBindError => IBV_WC_MW_BIND_ERR,
-            WcStatus::BadResponse => IBV_WC_BAD_RESP_ERR,
-            WcStatus::LocalAccessError => IBV_WC_LOC_ACCESS_ERR,
-            WcStatus::RemoteInvalidRequest => IBV_WC_REM_INV_REQ_ERR,
-            WcStatus::RemoteAccessError => IBV_WC_REM_ACCESS_ERR,
-            WcStatus::RemoteOperationError => IBV_WC_REM_OP_ERR,
-            WcStatus::RetryExceeded => IBV_WC_RETRY_EXC_ERR,
-            WcStatus::RnrRetryExceeded => IBV_WC_RNR_RETRY_EXC_ERR,
-            WcStatus::LocalRddViolation => IBV_WC_LOC_RDD_VIOL_ERR,
-            WcStatus::RemoteInvalidRdRequest => IBV_WC_REM_INV_RD_REQ_ERR,
-            WcStatus::RemoteAborted => IBV_WC_REM_ABORT_ERR,
-            WcStatus::InvalidEecn => IBV_WC_INV_EECN_ERR,
-            WcStatus::InvalidEecState => IBV_WC_INV_EEC_STATE_ERR,
-            WcStatus::Fatal => IBV_WC_FATAL_ERR,
-            WcStatus::ResponseTimeout => IBV_WC_RESP_TIMEOUT_ERR,
-            WcStatus::GeneralError => IBV_WC_GENERAL_ERR,
-            WcStatus::TagMatchingError => IBV_WC_TM_ERR,
-            WcStatus::TagMatchingRendezvousIncomplete => IBV_WC_TM_RNDV_INCOMPLETE,
-        }
-    }
-}
-
-impl fmt::Display for WcStatus {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let msg = match self {
-            WcStatus::Success => "success",
-            WcStatus::LocalLengthError => "local length error",
-            WcStatus::LocalQpOperationError => "local QP operation error",
-            WcStatus::LocalEecOperationError => "local EE context operation error",
-            WcStatus::LocalProtectionError => "local protection error",
-            WcStatus::WorkRequestFlushed => "work request flushed",
-            WcStatus::MemoryWindowBindError => "memory window bind error",
-            WcStatus::BadResponse => "bad response from remote",
-            WcStatus::LocalAccessError => "local access error",
-            WcStatus::RemoteInvalidRequest => "remote rejected the request as invalid",
-            WcStatus::RemoteAccessError => "remote access error",
-            WcStatus::RemoteOperationError => "remote operation error",
-            WcStatus::RetryExceeded => "transport retry counter exceeded",
-            WcStatus::RnrRetryExceeded => "receiver-not-ready retry counter exceeded",
-            WcStatus::LocalRddViolation => "local RDD violation",
-            WcStatus::RemoteInvalidRdRequest => "remote rejected the RD request as invalid",
-            WcStatus::RemoteAborted => "remote aborted the operation",
-            WcStatus::InvalidEecn => "invalid EE context number",
-            WcStatus::InvalidEecState => "invalid EE context state",
-            WcStatus::Fatal => "fatal transport error",
-            WcStatus::ResponseTimeout => "response timeout",
-            WcStatus::GeneralError => "general error",
-            WcStatus::TagMatchingError => "tag matching error",
-            WcStatus::TagMatchingRendezvousIncomplete => "tag matching rendezvous incomplete",
-        };
-        f.write_str(msg)
+c_enum! {
+    /// The completion status of a work request, reported by [`WorkCompletion::ok`] (as the
+    /// [`WcError::status`] of a failed completion).
+    ///
+    /// Anything other than [`Success`](Self::Success) means the work request failed (and, on a
+    /// connected queue pair, that the queue pair has moved to the error state); once one work request
+    /// fails, the ones behind it complete as [`WorkRequestFlushed`](Self::WorkRequestFlushed).
+    /// `Display` gives the human-readable message.
+    pub enum WcStatus(ffi::ibv_wc_status) {
+        /// The work request completed successfully.
+        Success = IBV_WC_SUCCESS => "success";
+        /// A posted buffer was too small for the data (local length error).
+        LocalLengthError = IBV_WC_LOC_LEN_ERR => "local length error";
+        /// An internal queue-pair consistency error was detected locally.
+        LocalQpOperationError = IBV_WC_LOC_QP_OP_ERR => "local QP operation error";
+        /// An internal EE-context consistency error was detected locally (RD only).
+        LocalEecOperationError = IBV_WC_LOC_EEC_OP_ERR => "local EE context operation error";
+        /// A posted buffer did not have valid protection (local protection error).
+        LocalProtectionError = IBV_WC_LOC_PROT_ERR => "local protection error";
+        /// The work request was flushed because the queue pair entered the error state before (or
+        /// while) processing it.
+        WorkRequestFlushed = IBV_WC_WR_FLUSH_ERR => "work request flushed";
+        /// A memory-window bind operation failed.
+        MemoryWindowBindError = IBV_WC_MW_BIND_ERR => "memory window bind error";
+        /// The responder returned a malformed response.
+        BadResponse = IBV_WC_BAD_RESP_ERR => "bad response from remote";
+        /// A local access violation while responding to an incoming operation.
+        LocalAccessError = IBV_WC_LOC_ACCESS_ERR => "local access error";
+        /// The remote side rejected the request as invalid for its queue pair.
+        RemoteInvalidRequest = IBV_WC_REM_INV_REQ_ERR => "remote rejected the request as invalid";
+        /// The remote side reported an access violation for the targeted region.
+        RemoteAccessError = IBV_WC_REM_ACCESS_ERR => "remote access error";
+        /// The remote side could not complete the operation.
+        RemoteOperationError = IBV_WC_REM_OP_ERR => "remote operation error";
+        /// The transport retry counter was exceeded without a response from the remote side.
+        RetryExceeded = IBV_WC_RETRY_EXC_ERR => "transport retry counter exceeded";
+        /// The receiver-not-ready retry counter was exceeded.
+        RnrRetryExceeded = IBV_WC_RNR_RETRY_EXC_ERR => "receiver-not-ready retry counter exceeded";
+        /// A local RD domain violation (RD only).
+        LocalRddViolation = IBV_WC_LOC_RDD_VIOL_ERR => "local RDD violation";
+        /// The remote side rejected an RD read request as invalid (RD only).
+        RemoteInvalidRdRequest = IBV_WC_REM_INV_RD_REQ_ERR => "remote rejected the RD request as invalid";
+        /// The remote side aborted the operation (RD only).
+        RemoteAborted = IBV_WC_REM_ABORT_ERR => "remote aborted the operation";
+        /// An invalid EE context number was detected (RD only).
+        InvalidEecn = IBV_WC_INV_EECN_ERR => "invalid EE context number";
+        /// An invalid EE context state was detected (RD only).
+        InvalidEecState = IBV_WC_INV_EEC_STATE_ERR => "invalid EE context state";
+        /// A fatal transport error occurred; further use of the device is undefined.
+        Fatal = IBV_WC_FATAL_ERR => "fatal transport error";
+        /// The response timer expired before a response arrived.
+        ResponseTimeout = IBV_WC_RESP_TIMEOUT_ERR => "response timeout";
+        /// An error not covered by the other statuses.
+        GeneralError = IBV_WC_GENERAL_ERR => "general error";
+        /// A tag-matching error occurred.
+        TagMatchingError = IBV_WC_TM_ERR => "tag matching error";
+        /// A tag-matching rendezvous transfer did not complete.
+        TagMatchingRendezvousIncomplete = IBV_WC_TM_RNDV_INCOMPLETE => "tag matching rendezvous incomplete";
     }
 }
 
@@ -592,136 +460,70 @@ impl fmt::Display for WcError {
 
 impl std::error::Error for WcError {}
 
-/// The kind of operation a work completion reports on. Returned by [`WorkCompletion::opcode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum WcOpcode {
-    /// A SEND completed.
-    Send,
-    /// An RDMA write completed.
-    RdmaWrite,
-    /// An RDMA read completed.
-    RdmaRead,
-    /// An atomic compare-and-swap completed.
-    CompSwap,
-    /// An atomic fetch-and-add completed.
-    FetchAdd,
-    /// A memory-window bind completed.
-    BindMw,
-    /// A local invalidate completed.
-    LocalInv,
-    /// A TCP segmentation offload send completed.
-    Tso,
-    /// A memory flush completed.
-    Flush,
-    /// An atomic write completed.
-    AtomicWrite,
-    /// An incoming message was received.
-    Recv,
-    /// An incoming RDMA-write-with-immediate consumed a receive.
-    RecvRdmaWithImm,
-    /// A tag-matching entry was added.
-    TmAdd,
-    /// A tag-matching entry was deleted.
-    TmDel,
-    /// A tag-matching list synchronization completed.
-    TmSync,
-    /// A tag-matching receive completed.
-    TmRecv,
-    /// An unexpected (untagged) tag-matching receive completed.
-    TmNoTag,
-    /// Provider-specific operation 1.
-    Driver1,
-    /// Provider-specific operation 2.
-    Driver2,
-    /// Provider-specific operation 3.
-    Driver3,
-}
-
-impl From<ffi::ibv_wc_opcode> for WcOpcode {
-    fn from(opcode: ffi::ibv_wc_opcode) -> Self {
-        use ffi::ibv_wc_opcode::*;
-        match opcode {
-            IBV_WC_SEND => WcOpcode::Send,
-            IBV_WC_RDMA_WRITE => WcOpcode::RdmaWrite,
-            IBV_WC_RDMA_READ => WcOpcode::RdmaRead,
-            IBV_WC_COMP_SWAP => WcOpcode::CompSwap,
-            IBV_WC_FETCH_ADD => WcOpcode::FetchAdd,
-            IBV_WC_BIND_MW => WcOpcode::BindMw,
-            IBV_WC_LOCAL_INV => WcOpcode::LocalInv,
-            IBV_WC_TSO => WcOpcode::Tso,
-            IBV_WC_FLUSH => WcOpcode::Flush,
-            IBV_WC_ATOMIC_WRITE => WcOpcode::AtomicWrite,
-            IBV_WC_RECV => WcOpcode::Recv,
-            IBV_WC_RECV_RDMA_WITH_IMM => WcOpcode::RecvRdmaWithImm,
-            IBV_WC_TM_ADD => WcOpcode::TmAdd,
-            IBV_WC_TM_DEL => WcOpcode::TmDel,
-            IBV_WC_TM_SYNC => WcOpcode::TmSync,
-            IBV_WC_TM_RECV => WcOpcode::TmRecv,
-            IBV_WC_TM_NO_TAG => WcOpcode::TmNoTag,
-            IBV_WC_DRIVER1 => WcOpcode::Driver1,
-            IBV_WC_DRIVER2 => WcOpcode::Driver2,
-            IBV_WC_DRIVER3 => WcOpcode::Driver3,
-        }
-    }
-}
-
-impl From<WcOpcode> for ffi::ibv_wc_opcode {
-    fn from(opcode: WcOpcode) -> Self {
-        use ffi::ibv_wc_opcode::*;
-        match opcode {
-            WcOpcode::Send => IBV_WC_SEND,
-            WcOpcode::RdmaWrite => IBV_WC_RDMA_WRITE,
-            WcOpcode::RdmaRead => IBV_WC_RDMA_READ,
-            WcOpcode::CompSwap => IBV_WC_COMP_SWAP,
-            WcOpcode::FetchAdd => IBV_WC_FETCH_ADD,
-            WcOpcode::BindMw => IBV_WC_BIND_MW,
-            WcOpcode::LocalInv => IBV_WC_LOCAL_INV,
-            WcOpcode::Tso => IBV_WC_TSO,
-            WcOpcode::Flush => IBV_WC_FLUSH,
-            WcOpcode::AtomicWrite => IBV_WC_ATOMIC_WRITE,
-            WcOpcode::Recv => IBV_WC_RECV,
-            WcOpcode::RecvRdmaWithImm => IBV_WC_RECV_RDMA_WITH_IMM,
-            WcOpcode::TmAdd => IBV_WC_TM_ADD,
-            WcOpcode::TmDel => IBV_WC_TM_DEL,
-            WcOpcode::TmSync => IBV_WC_TM_SYNC,
-            WcOpcode::TmRecv => IBV_WC_TM_RECV,
-            WcOpcode::TmNoTag => IBV_WC_TM_NO_TAG,
-            WcOpcode::Driver1 => IBV_WC_DRIVER1,
-            WcOpcode::Driver2 => IBV_WC_DRIVER2,
-            WcOpcode::Driver3 => IBV_WC_DRIVER3,
-        }
-    }
-}
-
-impl std::fmt::Display for WcOpcode {
-    /// Formats the opcode as it is named in the C headers, for example `RDMA_WRITE` for
+c_enum! {
+    /// The kind of operation a work completion reports on. Returned by [`WorkCompletion::opcode`].
+    ///
+    /// `Display` formats the opcode as it is named in the C headers, for example `RDMA_WRITE` for
     /// [`RdmaWrite`](Self::RdmaWrite).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            WcOpcode::Send => "SEND",
-            WcOpcode::RdmaWrite => "RDMA_WRITE",
-            WcOpcode::RdmaRead => "RDMA_READ",
-            WcOpcode::CompSwap => "COMP_SWAP",
-            WcOpcode::FetchAdd => "FETCH_ADD",
-            WcOpcode::BindMw => "BIND_MW",
-            WcOpcode::LocalInv => "LOCAL_INV",
-            WcOpcode::Tso => "TSO",
-            WcOpcode::Flush => "FLUSH",
-            WcOpcode::AtomicWrite => "ATOMIC_WRITE",
-            WcOpcode::Recv => "RECV",
-            WcOpcode::RecvRdmaWithImm => "RECV_RDMA_WITH_IMM",
-            WcOpcode::TmAdd => "TM_ADD",
-            WcOpcode::TmDel => "TM_DEL",
-            WcOpcode::TmSync => "TM_SYNC",
-            WcOpcode::TmRecv => "TM_RECV",
-            WcOpcode::TmNoTag => "TM_NO_TAG",
-            WcOpcode::Driver1 => "DRIVER1",
-            WcOpcode::Driver2 => "DRIVER2",
-            WcOpcode::Driver3 => "DRIVER3",
-        };
-        f.write_str(name)
+    pub enum WcOpcode(ffi::ibv_wc_opcode) {
+        /// A SEND completed.
+        Send = IBV_WC_SEND => "SEND";
+        /// An RDMA write completed.
+        RdmaWrite = IBV_WC_RDMA_WRITE => "RDMA_WRITE";
+        /// An RDMA read completed.
+        RdmaRead = IBV_WC_RDMA_READ => "RDMA_READ";
+        /// An atomic compare-and-swap completed.
+        CompSwap = IBV_WC_COMP_SWAP => "COMP_SWAP";
+        /// An atomic fetch-and-add completed.
+        FetchAdd = IBV_WC_FETCH_ADD => "FETCH_ADD";
+        /// A memory-window bind completed.
+        BindMw = IBV_WC_BIND_MW => "BIND_MW";
+        /// A local invalidate completed.
+        LocalInv = IBV_WC_LOCAL_INV => "LOCAL_INV";
+        /// A TCP segmentation offload send completed.
+        Tso = IBV_WC_TSO => "TSO";
+        /// A memory flush completed.
+        Flush = IBV_WC_FLUSH => "FLUSH";
+        /// An atomic write completed.
+        AtomicWrite = IBV_WC_ATOMIC_WRITE => "ATOMIC_WRITE";
+        /// An incoming message was received.
+        Recv = IBV_WC_RECV => "RECV";
+        /// An incoming RDMA-write-with-immediate consumed a receive.
+        RecvRdmaWithImm = IBV_WC_RECV_RDMA_WITH_IMM => "RECV_RDMA_WITH_IMM";
+        /// A tag-matching entry was added.
+        TmAdd = IBV_WC_TM_ADD => "TM_ADD";
+        /// A tag-matching entry was deleted.
+        TmDel = IBV_WC_TM_DEL => "TM_DEL";
+        /// A tag-matching list synchronization completed.
+        TmSync = IBV_WC_TM_SYNC => "TM_SYNC";
+        /// A tag-matching receive completed.
+        TmRecv = IBV_WC_TM_RECV => "TM_RECV";
+        /// An unexpected (untagged) tag-matching receive completed.
+        TmNoTag = IBV_WC_TM_NO_TAG => "TM_NO_TAG";
+        /// Provider-specific operation 1.
+        Driver1 = IBV_WC_DRIVER1 => "DRIVER1";
+        /// Provider-specific operation 2.
+        Driver2 = IBV_WC_DRIVER2 => "DRIVER2";
+        /// Provider-specific operation 3.
+        Driver3 = IBV_WC_DRIVER3 => "DRIVER3";
     }
+}
+
+/// Defines lazy readers on [`WorkCompletion`]: each calls the provider's `read_*` accessor for the
+/// entry the queue is positioned on, panicking with the given message if the queue did not
+/// request the field (the provider then installs no reader), and passes the value through the
+/// conversion.
+macro_rules! wc_reader {
+    ($( $(#[$meta:meta])* $name:ident: $ty:ty = $field:ident, $missing:literal, $conv:expr; )+) => {
+        $(
+            $(#[$meta])*
+            #[inline]
+            pub fn $name(&self) -> $ty {
+                let raw = unsafe { (*self.cq).$field.expect($missing)(self.cq) };
+                ($conv)(raw)
+            }
+        )+
+    };
 }
 
 /// A single work completion, borrowed from the completion queue being polled.
@@ -756,20 +558,62 @@ impl WorkCompletion<'_> {
         }
     }
 
-    /// The opcode of the completed work request.
-    ///
-    /// Like `len` and the other detail fields, this is only meaningful when the completion
-    /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
-    /// [`wr_id`](Self::wr_id) and the status are defined.
-    #[inline]
-    pub fn opcode(&self) -> WcOpcode {
-        unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }.into()
-    }
-
-    /// The number of bytes transferred, for a successful completion.
-    #[inline]
-    pub fn len(&self) -> usize {
-        unsafe { (*self.cq).read_byte_len.unwrap()(self.cq) as usize }
+    wc_reader! {
+        /// The opcode of the completed work request.
+        ///
+        /// Like `len` and the other detail fields, this is only meaningful when the completion
+        /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
+        /// [`wr_id`](Self::wr_id) and the status are defined.
+        opcode: WcOpcode = read_opcode, "the provider did not install the opcode reader", WcOpcode::from;
+        /// The number of bytes transferred, for a successful completion.
+        len: usize = read_byte_len, "the provider did not install the byte-length reader", |n: u32| n as usize;
+        /// The local QP number of the completed work request.
+        qp_num: u32 = read_qp_num, "the provider did not install the QP-number reader", |n| n;
+        /// The source (remote) QP number, relevant for datagram receive completions.
+        src_qp: u32 = read_src_qp, "the provider did not install the source-QP reader", |n| n;
+        /// The hardware timestamp captured when this work request completed, as a reading of the
+        /// device's free-running clock (the same time base as [`Context::query_rt_values_ex`]; see
+        /// [`HcaClock`] for converting tick deltas to time).
+        ///
+        /// Only valid on a completion queue that requested [`WcFields::COMPLETION_TIMESTAMP`] (see
+        /// [`CompletionQueueBuilder::set_wc_flags`]). Calling this on a completion from any other
+        /// completion queue panics, because the provider did not install the timestamp reader.
+        completion_timestamp: HcaClock = read_completion_ts, "completion queue was not created with timestamps", HcaClock;
+        /// The wallclock hardware timestamp (in nanoseconds) captured when this work request completed.
+        ///
+        /// Only valid on a completion queue that requested
+        /// [`WcFields::COMPLETION_TIMESTAMP_WALLCLOCK`] (see
+        /// [`CompletionQueueBuilder::set_wc_flags`]). Panics on a completion from any other
+        /// completion queue, because the provider did not install the reader.
+        completion_wallclock_ns: u64 = read_completion_wallclock_ns, "completion queue was not created with wallclock timestamps", |n| n;
+        /// The work-completion flags (`IBV_WC_*`), such as whether a GRH is present or immediate
+        /// data is carried. Always available.
+        wc_flags: WcFlags = read_wc_flags, "the provider did not install the flags reader", WcFlags;
+        /// The source LID this message was sent from (relevant for datagram receive completions).
+        ///
+        /// Only valid on a completion queue that requested [`WcFields::SLID`] (see
+        /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+        slid: u32 = read_slid, "completion queue did not request the source LID", |n| n;
+        /// The service level this message was sent with (relevant for datagram receive completions).
+        ///
+        /// Only valid on a completion queue that requested [`WcFields::SL`] (see
+        /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+        sl: u8 = read_sl, "completion queue did not request the service level", |n| n;
+        /// The destination LID path bits (relevant for datagram receive completions).
+        ///
+        /// Only valid on a completion queue that requested [`WcFields::DLID_PATH_BITS`] (see
+        /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+        dlid_path_bits: u8 = read_dlid_path_bits, "completion queue did not request the DLID path bits", |n| n;
+        /// The customer VLAN tag (802.1Q) of the incoming packet.
+        ///
+        /// Only valid on a completion queue that requested [`WcFields::CVLAN`] (see
+        /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+        cvlan: u16 = read_cvlan, "completion queue did not request the customer VLAN", |n| n;
+        /// The flow tag the device's steering rules attached to the incoming packet.
+        ///
+        /// Only valid on a completion queue that requested [`WcFields::FLOW_TAG`] (see
+        /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+        flow_tag: u32 = read_flow_tag, "completion queue did not request the flow tag", |n| n;
     }
 
     /// The 32-bit immediate value (host byte order) if one was carried ([`WcFlags::WITH_IMM`]).
@@ -784,102 +628,11 @@ impl WorkCompletion<'_> {
         }
     }
 
-    /// The local QP number of the completed work request.
-    #[inline]
-    pub fn qp_num(&self) -> u32 {
-        unsafe { (*self.cq).read_qp_num.unwrap()(self.cq) }
-    }
-
-    /// The source (remote) QP number, relevant for datagram receive completions.
-    #[inline]
-    pub fn src_qp(&self) -> u32 {
-        unsafe { (*self.cq).read_src_qp.unwrap()(self.cq) }
-    }
-
-    /// The hardware timestamp captured when this work request completed, as a reading of the
-    /// device's free-running clock (the same time base as [`Context::query_rt_values_ex`]; see
-    /// [`HcaClock`] for converting tick deltas to time).
-    ///
-    /// Only valid on a completion queue that requested [`WcFields::COMPLETION_TIMESTAMP`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Calling this on a completion from any other
-    /// completion queue panics, because the provider did not install the timestamp reader.
-    #[inline]
-    pub fn completion_timestamp(&self) -> HcaClock {
-        HcaClock(unsafe {
-            (*self.cq)
-                .read_completion_ts
-                .expect("completion queue was not created with timestamps")(self.cq)
-        })
-    }
-
-    /// The wallclock hardware timestamp (in nanoseconds) captured when this work request completed.
-    ///
-    /// Only valid on a completion queue that requested
-    /// [`WcFields::COMPLETION_TIMESTAMP_WALLCLOCK`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics on a completion from any other
-    /// completion queue, because the provider did not install the reader.
-    #[inline]
-    pub fn completion_wallclock_ns(&self) -> u64 {
-        unsafe {
-            (*self.cq)
-                .read_completion_wallclock_ns
-                .expect("completion queue was not created with wallclock timestamps")(
-                self.cq
-            )
-        }
-    }
-
-    /// The work-completion flags (`IBV_WC_*`), such as whether a GRH is present or immediate
-    /// data is carried. Always available.
-    #[inline]
-    pub fn wc_flags(&self) -> WcFlags {
-        WcFlags(unsafe { (*self.cq).read_wc_flags.unwrap()(self.cq) })
-    }
-
     /// Whether the receive completion carries a 40-byte Global Routing Header (GRH) at the front of
     /// the scatter buffers (set for unreliable-datagram receives with a GRH). Always available.
     #[inline]
     pub fn has_grh(&self) -> bool {
         self.wc_flags().contains(WcFlags::GRH)
-    }
-
-    /// The source LID this message was sent from (relevant for datagram receive completions).
-    ///
-    /// Only valid on a completion queue that requested [`WcFields::SLID`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
-    #[inline]
-    pub fn slid(&self) -> u32 {
-        unsafe {
-            (*self.cq)
-                .read_slid
-                .expect("completion queue did not request the source LID")(self.cq)
-        }
-    }
-
-    /// The service level this message was sent with (relevant for datagram receive completions).
-    ///
-    /// Only valid on a completion queue that requested [`WcFields::SL`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
-    #[inline]
-    pub fn sl(&self) -> u8 {
-        unsafe {
-            (*self.cq)
-                .read_sl
-                .expect("completion queue did not request the service level")(self.cq)
-        }
-    }
-
-    /// The destination LID path bits (relevant for datagram receive completions).
-    ///
-    /// Only valid on a completion queue that requested [`WcFields::DLID_PATH_BITS`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
-    #[inline]
-    pub fn dlid_path_bits(&self) -> u8 {
-        unsafe {
-            (*self.cq)
-                .read_dlid_path_bits
-                .expect("completion queue did not request the DLID path bits")(self.cq)
-        }
     }
 
     /// The remote key a SEND-with-invalidate invalidated, if this completion reports one
@@ -891,32 +644,6 @@ impl WorkCompletion<'_> {
             Some(unsafe { (*self.cq).read_imm_data.unwrap()(self.cq) })
         } else {
             None
-        }
-    }
-
-    /// The customer VLAN tag (802.1Q) of the incoming packet.
-    ///
-    /// Only valid on a completion queue that requested [`WcFields::CVLAN`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
-    #[inline]
-    pub fn cvlan(&self) -> u16 {
-        unsafe {
-            (*self.cq)
-                .read_cvlan
-                .expect("completion queue did not request the customer VLAN")(self.cq)
-        }
-    }
-
-    /// The flow tag the device's steering rules attached to the incoming packet.
-    ///
-    /// Only valid on a completion queue that requested [`WcFields::FLOW_TAG`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
-    #[inline]
-    pub fn flow_tag(&self) -> u32 {
-        unsafe {
-            (*self.cq)
-                .read_flow_tag
-                .expect("completion queue did not request the flow tag")(self.cq)
         }
     }
 
@@ -986,10 +713,9 @@ pub struct TagMatchingInfo {
 ///
 /// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
-/// call (which is why it cannot implement [`Iterator`]); [`for_each`](Self::for_each) runs a
-/// closure over the rest instead. The provider holds the queue's poll lock from the poll's start
-/// until the `Completions` is dropped (`ibv_end_poll`), so keep it short-lived; a poll of an
-/// empty queue holds nothing.
+/// call (which is why it cannot implement [`Iterator`]). The provider holds the queue's poll lock
+/// from the poll's start until the `Completions` is dropped (`ibv_end_poll`), so keep it
+/// short-lived; a poll of an empty queue holds nothing.
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
@@ -1031,17 +757,6 @@ impl Completions<'_> {
             _iter: std::marker::PhantomData,
         })
     }
-
-    /// Run `f` on each remaining work completion, then release the queue.
-    ///
-    /// The closure form of the `while let` loop over [`next`](Self::next):
-    /// `cq.poll()?.for_each(|wc| ..)`.
-    #[inline]
-    pub fn for_each(mut self, mut f: impl FnMut(WorkCompletion<'_>)) {
-        while let Some(wc) = self.next() {
-            f(wc);
-        }
-    }
 }
 
 impl Drop for Completions<'_> {
@@ -1057,10 +772,15 @@ impl Drop for Completions<'_> {
 #[must_use]
 #[derive(Clone)]
 pub struct CompletionQueue {
-    pub(crate) inner: Arc<CompletionQueueInner>,
+    inner: Arc<CompletionQueueInner>,
 }
 
 impl CompletionQueue {
+    /// The device context this queue was created on.
+    pub fn context(&self) -> &Context {
+        &self.inner.ctx
+    }
+
     /// Poll for the work completions that are ready, through the extended interface.
     ///
     /// The returned [`Completions`] is a lending iterator whose [`WorkCompletion`]s read their
@@ -1090,8 +810,6 @@ impl CompletionQueue {
     ///         eprintln!("work request {}: {e}", wc.wr_id());
     ///     }
     /// }
-    /// // Or, as a closure over the batch:
-    /// cq.poll()?.for_each(|wc| println!("work request {} completed", wc.wr_id()));
     /// # Ok(())
     /// # }
     /// ```
@@ -1161,13 +879,11 @@ impl CompletionQueue {
     /// ```
     #[inline]
     pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
-        let cq = self.inner.cq();
-        // `ibv_poll_cq` is a `static inline` in verbs.h that dispatches through the context op
-        // table; an `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
+        // An `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
         // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
-        let ctx = unsafe { (*cq).context };
+        let cq = self.inner.cq();
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
-        let n = unsafe { (*ctx).ops.poll_cq.unwrap()(cq, num_entries, wc.as_mut_ptr()) };
+        let n = unsafe { ffi::ibv_poll_cq(cq, num_entries, wc.as_mut_ptr()) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
             // surface whatever the provider left there as the cause.
@@ -1195,13 +911,8 @@ impl CompletionQueue {
     ///
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
-        let cq = self.inner.cq();
-        let ctx = unsafe { *cq }.context;
-        let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, solicited_only as i32) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::PollCompletionQueue));
-        }
-        Ok(())
+        let errno = unsafe { ffi::ibv_req_notify_cq(self.inner.cq(), solicited_only as i32) };
+        raw::errno(errno, Error::PollCompletionQueue)
     }
 
     /// The completion channel this queue delivers notifications on, if it was built with one

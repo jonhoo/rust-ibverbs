@@ -6,19 +6,21 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
 use crate::error::{Error, Result};
-use crate::pd::{ProtectionDomain, ProtectionDomainInner};
+use crate::fd;
+use crate::pd::ProtectionDomain;
+use crate::raw;
 
 #[cfg(doc)]
 use crate::{Device, QueuePairBuilder, WorkCompletion};
 
-pub(crate) struct ContextInner {
-    pub(crate) ctx: *mut ffi::ibv_context,
+struct ContextInner {
+    ctx: *mut ffi::ibv_context,
     ownership: ContextOwnership,
 }
 
@@ -35,51 +37,13 @@ enum ContextOwnership {
     Borrowed(Arc<dyn Send + Sync>),
 }
 
-impl ContextInner {
-    pub(crate) fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr> {
-        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
-        //
-        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
-        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
-        //   recommended avoiding saving the result of this query, or to flush them when a new SM
-        //   (re)configures the subnet.
-        //
-        let mut port_attr = ffi::ibv_port_attr::default();
-        // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
-        // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
-        let errno = unsafe { ffi::___ibv_query_port(self.ctx, port_num, &mut port_attr) };
-        if errno != 0 {
-            return Err(Error::errno(errno, |e| Error::QueryPort {
-                port_num,
-                source: e,
-            }));
-        }
-
-        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
-        //
-        //   The content of the GID table is valid only when the port_attr.state is either
-        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
-        //   table is indeterminate.
-        //
-        match port_attr.state {
-            ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
-            _ => {
-                return Err(Error::PortNotActive(port_num));
-            }
-        }
-        Ok(port_attr)
-    }
-}
-
 impl Drop for ContextInner {
     fn drop(&mut self) {
         match &self.ownership {
             ContextOwnership::Owned => {
-                let errno = unsafe { ffi::ibv_close_device(self.ctx) };
-                if errno != 0 {
-                    let e = io::Error::from_raw_os_error(errno);
-                    panic!("ibv_close_device failed: {e}");
-                }
+                raw::destroyed("ibv_close_device", unsafe {
+                    ffi::ibv_close_device(self.ctx)
+                });
             }
             // Borrowed: don't close the device; dropping the kept-alive owner is enough.
             #[cfg(feature = "rdmacm")]
@@ -119,10 +83,7 @@ impl Context {
     pub(crate) fn with_device(dev: *mut ffi::ibv_device) -> Result<Context> {
         assert!(!dev.is_null());
 
-        let ctx = unsafe { ffi::ibv_open_device(dev) };
-        if ctx.is_null() {
-            return Err(Error::OpenDevice(io::Error::last_os_error()));
-        }
+        let ctx = raw::nonnull(unsafe { ffi::ibv_open_device(dev) }, Error::OpenDevice)?;
         let context = Context {
             inner: Arc::new(ContextInner {
                 ctx,
@@ -150,8 +111,10 @@ impl Context {
                 ownership: ContextOwnership::Borrowed(owner),
             }),
         };
-        // The async-event descriptor is shared with every other borrow of this device context;
-        // setting it non-blocking is idempotent, so doing it once per borrow is harmless.
+        // The async-event descriptor belongs to librdmacm's per-device context, which every
+        // connection-manager id on this device in the process shares: making it non-blocking is
+        // a process-wide side effect on that context (needed for `poll_async_event`), and setting
+        // the flag again on a later borrow is idempotent.
         context.set_async_fd_nonblocking()?;
         Ok(context)
     }
@@ -160,15 +123,7 @@ impl Context {
     /// [`poll_async_event`](Self::poll_async_event) reports an empty event queue instead of
     /// blocking.
     fn set_async_fd_nonblocking(&self) -> Result<()> {
-        // SAFETY: the context owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.ctx).async_fd) };
-        let flags =
-            nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(|e| Error::OpenDevice(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::OpenDevice(e.into()))?;
-        Ok(())
+        fd::set_nonblocking(self.async_fd()).map_err(Error::OpenDevice)
     }
 
     /// Begin building a completion queue (CQ) with room for at least `min_cq_entries` entries.
@@ -198,14 +153,7 @@ impl Context {
     /// # }
     /// ```
     pub fn create_cq(&self, min_cq_entries: u32) -> CompletionQueueBuilder {
-        CompletionQueueBuilder {
-            ctx: self.inner.clone(),
-            min_cq_entries,
-            cq_context: 0,
-            comp_vector: 0,
-            wc_flags: 0,
-            comp_channel: None,
-        }
+        CompletionQueueBuilder::new(self.clone(), min_cq_entries)
     }
 
     /// Create a completion channel: the file descriptor that delivers completion notifications for
@@ -222,7 +170,7 @@ impl Context {
     ///  - [`CreateCompletionChannel`](Error::CreateCompletionChannel): creating the channel or
     ///    setting its descriptor non-blocking failed.
     pub fn create_comp_channel(&self) -> Result<CompletionChannel> {
-        CompletionChannel::new(&self.inner)
+        CompletionChannel::new(self)
     }
 
     /// The file descriptor that delivers the device's asynchronous events, for handing to an
@@ -250,8 +198,9 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
     pub fn poll_async_event(&self) -> Result<Option<AsyncEvent<'_>>> {
-        // `ibv_async_event` embeds an enum with no zero variant inside a union, so let
-        // `ibv_get_async_event` initialize the storage before a Rust value is formed.
+        // Let `ibv_get_async_event` fill the storage before a Rust value is formed: which member
+        // of the `element` union is valid depends on `event_type`, so no zeroed value would be
+        // meaningful.
         let mut event = std::mem::MaybeUninit::<ffi::ibv_async_event>::uninit();
         let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, event.as_mut_ptr()) };
         if rc != 0 {
@@ -259,7 +208,7 @@ impl Context {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::AsyncEvent(e));
+            return Err(Error::os(e, Error::AsyncEvent));
         }
         Ok(Some(AsyncEvent {
             // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
@@ -279,36 +228,15 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
     pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = fd::deadline(timeout);
         loop {
-            let remaining = deadline.map(|deadline| {
-                crate::completion::ceil_to_millis(
-                    deadline.saturating_duration_since(Instant::now()),
-                )
-            });
-            let pollfd = nix::poll::PollFd::new(self.async_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::AsyncEvent(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::AsyncEvent(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // event first; if so, go back to waiting for the next one.
-                    if let Some(event) = self.poll_async_event()? {
-                        return Ok(Some(event));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !fd::wait_readable(self.async_fd(), deadline).map_err(Error::AsyncEvent)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the event first;
+            // if so, go back to waiting for the next one.
+            if let Some(event) = self.poll_async_event()? {
+                return Ok(Some(event));
             }
         }
     }
@@ -325,17 +253,7 @@ impl Context {
     ///
     ///  - [`AllocProtectionDomain`](Error::AllocProtectionDomain): `ibv_alloc_pd` failed.
     pub fn alloc_pd(&self) -> Result<ProtectionDomain> {
-        let pd = unsafe { ffi::ibv_alloc_pd(self.inner.ctx) };
-        if pd.is_null() {
-            Err(Error::AllocProtectionDomain(io::Error::last_os_error()))
-        } else {
-            Ok(ProtectionDomain {
-                inner: Arc::new(ProtectionDomainInner {
-                    ctx: self.inner.clone(),
-                    pd,
-                }),
-            })
-        }
+        ProtectionDomain::alloc(self)
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
@@ -449,9 +367,7 @@ impl Context {
     pub fn query_device(&self) -> Result<DeviceAttr> {
         let mut device_attr = ffi::ibv_device_attr::default();
         let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
+        raw::errno(errno, Error::QueryDevice)?;
         Ok(DeviceAttr(device_attr))
     }
 
@@ -475,9 +391,7 @@ impl Context {
         let errno = unsafe {
             ffi::ibv_query_device_ex(self.inner.ctx, std::ptr::null(), &mut device_attr as *mut _)
         };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
+        raw::errno(errno, Error::QueryDevice)?;
         Ok(DeviceAttrEx(device_attr))
     }
 
@@ -501,12 +415,10 @@ impl Context {
         // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
         // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
         let errno = unsafe { ffi::___ibv_query_port(self.inner.ctx, port_num, &mut port_attr) };
-        if errno != 0 {
-            return Err(Error::errno(errno, |e| Error::QueryPort {
-                port_num,
-                source: e,
-            }));
-        }
+        raw::errno(errno, |e| Error::QueryPort {
+            port_num,
+            source: e,
+        })?;
         Ok(PortAttr(port_attr))
     }
 
@@ -538,9 +450,7 @@ impl Context {
         let mut values: ffi::ibv_values_ex = unsafe { std::mem::zeroed() };
         values.comp_mask = ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK as u32;
         let errno = unsafe { ffi::ibv_query_rt_values_ex(self.inner.ctx, &mut values as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryRealTimeValues));
-        }
+        raw::errno(errno, Error::QueryRealTimeValues)?;
         // The C ABI reports the raw clock through a `timespec`, but the value is a tick count, not
         // a time (mlx5, for instance, returns the whole counter through `tv_nsec`); fold the two
         // fields back into the single 64-bit counter.
@@ -623,148 +533,62 @@ impl fmt::Debug for AsyncEvent<'_> {
     }
 }
 
-/// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
-///
-/// The events fall into three scopes: affiliated errors and state changes on a completion queue,
-/// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which),
-/// port-level changes (with [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AsyncEventType {
-    /// An error occurred on a completion queue (overrun or protection fault); the queue and the
-    /// queue pairs attached to it are unusable.
-    CqError,
-    /// An error occurred on a queue pair that its completion queues could not report; the queue
-    /// pair moved to the error state.
-    QpFatal,
-    /// The transport detected an invalid request on the queue pair while it was the responder.
-    QpRequestError,
-    /// The transport detected an access violation on the queue pair while it was the responder.
-    QpAccessError,
-    /// The first message arrived on a queue pair still in `RTR` (communication is established).
-    CommEstablished,
-    /// The send queue finished draining after a transition to `SQD`.
-    SqDrained,
-    /// The connection migrated to its alternate path.
-    PathMigrated,
-    /// The connection failed to migrate to its alternate path.
-    PathMigrationError,
-    /// The device is in a fatal state; all of its resources are unusable.
-    DeviceFatal,
-    /// The port's logical state became active.
-    PortActive,
-    /// The port's logical state left active.
-    PortError,
-    /// The subnet manager changed the port's LID.
-    LidChange,
-    /// The port's partition-key (P_Key) table changed.
-    PkeyChange,
-    /// A new subnet manager took over the port.
-    SmChange,
-    /// An error occurred on a shared receive queue.
-    SrqError,
-    /// The number of receives posted to a shared receive queue dropped below its low watermark
-    /// (the `srq_limit` of [`ProtectionDomain::create_srq`]).
-    SrqLimitReached,
-    /// The last work request reached a queue pair, attached to a shared receive queue, that is in
-    /// the error state: no more receives will be consumed from the SRQ by this queue pair.
-    QpLastWqeReached,
-    /// The subnet manager asked the port's clients to reregister their subscriptions.
-    ClientReregister,
-    /// The port's GID table changed.
-    GidChange,
-    /// An error occurred on a work queue.
-    WqFatal,
-    /// The device's link speed changed.
-    DeviceSpeedChange,
-}
-
-impl From<ffi::ibv_event_type> for AsyncEventType {
-    fn from(event: ffi::ibv_event_type) -> Self {
-        use ffi::ibv_event_type::*;
-        match event {
-            IBV_EVENT_CQ_ERR => AsyncEventType::CqError,
-            IBV_EVENT_QP_FATAL => AsyncEventType::QpFatal,
-            IBV_EVENT_QP_REQ_ERR => AsyncEventType::QpRequestError,
-            IBV_EVENT_QP_ACCESS_ERR => AsyncEventType::QpAccessError,
-            IBV_EVENT_COMM_EST => AsyncEventType::CommEstablished,
-            IBV_EVENT_SQ_DRAINED => AsyncEventType::SqDrained,
-            IBV_EVENT_PATH_MIG => AsyncEventType::PathMigrated,
-            IBV_EVENT_PATH_MIG_ERR => AsyncEventType::PathMigrationError,
-            IBV_EVENT_DEVICE_FATAL => AsyncEventType::DeviceFatal,
-            IBV_EVENT_PORT_ACTIVE => AsyncEventType::PortActive,
-            IBV_EVENT_PORT_ERR => AsyncEventType::PortError,
-            IBV_EVENT_LID_CHANGE => AsyncEventType::LidChange,
-            IBV_EVENT_PKEY_CHANGE => AsyncEventType::PkeyChange,
-            IBV_EVENT_SM_CHANGE => AsyncEventType::SmChange,
-            IBV_EVENT_SRQ_ERR => AsyncEventType::SrqError,
-            IBV_EVENT_SRQ_LIMIT_REACHED => AsyncEventType::SrqLimitReached,
-            IBV_EVENT_QP_LAST_WQE_REACHED => AsyncEventType::QpLastWqeReached,
-            IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
-            IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
-            IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
-            IBV_EVENT_DEVICE_SPEED_CHANGE => AsyncEventType::DeviceSpeedChange,
-        }
-    }
-}
-
-impl From<AsyncEventType> for ffi::ibv_event_type {
-    fn from(event: AsyncEventType) -> Self {
-        use ffi::ibv_event_type::*;
-        match event {
-            AsyncEventType::CqError => IBV_EVENT_CQ_ERR,
-            AsyncEventType::QpFatal => IBV_EVENT_QP_FATAL,
-            AsyncEventType::QpRequestError => IBV_EVENT_QP_REQ_ERR,
-            AsyncEventType::QpAccessError => IBV_EVENT_QP_ACCESS_ERR,
-            AsyncEventType::CommEstablished => IBV_EVENT_COMM_EST,
-            AsyncEventType::SqDrained => IBV_EVENT_SQ_DRAINED,
-            AsyncEventType::PathMigrated => IBV_EVENT_PATH_MIG,
-            AsyncEventType::PathMigrationError => IBV_EVENT_PATH_MIG_ERR,
-            AsyncEventType::DeviceFatal => IBV_EVENT_DEVICE_FATAL,
-            AsyncEventType::PortActive => IBV_EVENT_PORT_ACTIVE,
-            AsyncEventType::PortError => IBV_EVENT_PORT_ERR,
-            AsyncEventType::LidChange => IBV_EVENT_LID_CHANGE,
-            AsyncEventType::PkeyChange => IBV_EVENT_PKEY_CHANGE,
-            AsyncEventType::SmChange => IBV_EVENT_SM_CHANGE,
-            AsyncEventType::SrqError => IBV_EVENT_SRQ_ERR,
-            AsyncEventType::SrqLimitReached => IBV_EVENT_SRQ_LIMIT_REACHED,
-            AsyncEventType::QpLastWqeReached => IBV_EVENT_QP_LAST_WQE_REACHED,
-            AsyncEventType::ClientReregister => IBV_EVENT_CLIENT_REREGISTER,
-            AsyncEventType::GidChange => IBV_EVENT_GID_CHANGE,
-            AsyncEventType::WqFatal => IBV_EVENT_WQ_FATAL,
-            AsyncEventType::DeviceSpeedChange => IBV_EVENT_DEVICE_SPEED_CHANGE,
-        }
-    }
-}
-
-impl std::fmt::Display for AsyncEventType {
-    /// Formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
+c_enum! {
+    /// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
+    ///
+    /// The events fall into three scopes: affiliated errors and state changes on a completion queue,
+    /// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which),
+    /// port-level changes (with [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
+    ///
+    /// `Display` formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
     /// [`SrqLimitReached`](Self::SrqLimitReached).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            AsyncEventType::CqError => "CQ_ERR",
-            AsyncEventType::QpFatal => "QP_FATAL",
-            AsyncEventType::QpRequestError => "QP_REQ_ERR",
-            AsyncEventType::QpAccessError => "QP_ACCESS_ERR",
-            AsyncEventType::CommEstablished => "COMM_EST",
-            AsyncEventType::SqDrained => "SQ_DRAINED",
-            AsyncEventType::PathMigrated => "PATH_MIG",
-            AsyncEventType::PathMigrationError => "PATH_MIG_ERR",
-            AsyncEventType::DeviceFatal => "DEVICE_FATAL",
-            AsyncEventType::PortActive => "PORT_ACTIVE",
-            AsyncEventType::PortError => "PORT_ERR",
-            AsyncEventType::LidChange => "LID_CHANGE",
-            AsyncEventType::PkeyChange => "PKEY_CHANGE",
-            AsyncEventType::SmChange => "SM_CHANGE",
-            AsyncEventType::SrqError => "SRQ_ERR",
-            AsyncEventType::SrqLimitReached => "SRQ_LIMIT_REACHED",
-            AsyncEventType::QpLastWqeReached => "QP_LAST_WQE_REACHED",
-            AsyncEventType::ClientReregister => "CLIENT_REREGISTER",
-            AsyncEventType::GidChange => "GID_CHANGE",
-            AsyncEventType::WqFatal => "WQ_FATAL",
-            AsyncEventType::DeviceSpeedChange => "DEVICE_SPEED_CHANGE",
-        };
-        f.write_str(name)
+    pub enum AsyncEventType(ffi::ibv_event_type) {
+        /// An error occurred on a completion queue (overrun or protection fault); the queue and the
+        /// queue pairs attached to it are unusable.
+        CqError = IBV_EVENT_CQ_ERR => "CQ_ERR";
+        /// An error occurred on a queue pair that its completion queues could not report; the queue
+        /// pair moved to the error state.
+        QpFatal = IBV_EVENT_QP_FATAL => "QP_FATAL";
+        /// The transport detected an invalid request on the queue pair while it was the responder.
+        QpRequestError = IBV_EVENT_QP_REQ_ERR => "QP_REQ_ERR";
+        /// The transport detected an access violation on the queue pair while it was the responder.
+        QpAccessError = IBV_EVENT_QP_ACCESS_ERR => "QP_ACCESS_ERR";
+        /// The first message arrived on a queue pair still in `RTR` (communication is established).
+        CommEstablished = IBV_EVENT_COMM_EST => "COMM_EST";
+        /// The send queue finished draining after a transition to `SQD`.
+        SqDrained = IBV_EVENT_SQ_DRAINED => "SQ_DRAINED";
+        /// The connection migrated to its alternate path.
+        PathMigrated = IBV_EVENT_PATH_MIG => "PATH_MIG";
+        /// The connection failed to migrate to its alternate path.
+        PathMigrationError = IBV_EVENT_PATH_MIG_ERR => "PATH_MIG_ERR";
+        /// The device is in a fatal state; all of its resources are unusable.
+        DeviceFatal = IBV_EVENT_DEVICE_FATAL => "DEVICE_FATAL";
+        /// The port's logical state became active.
+        PortActive = IBV_EVENT_PORT_ACTIVE => "PORT_ACTIVE";
+        /// The port's logical state left active.
+        PortError = IBV_EVENT_PORT_ERR => "PORT_ERR";
+        /// The subnet manager changed the port's LID.
+        LidChange = IBV_EVENT_LID_CHANGE => "LID_CHANGE";
+        /// The port's partition-key (P_Key) table changed.
+        PkeyChange = IBV_EVENT_PKEY_CHANGE => "PKEY_CHANGE";
+        /// A new subnet manager took over the port.
+        SmChange = IBV_EVENT_SM_CHANGE => "SM_CHANGE";
+        /// An error occurred on a shared receive queue.
+        SrqError = IBV_EVENT_SRQ_ERR => "SRQ_ERR";
+        /// The number of receives posted to a shared receive queue dropped below its low watermark
+        /// (the `srq_limit` of [`ProtectionDomain::create_srq`]).
+        SrqLimitReached = IBV_EVENT_SRQ_LIMIT_REACHED => "SRQ_LIMIT_REACHED";
+        /// The last work request reached a queue pair, attached to a shared receive queue, that is in
+        /// the error state: no more receives will be consumed from the SRQ by this queue pair.
+        QpLastWqeReached = IBV_EVENT_QP_LAST_WQE_REACHED => "QP_LAST_WQE_REACHED";
+        /// The subnet manager asked the port's clients to reregister their subscriptions.
+        ClientReregister = IBV_EVENT_CLIENT_REREGISTER => "CLIENT_REREGISTER";
+        /// The port's GID table changed.
+        GidChange = IBV_EVENT_GID_CHANGE => "GID_CHANGE";
+        /// An error occurred on a work queue.
+        WqFatal = IBV_EVENT_WQ_FATAL => "WQ_FATAL";
+        /// The device's link speed changed.
+        DeviceSpeedChange = IBV_EVENT_DEVICE_SPEED_CHANGE => "DEVICE_SPEED_CHANGE";
     }
 }
 
@@ -796,23 +620,25 @@ impl std::ops::Sub for HcaClock {
     }
 }
 
-/// A path or port MTU (maximum transfer unit), the message fragment size on the wire.
-///
-/// Returned by [`PortAttr::active_mtu`] / [`PortAttr::max_mtu`], and set on a queue pair with
-/// [`QueuePairBuilder::set_path_mtu`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum Mtu {
-    /// 256 bytes.
-    Mtu256,
-    /// 512 bytes.
-    Mtu512,
-    /// 1024 bytes.
-    Mtu1024,
-    /// 2048 bytes.
-    Mtu2048,
-    /// 4096 bytes.
-    Mtu4096,
+c_enum! {
+    /// A path or port MTU (maximum transfer unit), the message fragment size on the wire.
+    ///
+    /// Returned by [`PortAttr::active_mtu`] / [`PortAttr::max_mtu`], and set on a queue pair with
+    /// [`QueuePairBuilder::set_path_mtu`].
+    ///
+    /// `Display` writes the size in bytes.
+    pub enum Mtu(ffi::ibv_mtu) {
+        /// 256 bytes.
+        Mtu256 = IBV_MTU_256 => "256";
+        /// 512 bytes.
+        Mtu512 = IBV_MTU_512 => "512";
+        /// 1024 bytes.
+        Mtu1024 = IBV_MTU_1024 => "1024";
+        /// 2048 bytes.
+        Mtu2048 = IBV_MTU_2048 => "2048";
+        /// 4096 bytes.
+        Mtu4096 = IBV_MTU_4096 => "4096";
+    }
 }
 
 impl Mtu {
@@ -828,91 +654,21 @@ impl Mtu {
     }
 }
 
-impl From<ffi::ibv_mtu> for Mtu {
-    fn from(mtu: ffi::ibv_mtu) -> Self {
-        match mtu {
-            ffi::ibv_mtu::IBV_MTU_256 => Mtu::Mtu256,
-            ffi::ibv_mtu::IBV_MTU_512 => Mtu::Mtu512,
-            ffi::ibv_mtu::IBV_MTU_1024 => Mtu::Mtu1024,
-            ffi::ibv_mtu::IBV_MTU_2048 => Mtu::Mtu2048,
-            ffi::ibv_mtu::IBV_MTU_4096 => Mtu::Mtu4096,
-        }
-    }
-}
-
-impl From<Mtu> for ffi::ibv_mtu {
-    fn from(mtu: Mtu) -> Self {
-        match mtu {
-            Mtu::Mtu256 => ffi::ibv_mtu::IBV_MTU_256,
-            Mtu::Mtu512 => ffi::ibv_mtu::IBV_MTU_512,
-            Mtu::Mtu1024 => ffi::ibv_mtu::IBV_MTU_1024,
-            Mtu::Mtu2048 => ffi::ibv_mtu::IBV_MTU_2048,
-            Mtu::Mtu4096 => ffi::ibv_mtu::IBV_MTU_4096,
-        }
-    }
-}
-
-impl fmt::Display for Mtu {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.bytes())
-    }
-}
-
-/// The logical state of a port. Returned by [`PortAttr::state`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum PortState {
-    /// Reserved value (no state change).
-    Nop,
-    /// The port is down.
-    Down,
-    /// The port is initializing: the link is up, but the subnet manager has not configured it yet.
-    Init,
-    /// The port is armed: it may receive, but not yet transmit, data packets.
-    Armed,
-    /// The port is active and may send and receive packets.
-    Active,
-    /// The port is active, but temporarily deferring packet transmission.
-    ActiveDefer,
-}
-
-impl From<ffi::ibv_port_state> for PortState {
-    fn from(state: ffi::ibv_port_state) -> Self {
-        match state {
-            ffi::ibv_port_state::IBV_PORT_NOP => PortState::Nop,
-            ffi::ibv_port_state::IBV_PORT_DOWN => PortState::Down,
-            ffi::ibv_port_state::IBV_PORT_INIT => PortState::Init,
-            ffi::ibv_port_state::IBV_PORT_ARMED => PortState::Armed,
-            ffi::ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
-            ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
-        }
-    }
-}
-
-impl From<PortState> for ffi::ibv_port_state {
-    fn from(state: PortState) -> Self {
-        match state {
-            PortState::Nop => ffi::ibv_port_state::IBV_PORT_NOP,
-            PortState::Down => ffi::ibv_port_state::IBV_PORT_DOWN,
-            PortState::Init => ffi::ibv_port_state::IBV_PORT_INIT,
-            PortState::Armed => ffi::ibv_port_state::IBV_PORT_ARMED,
-            PortState::Active => ffi::ibv_port_state::IBV_PORT_ACTIVE,
-            PortState::ActiveDefer => ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER,
-        }
-    }
-}
-
-impl fmt::Display for PortState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            PortState::Nop => "Nop",
-            PortState::Down => "Down",
-            PortState::Init => "Init",
-            PortState::Armed => "Armed",
-            PortState::Active => "Active",
-            PortState::ActiveDefer => "ActiveDefer",
-        };
-        f.write_str(name)
+c_enum! {
+    /// The logical state of a port. Returned by [`PortAttr::state`].
+    pub enum PortState(ffi::ibv_port_state) {
+        /// Reserved value (no state change).
+        Nop = IBV_PORT_NOP => "Nop";
+        /// The port is down.
+        Down = IBV_PORT_DOWN => "Down";
+        /// The port is initializing: the link is up, but the subnet manager has not configured it yet.
+        Init = IBV_PORT_INIT => "Init";
+        /// The port is armed: it may receive, but not yet transmit, data packets.
+        Armed = IBV_PORT_ARMED => "Armed";
+        /// The port is active and may send and receive packets.
+        Active = IBV_PORT_ACTIVE => "Active";
+        /// The port is active, but temporarily deferring packet transmission.
+        ActiveDefer = IBV_PORT_ACTIVE_DEFER => "ActiveDefer";
     }
 }
 
@@ -1200,9 +956,10 @@ impl Deref for DeviceAttr {
 
 /// Extended device-wide attributes and capabilities, as returned by [`Context::query_device_ex`].
 ///
-/// Dereferences to the raw [`ffi::ibv_device_attr_ex`], so every field is accessible; the inherent
-/// methods add typed accessors for the most useful extended capabilities, and [`orig`] returns the
-/// base attributes that [`Context::query_device`] reports.
+/// Dereferences to the raw [`ffi::ibv_device_attr_ex`], so every field is accessible (the PCI
+/// atomic, packet-pacing, and raw-packet capabilities among them); the inherent methods add typed
+/// accessors for the most useful extended capabilities, and [`orig`] returns the base attributes
+/// that [`Context::query_device`] reports.
 ///
 /// [`orig`]: DeviceAttrEx::orig
 #[derive(Clone)]
@@ -1212,16 +969,6 @@ impl DeviceAttrEx {
     /// The base device attributes, the same set [`Context::query_device`] returns.
     pub fn orig(&self) -> DeviceAttr {
         DeviceAttr(self.0.orig_attr)
-    }
-
-    /// The node GUID of the device.
-    pub fn node_guid(&self) -> Guid {
-        Guid::from_be64(self.0.orig_attr.node_guid)
-    }
-
-    /// The system-image GUID, shared by the ports of the same physical device.
-    pub fn sys_image_guid(&self) -> Guid {
-        Guid::from_be64(self.0.orig_attr.sys_image_guid)
     }
 
     /// The mask that bounds the device's completion timestamps: the free-running HCA clock that
@@ -1235,24 +982,6 @@ impl DeviceAttrEx {
     /// [`Context::query_rt_values_ex`] this relates raw completion timestamps to host time.
     pub fn hca_core_clock_khz(&self) -> u64 {
         self.0.hca_core_clock
-    }
-
-    /// The device's PCI atomic capabilities. Each field (`fetch_add`, `swap`, `compare_swap`) is a
-    /// bitmask of the operand sizes, in bytes, the device can operate on atomically across PCIe.
-    pub fn pci_atomic_caps(&self) -> ffi::ibv_pci_atomic_caps {
-        self.0.pci_atomic_caps
-    }
-
-    /// The packet-pacing (rate-limit) capabilities: the supported rate range in kbps and the
-    /// queue-pair types that can be rate limited. The minimum and maximum rate are zero if the
-    /// device does not support packet pacing.
-    pub fn packet_pacing_caps(&self) -> ffi::ibv_packet_pacing_caps {
-        self.0.packet_pacing_caps
-    }
-
-    /// The raw-packet capability flags (`IBV_RAW_PACKET_CAP_*`) the device supports.
-    pub fn raw_packet_caps(&self) -> u32 {
-        self.0.raw_packet_caps
     }
 
     /// The maximum size, in bytes, of a single device-memory allocation, or zero if the device has
@@ -1276,11 +1005,11 @@ impl fmt::Debug for DeviceAttrEx {
                 &format_args!("{:#x}", self.completion_timestamp_mask()),
             )
             .field("hca_core_clock_khz", &self.hca_core_clock_khz())
-            .field("pci_atomic_caps", &self.pci_atomic_caps())
-            .field("packet_pacing_caps", &self.packet_pacing_caps())
+            .field("pci_atomic_caps", &self.0.pci_atomic_caps)
+            .field("packet_pacing_caps", &self.0.packet_pacing_caps)
             .field(
                 "raw_packet_caps",
-                &format_args!("{:#x}", self.raw_packet_caps()),
+                &format_args!("{:#x}", self.0.raw_packet_caps),
             )
             .field("max_device_memory", &self.max_device_memory())
             .finish_non_exhaustive()
