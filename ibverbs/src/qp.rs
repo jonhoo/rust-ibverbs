@@ -13,6 +13,7 @@ use crate::context::Mtu;
 use crate::error::{Error, Result};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomainInner;
+use crate::raw;
 use crate::srq::SharedReceiveQueue;
 
 #[cfg(doc)]
@@ -749,49 +750,45 @@ impl<T: Transport> QueuePairBuilder<T> {
             (*p).send_ops_flags = send_ops_flags as u64;
         }
 
-        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, attr.as_mut_ptr()) };
-        if qp.is_null() {
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateQueuePair,
-            ))
-        } else {
-            let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-            let prepared = PreparedQueuePair {
-                lid: self.port_attr.lid,
-                port_num: self.port_num,
-                qp: QueuePair {
-                    pd: self.pd.clone(),
-                    _srq: self.srq.clone(),
-                    _send_cq: self.send.clone(),
-                    _recv_cq: self.recv.clone(),
-                    qp,
-                    qp_ex,
-                    _transport: std::marker::PhantomData,
-                },
-                gid_index: self.gid_index,
-                traffic_class: self.traffic_class,
-                access: self.access,
-                timeout: self.timeout,
-                retry_count: self.retry_count,
-                rnr_retry: self.rnr_retry,
-                min_rnr_timer: self.min_rnr_timer,
-                max_rd_atomic: self.max_rd_atomic,
-                max_dest_rd_atomic: self.max_dest_rd_atomic,
-                path_mtu: self.path_mtu,
-                psn: self.psn,
-                service_level: self.service_level,
-            };
-            // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
-            // work-request table; one that accepted the send-operations mask without doing so has
-            // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
-            if qp_ex.is_null() {
-                return Err(Error::Unsupported {
-                    operation: "ibv_qp_to_qp_ex",
-                });
-            }
-            Ok(prepared)
+        let qp = raw::nonnull(
+            unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, attr.as_mut_ptr()) },
+            Error::CreateQueuePair,
+        )?;
+        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
+        let prepared = PreparedQueuePair {
+            lid: self.port_attr.lid,
+            port_num: self.port_num,
+            qp: QueuePair {
+                pd: self.pd.clone(),
+                _srq: self.srq.clone(),
+                _send_cq: self.send.clone(),
+                _recv_cq: self.recv.clone(),
+                qp,
+                qp_ex,
+                _transport: std::marker::PhantomData,
+            },
+            gid_index: self.gid_index,
+            traffic_class: self.traffic_class,
+            access: self.access,
+            timeout: self.timeout,
+            retry_count: self.retry_count,
+            rnr_retry: self.rnr_retry,
+            min_rnr_timer: self.min_rnr_timer,
+            max_rd_atomic: self.max_rd_atomic,
+            max_dest_rd_atomic: self.max_dest_rd_atomic,
+            path_mtu: self.path_mtu,
+            psn: self.psn,
+            service_level: self.service_level,
+        };
+        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
+        // work-request table; one that accepted the send-operations mask without doing so has
+        // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
+        if qp_ex.is_null() {
+            return Err(Error::Unsupported {
+                operation: "ibv_qp_to_qp_ex",
+            });
         }
+        Ok(prepared)
     }
 }
 
@@ -1332,6 +1329,32 @@ impl<'a> RecvRequest<'a> {
     }
 }
 
+/// Link `recvs` in place into the list the receive-posting verbs expect and post it with `post`
+/// (an `ibv_post_recv`-style verb taking the list head and a `bad_wr` out-pointer and returning
+/// an `errno`), the batch-posting shared by queue pairs and shared receive queues. An empty batch
+/// posts nothing.
+///
+/// # Safety
+///
+/// The safety contract of the posting verb: every referenced memory region must stay valid until
+/// a work completion has been polled for the corresponding `wr_id`.
+pub(crate) unsafe fn post_linked(
+    recvs: &mut [RecvRequest<'_>],
+    post: impl FnOnce(*mut ffi::ibv_recv_wr, *mut *mut ffi::ibv_recv_wr) -> std::os::raw::c_int,
+) -> Result<()> {
+    let Some(last) = recvs.len().checked_sub(1) else {
+        return Ok(());
+    };
+    for i in 0..last {
+        let next = &mut recvs[i + 1].wr as *mut ffi::ibv_recv_wr;
+        recvs[i].wr.next = next;
+    }
+    recvs[last].wr.next = ptr::null_mut();
+    let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
+    let errno = post(&mut recvs[0].wr, &mut bad_wr);
+    raw::errno(errno, Error::PostReceive)
+}
+
 /// A batch of send work requests being built on a [`QueuePair`]'s send queue.
 ///
 /// Created by [`QueuePair::start_send`]. Each work request starts at [`op`](Self::op) (on a
@@ -1459,11 +1482,7 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
         // are about to `wr_complete`.
         std::mem::forget(self);
         let ret = unsafe { (*qpx).wr_complete.unwrap()(qpx) };
-        if ret != 0 {
-            Err(Error::errno(ret, Error::PostSend))
-        } else {
-            Ok(())
-        }
+        raw::errno(ret, Error::PostSend)
     }
 }
 
@@ -2229,7 +2248,7 @@ unsafe impl<T: Transport> Sync for QueuePair<T> {}
 impl<T: Transport> QueuePair<T> {
     /// Returns the local QP number of this QueuePair.
     pub fn qp_num(&self) -> u32 {
-        unsafe { *self.qp }.qp_num
+        unsafe { (*self.qp).qp_num }
     }
 
     /// Returns the underlying `ibv_qp` pointer.
@@ -2307,9 +2326,7 @@ impl<T: Transport> QueuePair<T> {
                 init_attr.as_mut_ptr(),
             )
         };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryQueuePair));
-        }
+        raw::errno(errno, Error::QueryQueuePair)?;
         let init_attr = unsafe { init_attr.assume_init() };
         Ok((
             QueuePairAttribute { attr, mask },
@@ -2378,31 +2395,11 @@ impl<T: Transport> QueuePair<T> {
     ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
     ///    resources).
     pub unsafe fn post_recv<'a>(&mut self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
-        let recvs = recvs.as_mut();
-        if recvs.is_empty() {
-            return Ok(());
-        }
-        // Link the requests into the list `ibv_post_recv` expects.
-        for i in 0..recvs.len() - 1 {
-            let next = &mut recvs[i + 1].wr as *mut ffi::ibv_recv_wr;
-            recvs[i].wr.next = next;
-        }
-        recvs.last_mut().unwrap().wr.next = ptr::null_mut();
-
-        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_recv.as_mut().unwrap()(
-                self.qp,
-                &mut recvs[0].wr as *mut _,
-                &mut bad_wr as *mut _,
-            )
-        };
-        if errno != 0 {
-            Err(Error::errno(errno, Error::PostReceive))
-        } else {
-            Ok(())
+        let qp = self.qp;
+        unsafe {
+            post_linked(recvs.as_mut(), |wr, bad_wr| {
+                ffi::ibv_post_recv(qp, wr, bad_wr)
+            })
         }
     }
 
@@ -2442,12 +2439,7 @@ impl<T: Transport> QueuePair<T> {
 
 impl<T: Transport> Drop for QueuePair<T> {
     fn drop(&mut self) {
-        // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
-        let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_qp failed: {e}");
-        }
+        raw::destroyed("ibv_destroy_qp", unsafe { ffi::ibv_destroy_qp(self.qp) });
     }
 }
 

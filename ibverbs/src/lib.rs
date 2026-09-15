@@ -316,6 +316,7 @@ mod error;
 mod mr;
 mod pd;
 mod qp;
+mod raw;
 mod srq;
 
 #[cfg(feature = "efa")]

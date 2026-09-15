@@ -8,7 +8,6 @@
 // [`QueuePair::post_recv`], and completions through [`CompletionQueue::poll`].
 // ---------------------------------------------------------------------------
 
-use std::io;
 use std::os::raw::c_void;
 
 use crate::completion::CompletionQueue;
@@ -19,6 +18,7 @@ use crate::qp::{
     sealed, AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
     QueuePairType, Transport,
 };
+use crate::raw;
 
 #[cfg(doc)]
 use crate::AddressHandle;
@@ -102,20 +102,17 @@ impl QueuePairBuilder<Srd> {
         unsafe {
             (*efa_attr.as_mut_ptr()).driver_qp_type = ffi::EFADV_QP_DRIVER_TYPE_SRD as u32;
         }
-        let qp = unsafe {
-            ffi::efadv_create_qp_ex(
-                self.pd.ctx.ctx,
-                attr.as_mut_ptr(),
-                efa_attr.as_mut_ptr(),
-                std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
-            )
-        };
-        if qp.is_null() {
-            return Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateQueuePair,
-            ));
-        }
+        let qp = raw::nonnull(
+            unsafe {
+                ffi::efadv_create_qp_ex(
+                    self.pd.ctx.ctx,
+                    attr.as_mut_ptr(),
+                    efa_attr.as_mut_ptr(),
+                    std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
+                )
+            },
+            Error::CreateQueuePair,
+        )?;
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         let prepared = PreparedQueuePair {
             lid: self.port_attr.lid,

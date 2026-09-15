@@ -1,10 +1,10 @@
 use std::convert::TryInto;
-use std::io;
 use std::ops::{Deref, DerefMut, RangeBounds};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::pd::ProtectionDomainInner;
+use crate::raw;
 
 #[cfg(doc)]
 use crate::QueuePair;
@@ -64,11 +64,7 @@ unsafe impl Send for MemoryRegionInner {}
 
 impl Drop for MemoryRegionInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dereg_mr(self.mr) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_dereg_mr failed: {e}");
-        }
+        raw::destroyed("ibv_dereg_mr", unsafe { ffi::ibv_dereg_mr(self.mr) });
     }
 }
 

@@ -13,6 +13,7 @@ use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
 use crate::error::{Error, Result};
 use crate::pd::{ProtectionDomain, ProtectionDomainInner};
+use crate::raw;
 
 #[cfg(doc)]
 use crate::{Device, QueuePairBuilder, WorkCompletion};
@@ -48,12 +49,10 @@ impl ContextInner {
         // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
         // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
         let errno = unsafe { ffi::___ibv_query_port(self.ctx, port_num, &mut port_attr) };
-        if errno != 0 {
-            return Err(Error::errno(errno, |e| Error::QueryPort {
-                port_num,
-                source: e,
-            }));
-        }
+        raw::errno(errno, |e| Error::QueryPort {
+            port_num,
+            source: e,
+        })?;
 
         // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
         //
@@ -75,11 +74,9 @@ impl Drop for ContextInner {
     fn drop(&mut self) {
         match &self.ownership {
             ContextOwnership::Owned => {
-                let errno = unsafe { ffi::ibv_close_device(self.ctx) };
-                if errno != 0 {
-                    let e = io::Error::from_raw_os_error(errno);
-                    panic!("ibv_close_device failed: {e}");
-                }
+                raw::destroyed("ibv_close_device", unsafe {
+                    ffi::ibv_close_device(self.ctx)
+                });
             }
             // Borrowed: don't close the device; dropping the kept-alive owner is enough.
             #[cfg(feature = "rdmacm")]
@@ -119,10 +116,7 @@ impl Context {
     pub(crate) fn with_device(dev: *mut ffi::ibv_device) -> Result<Context> {
         assert!(!dev.is_null());
 
-        let ctx = unsafe { ffi::ibv_open_device(dev) };
-        if ctx.is_null() {
-            return Err(Error::OpenDevice(io::Error::last_os_error()));
-        }
+        let ctx = raw::nonnull(unsafe { ffi::ibv_open_device(dev) }, Error::OpenDevice)?;
         let context = Context {
             inner: Arc::new(ContextInner {
                 ctx,
@@ -259,7 +253,7 @@ impl Context {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::AsyncEvent(e));
+            return Err(Error::os(e, Error::AsyncEvent));
         }
         Ok(Some(AsyncEvent {
             // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
@@ -325,17 +319,16 @@ impl Context {
     ///
     ///  - [`AllocProtectionDomain`](Error::AllocProtectionDomain): `ibv_alloc_pd` failed.
     pub fn alloc_pd(&self) -> Result<ProtectionDomain> {
-        let pd = unsafe { ffi::ibv_alloc_pd(self.inner.ctx) };
-        if pd.is_null() {
-            Err(Error::AllocProtectionDomain(io::Error::last_os_error()))
-        } else {
-            Ok(ProtectionDomain {
-                inner: Arc::new(ProtectionDomainInner {
-                    ctx: self.inner.clone(),
-                    pd,
-                }),
-            })
-        }
+        let pd = raw::nonnull(
+            unsafe { ffi::ibv_alloc_pd(self.inner.ctx) },
+            Error::AllocProtectionDomain,
+        )?;
+        Ok(ProtectionDomain {
+            inner: Arc::new(ProtectionDomainInner {
+                ctx: self.inner.clone(),
+                pd,
+            }),
+        })
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
@@ -449,9 +442,7 @@ impl Context {
     pub fn query_device(&self) -> Result<DeviceAttr> {
         let mut device_attr = ffi::ibv_device_attr::default();
         let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
+        raw::errno(errno, Error::QueryDevice)?;
         Ok(DeviceAttr(device_attr))
     }
 
@@ -475,9 +466,7 @@ impl Context {
         let errno = unsafe {
             ffi::ibv_query_device_ex(self.inner.ctx, std::ptr::null(), &mut device_attr as *mut _)
         };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
+        raw::errno(errno, Error::QueryDevice)?;
         Ok(DeviceAttrEx(device_attr))
     }
 
@@ -501,12 +490,10 @@ impl Context {
         // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
         // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
         let errno = unsafe { ffi::___ibv_query_port(self.inner.ctx, port_num, &mut port_attr) };
-        if errno != 0 {
-            return Err(Error::errno(errno, |e| Error::QueryPort {
-                port_num,
-                source: e,
-            }));
-        }
+        raw::errno(errno, |e| Error::QueryPort {
+            port_num,
+            source: e,
+        })?;
         Ok(PortAttr(port_attr))
     }
 
@@ -538,9 +525,7 @@ impl Context {
         let mut values: ffi::ibv_values_ex = unsafe { std::mem::zeroed() };
         values.comp_mask = ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK as u32;
         let errno = unsafe { ffi::ibv_query_rt_values_ex(self.inner.ctx, &mut values as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryRealTimeValues));
-        }
+        raw::errno(errno, Error::QueryRealTimeValues)?;
         // The C ABI reports the raw clock through a `timespec`, but the value is a tick count, not
         // a time (mlx5, for instance, returns the whole counter through `tv_nsec`); fold the two
         // fields back into the single 64-bit counter.
