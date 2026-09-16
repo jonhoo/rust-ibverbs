@@ -102,6 +102,7 @@ version = "0.3.2+63.0"
 dependencies = [
  "bindgen",
  "proc-macro2",
+ "syn",
 ]
 
 [[package]]

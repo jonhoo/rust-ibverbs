@@ -356,6 +356,19 @@ impl Default for ibv_qp_attr {
     }
 }
 
+/// `ibv_port_attr` has no valid all-zero representation: `max_mtu` and `active_mtu` are
+/// `ibv_mtu`. Both are set to the smallest variant; a port query overwrites every field.
+impl Default for ibv_port_attr {
+    fn default() -> Self {
+        let mut attr = ::std::mem::MaybeUninit::<Self>::zeroed();
+        unsafe {
+            (*attr.as_mut_ptr()).max_mtu = ibv_mtu::IBV_MTU_256;
+            (*attr.as_mut_ptr()).active_mtu = ibv_mtu::IBV_MTU_256;
+            attr.assume_init()
+        }
+    }
+}
+
 // `ibv_create_cq_ex` and `ibv_create_qp_ex` are `static inline` in verbs.h: they reach the provider
 // through the op table embedded in `verbs_context`, so there is no exported symbol for bindgen to
 // bind. The functions below reimplement that dispatch (the `verbs_get_ctx` container_of and the
