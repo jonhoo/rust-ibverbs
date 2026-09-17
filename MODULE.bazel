@@ -23,7 +23,7 @@ use_repo(llvm, "llvm_toolchain_llvm")
 
 # Configure rust toolchain
 rust = use_extension("@rules_rust//rust:extensions.bzl", "rust")
-rust.toolchain(edition = "2021")
+rust.toolchain(edition = "2024")
 use_repo(rust, "rust_toolchains")
 
 register_toolchains("@rust_toolchains//:all")

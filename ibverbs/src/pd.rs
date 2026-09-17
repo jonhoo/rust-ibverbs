@@ -276,7 +276,7 @@ impl ProtectionDomain {
         len: usize,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegionInner> {
-        let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
+        let mr = unsafe { ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32) };
         // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
         if mr.is_null() {
             // Promotes EOPNOTSUPP (an access flag the device cannot honor) to Unsupported, like
@@ -375,7 +375,7 @@ impl ProtectionDomain {
         access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
         assert!(len > 0);
-        let inner = self.reg_mr(ptr as *mut c_void, len, access_flags)?;
+        let inner = unsafe { self.reg_mr(ptr as *mut c_void, len, access_flags) }?;
         Ok(MemoryRegion { inner, owner: () })
     }
 

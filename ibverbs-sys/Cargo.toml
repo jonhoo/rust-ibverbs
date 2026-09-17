@@ -1,8 +1,8 @@
 [package]
 name = "ibverbs-sys"
 version = "0.3.2+63.0"
-edition = "2021"
-rust-version = "1.82" # unsafe extern in generated bindings
+edition = "2024"
+rust-version = "1.85" # edition 2024
 
 description = "Raw, FFI bindings for RDMA ibverbs through rdma-core"
 readme = "../README.md"

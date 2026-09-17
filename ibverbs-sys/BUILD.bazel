@@ -21,6 +21,13 @@ rust_bindgen(
     name = "bindings",
     bindgen_flags = [
         "--no-layout-tests",
+        # `--rust-target` is the crate's MSRV; `--wrap-unsafe-ops` keeps the generated `unsafe fn`
+        # bodies clean under 2024's `unsafe_op_in_unsafe_fn`. No `--rust-edition` here: rust_bindgen
+        # always appends one from `rust.toolchain(edition = ...)` in MODULE.bazel (its check for a
+        # caller-supplied flag compares against "--rust-edition " with a trailing space, so it never
+        # matches), and bindgen rejects the flag twice.
+        "--rust-target=1.85",
+        "--wrap-unsafe-ops",
         "--with-derive-default",
         "--allowlist-function=ibv_.*",
         "--allowlist-function=_ibv_.*",
@@ -66,7 +73,7 @@ rust_library(
     ],
     compile_data = [":bindings"],
     crate_name = "ibverbs_sys",
-    edition = "2021",
+    edition = "2024",
     rustc_env = {
         # Set OUT_DIR relative to src/ directory where lib.rs lives
         # bindings.rs is at ibverbs-sys/bindings.rs, lib.rs is at ibverbs-sys/src/lib.rs

@@ -10,7 +10,7 @@ rust_library(
         "//ibverbs-sys": "ffi",
     },
     crate_name = "ibverbs",
-    edition = "2021",
+    edition = "2024",
     deps = [
         "//ibverbs-sys",
         # These deps should be provided by the consuming workspace's crates repository
@@ -23,7 +23,7 @@ rust_library(
 rust_binary(
     name = "loopback",
     srcs = ["examples/loopback.rs"],
-    edition = "2021",
+    edition = "2024",
     deps = [":ibverbs"],
 )
 

@@ -16,8 +16,8 @@ use crate::error::{Error, Result};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
 use crate::qp::{
-    sealed, AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
-    QueuePairType, Transport,
+    AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
+    QueuePairType, Transport, sealed,
 };
 
 #[cfg(doc)]

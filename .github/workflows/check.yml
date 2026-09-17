@@ -153,7 +153,7 @@ jobs:
     # https://docs.github.com/en/actions/learn-github-actions/contexts#context-availability
     strategy:
       matrix:
-        msrv: ["1.82.0"] # unsafe extern in the generated bindings (see ibverbs-sys/Cargo.toml)
+        msrv: ["1.85.0"] # edition 2024 (see ibverbs-sys/Cargo.toml)
     name: ubuntu / ${{ matrix.msrv }}
     steps:
       - uses: actions/checkout@v4
