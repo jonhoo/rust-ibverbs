@@ -408,10 +408,10 @@ pub unsafe fn ___ibv_query_port(
     port_num: u8,
     port_attr: *mut ibv_port_attr,
 ) -> ::std::os::raw::c_int {
+    let need =
+        ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, query_port);
     unsafe {
         let vctx = verbs_get_ctx(context);
-        let need = ::std::mem::size_of::<verbs_context>()
-            - ::std::mem::offset_of!(verbs_context, query_port);
         match (*vctx).query_port {
             Some(query_port) if (*vctx).sz >= need => query_port(
                 context,
@@ -431,6 +431,11 @@ pub unsafe fn ___ibv_query_port(
 /// `errno = EOPNOTSUPP` before returning null).
 ///
 /// rdma-core targets only Linux, where both glibc and musl expose `__errno_location`.
+///
+/// # Safety
+///
+/// Sound on any Linux libc: `__errno_location` takes no arguments and returns the calling
+/// thread's `errno` slot. The function is `unsafe` only because it calls a foreign symbol.
 unsafe fn set_errno(err: ::std::os::raw::c_int) {
     unsafe {
         unsafe extern "C" {
@@ -453,10 +458,10 @@ pub unsafe fn ibv_create_cq_ex(
     context: *mut ibv_context,
     cq_attr: *mut ibv_cq_init_attr_ex,
 ) -> *mut ibv_cq_ex {
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, create_cq_ex);
     unsafe {
         let vctx = verbs_get_ctx(context);
-        let need = ::std::mem::size_of::<verbs_context>()
-            - ::std::mem::offset_of!(verbs_context, create_cq_ex);
         match (*vctx).create_cq_ex {
             Some(create_cq_ex) if (*vctx).sz >= need => create_cq_ex(context, cq_attr),
             _ => {
@@ -481,10 +486,10 @@ pub unsafe fn ibv_create_qp_ex(
     context: *mut ibv_context,
     qp_attr: *mut ibv_qp_init_attr_ex,
 ) -> *mut ibv_qp {
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, create_qp_ex);
     unsafe {
         let vctx = verbs_get_ctx(context);
-        let need = ::std::mem::size_of::<verbs_context>()
-            - ::std::mem::offset_of!(verbs_context, create_qp_ex);
         match (*vctx).create_qp_ex {
             Some(create_qp_ex) if (*vctx).sz >= need => create_qp_ex(context, qp_attr),
             _ => {
@@ -512,10 +517,10 @@ pub unsafe fn ibv_advise_mr(
     sg_list: *mut ibv_sge,
     num_sge: u32,
 ) -> ::std::os::raw::c_int {
+    let need =
+        ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, advise_mr);
     unsafe {
         let vctx = verbs_get_ctx((*pd).context);
-        let need = ::std::mem::size_of::<verbs_context>()
-            - ::std::mem::offset_of!(verbs_context, advise_mr);
         match (*vctx).advise_mr {
             Some(advise_mr) if (*vctx).sz >= need => advise_mr(pd, advice, flags, sg_list, num_sge),
             // The provider does not implement advise_mr; mirror the C inline's `return EOPNOTSUPP`
@@ -538,10 +543,10 @@ pub unsafe fn ibv_query_rt_values_ex(
     context: *mut ibv_context,
     values: *mut ibv_values_ex,
 ) -> ::std::os::raw::c_int {
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, query_rt_values);
     unsafe {
         let vctx = verbs_get_ctx(context);
-        let need = ::std::mem::size_of::<verbs_context>()
-            - ::std::mem::offset_of!(verbs_context, query_rt_values);
         match (*vctx).query_rt_values {
             Some(query_rt_values) if (*vctx).sz >= need => query_rt_values(context, values),
             // The provider does not implement query_rt_values; mirror the C inline's `return EOPNOTSUPP`
@@ -567,15 +572,15 @@ pub unsafe fn ibv_query_device_ex(
     input: *const ibv_query_device_ex_input,
     attr: *mut ibv_device_attr_ex,
 ) -> ::std::os::raw::c_int {
+    // The only component mask the input may carry is reserved; reject anything set with EINVAL
+    // (22 on Linux, the only platform rdma-core targets), matching the C inline.
+    if !input.is_null() && unsafe { (*input).comp_mask } != 0 {
+        return 22;
+    }
+    let need = ::std::mem::size_of::<verbs_context>()
+        - ::std::mem::offset_of!(verbs_context, query_device_ex);
     unsafe {
-        // The only component mask the input may carry is reserved; reject anything set with EINVAL
-        // (22 on Linux, the only platform rdma-core targets), matching the C inline.
-        if !input.is_null() && (*input).comp_mask != 0 {
-            return 22;
-        }
         let vctx = verbs_get_ctx(context);
-        let need = ::std::mem::size_of::<verbs_context>()
-            - ::std::mem::offset_of!(verbs_context, query_device_ex);
         if let Some(query_device_ex) = (*vctx).query_device_ex {
             if (*vctx).sz >= need {
                 let ret = query_device_ex(
