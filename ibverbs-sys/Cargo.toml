@@ -38,6 +38,9 @@ rdmacm = []
 [build-dependencies]
 bindgen = "0.72"
 
+[dev-dependencies]
+syn = { version = "2.0", features = ["full"] }
+
 # to make -Zminimal-versions work
 [target.'cfg(any())'.dependencies]
 # https://github.com/rust-lang/rust-bindgen/pull/3048

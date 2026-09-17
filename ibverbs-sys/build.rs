@@ -2,6 +2,14 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The quoted names in `no_default.bzl`, whose only Starlark is a list of string literals.
+fn no_default_types(bzl: &str) -> impl Iterator<Item = &str> {
+    bzl.lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix('"'))
+        .map(|line| line.trim_end_matches(',').trim_end_matches('"'))
+}
+
 /// Configure the vendored rdma-core checkout with cmake and return the include directory it
 /// generates.
 ///
@@ -133,9 +141,6 @@ fn main() {
             non_exhaustive: false,
         })
         .derive_default(true)
-        // `ibv_qp_attr` gets a hand-written `Default` in lib.rs: bindgen's fallback zeroes the
-        // struct, but its `path_mtu` enum has no zero variant, so that would be an invalid value.
-        .no_default("ibv_qp_attr")
         .derive_debug(true)
         .prepend_enum_name(false)
         .blocklist_type("ibv_wc")
@@ -160,6 +165,15 @@ fn main() {
             .allowlist_type("rdma_.*")
             // the `rdma_set_option` levels and option names are anonymous enums
             .allowlist_var("RDMA_OPTION_.*");
+    }
+
+    // The types whose zero-filled fallback `Default` would be an invalid value; the list is shared
+    // with the Bazel build, which loads the same file. It lives in the package directory, so
+    // Cargo's default change tracking covers it (a `rerun-if-changed` here would replace that
+    // tracking and drop the headers from it).
+    let no_default = std::fs::read_to_string("no_default.bzl").expect("read no_default.bzl");
+    for name in no_default_types(&no_default) {
+        builder = builder.no_default(name);
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");
