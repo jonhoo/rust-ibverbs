@@ -21,9 +21,11 @@ rust_bindgen(
     name = "bindings",
     bindgen_flags = [
         "--no-layout-tests",
-        # the MSRV; `--wrap-unsafe-ops` keeps the generated `unsafe fn` bodies clean under 2024's
-        # `unsafe_op_in_unsafe_fn`. The edition comes from `rust.toolchain` in MODULE.bazel: the
-        # rule always adds `--rust-edition` itself, and bindgen rejects it twice.
+        # `--rust-target` is the crate's MSRV; `--wrap-unsafe-ops` keeps the generated `unsafe fn`
+        # bodies clean under 2024's `unsafe_op_in_unsafe_fn`. No `--rust-edition` here: rust_bindgen
+        # always appends one from `rust.toolchain(edition = ...)` in MODULE.bazel (its check for a
+        # caller-supplied flag compares against "--rust-edition " with a trailing space, so it never
+        # matches), and bindgen rejects the flag twice.
         "--rust-target=1.85",
         "--wrap-unsafe-ops",
         "--with-derive-default",

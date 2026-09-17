@@ -430,19 +430,14 @@ pub unsafe fn ___ibv_query_port(
 /// Set `errno`, so the shims below can report failures the way the C inlines do (they set
 /// `errno = EOPNOTSUPP` before returning null).
 ///
-/// rdma-core targets only Linux, where both glibc and musl expose `__errno_location`.
-///
-/// # Safety
-///
-/// Sound on any Linux libc: `__errno_location` takes no arguments and returns the calling
-/// thread's `errno` slot. The function is `unsafe` only because it calls a foreign symbol.
-unsafe fn set_errno(err: ::std::os::raw::c_int) {
-    unsafe {
-        unsafe extern "C" {
-            fn __errno_location() -> *mut ::std::os::raw::c_int;
-        }
-        *__errno_location() = err;
+/// rdma-core targets only Linux, where both glibc and musl expose `__errno_location`. It takes
+/// no arguments and always returns the calling thread's `errno` slot, so calling it is safe; only
+/// the write through the returned pointer is not.
+fn set_errno(err: ::std::os::raw::c_int) {
+    unsafe extern "C" {
+        safe fn __errno_location() -> *mut ::std::os::raw::c_int;
     }
+    unsafe { *__errno_location() = err }
 }
 
 /// Create an extended completion queue (`ibv_create_cq_ex`).
