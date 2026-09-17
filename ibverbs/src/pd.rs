@@ -276,21 +276,23 @@ impl ProtectionDomain {
         len: usize,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegionInner> {
-        let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
-        // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
-        if mr.is_null() {
-            // Promotes EOPNOTSUPP (an access flag the device cannot honor) to Unsupported, like
-            // register_dmabuf and the other verbs.
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::RegisterMemoryRegion,
-            ))
-        } else {
-            Ok(MemoryRegionInner {
-                _pd: self.inner.clone(),
-                mr,
-                addr: ptr as u64,
-            })
+        unsafe {
+            let mr = ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32);
+            // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
+            if mr.is_null() {
+                // Promotes EOPNOTSUPP (an access flag the device cannot honor) to Unsupported, like
+                // register_dmabuf and the other verbs.
+                Err(Error::os(
+                    io::Error::last_os_error(),
+                    Error::RegisterMemoryRegion,
+                ))
+            } else {
+                Ok(MemoryRegionInner {
+                    _pd: self.inner.clone(),
+                    mr,
+                    addr: ptr as u64,
+                })
+            }
         }
     }
 
@@ -374,9 +376,11 @@ impl ProtectionDomain {
         len: usize,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
-        assert!(len > 0);
-        let inner = self.reg_mr(ptr as *mut c_void, len, access_flags)?;
-        Ok(MemoryRegion { inner, owner: () })
+        unsafe {
+            assert!(len > 0);
+            let inner = self.reg_mr(ptr as *mut c_void, len, access_flags)?;
+            Ok(MemoryRegion { inner, owner: () })
+        }
     }
 
     /// Registers an already allocated DMA-BUF as a memory region (MR) associated with this

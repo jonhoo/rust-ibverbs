@@ -1676,7 +1676,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
 
     /// The opcode builder for a SEND, with or without the immediate set by [`imm`](Self::imm).
     #[inline]
-    fn send_op(imm: Option<u32>) -> impl FnOnce(*mut ffi::ibv_qp_ex) {
+    fn send_op(imm: Option<u32>) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
         move |q| unsafe {
             match imm {
                 Some(imm) => (*q).wr_send_imm.unwrap()(q, imm.to_be()),
@@ -1688,7 +1688,10 @@ impl<T: Transport> SendOp<'_, '_, T> {
     /// The opcode builder for an RDMA WRITE into `remote`, with or without the immediate set by
     /// [`imm`](Self::imm).
     #[inline]
-    fn write_op(imm: Option<u32>, remote: RemoteMemorySlice) -> impl FnOnce(*mut ffi::ibv_qp_ex) {
+    fn write_op(
+        imm: Option<u32>,
+        remote: RemoteMemorySlice,
+    ) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
         move |q| unsafe {
             match imm {
                 Some(imm) => {

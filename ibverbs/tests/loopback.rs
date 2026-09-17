@@ -2028,10 +2028,11 @@ fn routable_gid() {
             .any(|e| e.port_num == 1 && e.gid_index == entry.gid_index && e.gid == entry.gid),
         "the routable entry comes from the table: {entry:?}"
     );
-    assert!(ctx
-        .routable_gid(250)
-        .expect("failed to read the GID table")
-        .is_none());
+    assert!(
+        ctx.routable_gid(250)
+            .expect("failed to read the GID table")
+            .is_none()
+    );
 }
 
 /// The attributes `handshake` applies are exposed, so a manual bring-up can start from them,

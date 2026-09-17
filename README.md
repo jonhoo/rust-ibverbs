@@ -129,7 +129,7 @@ needs `cmake` and a C compiler for its probes, but no RDMA development packages)
 pre-built `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
 not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
 
-The minimum supported Rust version is 1.82.
+The minimum supported Rust version is 1.85.
 
 ### Provider requirements
 
