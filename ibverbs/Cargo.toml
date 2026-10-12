@@ -8,7 +8,7 @@ description = "Safe Rust API for RDMA verbs (libibverbs), with rdmacm and EFA su
 readme = "../README.md"
 authors = [
     "Jon Gjengset <jon@thesquareplanet.com>",
-    "Jonathan Behrens <fintelia@gmail.com>"
+    "Jonathan Behrens <fintelia@gmail.com>",
 ]
 
 homepage = "https://github.com/jonhoo/rust-ibverbs"
@@ -20,21 +20,20 @@ categories = ["network-programming", "api-bindings"]
 license = "MIT OR Apache-2.0"
 
 [package.metadata.docs.rs]
-# so docs.rs shows the `rdmacm` module and the `efa` queue pairs
 all-features = true
-
-[dependencies]
-ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.3.0" }
-nix = { version = "0.31.3", default-features = false, features = ["fs", "poll"] }
-thiserror = "2.0"
-
 
 [features]
 default = []
 # AWS Elastic Fabric Adapter (EFA) SRD queue pairs. Pulls in the efadv bindings and links libefa.
 efa = ["ffi/efa"]
+mlx5 = ["ffi/mlx5"]
 # RDMA connection manager (`librdmacm`): connection setup without an out-of-band endpoint exchange.
 rdmacm = ["ffi/rdmacm", "nix/socket", "nix/net"]
+
+[dependencies]
+ffi = { path = "../ibverbs-sys", package = "ibverbs-sys", version = "0.3.0" }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "poll"] }
+thiserror = "2.0"
 
 [[example]]
 name = "efa_srd"

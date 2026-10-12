@@ -40,28 +40,30 @@ jobs:
         # enable this ci template to run regardless of whether the lockfile is checked in or not
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
-      # https://twitter.com/jonhoo/status/1571290371124260865
+      - name: cargo test with system libraries
+        run: |
+          cargo test --locked --all-targets
+          cargo test --locked --no-default-features --all-targets
+      - name: Build matching libraries for mlx5
+        run: ./configure-ci.sh --vendored-libs
+      - name: cargo test --no-default-features --features mlx5
+        run: cargo test --locked --no-default-features --features mlx5 --all-targets
       - name: cargo test --locked
         run: cargo test --locked --all-features --all-targets
       # https://github.com/rust-lang/cargo/issues/6669
       - name: cargo test --doc
         run: cargo test --locked --all-features --doc
   vendored:
-    # Build the way a crates.io consumer does: with no RDMA_CORE_INCLUDE_DIR / IBVERBS_HEADER_DIR,
-    # ibverbs-sys configures the vendored rdma-core checkout with cmake and binds against the
-    # headers that generates. The host's rdma-core headers are deleted first (only the runtime
-    # libraries and their link-time symlinks stay), so this can only pass if the vendored headers
-    # really are the ones in use.
     runs-on: ubuntu-latest
     name: ubuntu / stable / vendored-headers
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
-      - name: Install the libraries and build tools, then remove the host headers
+      - name: Build matching libraries, then remove header overrides and host headers
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libibverbs-dev librdmacm-dev clang cmake
+          ./configure-ci.sh --vendored-libs
+          rm .cargo/config.toml
           sudo rm -rf /usr/include/infiniband /usr/include/rdma
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
@@ -83,26 +85,12 @@ jobs:
     # the one the bindings are generated from.
     runs-on: ubuntu-latest
     name: ubuntu / stable / soft-roce
-    env:
-      # Link and load the in-place rdma-core build (libibverbs, its providers, and librdmacm).
-      RDMA_CORE_LIB_DIR: ${{ github.workspace }}/rdma-core-build/lib
-      LD_LIBRARY_PATH: ${{ github.workspace }}/rdma-core-build/lib
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
-      - name: Build the vendored rdma-core in place
-        run: |
-          set -euxo pipefail
-          sudo apt-get install -y --no-install-recommends \
-            build-essential pkg-config libnl-3-dev libnl-route-3-dev
-          cmake -S ibverbs-sys/vendor/rdma-core -B rdma-core-build \
-            -DIN_PLACE=1 -DNO_MAN_PAGES=1 -DNO_PYVERBS=1 -DCMAKE_BUILD_TYPE=Release
-          cmake --build rdma-core-build -j"$(nproc)"
-          ls rdma-core-build/lib/libibverbs.so* rdma-core-build/lib/librdmacm.so* \
-            rdma-core-build/lib/librxe-rdmav*.so
+        run: ./configure-ci.sh --vendored-libs
       - name: Set up a Soft-RoCE (rxe) device
         run: |
           set -euxo pipefail
@@ -170,6 +158,10 @@ jobs:
         # The connection manager binds the runner's own IPv4 address, which resolves onto the same
         # rxe device. Serial for the same reason as the loopback tests.
         run: cargo test --locked --features rdmacm --test rdmacm -- --ignored --test-threads=1
+      - name: cargo test --features mlx5 -- --ignored
+        env:
+          IBVERBS_TEST_DEVICE: rxe0
+        run: cargo test --locked --no-default-features --features mlx5 --test mlx5 -- --ignored --test-threads=1
       - name: Dump the RDMA state
         # The device is set up from scratch on every run, so when a test fails the interesting
         # evidence is what the kernel and the device looked like at that moment.
@@ -211,7 +203,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
       - name: Install nightly for -Zminimal-versions
@@ -251,7 +243,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
         with:

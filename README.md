@@ -115,19 +115,42 @@ None are enabled by default.
 
 - `rdmacm`: the RDMA connection manager. Links `librdmacm`.
 - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter. Links `libefa`.
+- `mlx5`: mlx5 DMA-BUF registration and Data Direct device queries. Links `libmlx5`;
+  requires matching rdma-core 54+ libraries at build and run time.
+
+### mlx5 Data Direct
+
+Enable `mlx5` and call `ProtectionDomain::register_dmabuf_mlx5` with ordinary
+`AccessFlags` and separate `Mlx5DmabufAccessFlags::DATA_DIRECT`. The exporter must
+support Data Direct (for GPU memory, use its PCIe-mapped DMA-BUF export).
+Registration failure is returned directly, never retried as ordinary registration.
+
+The result is the same `MemoryRegion<()>` returned by `register_dmabuf`: it retains
+its protection domain and deregisters on drop. Its slices and remote descriptors
+use the requested IOVA, not a host virtual address. Keep the exported allocation
+alive until the MR is dropped and finish all RDMA operations before dropping it.
+
+`Context::mlx5_data_direct_sysfs_path` returns the provider's path bytes unchanged,
+without the `/sys` mount prefix. Unsupported providers return `Error::Unsupported`;
+`ENODEV` means no associated Data Direct device. Device selection and fallback policy
+remain with the caller.
 
 ## Building
 
 This crate dynamically links `libibverbs`, which is part of
 [`rdma-core`](https://github.com/linux-rdma/rdma-core) (the package is `libibverbs1`, with
 `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core` on Arch; `rdma-core-devel` on
-Fedora), plus `librdmacm` and `libefa` when the corresponding features are enabled.
+Fedora), plus `librdmacm`, `libefa`, and `libmlx5` when the corresponding features are enabled.
 
 At build time, bindings are generated from a vendored `rdma-core` checkout, whose headers the
 `ibverbs-sys` crate generates by running `cmake`'s configure step (nothing is compiled, so this
 needs `cmake` and a C compiler for its probes, but no RDMA development packages). To use
 pre-built `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
 not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
+`RDMA_CORE_LIB_DIR` also works alone when using vendored headers. The `mlx5` feature
+requires libraries exporting both Data Direct functions; newer headers do not upgrade
+older system libraries. Set the runtime library search path as well when linking a
+custom rdma-core build, and keep its provider libraries and `libibverbs` together.
 
 The minimum supported Rust version is 1.85.
 
