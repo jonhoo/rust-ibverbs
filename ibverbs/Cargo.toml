@@ -26,6 +26,7 @@ all-features = true
 default = []
 # AWS Elastic Fabric Adapter (EFA) SRD queue pairs. Pulls in the efadv bindings and links libefa.
 efa = ["ffi/efa"]
+# mlx5 DMA-BUF registration and Data Direct queries. Pulls in mlx5dv bindings and links libmlx5.
 mlx5 = ["ffi/mlx5"]
 # RDMA connection manager (`librdmacm`): connection setup without an out-of-band endpoint exchange.
 rdmacm = ["ffi/rdmacm", "nix/socket", "nix/net"]
