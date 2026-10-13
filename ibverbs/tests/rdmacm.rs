@@ -1031,6 +1031,27 @@ fn connect_rejects_oversized_private_data() {
 }
 
 #[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn operations_needing_a_device_refuse_an_unresolved_id() {
+    // librdmacm dereferences the id's device in these without checking for one; on an id whose
+    // address has not resolved they must fail instead of crashing.
+    let id = CmId::create(PortSpace::Tcp).expect("id");
+    let is_invalid_input = |e: &io::Error| e.kind() == io::ErrorKind::InvalidInput;
+    match id.resolve_route(Duration::from_secs(1)) {
+        Err(Error::ResolveRoute(e)) if is_invalid_input(&e) => {}
+        other => panic!("resolve_route on an unresolved id: {other:?}"),
+    }
+    match id.connect(&ConnectionParameter::default()) {
+        Err(Error::Connect(e)) if is_invalid_input(&e) => {}
+        other => panic!("connect on an unresolved id: {other:?}"),
+    }
+    match id.accept(&ConnectionParameter::default()) {
+        Err(Error::Accept(e)) if is_invalid_input(&e) => {}
+        other => panic!("accept on an unresolved id: {other:?}"),
+    }
+}
+
+#[test]
 fn blocking_helpers_need_a_connected_port_space() {
     // Checked before anything touches a device, so this needs none.
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
