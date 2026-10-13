@@ -176,6 +176,9 @@ pub struct Uc;
 /// The unreliable-datagram (UD) transport: connectionless, each message fits in one MTU, and each
 /// send is addressed individually with an [`AddressHandle`]
 /// ([`QueuePairType::UnreliableDatagram`]).
+///
+/// On EFA, mark every UD send [`signaled`](AddressedSendOp::signaled): EFA refuses unsignaled work
+/// requests, and the batch then fails at [`submit`](SendBatch::submit).
 #[derive(Debug, Clone, Copy)]
 pub struct Ud;
 
@@ -1816,7 +1819,8 @@ pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
 impl<T: Datagram> AddressedSendOp<'_, '_, T> {
     /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
     ///
-    /// On SRD every work request generates a completion, so this is implied there.
+    /// On SRD every work request generates a completion, so this is implied there. EFA refuses
+    /// unsignaled work requests on UD too, so on EFA mark every UD send signaled.
     #[inline]
     pub fn signaled(self) -> Self {
         AddressedSendOp {
