@@ -19,6 +19,9 @@ categories = ["network-programming", "api-bindings"]
 
 license = "MIT OR Apache-2.0"
 
+# The Bazel build file is for building this repository with Bazel, not for crate users.
+exclude = ["/BUILD.bazel"]
+
 [package.metadata.docs.rs]
 all-features = true
 
