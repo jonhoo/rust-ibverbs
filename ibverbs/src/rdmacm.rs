@@ -72,14 +72,14 @@
 //! [`AsFd`]: std::os::fd::AsFd
 
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
+use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage};
 
 use crate::qp::QueuePairState;
 use crate::{
@@ -285,28 +285,6 @@ impl std::fmt::Display for CmEventType {
     }
 }
 
-/// Holds a `sockaddr` of the right family so its pointer stays valid for a single C call.
-enum OsSocketAddr {
-    V4(SockaddrIn),
-    V6(SockaddrIn6),
-}
-
-impl OsSocketAddr {
-    fn new(addr: SocketAddr) -> Self {
-        match addr {
-            SocketAddr::V4(v4) => OsSocketAddr::V4(v4.into()),
-            SocketAddr::V6(v6) => OsSocketAddr::V6(v6.into()),
-        }
-    }
-
-    fn as_ptr(&self) -> *mut ffi::sockaddr {
-        match self {
-            OsSocketAddr::V4(s) => s.as_ptr() as *mut ffi::sockaddr,
-            OsSocketAddr::V6(s) => s.as_ptr() as *mut ffi::sockaddr,
-        }
-    }
-}
-
 /// Decode a `sockaddr` owned by an `rdma_cm_id` into a socket address. Returns `None` for any
 /// address family other than IPv4 and IPv6 — in particular `AF_UNSPEC`, an id whose address has
 /// not been bound or resolved yet.
@@ -316,25 +294,11 @@ impl OsSocketAddr {
 /// `sa` must point to `sockaddr_storage`-sized readable memory (which the `rdma_cm_id`'s own
 /// address storage is).
 unsafe fn socket_addr_of(sa: *const ffi::sockaddr) -> Option<SocketAddr> {
-    match unsafe { (*sa).sa_family } as c_int {
-        nix::libc::AF_INET => {
-            let sin = unsafe { *(sa as *const nix::libc::sockaddr_in) };
-            Some(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
-                u16::from_be(sin.sin_port),
-            )))
-        }
-        nix::libc::AF_INET6 => {
-            let sin6 = unsafe { *(sa as *const nix::libc::sockaddr_in6) };
-            Some(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(sin6.sin6_addr.s6_addr),
-                u16::from_be(sin6.sin6_port),
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
-            )))
-        }
-        _ => None,
-    }
+    // Each `from_raw` checks the family before reading its own struct.
+    let sa = sa.cast::<nix::libc::sockaddr>();
+    unsafe { SockaddrIn::from_raw(sa, None) }
+        .map(SocketAddr::from)
+        .or_else(|| unsafe { SockaddrIn6::from_raw(sa, None) }.map(SocketAddr::from))
 }
 
 fn timeout_ms(timeout: Duration) -> c_int {
@@ -641,8 +605,9 @@ impl CmId {
     /// Binds to a local `addr` (passive side). Bind to an unspecified address such as
     /// `0.0.0.0:port` to accept connections on any device. Follow with [`listen`](Self::listen).
     pub fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
-        let addr = OsSocketAddr::new(addr);
-        let ret = unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr()) };
+        let addr = SockaddrStorage::from(addr);
+        let ret =
+            unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr() as *mut ffi::sockaddr) };
         if ret != 0 {
             return Err(Error::BindAddress(io::Error::last_os_error()));
         }
@@ -665,12 +630,12 @@ impl CmId {
     /// [`context`](Self::context) is available and [`resolve_route`](Self::resolve_route) is the
     /// next step.
     pub fn resolve_addr(&self, dst: SocketAddr, timeout: Duration) -> Result<()> {
-        let dst = OsSocketAddr::new(dst);
+        let dst = SockaddrStorage::from(dst);
         let ret = unsafe {
             ffi::rdma_resolve_addr(
                 self.inner.id,
                 ptr::null_mut(),
-                dst.as_ptr(),
+                dst.as_ptr() as *mut ffi::sockaddr,
                 timeout_ms(timeout),
             )
         };
