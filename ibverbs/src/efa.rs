@@ -127,16 +127,8 @@ impl QueuePairBuilder<Srd> {
             },
             gid_index: self.gid_index,
             traffic_class: self.traffic_class,
-            access: None,
-            timeout: None,
-            retry_count: None,
-            rnr_retry: None,
-            min_rnr_timer: None,
-            max_rd_atomic: None,
-            max_dest_rd_atomic: None,
-            path_mtu: None,
-            psn: self.psn,
             service_level: self.service_level,
+            bring_up: self.bring_up.clone(),
         };
         // As in qp.rs: a provider that accepted the send-operations mask without installing the
         // work-request table leaves `ibv_qp_to_qp_ex` returning NULL. Dropping `prepared` destroys

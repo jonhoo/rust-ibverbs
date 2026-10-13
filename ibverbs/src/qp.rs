@@ -4,8 +4,6 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ffi::ibv_mtu;
-
 use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueueInner;
@@ -574,26 +572,10 @@ pub struct QueuePairBuilder<T: Transport> {
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
     pub(crate) traffic_class: u8,
-    /// only valid for RC and UC
-    access: Option<ffi::ibv_access_flags>,
-    /// only valid for RC
-    timeout: Option<u8>,
-    /// only valid for RC
-    retry_count: Option<u8>,
-    /// only valid for RC
-    rnr_retry: Option<u8>,
-    /// only valid for RC
-    min_rnr_timer: Option<u8>,
-    /// only valid for RC
-    max_rd_atomic: Option<u8>,
-    /// only valid for RC
-    max_dest_rd_atomic: Option<u8>,
-    /// only valid for RC and UC
-    path_mtu: Option<ibv_mtu>,
-    /// the packet sequence number the send queue starts at; the peer learns it from the endpoint
-    pub(crate) psn: u32,
     /// service level (0-15). Higher value means higher priority.
     pub(crate) service_level: u8,
+    /// the transport's bring-up attributes, with the setters' values written into them
+    pub(crate) bring_up: BringUp,
     /// shared receive queue
     srq: Option<SharedReceiveQueue>,
     _transport: std::marker::PhantomData<T>,
@@ -628,7 +610,30 @@ impl<T: Transport> QueuePairBuilder<T> {
         max_recv_sge: u32,
         rd_atomic_limits: Option<(u8, u8)>,
     ) -> QueuePairBuilder<T> {
-        let port_active_mtu = port_attr.active_mtu;
+        let reliable = qp_type == ffi::ibv_qp_type::IBV_QPT_RC;
+        let connected = reliable || qp_type == ffi::ibv_qp_type::IBV_QPT_UC;
+        let mut init = QueuePairAttribute::new();
+        init.set_state(QueuePairState::Init)
+            .set_pkey_index(0)
+            .set_port(port_num);
+        let mut rtr = QueuePairAttribute::new();
+        rtr.set_state(QueuePairState::ReadyToReceive);
+        let mut rts = QueuePairAttribute::new();
+        rts.set_state(QueuePairState::ReadyToSend).set_sq_psn(0);
+        if connected {
+            init.set_access_flags(AccessFlags::LOCAL_WRITE);
+            rtr.set_path_mtu(port_attr.active_mtu.into());
+        }
+        if reliable {
+            rtr.set_min_rnr_timer(RnrTimer::from_encoding(16));
+            rts.set_timeout(AckTimeout::from_exponent(4))
+                .set_retry_count(6)
+                .set_rnr_retry(6);
+        }
+        if let Some((initiator, responder)) = rd_atomic_limits {
+            rtr.set_max_dest_rd_atomic(responder);
+            rts.set_max_rd_atomic(initiator);
+        }
         QueuePairBuilder {
             ctx: 0,
             pd,
@@ -649,20 +654,8 @@ impl<T: Transport> QueuePairBuilder<T> {
 
             qp_type,
 
-            access: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-                || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
-                .then_some(ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE),
-            min_rnr_timer: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(16),
-            retry_count: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(6),
-            rnr_retry: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(6),
-            timeout: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(4),
-            max_rd_atomic: rd_atomic_limits.map(|(initiator, _)| initiator),
-            max_dest_rd_atomic: rd_atomic_limits.map(|(_, responder)| responder),
-            path_mtu: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
-                || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
-                .then_some(port_active_mtu),
-            psn: 0,
             service_level: 0,
+            bring_up: BringUp { init, rtr, rts },
             srq: None,
             _transport: std::marker::PhantomData,
         }
@@ -728,7 +721,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// [`endpoint`]: PreparedQueuePair::endpoint
     /// [`handshake`]: PreparedQueuePair::handshake
     pub fn set_sq_psn(&mut self, psn: u32) -> &mut Self {
-        self.psn = psn;
+        self.bring_up.rts.set_sq_psn(psn);
         self
     }
 
@@ -889,16 +882,8 @@ impl<T: Transport> QueuePairBuilder<T> {
                 },
                 gid_index: self.gid_index,
                 traffic_class: self.traffic_class,
-                access: self.access,
-                timeout: self.timeout,
-                retry_count: self.retry_count,
-                rnr_retry: self.rnr_retry,
-                min_rnr_timer: self.min_rnr_timer,
-                max_rd_atomic: self.max_rd_atomic,
-                max_dest_rd_atomic: self.max_dest_rd_atomic,
-                path_mtu: self.path_mtu,
-                psn: self.psn,
                 service_level: self.service_level,
+                bring_up: self.bring_up.clone(),
             };
             // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
             // work-request table; one that accepted the send-operations mask without doing so has
@@ -918,7 +903,7 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///
     /// Defaults to [`AccessFlags::LOCAL_WRITE`].
     pub fn set_access(&mut self, access: AccessFlags) -> &mut Self {
-        self.access = Some(access.into());
+        self.bring_up.init.set_access_flags(access);
         self
     }
 
@@ -926,7 +911,7 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///
     /// Defaults to the port's active MTU.
     pub fn set_path_mtu(&mut self, path_mtu: Mtu) -> &mut Self {
-        self.path_mtu = Some(path_mtu.into());
+        self.bring_up.rtr.set_path_mtu(path_mtu);
         self
     }
 
@@ -986,7 +971,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     ///
     /// Defaults to a 2.56 ms delay.
     pub fn set_min_rnr_timer(&mut self, timer: RnrTimer) -> &mut Self {
-        self.min_rnr_timer = Some(timer.encoding());
+        self.bring_up.rtr.set_min_rnr_timer(timer);
         self
     }
 
@@ -1000,7 +985,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     ///
     /// Defaults to 65.536 µs.
     pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
-        self.timeout = Some(timeout.exponent());
+        self.bring_up.rts.set_timeout(timeout);
         self
     }
 
@@ -1013,8 +998,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     ///
     /// Panics if a count higher than 7 is given.
     pub fn set_retry_count(&mut self, count: u8) -> &mut Self {
-        assert!(count <= 7);
-        self.retry_count = Some(count);
+        self.bring_up.rts.set_retry_count(count);
         self
     }
 
@@ -1028,8 +1012,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     ///
     /// Panics if a limit higher than 7 is given.
     pub fn set_rnr_retry(&mut self, n: u8) -> &mut Self {
-        assert!(n <= 7);
-        self.rnr_retry = Some(n);
+        self.bring_up.rts.set_rnr_retry(n);
         self
     }
 
@@ -1043,7 +1026,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// [`Context::query_device`](crate::Context::query_device)), as librdmacm does: with a single
     /// outstanding operation, every read and atomic waits for the previous one's response.
     pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
-        self.max_rd_atomic = Some(max_rd_atomic);
+        self.bring_up.rts.set_max_rd_atomic(max_rd_atomic);
         self
     }
 
@@ -1054,7 +1037,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// Defaults to the device's limit (`max_qp_rd_atom` in
     /// [`Context::query_device`](crate::Context::query_device)).
     pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
-        self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
+        self.bring_up.rtr.set_max_dest_rd_atomic(max_dest_rd_atomic);
         self
     }
 }
@@ -1099,26 +1082,21 @@ pub struct PreparedQueuePair<T: Transport> {
     pub(crate) gid_index: Option<u32>,
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
     pub(crate) traffic_class: u8,
-    /// only valid for RC and UC
-    pub(crate) access: Option<ffi::ibv_access_flags>,
-    /// only valid for RC
-    pub(crate) min_rnr_timer: Option<u8>,
-    /// only valid for RC
-    pub(crate) timeout: Option<u8>,
-    /// only valid for RC
-    pub(crate) retry_count: Option<u8>,
-    /// only valid for RC
-    pub(crate) rnr_retry: Option<u8>,
-    /// only valid for RC
-    pub(crate) max_rd_atomic: Option<u8>,
-    /// only valid for RC
-    pub(crate) max_dest_rd_atomic: Option<u8>,
-    /// only valid for RC and UC
-    pub(crate) path_mtu: Option<ibv_mtu>,
-    /// the packet sequence number the send queue starts at
-    pub(crate) psn: u32,
     /// service level (0-15). Higher value means higher priority.
     pub(crate) service_level: u8,
+    pub(crate) bring_up: BringUp,
+}
+
+/// The `INIT`, `RTR`, and `RTS` attributes of a queue pair's bring-up as the builder configured
+/// them: seeded with the transport's defaults, each setter writes into the transition that applies
+/// its value. The `*_attributes` methods add only what depends on the peer or the call: a
+/// connected transport's route, remote queue pair number, and receive-queue PSN at `RTR` (and the
+/// cap of its RDMA read and atomic depth at `RTS`), or a datagram transport's Q_Key at `INIT`.
+#[derive(Clone)]
+pub(crate) struct BringUp {
+    pub(crate) init: QueuePairAttribute,
+    pub(crate) rtr: QueuePairAttribute,
+    pub(crate) rts: QueuePairAttribute,
 }
 
 /// An identifier for the network endpoint of a `QueuePair`. Returned by
@@ -1244,8 +1222,9 @@ impl<T: Transport> PreparedQueuePair<T> {
             qp_num,
             lid: self.lid,
             gid,
-            psn: self.psn,
-            max_dest_rd_atomic: self.max_dest_rd_atomic.unwrap_or(0),
+            psn: self.bring_up.rts.sq_psn(),
+            // Unset, so zero, on the transports without RDMA reads.
+            max_dest_rd_atomic: self.bring_up.rtr.max_dest_rd_atomic(),
         })
     }
 }
@@ -1259,16 +1238,8 @@ impl<T: Datagram> PreparedQueuePair<T> {
     /// Exposed so a manual bring-up ([`into_queue_pair`](Self::into_queue_pair) plus
     /// [`QueuePair::modify`]) can start from what `activate` would do and adjust it.
     pub fn activate_attributes(&self, qkey: u32) -> [QueuePairAttribute; 3] {
-        let mut init = QueuePairAttribute::new();
-        init.set_state(QueuePairState::Init)
-            .set_pkey_index(0)
-            .set_port(self.port_num)
-            .set_qkey(qkey);
-        let mut rtr = QueuePairAttribute::new();
-        rtr.set_state(QueuePairState::ReadyToReceive);
-        let mut rts = QueuePairAttribute::new();
-        rts.set_state(QueuePairState::ReadyToSend)
-            .set_sq_psn(self.psn);
+        let BringUp { mut init, rtr, rts } = self.bring_up.clone();
+        init.set_qkey(qkey);
         [init, rtr, rts]
     }
 
@@ -1293,14 +1264,7 @@ impl<T: Connected> PreparedQueuePair<T> {
     /// exactly what the handshake would do and adjust it — a partition key, an alternate path, a
     /// timer — instead of rebuilding the address vector by hand.
     pub fn init_attributes(&self) -> QueuePairAttribute {
-        let mut attr = QueuePairAttribute::new();
-        attr.set_state(QueuePairState::Init)
-            .set_pkey_index(0)
-            .set_port(self.port_num);
-        if let Some(access) = self.access {
-            attr.set_access_flags(access.into());
-        }
-        attr
+        self.bring_up.init.clone()
     }
 
     /// The attributes [`handshake`](Self::handshake) applies to reach `RTR` for `remote`: the
@@ -1321,21 +1285,11 @@ impl<T: Connected> PreparedQueuePair<T> {
             let sgid_index = self.gid_index.ok_or(Error::GidMismatch)?;
             path.set_grh(gid, sgid_index as u8, 0xff, self.traffic_class);
         }
-        let mut attr = QueuePairAttribute::new();
-        attr.set_state(QueuePairState::ReadyToReceive)
-            .set_address_vector(&path)
+        let mut attr = self.bring_up.rtr.clone();
+        attr.set_address_vector(&path)
             .set_dest_qp_num(remote.qp_num)
             // The receive queue starts at the PSN the peer's send queue starts at.
             .set_rq_psn(remote.psn);
-        if let Some(max_dest_rd_atomic) = self.max_dest_rd_atomic {
-            attr.set_max_dest_rd_atomic(max_dest_rd_atomic);
-        }
-        if let Some(min_rnr_timer) = self.min_rnr_timer {
-            attr.set_min_rnr_timer(RnrTimer::from_encoding(min_rnr_timer));
-        }
-        if let Some(path_mtu) = self.path_mtu {
-            attr.set_path_mtu(path_mtu.into());
-        }
         Ok(attr)
     }
 
@@ -1344,22 +1298,14 @@ impl<T: Connected> PreparedQueuePair<T> {
     /// builder's ACK timeout, retry counts, and initiator-side RDMA limit, capped to the responder
     /// resources `remote` advertises.
     pub fn rts_attributes(&self, remote: &QueuePairEndpoint) -> QueuePairAttribute {
-        let mut attr = QueuePairAttribute::new();
-        attr.set_state(QueuePairState::ReadyToSend)
-            .set_sq_psn(self.psn);
-        if let Some(timeout) = self.timeout {
-            attr.set_timeout(AckTimeout::from_exponent(timeout));
-        }
-        if let Some(retry_count) = self.retry_count {
-            attr.set_retry_count(retry_count);
-        }
-        if let Some(rnr_retry) = self.rnr_retry {
-            attr.set_rnr_retry(rnr_retry);
-        }
-        if let Some(max_rd_atomic) = self.max_rd_atomic {
+        let mut attr = self.bring_up.rts.clone();
+        if attr
+            .mask()
+            .contains(QueuePairAttributeMask::MAX_QP_RD_ATOMIC)
+        {
             // More outstanding reads and atomics than the peer has responder resources for is a
             // protocol error, which the peer answers with an invalid-request NAK.
-            attr.set_max_rd_atomic(max_rd_atomic.min(remote.max_dest_rd_atomic));
+            attr.set_max_rd_atomic(attr.max_rd_atomic().min(remote.max_dest_rd_atomic));
         }
         attr
     }
