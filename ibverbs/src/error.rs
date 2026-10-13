@@ -331,6 +331,11 @@ impl Error {
     }
 
     /// As [`os`](Error::os), but from a raw `errno`.
+    ///
+    /// Cold and out of line: the data-path calls (`submit`, `post_recv`, `poll`) report failures
+    /// through this, and inlining the construction would bloat every one of their call sites.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn errno(errno: i32, wrap: impl FnOnce(io::Error) -> Error) -> Error {
         Error::os(io::Error::from_raw_os_error(errno), wrap)
     }
