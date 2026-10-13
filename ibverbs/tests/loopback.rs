@@ -1394,6 +1394,58 @@ fn inline_send() {
     assert_eq!(&dst.bytes()[..4], b"wxyz");
 }
 
+/// An inline payload longer than the queue pair's granted inline capacity panics before the
+/// provider copies it, for one buffer and for a list whose buffers each fit but whose total does
+/// not. The panic aborts the open batch, so the queue pair still posts afterwards.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn inline_capacity_is_enforced() {
+    use std::io::IoSlice;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_max_inline_data(16).set_access(read_write());
+    });
+    let (_, init) = qp
+        .query(QueuePairAttributeMask::STATE)
+        .expect("failed to query the queue pair");
+    let cap = init.max_inline_data as usize;
+    assert!(
+        cap >= 16,
+        "granted inline capacity {cap} is below the requested 16"
+    );
+
+    let too_long = vec![0u8; cap + 1];
+    let half = vec![0u8; cap / 2 + 1];
+    let halves = [IoSlice::new(&half), IoSlice::new(&half)];
+    for payload in [Payload::Inline(&too_long), Payload::InlineList(&halves)] {
+        let posted = catch_unwind(AssertUnwindSafe(|| {
+            let mut batch = qp.start_send();
+            batch.op().signaled().send(1, payload);
+        }));
+        assert!(
+            posted.is_err(),
+            "an inline payload over the capacity was posted"
+        );
+    }
+
+    let recv = pd
+        .allocate(cap, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    unsafe { qp.post_recv([RecvRequest::new(2, &[recv.slice(..)])]) }.expect("post_recv failed");
+    let fits = vec![7u8; cap];
+    let mut batch = qp.start_send();
+    batch.op().signaled().send(3, Payload::Inline(&fits));
+    unsafe { batch.submit() }.expect("inline send submit failed");
+    let mut ids: Vec<u64> = drain(&cq, 2).iter().map(Completed::wr_id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [2, 3], "only the send that fits completed");
+    assert_eq!(&recv.bytes()[..cap], &fits[..]);
+}
+
 /// A queue pair created on an explicitly chosen port (port 1) connects and transfers data. The test
 /// device has a single port, so this exercises the port-threading path rather than a second port.
 #[test]

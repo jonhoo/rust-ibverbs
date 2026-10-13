@@ -769,7 +769,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// A send queue must reserve this capacity up front; the actual value granted by the device can
     /// be larger than requested and is reported by [`QueuePair::query`] (see
     /// [`QueuePairInitAttribute::max_inline_data`]). Posting more inline bytes than the queue pair
-    /// supports fails at submit time.
+    /// supports panics.
     ///
     /// Defaults to 0 (inline sends disabled).
     pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
@@ -877,6 +877,8 @@ impl<T: Transport> QueuePairBuilder<T> {
                 _recv_cq: self.recv.clone(),
                 qp,
                 qp_ex,
+                // Creation writes the granted capacities back into `attr.cap`.
+                max_inline_data: attr.cap.max_inline_data,
                 _transport: std::marker::PhantomData,
             },
             gid_index: self.gid_index,
@@ -1499,6 +1501,7 @@ impl<'a> RecvRequest<'a> {
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
+    max_inline_data: u32,
     _qp: std::marker::PhantomData<&'qp mut QueuePair<T>>,
 }
 
@@ -1662,6 +1665,19 @@ impl<T: Transport> SendOp<'_, '_, T> {
         op: impl FnOnce(*mut ffi::ibv_qp_ex),
     ) {
         let qpx = self.batch.qpx;
+        // Not every provider checks an inline payload against the queue pair's capacity before
+        // copying it into the send queue (rxe before rdma-core 64 checks each buffer of a list
+        // alone, and hns sums the lengths in a u32), so refuse a payload that does not fit.
+        let inline_len = match payload {
+            Payload::Sges(_) => 0,
+            Payload::Inline(data) => data.len(),
+            Payload::InlineList(bufs) => {
+                bufs.iter().fold(0, |n: usize, b| n.saturating_add(b.len()))
+            }
+        };
+        if inline_len > self.batch.max_inline_data as usize {
+            inline_too_long(inline_len, self.batch.max_inline_data);
+        }
         unsafe {
             (*qpx).wr_id = wr_id;
             (*qpx).wr_flags = match payload {
@@ -1745,6 +1761,11 @@ impl<T: Connected> SendOp<'_, '_, T> {
     /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
     /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
     /// requirements of each.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
+    /// [`Payload`]).
     #[inline]
     pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
         let imm = self.imm;
@@ -1757,6 +1778,11 @@ impl<T: Connected> SendOp<'_, '_, T> {
     /// Registered memory converts implicitly (`write(id, &[mr.slice(..)], remote)`); inline data
     /// is spelled out (`write(id, Payload::Inline(b"ping"), remote)`). See [`Payload`] for the
     /// lifetime and capacity requirements of each.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
+    /// [`Payload`]).
     #[inline]
     pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
         let imm = self.imm;
@@ -1842,6 +1868,11 @@ impl<T: Datagram> AddressedSendOp<'_, '_, T> {
     /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
     /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
     /// requirements of each.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
+    /// [`Payload`]).
     #[inline]
     pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
         let imm = self.op.imm;
@@ -1872,6 +1903,17 @@ impl AddressedSendOp<'_, '_, Ud> {
     }
 }
 
+/// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
+/// so the posting path carries only the comparison.
+#[cold]
+#[inline(never)]
+fn inline_too_long(len: usize, max_inline_data: u32) -> ! {
+    panic!(
+        "{len} bytes of inline data exceed the queue pair's inline capacity of {max_inline_data} \
+         bytes"
+    )
+}
+
 /// The data a SEND or RDMA WRITE carries: registered memory the device reads after the request is
 /// posted, or bytes copied into the work request as it is posted.
 ///
@@ -1880,7 +1922,8 @@ impl AddressedSendOp<'_, '_, Ud> {
 /// contract). The inline variants copy the bytes into the work request during the opcode call,
 /// which lowers latency for small messages and lets the bytes be reused or dropped right away;
 /// they need a queue pair built with enough inline capacity
-/// ([`QueuePairBuilder::set_max_inline_data`]) or the batch fails to submit with `EINVAL`.
+/// ([`QueuePairBuilder::set_max_inline_data`]), and the opcode method panics on a longer inline
+/// payload.
 ///
 /// A scatter/gather list converts implicitly, so `batch.op().send(id, &[mr.slice(..)])` reads
 /// naturally; inline payloads are spelled out: `batch.op().send(id, Payload::Inline(b"ping"))`.
@@ -2348,6 +2391,8 @@ pub struct QueuePair<T: Transport = Rc> {
     // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
     // this aliases `qp` and lives exactly as long.
     pub(crate) qp_ex: *mut ffi::ibv_qp_ex,
+    // The inline capacity the provider granted, which the send path enforces (`SendOp::build`).
+    pub(crate) max_inline_data: u32,
     pub(crate) _transport: std::marker::PhantomData<T>,
 }
 
@@ -2592,6 +2637,7 @@ impl<T: Transport> QueuePair<T> {
         unsafe { (*qpx).wr_start.unwrap()(qpx) };
         SendBatch {
             qpx,
+            max_inline_data: self.max_inline_data,
             _qp: std::marker::PhantomData,
         }
     }
