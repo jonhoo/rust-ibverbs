@@ -259,6 +259,15 @@ unsafe fn socket_addr_of(sa: *const ffi::sockaddr) -> Option<SocketAddr> {
         .or_else(|| unsafe { SockaddrIn6::from_raw(sa, None) }.map(SocketAddr::from))
 }
 
+/// Converts a librdmacm return value into a `Result`. The calls return 0 on success; on failure
+/// `wrap` makes the error from `errno`.
+fn check_ret(ret: c_int, wrap: fn(io::Error) -> Error) -> Result<()> {
+    if ret != 0 {
+        return Err(wrap(io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 fn timeout_ms(timeout: Duration) -> c_int {
     timeout.as_millis().min(c_int::MAX as u128) as c_int
 }
@@ -413,10 +422,8 @@ impl CmId {
                 port_space.into(),
             )
         };
-        if ret != 0 {
-            // `channel` drops here, destroying the event channel.
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        // On failure `channel` drops on return, destroying the event channel.
+        check_ret(ret, Error::ConnectionSetup)?;
         Ok(CmId {
             inner: Arc::new(CmIdInner { channel, id }),
         })
@@ -431,9 +438,7 @@ impl CmId {
     pub fn get_cm_event(&self) -> Result<CmEvent> {
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
         let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        check_ret(ret, Error::ConnectionSetup)?;
         Ok(CmEvent {
             event,
             _id: self.clone(),
@@ -503,9 +508,7 @@ impl CmId {
         };
         let mut mask: c_int = 0;
         let ret = unsafe { ffi::rdma_init_qp_attr(self.inner.id, &mut attr, &mut mask) };
-        if ret != 0 {
-            return Err(Error::ModifyQueuePair(io::Error::last_os_error()));
-        }
+        check_ret(ret, Error::ModifyQueuePair)?;
         Ok(QueuePairAttribute::from_raw(
             attr,
             ffi::ibv_qp_attr_mask(mask as u32),
@@ -567,10 +570,7 @@ impl CmId {
         let addr = SockaddrStorage::from(addr);
         let ret =
             unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr() as *mut ffi::sockaddr) };
-        if ret != 0 {
-            return Err(Error::BindAddress(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::BindAddress)
     }
 
     /// Starts listening for incoming connection requests (passive side), queueing up to `backlog`.
@@ -578,10 +578,7 @@ impl CmId {
     /// new id with [`CmEvent::connection_request`].
     pub fn listen(&self, backlog: u32) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog.min(i32::MAX as u32) as i32) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Resolves the destination address to an RDMA device and local route (active side). On success
@@ -598,10 +595,7 @@ impl CmId {
                 timeout_ms(timeout),
             )
         };
-        if ret != 0 {
-            return Err(Error::ResolveAddress(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ResolveAddress)
     }
 
     /// Resolves the route to the destination (active side), after the address has resolved. On
@@ -615,10 +609,7 @@ impl CmId {
     pub fn resolve_route(&self, timeout: Duration) -> Result<()> {
         self.device_or(Error::ResolveRoute)?;
         let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout)) };
-        if ret != 0 {
-            return Err(Error::ResolveRoute(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ResolveRoute)
     }
 
     /// Initiates a connection to the remote (active side). On success a
@@ -646,10 +637,7 @@ impl CmId {
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
         let ret = unsafe { ffi::rdma_connect(self.inner.id, &mut raw) };
-        if ret != 0 {
-            return Err(Error::Connect(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::Connect)
     }
 
     /// Accepts a connection request (passive side), in response to a
@@ -675,10 +663,7 @@ impl CmId {
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
         let ret = unsafe { ffi::rdma_accept(self.inner.id, &mut raw) };
-        if ret != 0 {
-            return Err(Error::Accept(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::Accept)
     }
 
     /// Declines a connection request (passive side), on the id taken from a
@@ -704,20 +689,14 @@ impl CmId {
                 private_data.len() as u8,
             )
         };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Completes connection establishment on the active side after the queue pair has reached
     /// `RTS`, in response to a [`CmEventType::ConnectResponse`].
     pub fn establish(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_establish(self.inner.id) };
-        if ret != 0 {
-            return Err(Error::Connect(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::Connect)
     }
 
     /// Disconnects an established connection, delivering [`CmEventType::Disconnected`] to both
@@ -729,10 +708,7 @@ impl CmId {
     /// [`Connection::disconnect`] does).
     pub fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.inner.id) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Set an `RDMA_OPTION_ID`-level option (`rdma_set_option`) to `value`.
@@ -746,10 +722,7 @@ impl CmId {
                 std::mem::size_of::<T>(),
             )
         };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Set the type of service of this id's traffic: the IP DSCP/ToS byte (RFC 2474) its packets
@@ -811,10 +784,7 @@ impl CmId {
     pub fn notify_established(&self) -> Result<()> {
         let ret =
             unsafe { ffi::rdma_notify(self.inner.id, ffi::ibv_event_type::IBV_EVENT_COMM_EST) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// The IP address and port of the remote end of this id, or `None` while the destination has
