@@ -824,19 +824,14 @@ impl<T: Transport> QueuePairBuilder<T> {
         Ok(())
     }
 
-    /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
-    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
-    fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
-        self.check_same_context()?;
-        // The extended send operations driven through the doorbell post API: the transport's
-        // default set, or whatever the builder was told to request instead.
-        let send_ops_flags = self.send_ops().0;
-
-        let mut attr = ffi::ibv_qp_init_attr_ex {
+    /// The creation attributes both `ibv_create_qp_ex` and `efadv_create_qp_ex` take: the
+    /// builder's context value, completion queues, capacities, and send operations, in its
+    /// protection domain. The shared receive queue is left to the caller.
+    pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
+        ffi::ibv_qp_init_attr_ex {
             qp_context: self.ctx as usize as *mut c_void,
             send_cq: self.send.cq(),
             recv_cq: self.recv.cq(),
-            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.inner.srq),
             cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
@@ -848,8 +843,20 @@ impl<T: Transport> QueuePairBuilder<T> {
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
             pd: self.pd.pd,
-            send_ops_flags: send_ops_flags as u64,
+            // The extended send operations driven through the doorbell post API: the transport's
+            // default set, or whatever the builder was told to request instead.
+            send_ops_flags: self.send_ops().0 as u64,
             ..Default::default()
+        }
+    }
+
+    /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
+    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
+    fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
+        self.check_same_context()?;
+        let mut attr = ffi::ibv_qp_init_attr_ex {
+            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.inner.srq),
+            ..self.init_attr_ex()
         };
         let qp = nonnull(
             unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) },

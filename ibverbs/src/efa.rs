@@ -8,8 +8,6 @@
 // [`QueuePair::post_recv`], and completions through [`CompletionQueue::poll`].
 // ---------------------------------------------------------------------------
 
-use std::os::raw::c_void;
-
 use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::qp::{
@@ -69,31 +67,12 @@ impl QueuePairBuilder<Srd> {
     ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
         self.check_same_context()?;
-        // SRD supports send and one-sided RDMA, including the immediate variants (the transport's
-        // default set), or whatever the builder was told to request instead.
-        let send_ops_flags = self.send_ops().0;
-
         let mut attr = ffi::ibv_qp_init_attr_ex {
-            qp_context: self.ctx as usize as *mut c_void,
-            send_cq: self.send.cq(),
-            recv_cq: self.recv.cq(),
-            cap: ffi::ibv_qp_cap {
-                max_send_wr: self.max_send_wr,
-                max_recv_wr: self.max_recv_wr,
-                max_send_sge: self.max_send_sge,
-                max_recv_sge: self.max_recv_sge,
-                max_inline_data: self.max_inline_data,
-            },
-            qp_type: ffi::ibv_qp_type::IBV_QPT_DRIVER,
             // EFA rejects a work request without `IBV_SEND_SIGNALED` unless the queue pair signals
             // every send, and requests a completion for every work request either way, so
             // signaling all costs nothing and spares each request the flag.
             sq_sig_all: 1,
-            comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
-                | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
-            pd: self.pd.pd,
-            send_ops_flags: send_ops_flags as u64,
-            ..Default::default()
+            ..self.init_attr_ex()
         };
         // rdma-core adds fields to this struct over time (64.0 added `wr_flags`); the provider
         // reads only as much as the passed-in length covers.
