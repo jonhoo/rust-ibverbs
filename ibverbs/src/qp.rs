@@ -1195,6 +1195,11 @@ impl<T: Transport> PreparedQueuePair<T> {
     /// set a GID index on the builder ([`QueuePairBuilder::set_gid_index`]) first: the endpoint
     /// carries a GID only then, and the peer cannot route to one without it.
     ///
+    /// The GID is queried on every call, but the LID is the port's when the builder was created
+    /// ([`ProtectionDomain::create_qp`](crate::ProtectionDomain::create_qp)): on InfiniBand it is
+    /// stale once the subnet manager changes the port's LID
+    /// ([`AsyncEventType::LidChange`](crate::AsyncEventType::LidChange)).
+    ///
     /// # Errors
     ///
     ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
