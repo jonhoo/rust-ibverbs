@@ -970,7 +970,7 @@ fn atomic_operations() {
 
     let mut target = lb
         .pd
-        .allocate(8, AccessFlags::PERMISSIVE)
+        .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
         .expect("failed to register target MR");
     let mut local = lb
         .pd

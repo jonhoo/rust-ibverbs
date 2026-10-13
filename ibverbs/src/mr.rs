@@ -41,15 +41,15 @@ flags_newtype! {
 }
 
 impl AccessFlags {
-    /// Local write plus all remote data access (remote read, remote write, and remote atomics),
-    /// with relaxed ordering: a convenient bundle for buffers both sides fully trust. Narrow it
-    /// when the region does not need to be remotely writable.
+    /// Local write plus remote read and remote write: a convenient bundle for buffers both sides
+    /// fully trust. Narrow it when the region does not need to be remotely writable.
+    ///
+    /// Add the rest with `|` where they apply. Not every device supports
+    /// [`REMOTE_ATOMIC`](Self::REMOTE_ATOMIC) (EFA refuses to register a region that asks for
+    /// it), and [`RELAXED_ORDERING`](Self::RELAXED_ORDERING) lets the bytes of an RDMA write land
+    /// out of order, which breaks a receiver that polls the last byte to see the write arrive.
     pub const PERMISSIVE: AccessFlags = AccessFlags(
-        AccessFlags::LOCAL_WRITE.0
-            | AccessFlags::REMOTE_WRITE.0
-            | AccessFlags::REMOTE_READ.0
-            | AccessFlags::REMOTE_ATOMIC.0
-            | AccessFlags::RELAXED_ORDERING.0,
+        AccessFlags::LOCAL_WRITE.0 | AccessFlags::REMOTE_WRITE.0 | AccessFlags::REMOTE_READ.0,
     );
 }
 
@@ -350,9 +350,9 @@ mod test {
 
     #[test]
     fn permissive_access_flags() {
-        assert!(
-            AccessFlags::PERMISSIVE.contains(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_ATOMIC)
+        assert_eq!(
+            AccessFlags::PERMISSIVE,
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ
         );
-        assert!(!AccessFlags::PERMISSIVE.contains(AccessFlags::ON_DEMAND));
     }
 }
