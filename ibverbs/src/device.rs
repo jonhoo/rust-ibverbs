@@ -57,7 +57,7 @@ impl DeviceList {
 
     /// Returns the device at the given `index`, or `None` if out of bounds.
     pub fn get(&self, index: usize) -> Option<Device<'_>> {
-        self.0.get(index).map(|d| d.into())
+        self.0.get(index).map(Device)
     }
 }
 
@@ -82,20 +82,22 @@ impl<'iter> Iterator for DeviceListIter<'iter> {
         if e.is_some() {
             self.i += 1;
         }
-        e.map(|e| e.into())
+        e.map(Device)
     }
 }
 
 /// An RDMA device. Returned by [`DeviceList::iter`] / [`DeviceList::get`].
+///
+/// A `Device` only ever comes from a [`DeviceList`], so it always refers to a device the list
+/// holds; it cannot be made from an arbitrary pointer:
+///
+/// ```compile_fail,E0277
+/// let device: *mut ibverbs::ffi::ibv_device = std::ptr::null_mut();
+/// let _ = ibverbs::Device::from(&device);
+/// ```
 pub struct Device<'devlist>(&'devlist *mut ffi::ibv_device);
 unsafe impl Sync for Device<'_> {}
 unsafe impl Send for Device<'_> {}
-
-impl<'d> From<&'d *mut ffi::ibv_device> for Device<'d> {
-    fn from(d: &'d *mut ffi::ibv_device) -> Self {
-        Device(d)
-    }
-}
 
 impl fmt::Debug for Device<'_> {
     /// Shows the device name and GUID. The GUID is read best-effort and shown as `None` if it
