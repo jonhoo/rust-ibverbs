@@ -3,8 +3,9 @@
 //! the pieces of a string into a destination buffer and finishes with a send that notifies the
 //! (self-looped) receiver.
 //!
-//! This runs against the first RDMA device; on a machine without one, create a SoftRoCE device
-//! with `rdma link add rxe0 type rxe netdev <netdev>`.
+//! This runs against the RDMA device `IBVERBS_TEST_DEVICE` names, or else the first one; on a
+//! machine without one, create a SoftRoCE device with
+//! `rdma link add rxe0 type rxe netdev <netdev>`.
 
 use ibverbs::{AccessFlags, LocalMemorySlice, RecvRequest, RemoteMemorySlice};
 
@@ -16,12 +17,13 @@ const CQ_CAPACITY: u32 = 16;
 const MAX_SEND_WR: u32 = 16;
 
 fn main() {
-    // Find and open the first RDMA device
+    // Find and open the RDMA device
+    let name = std::env::var("IBVERBS_TEST_DEVICE").unwrap_or_default();
     let ctx = ibverbs::devices()
         .unwrap()
         .iter()
-        .next()
-        .expect("no rdma device available")
+        .find(|d| name.is_empty() || d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
+        .expect("no matching rdma device available")
         .open()
         .unwrap();
 
