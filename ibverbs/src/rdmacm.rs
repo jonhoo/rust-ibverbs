@@ -72,14 +72,14 @@
 //! [`AsFd`]: std::os::fd::AsFd
 
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::{c_int, c_void};
 use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike};
+use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage};
 
 use crate::qp::QueuePairState;
 use crate::{
@@ -102,19 +102,6 @@ pub enum PortSpace {
     Ib,
     /// A value this version of the crate does not know.
     Unknown(u32),
-}
-
-impl From<ffi::rdma_port_space> for PortSpace {
-    fn from(port_space: ffi::rdma_port_space) -> Self {
-        use ffi::rdma_port_space as E;
-        match port_space {
-            E::RDMA_PS_IPOIB => PortSpace::Ipoib,
-            E::RDMA_PS_TCP => PortSpace::Tcp,
-            E::RDMA_PS_UDP => PortSpace::Udp,
-            E::RDMA_PS_IB => PortSpace::Ib,
-            other => PortSpace::Unknown(other.0),
-        }
-    }
 }
 
 impl From<PortSpace> for ffi::rdma_port_space {
@@ -210,35 +197,6 @@ impl From<ffi::rdma_cm_event_type> for CmEventType {
     }
 }
 
-impl From<CmEventType> for ffi::rdma_cm_event_type {
-    fn from(event: CmEventType) -> Self {
-        use ffi::rdma_cm_event_type as E;
-        match event {
-            CmEventType::AddressResolved => E::RDMA_CM_EVENT_ADDR_RESOLVED,
-            CmEventType::AddressError => E::RDMA_CM_EVENT_ADDR_ERROR,
-            CmEventType::RouteResolved => E::RDMA_CM_EVENT_ROUTE_RESOLVED,
-            CmEventType::RouteError => E::RDMA_CM_EVENT_ROUTE_ERROR,
-            CmEventType::ConnectRequest => E::RDMA_CM_EVENT_CONNECT_REQUEST,
-            CmEventType::ConnectResponse => E::RDMA_CM_EVENT_CONNECT_RESPONSE,
-            CmEventType::ConnectError => E::RDMA_CM_EVENT_CONNECT_ERROR,
-            CmEventType::Unreachable => E::RDMA_CM_EVENT_UNREACHABLE,
-            CmEventType::Rejected => E::RDMA_CM_EVENT_REJECTED,
-            CmEventType::Established => E::RDMA_CM_EVENT_ESTABLISHED,
-            CmEventType::Disconnected => E::RDMA_CM_EVENT_DISCONNECTED,
-            CmEventType::DeviceRemoval => E::RDMA_CM_EVENT_DEVICE_REMOVAL,
-            CmEventType::MulticastJoin => E::RDMA_CM_EVENT_MULTICAST_JOIN,
-            CmEventType::MulticastError => E::RDMA_CM_EVENT_MULTICAST_ERROR,
-            CmEventType::AddressChange => E::RDMA_CM_EVENT_ADDR_CHANGE,
-            CmEventType::TimewaitExit => E::RDMA_CM_EVENT_TIMEWAIT_EXIT,
-            CmEventType::AddressInfoResolved => E::RDMA_CM_EVENT_ADDRINFO_RESOLVED,
-            CmEventType::AddressInfoError => E::RDMA_CM_EVENT_ADDRINFO_ERROR,
-            CmEventType::User => E::RDMA_CM_EVENT_USER,
-            CmEventType::Internal => E::RDMA_CM_EVENT_INTERNAL,
-            CmEventType::Unknown(raw) => ffi::rdma_cm_event_type(raw),
-        }
-    }
-}
-
 impl std::fmt::Display for PortSpace {
     /// Formats the port space as it is named in the C headers, for example `TCP` for
     /// [`Tcp`](Self::Tcp).
@@ -285,28 +243,6 @@ impl std::fmt::Display for CmEventType {
     }
 }
 
-/// Holds a `sockaddr` of the right family so its pointer stays valid for a single C call.
-enum OsSocketAddr {
-    V4(SockaddrIn),
-    V6(SockaddrIn6),
-}
-
-impl OsSocketAddr {
-    fn new(addr: SocketAddr) -> Self {
-        match addr {
-            SocketAddr::V4(v4) => OsSocketAddr::V4(v4.into()),
-            SocketAddr::V6(v6) => OsSocketAddr::V6(v6.into()),
-        }
-    }
-
-    fn as_ptr(&self) -> *mut ffi::sockaddr {
-        match self {
-            OsSocketAddr::V4(s) => s.as_ptr() as *mut ffi::sockaddr,
-            OsSocketAddr::V6(s) => s.as_ptr() as *mut ffi::sockaddr,
-        }
-    }
-}
-
 /// Decode a `sockaddr` owned by an `rdma_cm_id` into a socket address. Returns `None` for any
 /// address family other than IPv4 and IPv6 — in particular `AF_UNSPEC`, an id whose address has
 /// not been bound or resolved yet.
@@ -316,25 +252,20 @@ impl OsSocketAddr {
 /// `sa` must point to `sockaddr_storage`-sized readable memory (which the `rdma_cm_id`'s own
 /// address storage is).
 unsafe fn socket_addr_of(sa: *const ffi::sockaddr) -> Option<SocketAddr> {
-    match unsafe { (*sa).sa_family } as c_int {
-        nix::libc::AF_INET => {
-            let sin = unsafe { *(sa as *const nix::libc::sockaddr_in) };
-            Some(SocketAddr::V4(SocketAddrV4::new(
-                Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)),
-                u16::from_be(sin.sin_port),
-            )))
-        }
-        nix::libc::AF_INET6 => {
-            let sin6 = unsafe { *(sa as *const nix::libc::sockaddr_in6) };
-            Some(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(sin6.sin6_addr.s6_addr),
-                u16::from_be(sin6.sin6_port),
-                sin6.sin6_flowinfo,
-                sin6.sin6_scope_id,
-            )))
-        }
-        _ => None,
+    // Each `from_raw` checks the family before reading its own struct.
+    let sa = sa.cast::<nix::libc::sockaddr>();
+    unsafe { SockaddrIn::from_raw(sa, None) }
+        .map(SocketAddr::from)
+        .or_else(|| unsafe { SockaddrIn6::from_raw(sa, None) }.map(SocketAddr::from))
+}
+
+/// Converts a librdmacm return value into a `Result`. The calls return 0 on success; on failure
+/// `wrap` makes the error from `errno`.
+fn check_ret(ret: c_int, wrap: fn(io::Error) -> Error) -> Result<()> {
+    if ret != 0 {
+        return Err(wrap(io::Error::last_os_error()));
     }
+    Ok(())
 }
 
 fn timeout_ms(timeout: Duration) -> c_int {
@@ -373,6 +304,17 @@ fn max_accept_private_data(ps: ffi::rdma_port_space) -> usize {
 
 /// The most private-data bytes a rejection (`rdma_reject`) can carry: the CM REJ payload.
 const MAX_REJECT_PRIVATE_DATA: usize = 148;
+
+/// Checks that `len` bytes of private data (`what`, for the error message) fit in `limit`.
+fn check_private_data(len: usize, limit: usize, what: &str) -> io::Result<()> {
+    if len > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} is limited to {limit} bytes, got {len}"),
+        ));
+    }
+    Ok(())
+}
 
 /// The blocking helpers only set up reliable connections; the datagram port spaces would make
 /// them wait for events that never come.
@@ -480,10 +422,8 @@ impl CmId {
                 port_space.into(),
             )
         };
-        if ret != 0 {
-            // `channel` drops here, destroying the event channel.
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        // On failure `channel` drops on return, destroying the event channel.
+        check_ret(ret, Error::ConnectionSetup)?;
         Ok(CmId {
             inner: Arc::new(CmIdInner { channel, id }),
         })
@@ -498,9 +438,7 @@ impl CmId {
     pub fn get_cm_event(&self) -> Result<CmEvent> {
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
         let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
+        check_ret(ret, Error::ConnectionSetup)?;
         Ok(CmEvent {
             event,
             _id: self.clone(),
@@ -517,20 +455,10 @@ impl CmId {
     /// blocking channel it behaves like [`get_cm_event`](Self::get_cm_event), only ever returning
     /// `Some`.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
-        let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
-        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
-        if ret != 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
-            }
-            return Err(Error::ConnectionSetup(e));
+        match self.get_cm_event() {
+            Err(Error::ConnectionSetup(e)) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            event => event.map(Some),
         }
-        Ok(Some(CmEvent {
-            event,
-            _id: self.clone(),
-            taken: false,
-        }))
     }
 
     /// Switches this id's event channel between blocking and non-blocking delivery.
@@ -580,9 +508,7 @@ impl CmId {
         };
         let mut mask: c_int = 0;
         let ret = unsafe { ffi::rdma_init_qp_attr(self.inner.id, &mut attr, &mut mask) };
-        if ret != 0 {
-            return Err(Error::ModifyQueuePair(io::Error::last_os_error()));
-        }
+        check_ret(ret, Error::ModifyQueuePair)?;
         Ok(QueuePairAttribute::from_raw(
             attr,
             ffi::ibv_qp_attr_mask(mask as u32),
@@ -641,12 +567,10 @@ impl CmId {
     /// Binds to a local `addr` (passive side). Bind to an unspecified address such as
     /// `0.0.0.0:port` to accept connections on any device. Follow with [`listen`](Self::listen).
     pub fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
-        let addr = OsSocketAddr::new(addr);
-        let ret = unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr()) };
-        if ret != 0 {
-            return Err(Error::BindAddress(io::Error::last_os_error()));
-        }
-        Ok(())
+        let addr = SockaddrStorage::from(addr);
+        let ret =
+            unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr() as *mut ffi::sockaddr) };
+        check_ret(ret, Error::BindAddress)
     }
 
     /// Starts listening for incoming connection requests (passive side), queueing up to `backlog`.
@@ -654,10 +578,7 @@ impl CmId {
     /// new id with [`CmEvent::connection_request`].
     pub fn listen(&self, backlog: u32) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog.min(i32::MAX as u32) as i32) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Resolves the destination address to an RDMA device and local route (active side). On success
@@ -665,19 +586,16 @@ impl CmId {
     /// [`context`](Self::context) is available and [`resolve_route`](Self::resolve_route) is the
     /// next step.
     pub fn resolve_addr(&self, dst: SocketAddr, timeout: Duration) -> Result<()> {
-        let dst = OsSocketAddr::new(dst);
+        let dst = SockaddrStorage::from(dst);
         let ret = unsafe {
             ffi::rdma_resolve_addr(
                 self.inner.id,
                 ptr::null_mut(),
-                dst.as_ptr(),
+                dst.as_ptr() as *mut ffi::sockaddr,
                 timeout_ms(timeout),
             )
         };
-        if ret != 0 {
-            return Err(Error::ResolveAddress(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ResolveAddress)
     }
 
     /// Resolves the route to the destination (active side), after the address has resolved. On
@@ -691,10 +609,7 @@ impl CmId {
     pub fn resolve_route(&self, timeout: Duration) -> Result<()> {
         self.device_or(Error::ResolveRoute)?;
         let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout)) };
-        if ret != 0 {
-            return Err(Error::ResolveRoute(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ResolveRoute)
     }
 
     /// Initiates a connection to the remote (active side). On success a
@@ -711,26 +626,18 @@ impl CmId {
     ///    [`PortSpace::Ib`], 180 for the datagram port spaces), or the route has not resolved
     ///    yet.
     pub fn connect(&self, param: &ConnectionParameter) -> Result<()> {
-        let limit = max_connect_private_data(self.port_space());
-        if usize::from(param.param.private_data_len) > limit {
-            return Err(Error::Connect(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "connection request private data is limited to {limit} bytes in this port \
-                     space, got {}",
-                    param.param.private_data_len
-                ),
-            )));
-        }
+        check_private_data(
+            param.param.private_data_len.into(),
+            max_connect_private_data(self.port_space()),
+            "connection request private data in this port space",
+        )
+        .map_err(Error::Connect)?;
         self.device_or(Error::Connect)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
         let ret = unsafe { ffi::rdma_connect(self.inner.id, &mut raw) };
-        if ret != 0 {
-            return Err(Error::Connect(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::Connect)
     }
 
     /// Accepts a connection request (passive side), in response to a
@@ -745,26 +652,18 @@ impl CmId {
     ///    [`PortSpace::Ib`], 136 for the datagram port spaces), or the id has no device (a
     ///    connection request's id always has one).
     pub fn accept(&self, param: &ConnectionParameter) -> Result<()> {
-        let limit = max_accept_private_data(self.port_space());
-        if usize::from(param.param.private_data_len) > limit {
-            return Err(Error::Accept(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "connection reply private data is limited to {limit} bytes in this port \
-                     space, got {}",
-                    param.param.private_data_len
-                ),
-            )));
-        }
+        check_private_data(
+            param.param.private_data_len.into(),
+            max_accept_private_data(self.port_space()),
+            "connection reply private data in this port space",
+        )
+        .map_err(Error::Accept)?;
         self.device_or(Error::Accept)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
         let ret = unsafe { ffi::rdma_accept(self.inner.id, &mut raw) };
-        if ret != 0 {
-            return Err(Error::Accept(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::Accept)
     }
 
     /// Declines a connection request (passive side), on the id taken from a
@@ -777,15 +676,12 @@ impl CmId {
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_reject` failed, or `private_data`
     ///    is longer than a rejection can carry.
     pub fn reject(&self, private_data: &[u8]) -> Result<()> {
-        if private_data.len() > MAX_REJECT_PRIVATE_DATA {
-            return Err(Error::ConnectionSetup(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "rejection private data is limited to {MAX_REJECT_PRIVATE_DATA} bytes, got {}",
-                    private_data.len()
-                ),
-            )));
-        }
+        check_private_data(
+            private_data.len(),
+            MAX_REJECT_PRIVATE_DATA,
+            "rejection private data",
+        )
+        .map_err(Error::ConnectionSetup)?;
         let ret = unsafe {
             ffi::rdma_reject(
                 self.inner.id,
@@ -793,20 +689,14 @@ impl CmId {
                 private_data.len() as u8,
             )
         };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Completes connection establishment on the active side after the queue pair has reached
     /// `RTS`, in response to a [`CmEventType::ConnectResponse`].
     pub fn establish(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_establish(self.inner.id) };
-        if ret != 0 {
-            return Err(Error::Connect(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::Connect)
     }
 
     /// Disconnects an established connection, delivering [`CmEventType::Disconnected`] to both
@@ -818,10 +708,7 @@ impl CmId {
     /// [`Connection::disconnect`] does).
     pub fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.inner.id) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Set an `RDMA_OPTION_ID`-level option (`rdma_set_option`) to `value`.
@@ -835,10 +722,7 @@ impl CmId {
                 std::mem::size_of::<T>(),
             )
         };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// Set the type of service of this id's traffic: the IP DSCP/ToS byte (RFC 2474) its packets
@@ -900,10 +784,7 @@ impl CmId {
     pub fn notify_established(&self) -> Result<()> {
         let ret =
             unsafe { ffi::rdma_notify(self.inner.id, ffi::ibv_event_type::IBV_EVENT_COMM_EST) };
-        if ret != 0 {
-            return Err(Error::ConnectionSetup(io::Error::last_os_error()));
-        }
-        Ok(())
+        check_ret(ret, Error::ConnectionSetup)
     }
 
     /// The IP address and port of the remote end of this id, or `None` while the destination has
@@ -1452,24 +1333,14 @@ impl Acceptor {
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        loop {
-            let Some(event) = self.listener.get_cm_event_deadline(deadline)? else {
-                return Err(Error::TimedOut);
-            };
-            let kind = event.event_type();
-            if kind == CmEventType::ConnectRequest {
-                let private_data = event.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
-                return Ok(Incoming {
-                    id: event.connection_request()?,
-                    private_data,
-                });
-            }
-            if is_failure(kind) {
-                return Err(event.into_error());
-            }
-            // Only connection requests matter here; anything else is acknowledged and ignored
-            // when `event` drops.
-        }
+        let request = self
+            .listener
+            .wait_for(CmEventType::ConnectRequest, deadline)?;
+        let private_data = request.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
+        Ok(Incoming {
+            id: request.connection_request()?,
+            private_data,
+        })
     }
 }
 
@@ -1638,20 +1509,19 @@ mod test_conversions {
     use super::*;
 
     #[test]
-    fn port_space_roundtrip() {
+    fn port_space_to_raw() {
         for (wrapper, raw) in [
             (PortSpace::Tcp, ffi::rdma_port_space::RDMA_PS_TCP),
             (PortSpace::Udp, ffi::rdma_port_space::RDMA_PS_UDP),
             (PortSpace::Ipoib, ffi::rdma_port_space::RDMA_PS_IPOIB),
             (PortSpace::Ib, ffi::rdma_port_space::RDMA_PS_IB),
         ] {
-            assert_eq!(PortSpace::from(raw), wrapper);
             assert_eq!(ffi::rdma_port_space::from(wrapper), raw);
         }
     }
 
     #[test]
-    fn cm_event_type_roundtrip() {
+    fn cm_event_type_from_raw() {
         for (wrapper, raw) in [
             (
                 CmEventType::AddressResolved,
@@ -1671,7 +1541,6 @@ mod test_conversions {
             ),
         ] {
             assert_eq!(CmEventType::from(raw), wrapper);
-            assert_eq!(ffi::rdma_cm_event_type::from(wrapper), raw);
         }
     }
 
