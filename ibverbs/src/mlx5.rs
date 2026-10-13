@@ -82,14 +82,14 @@ impl ProtectionDomain {
             }
             return Err(registration_error(err));
         }
-        Ok(MemoryRegion {
-            inner: MemoryRegionInner {
+        Ok(MemoryRegion::new(
+            MemoryRegionInner {
                 _pd: self.inner.clone(),
                 mr,
                 addr: iova,
             },
-            owner: (),
-        })
+            (),
+        ))
     }
 }
 
