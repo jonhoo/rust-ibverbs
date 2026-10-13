@@ -212,6 +212,71 @@ fn accept_times_out() {
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn racing_accepts_time_out_on_time() {
+    // Several threads wait on one acceptor and a single client connects. The request wakes every
+    // waiter, but only one can take it; each of the others must go back to waiting and report
+    // TimedOut once its own timeout expires, rather than block until a next request that never
+    // comes. More than two waiters make it likelier that one sees the request it loses.
+    const WAITERS: usize = 4;
+    const TIMEOUT: Duration = Duration::from_secs(2);
+    let acceptor = Arc::new(bind_acceptor(device_ip(&open_test_device()), 1));
+    let addr = acceptor.local_addr().expect("listen address");
+    let start = Instant::now();
+    let (result_tx, result_rx) = mpsc::channel();
+    for _ in 0..WAITERS {
+        let acceptor = acceptor.clone();
+        let result_tx = result_tx.clone();
+        // Not joined: a waiter that hangs must fail the test below, not hang it.
+        std::thread::spawn(move || {
+            let before = Instant::now();
+            let result = acceptor
+                .accept(Some(TIMEOUT))
+                .and_then(|incoming| incoming.reject(&[]));
+            result_tx.send((result, before.elapsed())).ok();
+        });
+    }
+    // Let every waiter block before the request arrives.
+    std::thread::sleep(Duration::from_millis(200));
+
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+        Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got a connection"),
+    }
+
+    // The margin is generous: the point is that no waiter is stuck, not timing precision.
+    let deadline = start + TIMEOUT + Duration::from_secs(3);
+    let mut requests = 0;
+    for _ in 0..WAITERS {
+        let (result, elapsed) = result_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("a waiter that missed the request did not return TimedOut in time");
+        match result {
+            Ok(()) => requests += 1,
+            Err(Error::TimedOut) => assert!(
+                elapsed >= TIMEOUT,
+                "a waiter reported TimedOut early, after {elapsed:?}"
+            ),
+            Err(e) => panic!("expected the request or TimedOut, got {e:?}"),
+        }
+    }
+    assert_eq!(requests, 1, "exactly one waiter takes the single request");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn two_connections() {
     // Two clients connect to one acceptor. The second connection request must survive while the
     // first connection is being set up: with a per-connection event channel each connection's events
@@ -311,10 +376,10 @@ fn two_connections() {
     );
 }
 
-/// Pump events on `id` in non-blocking mode until the wanted one arrives (returning it, still
+/// Pump events on `id` without blocking until the wanted one arrives (returning it, still
 /// unacknowledged), ignoring (acknowledging) others. Mirrors how a reactor would drive the
 /// connection manager: poll, and only sleep when the channel is empty. Exercises
-/// [`CmId::poll_cm_event`] and [`CmId::set_nonblocking`].
+/// [`CmId::poll_cm_event`].
 fn pump_until(id: &CmId, want: CmEventType) -> CmEvent {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -348,9 +413,9 @@ const SERVER_PDATA: &[u8] =
 fn low_level_connect_and_send() {
     // Drive the connection-manager state machine directly with `CmId`, instead of the blocking
     // `Connector`/`Acceptor` helpers: the passive side blocks on `get_cm_event`, while the active
-    // side runs its channel non-blocking and pumps events off the file descriptor the way an event
-    // loop would. Proves the low-level escape hatch can set up a working connection, and that
-    // private data crosses it in both directions.
+    // side pumps events off its non-blocking file descriptor the way an event loop would. Proves
+    // the low-level escape hatch can set up a working connection, and that private data crosses it
+    // in both directions.
     let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
@@ -430,7 +495,11 @@ fn low_level_connect_and_send() {
         id.as_raw_fd() >= 0,
         "the event channel exposes a file descriptor"
     );
-    id.set_nonblocking(true).expect("set_nonblocking");
+    let flags = nix::fcntl::fcntl(&id, nix::fcntl::F_GETFL).expect("read the descriptor flags");
+    assert!(
+        nix::fcntl::OFlag::from_bits_retain(flags).contains(nix::fcntl::OFlag::O_NONBLOCK),
+        "the event channel's file descriptor is non-blocking, ready for a reactor"
+    );
 
     id.resolve_addr(addr, Duration::from_secs(5))
         .expect("resolve_addr");
@@ -866,7 +935,6 @@ fn dropping_connection_disconnects_peer() {
             .into_queue_pair();
         accept_low_level(&request, &mut qp);
         // Then watch for the peer going away.
-        request.set_nonblocking(true).expect("set_nonblocking");
         pump_until(&request, CmEventType::Disconnected);
     });
 
