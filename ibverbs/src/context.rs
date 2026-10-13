@@ -1204,7 +1204,7 @@ impl Deref for DeviceAttr {
 ///
 /// Dereferences to the raw [`ffi::ibv_device_attr_ex`], so every field is accessible; the inherent
 /// methods add typed accessors for the most useful extended capabilities, and [`orig`] returns the
-/// base attributes that [`Context::query_device`] reports.
+/// base attributes that [`Context::query_device`] reports (such as the device GUIDs).
 ///
 /// [`orig`]: DeviceAttrEx::orig
 #[derive(Clone)]
@@ -1214,16 +1214,6 @@ impl DeviceAttrEx {
     /// The base device attributes, the same set [`Context::query_device`] returns.
     pub fn orig(&self) -> DeviceAttr {
         DeviceAttr(self.0.orig_attr)
-    }
-
-    /// The node GUID of the device.
-    pub fn node_guid(&self) -> Guid {
-        Guid::from_be64(self.0.orig_attr.node_guid)
-    }
-
-    /// The system-image GUID, shared by the ports of the same physical device.
-    pub fn sys_image_guid(&self) -> Guid {
-        Guid::from_be64(self.0.orig_attr.sys_image_guid)
     }
 
     /// The mask that bounds the device's completion timestamps: the free-running HCA clock that
