@@ -98,8 +98,8 @@ impl QueuePairBuilder<Srd> {
         }
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         let prepared = PreparedQueuePair {
-            lid: self.port_attr.lid,
-            roce: self.port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET.0 as u8,
+            lid: self.lid,
+            roce: self.roce,
             port_num: self.port_num,
             qp: QueuePair {
                 pd: self.pd.clone(),

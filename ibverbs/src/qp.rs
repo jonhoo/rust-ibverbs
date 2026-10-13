@@ -551,7 +551,10 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
 pub struct QueuePairBuilder<T: Transport> {
     pub(crate) ctx: isize,
     pub(crate) pd: Arc<ProtectionDomainInner>,
-    pub(crate) port_attr: ffi::ibv_port_attr,
+    /// port local identifier
+    pub(crate) lid: u16,
+    /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
+    pub(crate) roce: bool,
     /// the device port this queue pair is associated with (numbered from 1)
     pub(crate) port_num: u8,
 
@@ -580,31 +583,17 @@ pub struct QueuePairBuilder<T: Transport> {
 }
 
 impl<T: Transport> QueuePairBuilder<T> {
-    /// Prepare a new `QueuePair` builder.
-    ///
-    /// `max_send_wr` is the maximum number of outstanding Work Requests that can be posted to the
-    /// Send Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`. Some devices
-    /// support fewer outstanding work requests for specific transport types than the maximum
-    /// reported value.
-    ///
-    /// Similarly, `max_recv_wr` is the maximum number of outstanding Work Requests that can be
-    /// posted to the Receive Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`.
-    /// Some devices support fewer outstanding work requests for specific transport types than the
-    /// maximum reported value. This value is ignored if the Queue Pair is associated with an SRQ.
+    /// Prepare a new `QueuePair` builder on port `port_num`, whose attributes are `port_attr`, with
+    /// the defaults the setters document.
     ///
     /// `rd_atomic_limits` is the device's `(initiator, responder)` RDMA read and atomic limit, the
     /// default for a reliable connection; it is `None` for the other transports.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pd: Arc<ProtectionDomainInner>,
-        port_attr: ffi::ibv_port_attr,
+        port_attr: &ffi::ibv_port_attr,
         port_num: u8,
         send: Arc<CompletionQueueInner>,
-        max_send_wr: u32,
         recv: Arc<CompletionQueueInner>,
-        max_recv_wr: u32,
-        max_send_sge: u32,
-        max_recv_sge: u32,
         rd_atomic_limits: Option<(u8, u8)>,
     ) -> QueuePairBuilder<T> {
         let reliable = T::TYPE == QueuePairType::ReliableConnection;
@@ -634,18 +623,19 @@ impl<T: Transport> QueuePairBuilder<T> {
         QueuePairBuilder {
             ctx: 0,
             pd,
-            port_attr,
+            lid: port_attr.lid,
+            roce: port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET.0 as u8,
             port_num,
 
             gid_index: None,
             traffic_class: 0,
             send,
-            max_send_wr,
+            max_send_wr: 1,
             recv,
-            max_recv_wr,
+            max_recv_wr: 1,
 
-            max_send_sge,
-            max_recv_sge,
+            max_send_sge: 1,
+            max_recv_sge: 1,
             max_inline_data: 0,
             send_ops: None,
 
@@ -870,8 +860,8 @@ impl<T: Transport> QueuePairBuilder<T> {
         } else {
             let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
             let prepared = PreparedQueuePair {
-                lid: self.port_attr.lid,
-                roce: self.port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET.0 as u8,
+                lid: self.lid,
+                roce: self.roce,
                 port_num: self.port_num,
                 qp: QueuePair {
                     pd: self.pd.clone(),

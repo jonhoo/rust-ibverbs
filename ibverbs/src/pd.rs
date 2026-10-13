@@ -249,14 +249,10 @@ impl ProtectionDomain {
         };
         Ok(QueuePairBuilder::new(
             self.inner.clone(),
-            port_attr,
+            &port_attr,
             port_num,
             send.inner.clone(),
-            1,
             recv.inner.clone(),
-            1,
-            1,
-            1,
             rd_atomic_limits,
         ))
     }
