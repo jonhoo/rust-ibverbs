@@ -27,8 +27,10 @@ use crate::{ProtectionDomain, QueuePairBuilder};
 /// };
 /// ```
 ///
-/// The `global` view is a convenience; the raw bytes are authoritative. For its two halves, read
-/// the [`segments`](std::net::Ipv6Addr::segments) of `Ipv6Addr::from(gid)`.
+/// The `global` view is a convenience; the raw bytes are authoritative.
+/// For continuity, the methods `subnet_prefix` and `interface_id` are provided.
+/// These methods read the array as big endian, regardless of native CPU
+/// endianness.
 #[derive(Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[repr(transparent)]
 pub struct Gid {
@@ -36,6 +38,20 @@ pub struct Gid {
 }
 
 impl Gid {
+    /// Expose the subnet_prefix component of the `Gid` as a u64. This is
+    /// equivalent to accessing the `global.subnet_prefix` component of the
+    /// `ffi::ibv_gid` union.
+    pub fn subnet_prefix(&self) -> u64 {
+        u64::from_be_bytes(self.raw[..8].try_into().unwrap())
+    }
+
+    /// Expose the interface_id component of the `Gid` as a u64. This is
+    /// equivalent to accessing the `global.interface_id` component of the
+    /// `ffi::ibv_gid` union.
+    pub fn interface_id(&self) -> u64 {
+        u64::from_be_bytes(self.raw[8..].try_into().unwrap())
+    }
+
     /// Whether this GID holds an IPv4-mapped address (`::ffff:a.b.c.d`).
     ///
     /// On RoCE, the GIDs of a port mirror the IP addresses of its network interface, so the entry
@@ -214,9 +230,8 @@ mod test_wire {
 
         let encoded = qpe.to_bytes();
         let decoded = QueuePairEndpoint::from_bytes(&encoded).unwrap();
-        let segments = std::net::Ipv6Addr::from(decoded.gid.unwrap()).segments();
-        assert_eq!(segments[..4], [0, 0, 0, 87]);
-        assert_eq!(segments[4..], [0, 0, 0, 192]);
+        assert_eq!(decoded.gid.unwrap().subnet_prefix(), 87);
+        assert_eq!(decoded.gid.unwrap().interface_id(), 192);
         assert_eq!(qpe, decoded);
     }
 
@@ -283,9 +298,8 @@ mod test {
         let gid = Gid::from("::ffff:192.0.2.1".parse::<std::net::Ipv6Addr>().unwrap());
         assert!(gid.is_ipv4_mapped());
         assert_eq!(gid.to_string(), "::ffff:192.0.2.1");
-        let segments = std::net::Ipv6Addr::from(gid).segments();
-        assert_eq!(segments[..4], [0, 0, 0, 0]);
-        assert_eq!(segments[4..6], [0, 0xffff]);
+        assert_eq!(gid.subnet_prefix(), 0);
+        assert_eq!(gid.interface_id() >> 32, 0xffff);
     }
 
     #[test]
