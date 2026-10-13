@@ -756,6 +756,10 @@ impl CmId {
     /// carry, which the network maps to a priority or a lossless class. Set it before resolving
     /// the address (active side) or binding (passive side).
     ///
+    /// On InfiniBand and RoCE a listener's setting has no effect, though: the connections it
+    /// accepts take their traffic class and service level from the peer's request, so set it on
+    /// the connecting side.
+    ///
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
@@ -1132,6 +1136,9 @@ impl ConnectionParameter {
 
     /// Sets how many times to retry a connection or transport operation before reporting an error
     /// (0-7).
+    ///
+    /// Only the connecting side's value counts: accepting ignores it (`rdma_accept(3)`), and the
+    /// accepting queue pair retries as often as the connection request asked.
     pub fn set_retry_count(mut self, retry_count: u8) -> Self {
         self.param.retry_count = retry_count;
         self
@@ -1321,7 +1328,7 @@ impl Acceptor {
 
     /// As [`bind`](Self::bind), running `configure` on the listener's id before it binds: the
     /// place for the options that must precede binding ([`CmId::set_reuse_addr`],
-    /// [`CmId::set_af_only`], [`CmId::set_tos`]).
+    /// [`CmId::set_af_only`]).
     ///
     /// # Errors
     ///
