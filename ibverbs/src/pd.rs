@@ -312,8 +312,8 @@ impl ProtectionDomain {
     /// that can be registered for a specific device.
     ///
     /// `access_flags` are the permissions the region is registered with; local read access is
-    /// always enabled. [`AccessFlags::PERMISSIVE`] is the local-write plus all-remote-data-access
-    /// bundle: local write, remote write, remote read, remote atomics, and relaxed ordering.
+    /// always enabled. [`AccessFlags::PERMISSIVE`] is the bundle of local write, remote write, and
+    /// remote read.
     ///
     /// # Panics
     ///
@@ -343,8 +343,8 @@ impl ProtectionDomain {
     /// access the bytes through your own pointer.
     ///
     /// `access_flags` are the permissions the region is registered with; local read access is
-    /// always enabled ([`AccessFlags::PERMISSIVE`] is the local-write plus all-remote-data-access
-    /// bundle).
+    /// always enabled ([`AccessFlags::PERMISSIVE`] is the bundle of local write, remote write, and
+    /// remote read).
     ///
     /// # Safety
     ///
