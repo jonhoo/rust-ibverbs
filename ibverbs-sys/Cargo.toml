@@ -21,7 +21,27 @@ categories = ["network-programming", "api-bindings"]
 
 license = "MIT OR Apache-2.0"
 
-exclude = ["vendor/rdma-core/build/"]
+# The crate itself (with the `no_default.bzl` list `build.rs` reads) and the vendored rdma-core
+# headers `build.rs` generates the bindings from (its `VENDORED_HEADERS`), with rdma-core's license
+# files.
+include = [
+    "/build.rs",
+    "/no_default.bzl",
+    "/src/**",
+    "/vendor/rdma-core/COPYING*",
+    "/vendor/rdma-core/libibverbs/verbs.h",
+    "/vendor/rdma-core/libibverbs/verbs_api.h",
+    "/vendor/rdma-core/libibverbs/sa.h",
+    "/vendor/rdma-core/libibverbs/tm_types.h",
+    "/vendor/rdma-core/kernel-headers/rdma/ib_user_ioctl_verbs.h",
+    "/vendor/rdma-core/kernel-headers/rdma/ib_user_verbs.h",
+    "/vendor/rdma-core/kernel-headers/rdma/mlx5_user_ioctl_verbs.h",
+    "/vendor/rdma-core/kernel-headers/linux/stddef.h",
+    "/vendor/rdma-core/providers/efa/efadv.h",
+    "/vendor/rdma-core/providers/mlx5/mlx5dv.h",
+    "/vendor/rdma-core/providers/mlx5/mlx5_api.h",
+    "/vendor/rdma-core/librdmacm/rdma_cma.h",
+]
 
 [package.metadata.docs.rs]
 all-features = true

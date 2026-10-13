@@ -93,10 +93,9 @@
 //! on Arch; `rdma-core-devel` on Fedora), plus `librdmacm` and `libefa` when the corresponding
 //! features are enabled.
 //!
-//! At build time, the bindings are generated from a vendored [`rdma-core`] checkout, whose headers
-//! `ibverbs-sys` generates by running `cmake`'s configure step (nothing is compiled, so this needs
-//! `cmake` and a C compiler for its probes, but no RDMA development packages). To generate
-//! bindings from pre-built `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and
+//! At build time, `bindgen` generates the bindings from the [`rdma-core`] headers vendored in
+//! `ibverbs-sys`, so building needs `libclang` but no RDMA development packages. To generate
+//! bindings from installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and
 //! `RDMA_CORE_LIB_DIR`.
 //!
 //! The crate drives completion queues and queue pairs exclusively through rdma-core's extended

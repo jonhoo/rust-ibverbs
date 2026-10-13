@@ -1,6 +1,6 @@
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::{env, fs};
 
 /// The quoted names in `no_default.bzl`, whose only Starlark is a list of string literals.
 fn no_default_types(bzl: &str) -> impl Iterator<Item = &str> {
@@ -10,46 +10,51 @@ fn no_default_types(bzl: &str) -> impl Iterator<Item = &str> {
         .map(|line| line.trim_end_matches(',').trim_end_matches('"'))
 }
 
-/// Configure the vendored rdma-core checkout with cmake and return the include directory it
-/// generates.
-///
-/// rdma-core publishes its public headers into the build tree at cmake *configure* time
-/// (`buildlib/publish_headers.cmake`), so configuring is all it takes to generate bindings from
-/// them; nothing is compiled.
-fn configure_vendored_rdma() -> PathBuf {
-    let build_dir =
-        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("rdma-core");
-    let cmake = env::var("CMAKE").unwrap_or_else(|_| "cmake".to_string());
-    eprintln!("run cmake (configure only)");
-    let output = Command::new(&cmake)
-        .arg("-S")
-        .arg("vendor/rdma-core")
-        .arg("-B")
-        .arg(&build_dir)
-        .arg("-DNO_MAN_PAGES=1")
-        .arg("-DNO_PYVERBS=1")
-        // never installed, but the configure step bakes the prefix into its output, and a long
-        // OUT_DIR-derived one used to overflow path limits on docs.rs (see #41)
-        .arg("-DCMAKE_INSTALL_PREFIX=/usr")
-        .output()
-        .unwrap_or_else(|e| {
-            panic!(
-                "failed to run `{cmake}` to configure vendor/rdma-core (is cmake installed?): {e}"
-            )
-        });
-    if !output.status.success() {
-        eprintln!("{}", String::from_utf8_lossy(&output.stdout));
-        eprintln!("{}", String::from_utf8_lossy(&output.stderr));
-        panic!(
-            "cmake failed to configure vendor/rdma-core ({})",
-            output.status
-        );
+/// The public rdma-core headers the bindings are generated from, each at the path its `#include`s
+/// use and at its place in the vendored checkout. An rdma-core build only links these into its
+/// include tree (nothing in them is generated), so laying them out is all the vendored build needs.
+/// The package's `include` list in Cargo.toml ships exactly these.
+const VENDORED_HEADERS: &[(&str, &str)] = &[
+    ("infiniband/verbs.h", "libibverbs/verbs.h"),
+    ("infiniband/verbs_api.h", "libibverbs/verbs_api.h"),
+    ("infiniband/sa.h", "libibverbs/sa.h"),
+    ("infiniband/tm_types.h", "libibverbs/tm_types.h"),
+    (
+        "infiniband/ib_user_ioctl_verbs.h",
+        "kernel-headers/rdma/ib_user_ioctl_verbs.h",
+    ),
+    ("infiniband/efadv.h", "providers/efa/efadv.h"),
+    ("infiniband/mlx5dv.h", "providers/mlx5/mlx5dv.h"),
+    ("infiniband/mlx5_api.h", "providers/mlx5/mlx5_api.h"),
+    (
+        "infiniband/mlx5_user_ioctl_verbs.h",
+        "kernel-headers/rdma/mlx5_user_ioctl_verbs.h",
+    ),
+    ("rdma/rdma_cma.h", "librdmacm/rdma_cma.h"),
+    (
+        "rdma/ib_user_verbs.h",
+        "kernel-headers/rdma/ib_user_verbs.h",
+    ),
+    ("linux/stddef.h", "kernel-headers/linux/stddef.h"),
+];
+
+/// Lay the vendored headers out the way an installed rdma-core does, and return that include
+/// directory.
+fn vendored_include_dir() -> PathBuf {
+    let include =
+        PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("include");
+    for (to, from) in VENDORED_HEADERS {
+        let to = include.join(to);
+        fs::create_dir_all(to.parent().expect("header paths have a directory"))
+            .expect("failed to create the vendored include directory");
+        fs::copy(Path::new("vendor/rdma-core").join(from), &to)
+            .unwrap_or_else(|e| panic!("failed to copy vendor/rdma-core/{from}: {e}"));
     }
-    build_dir.join("include")
+    include
 }
 
 fn update_submodule() {
-    if Path::new("vendor/rdma-core/CMakeLists.txt").exists() {
+    if Path::new("vendor/rdma-core/libibverbs/verbs.h").exists() {
         // don't touch source dir if not necessary
     } else if Path::new(".git").is_dir() {
         // initialize and update submodules
@@ -86,8 +91,7 @@ fn main() {
     }
 
     // Where `verbs.h`'s own includes (`<infiniband/verbs_api.h>` and friends) come from: either
-    // pre-generated rdma-core headers named by the caller, or the ones cmake generates from the
-    // vendored checkout.
+    // installed rdma-core headers named by the caller, or the vendored checkout's.
     if let Ok(rdma_core_lib_dir) = env::var("RDMA_CORE_LIB_DIR") {
         println!("cargo:rustc-link-search=native={rdma_core_lib_dir}");
     }
@@ -99,7 +103,7 @@ fn main() {
         PathBuf::from(rdma_core_include_dir)
     } else {
         update_submodule();
-        configure_vendored_rdma()
+        vendored_include_dir()
     };
     // exported to dependents as `DEP_IBVERBS_INCLUDE`
     println!("cargo:include={}", rdma_core_include_dir.display());

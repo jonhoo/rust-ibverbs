@@ -12,11 +12,11 @@ if (( $# > 1 )); then
     exit 1
 fi
 
-echo "Install libibverbs, librdmacm, clang, and cmake"
+echo "Install libibverbs, librdmacm, and clang"
 sudo apt-get update
-packages=(libibverbs1 libibverbs-dev librdmacm1 librdmacm-dev clang cmake)
+packages=(libibverbs1 libibverbs-dev librdmacm1 librdmacm-dev clang)
 if "$vendored_libs"; then
-    packages+=(build-essential pkg-config libnl-3-dev libnl-route-3-dev)
+    packages+=(cmake build-essential pkg-config libnl-3-dev libnl-route-3-dev)
 fi
 sudo apt-get install -y --no-install-recommends "${packages[@]}"
 
@@ -35,10 +35,6 @@ if "$vendored_libs"; then
             "$lib_dir" "$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
     fi
 else
-    echo "Configure vendored rdma-core headers for the system libraries"
-    build_dir="$(pwd)/ibverbs-sys/vendor/rdma-core/build"
-    cmake -S ibverbs-sys/vendor/rdma-core -B "$build_dir" \
-        -DNO_MAN_PAGES=1 -DNO_PYVERBS=1 -DCMAKE_INSTALL_PREFIX=/usr
     lib_dir=/usr/lib/x86_64-linux-gnu
 fi
 
@@ -52,7 +48,6 @@ target-dir = "/tmp/cargo"
 CC = "clang"
 CXX = "clang++"
 LD = "clang"
-RDMA_CORE_INCLUDE_DIR = "$build_dir/include"
 RDMA_CORE_LIB_DIR = "$lib_dir"
 EOF
 if "$vendored_libs"; then
