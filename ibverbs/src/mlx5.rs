@@ -93,7 +93,7 @@ impl Context {
 fn registration_error(err: io::Error) -> Error {
     if err.raw_os_error() == Some(nix::libc::EOPNOTSUPP) {
         Error::Unsupported {
-            operation: "mlx5dv_reg_dmabuf_mr",
+            operation: &"mlx5dv_reg_dmabuf_mr",
         }
     } else {
         Error::RegisterMemoryRegion(err)

@@ -812,13 +812,10 @@ fn rejected_request_reports_reason_and_private_data() {
         .build()
         .expect("client qp");
     match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
-        Err(Error::ConnectionManager {
-            event: CmEventType::Rejected,
-            status,
-            private_data,
-        }) => {
+        Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {
             // 28 is the InfiniBand CM's "consumer defined" reject reason: the peer itself said no.
-            assert_eq!(status, 28, "reject reason");
+            assert_eq!(failure.status, 28, "reject reason");
+            let private_data = &failure.private_data;
             assert!(
                 private_data.len() >= 4 && &private_data[..4] == b"nope",
                 "the rejection carries the peer's private data: {private_data:?}"
@@ -869,10 +866,7 @@ fn dropped_connect_request_is_rejected() {
         .expect("client qp");
     let before = Instant::now();
     match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
-        Err(Error::ConnectionManager {
-            event: CmEventType::Rejected,
-            ..
-        }) => {}
+        Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
     }

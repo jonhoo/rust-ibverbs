@@ -3,7 +3,7 @@ use std::io;
 use crate::qp::{QueuePairAttributeMask, QueuePairState};
 
 #[cfg(feature = "rdmacm")]
-use crate::rdmacm::CmEventType;
+use crate::rdmacm::CmFailure;
 
 #[cfg(doc)]
 use crate::QueuePair;
@@ -26,8 +26,9 @@ pub enum Error {
     /// (`EOPNOTSUPP`); `operation` names the verb that was declined.
     #[error("{operation} is not supported by the device or provider")]
     Unsupported {
-        /// The verb (or the capability it asked for) the device or provider declined.
-        operation: &'static str,
+        /// The verb (or the capability it asked for) the device or provider declined. A reference
+        /// to the name rather than the name itself, so that `Error` stays two words.
+        operation: &'static &'static str,
     },
 
     /// The device port is not in the `ACTIVE` or `ARMED` state, so its GID table and routing are
@@ -205,20 +206,10 @@ pub enum Error {
     MalformedWireFormat,
 
     /// The connection manager reported a failure event while a blocking helper was waiting for
-    /// the next setup step.
+    /// the next setup step. Boxed, so that `Error` stays two words.
     #[cfg(feature = "rdmacm")]
-    #[error("the connection manager reported {event} (status {status})")]
-    ConnectionManager {
-        /// The failure event.
-        event: CmEventType,
-        /// The event's status: a negative `errno` for address, route, and connection errors, or
-        /// the transport's reject reason for [`Rejected`](CmEventType::Rejected) (28, "consumer
-        /// defined", when the peer declined the request itself).
-        status: i32,
-        /// The private data the peer attached to its rejection, padded by the transport to its
-        /// wire format; empty when there is none.
-        private_data: Vec<u8>,
-    },
+    #[error("the connection manager reported {} (status {})", .0.event, .0.status)]
+    ConnectionManager(Box<CmFailure>),
 
     /// Binding a connection-manager identifier to a local address failed (`rdma_bind_addr`).
     #[cfg(feature = "rdmacm")]
@@ -261,57 +252,57 @@ impl Error {
     }
 
     /// The verb (or step) this error came from, as [`Unsupported`](Self::Unsupported) names it.
-    pub(crate) fn operation(&self) -> &'static str {
+    pub(crate) fn operation(&self) -> &'static &'static str {
         match self {
             Error::Unsupported { operation } => operation,
-            Error::PortNotActive(_) => "port activation",
-            Error::GidMismatch => "GID routing",
-            Error::DeviceIndexUnavailable => "the device index",
-            Error::GetDeviceList(_) => "ibv_get_device_list",
-            Error::OpenDevice(_) => "ibv_open_device",
-            Error::DeviceGuid(_) => "ibv_get_device_guid",
-            Error::QueryDevice(_) => "ibv_query_device",
-            Error::QueryPort { .. } => "ibv_query_port",
-            Error::QueryGid { .. } => "ibv_query_gid",
-            Error::QueryGidTable(_) => "ibv_query_gid_table",
-            Error::QueryRealTimeValues(_) => "ibv_query_rt_values_ex",
+            Error::PortNotActive(_) => &"port activation",
+            Error::GidMismatch => &"GID routing",
+            Error::DeviceIndexUnavailable => &"the device index",
+            Error::GetDeviceList(_) => &"ibv_get_device_list",
+            Error::OpenDevice(_) => &"ibv_open_device",
+            Error::DeviceGuid(_) => &"ibv_get_device_guid",
+            Error::QueryDevice(_) => &"ibv_query_device",
+            Error::QueryPort { .. } => &"ibv_query_port",
+            Error::QueryGid { .. } => &"ibv_query_gid",
+            Error::QueryGidTable(_) => &"ibv_query_gid_table",
+            Error::QueryRealTimeValues(_) => &"ibv_query_rt_values_ex",
             #[cfg(feature = "mlx5")]
-            Error::QueryMlx5DataDirectSysfsPath(_) => "mlx5dv_get_data_direct_sysfs_path",
-            Error::AllocProtectionDomain(_) => "ibv_alloc_pd",
-            Error::RegisterMemoryRegion(_) => "ibv_reg_mr",
-            Error::AdviseMemoryRegion(_) => "ibv_advise_mr",
-            Error::CreateCompletionChannel(_) => "ibv_create_comp_channel",
-            Error::CreateCompletionQueue(_) => "ibv_create_cq_ex",
-            Error::CreateQueuePair(_) => "ibv_create_qp_ex",
+            Error::QueryMlx5DataDirectSysfsPath(_) => &"mlx5dv_get_data_direct_sysfs_path",
+            Error::AllocProtectionDomain(_) => &"ibv_alloc_pd",
+            Error::RegisterMemoryRegion(_) => &"ibv_reg_mr",
+            Error::AdviseMemoryRegion(_) => &"ibv_advise_mr",
+            Error::CreateCompletionChannel(_) => &"ibv_create_comp_channel",
+            Error::CreateCompletionQueue(_) => &"ibv_create_cq_ex",
+            Error::CreateQueuePair(_) => &"ibv_create_qp_ex",
             Error::ModifyQueuePair(_)
             | Error::InvalidQueuePairTransition { .. }
-            | Error::InvalidQueuePairAttributeMask { .. } => "ibv_modify_qp",
-            Error::QueryQueuePair(_) => "ibv_query_qp",
-            Error::CreateAddressHandle(_) => "ibv_create_ah",
-            Error::CreateSharedReceiveQueue(_) => "ibv_create_srq",
-            Error::ModifySharedReceiveQueue(_) => "ibv_modify_srq",
-            Error::QuerySharedReceiveQueue(_) => "ibv_query_srq",
-            Error::PostSend(_) => "ibv_wr_complete",
-            Error::PostReceive(_) => "ibv_post_recv",
-            Error::PollCompletionQueue(_) => "completion-queue polling",
-            Error::AsyncEvent(_) => "ibv_get_async_event",
-            Error::MalformedWireFormat => "wire-format decoding",
+            | Error::InvalidQueuePairAttributeMask { .. } => &"ibv_modify_qp",
+            Error::QueryQueuePair(_) => &"ibv_query_qp",
+            Error::CreateAddressHandle(_) => &"ibv_create_ah",
+            Error::CreateSharedReceiveQueue(_) => &"ibv_create_srq",
+            Error::ModifySharedReceiveQueue(_) => &"ibv_modify_srq",
+            Error::QuerySharedReceiveQueue(_) => &"ibv_query_srq",
+            Error::PostSend(_) => &"ibv_wr_complete",
+            Error::PostReceive(_) => &"ibv_post_recv",
+            Error::PollCompletionQueue(_) => &"completion-queue polling",
+            Error::AsyncEvent(_) => &"ibv_get_async_event",
+            Error::MalformedWireFormat => &"wire-format decoding",
             #[cfg(feature = "rdmacm")]
-            Error::TimedOut => "the connection-manager wait",
+            Error::TimedOut => &"the connection-manager wait",
             #[cfg(feature = "rdmacm")]
-            Error::ConnectionManager { .. } => "the connection manager",
+            Error::ConnectionManager(_) => &"the connection manager",
             #[cfg(feature = "rdmacm")]
-            Error::BindAddress(_) => "rdma_bind_addr",
+            Error::BindAddress(_) => &"rdma_bind_addr",
             #[cfg(feature = "rdmacm")]
-            Error::ResolveAddress(_) => "rdma_resolve_addr",
+            Error::ResolveAddress(_) => &"rdma_resolve_addr",
             #[cfg(feature = "rdmacm")]
-            Error::ResolveRoute(_) => "rdma_resolve_route",
+            Error::ResolveRoute(_) => &"rdma_resolve_route",
             #[cfg(feature = "rdmacm")]
-            Error::Connect(_) => "rdma_connect",
+            Error::Connect(_) => &"rdma_connect",
             #[cfg(feature = "rdmacm")]
-            Error::Accept(_) => "rdma_accept",
+            Error::Accept(_) => &"rdma_accept",
             #[cfg(feature = "rdmacm")]
-            Error::ConnectionSetup(_) => "connection-manager setup",
+            Error::ConnectionSetup(_) => &"connection-manager setup",
         }
     }
 
@@ -355,7 +346,7 @@ mod tests {
             matches!(
                 err,
                 Error::Unsupported {
-                    operation: "ibv_create_qp_ex"
+                    operation: &"ibv_create_qp_ex"
                 }
             ),
             "{err:?}"
@@ -376,5 +367,13 @@ mod tests {
             Some(nix::libc::ENOMEM)
         );
         assert!(Error::GidMismatch.os_error().is_none());
+    }
+
+    #[test]
+    fn error_fits_in_two_words() {
+        // Returned in registers rather than through memory, on every data-path call.
+        let two_words = 2 * std::mem::size_of::<usize>();
+        assert!(std::mem::size_of::<Error>() <= two_words);
+        assert!(std::mem::size_of::<Result<()>>() <= two_words);
     }
 }

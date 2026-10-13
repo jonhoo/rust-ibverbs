@@ -104,7 +104,7 @@ fn data_direct_path_unsupported_names_the_mlx5_operation() {
     assert!(matches!(
         err,
         Error::Unsupported {
-            operation: "mlx5dv_get_data_direct_sysfs_path"
+            operation: &"mlx5dv_get_data_direct_sysfs_path"
         }
     ));
     assert!(err.os_error().is_none());
@@ -129,7 +129,7 @@ fn registration_unsupported_names_the_mlx5_operation() {
     assert!(matches!(
         err,
         Error::Unsupported {
-            operation: "mlx5dv_reg_dmabuf_mr"
+            operation: &"mlx5dv_reg_dmabuf_mr"
         }
     ));
     assert!(err.os_error().is_none());
