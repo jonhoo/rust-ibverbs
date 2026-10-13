@@ -8,10 +8,9 @@
 // [`QueuePair::post_recv`], and completions through [`CompletionQueue::poll`].
 // ---------------------------------------------------------------------------
 
-use std::io;
 use std::os::raw::c_void;
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::qp::{
     AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
@@ -110,12 +109,7 @@ impl QueuePairBuilder<Srd> {
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
             )
         };
-        if qp.is_null() {
-            return Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateQueuePair,
-            ));
-        }
+        let qp = nonnull(qp, Error::CreateQueuePair)?;
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         let prepared = PreparedQueuePair {
             lid: self.lid,

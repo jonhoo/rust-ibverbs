@@ -3,7 +3,7 @@ use std::fmt;
 use std::io;
 
 use crate::context::Context;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, nonnull};
 
 /// Returns the list of available RDMA devices.
 ///
@@ -13,12 +13,10 @@ use crate::error::{Error, Result};
 ///    permission is denied, `ENOMEM` if out of memory, `ENOSYS` without kernel support for RDMA).
 pub fn devices() -> Result<DeviceList> {
     let mut n = 0i32;
-    let devices = unsafe { ffi::ibv_get_device_list(&mut n as *mut _) };
-
-    if devices.is_null() {
-        return Err(Error::os(io::Error::last_os_error(), Error::GetDeviceList));
-    }
-
+    let devices = nonnull(
+        unsafe { ffi::ibv_get_device_list(&mut n as *mut _) },
+        Error::GetDeviceList,
+    )?;
     Ok(DeviceList {
         devices,
         len: n as usize,

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, check, destroyed, nonnull};
 use crate::pd::{ProtectionDomain, ProtectionDomainInner};
 
 #[cfg(doc)]
@@ -114,10 +114,7 @@ impl Context {
     pub(crate) fn with_device(dev: *mut ffi::ibv_device) -> Result<Context> {
         assert!(!dev.is_null());
 
-        let ctx = unsafe { ffi::ibv_open_device(dev) };
-        if ctx.is_null() {
-            return Err(Error::OpenDevice(io::Error::last_os_error()));
-        }
+        let ctx = nonnull(unsafe { ffi::ibv_open_device(dev) }, Error::OpenDevice)?;
         let context = Context {
             inner: Arc::new(ContextInner { ctx }),
         };
@@ -253,7 +250,7 @@ impl Context {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::AsyncEvent(e));
+            return Err(Error::os(e, Error::AsyncEvent));
         }
         Ok(Some(AsyncEvent {
             // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
@@ -319,17 +316,16 @@ impl Context {
     ///
     ///  - [`AllocProtectionDomain`](Error::AllocProtectionDomain): `ibv_alloc_pd` failed.
     pub fn alloc_pd(&self) -> Result<ProtectionDomain> {
-        let pd = unsafe { ffi::ibv_alloc_pd(self.inner.ctx) };
-        if pd.is_null() {
-            Err(Error::AllocProtectionDomain(io::Error::last_os_error()))
-        } else {
-            Ok(ProtectionDomain {
-                inner: Arc::new(ProtectionDomainInner {
-                    ctx: self.inner.clone(),
-                    pd,
-                }),
-            })
-        }
+        let pd = nonnull(
+            unsafe { ffi::ibv_alloc_pd(self.inner.ctx) },
+            Error::AllocProtectionDomain,
+        )?;
+        Ok(ProtectionDomain {
+            inner: Arc::new(ProtectionDomainInner {
+                ctx: self.inner.clone(),
+                pd,
+            }),
+        })
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
@@ -408,13 +404,11 @@ impl Context {
         let mut gid = ffi::ibv_gid::default();
         let rc =
             unsafe { ffi::ibv_query_gid(self.inner.ctx, port_num, gid_index as i32, &mut gid) };
-        if rc != 0 {
-            return Err(Error::os(io::Error::last_os_error(), |e| Error::QueryGid {
-                port_num,
-                gid_index,
-                source: e,
-            }));
-        }
+        check(rc, |e| Error::QueryGid {
+            port_num,
+            gid_index,
+            source: e,
+        })?;
         Ok(gid.into())
     }
 

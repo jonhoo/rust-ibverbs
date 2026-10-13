@@ -8,7 +8,7 @@ use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueueInner;
 use crate::context::Mtu;
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, check, destroyed, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomainInner;
 use crate::srq::SharedReceiveQueue;
@@ -851,42 +851,38 @@ impl<T: Transport> QueuePairBuilder<T> {
             send_ops_flags: send_ops_flags as u64,
             ..Default::default()
         };
-        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) };
-        if qp.is_null() {
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateQueuePair,
-            ))
-        } else {
-            let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-            let prepared = PreparedQueuePair {
-                lid: self.lid,
-                roce: self.roce,
-                port_num: self.port_num,
-                qp: QueuePair {
-                    pd: self.pd.clone(),
-                    _srq: self.srq.clone(),
-                    _send_cq: self.send.clone(),
-                    _recv_cq: self.recv.clone(),
-                    qp,
-                    qp_ex,
-                    _transport: std::marker::PhantomData,
-                },
-                gid_index: self.gid_index,
-                traffic_class: self.traffic_class,
-                service_level: self.service_level,
-                bring_up: self.bring_up.clone(),
-            };
-            // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
-            // work-request table; one that accepted the send-operations mask without doing so has
-            // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
-            if qp_ex.is_null() {
-                return Err(Error::Unsupported {
-                    operation: &"ibv_qp_to_qp_ex",
-                });
-            }
-            Ok(prepared)
+        let qp = nonnull(
+            unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) },
+            Error::CreateQueuePair,
+        )?;
+        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
+        let prepared = PreparedQueuePair {
+            lid: self.lid,
+            roce: self.roce,
+            port_num: self.port_num,
+            qp: QueuePair {
+                pd: self.pd.clone(),
+                _srq: self.srq.clone(),
+                _send_cq: self.send.clone(),
+                _recv_cq: self.recv.clone(),
+                qp,
+                qp_ex,
+                _transport: std::marker::PhantomData,
+            },
+            gid_index: self.gid_index,
+            traffic_class: self.traffic_class,
+            service_level: self.service_level,
+            bring_up: self.bring_up.clone(),
+        };
+        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
+        // work-request table; one that accepted the send-operations mask without doing so has
+        // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
+        if qp_ex.is_null() {
+            return Err(Error::Unsupported {
+                operation: &"ibv_qp_to_qp_ex",
+            });
         }
+        Ok(prepared)
     }
 }
 
@@ -1203,13 +1199,11 @@ impl<T: Transport> PreparedQueuePair<T> {
                     &mut gid,
                 )
             };
-            if rc < 0 {
-                return Err(Error::os(io::Error::last_os_error(), |e| Error::QueryGid {
-                    port_num: self.port_num,
-                    gid_index,
-                    source: e,
-                }));
-            }
+            check(rc, |e| Error::QueryGid {
+                port_num: self.port_num,
+                gid_index,
+                source: e,
+            })?;
             Some(Gid::from(gid))
         } else {
             None

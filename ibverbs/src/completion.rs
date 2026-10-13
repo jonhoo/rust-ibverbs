@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::context::{ContextInner, HcaClock};
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, nonnull};
 
 #[cfg(doc)]
 use crate::Context;
@@ -67,10 +67,10 @@ impl CompletionChannel {
     /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
     /// instead of blocking.
     pub(crate) fn new(ctx: &Arc<ContextInner>) -> Result<CompletionChannel> {
-        let cc = unsafe { ffi::ibv_create_comp_channel(ctx.ctx) };
-        if cc.is_null() {
-            return Err(Error::CreateCompletionChannel(io::Error::last_os_error()));
-        }
+        let cc = nonnull(
+            unsafe { ffi::ibv_create_comp_channel(ctx.ctx) },
+            Error::CreateCompletionChannel,
+        )?;
         let channel = CompletionChannel {
             inner: Arc::new(CompletionChannelInner {
                 _ctx: ctx.clone(),
@@ -119,7 +119,7 @@ impl CompletionChannel {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::PollCompletionQueue(e));
+            return Err(Error::os(e, Error::PollCompletionQueue));
         }
         // Every event from ibv_get_cq_event() must eventually be acknowledged.
         unsafe { ffi::ibv_ack_cq_events(out_cq, 1) };
@@ -299,23 +299,18 @@ impl CompletionQueueBuilder {
             wc_flags: wc_flags as u64,
             ..Default::default()
         };
-        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr) };
-
-        if cq_ex.is_null() {
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateCompletionQueue,
-            ))
-        } else {
-            Ok(CompletionQueue {
-                inner: Arc::new(CompletionQueueInner {
-                    _ctx: self.ctx.clone(),
-                    cc,
-                    cq_ex,
-                }),
+        let cq_ex = nonnull(
+            unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr) },
+            Error::CreateCompletionQueue,
+        )?;
+        Ok(CompletionQueue {
+            inner: Arc::new(CompletionQueueInner {
+                _ctx: self.ctx.clone(),
+                cc,
                 cq_ex,
-            })
-        }
+            }),
+            cq_ex,
+        })
     }
 }
 
@@ -1171,7 +1166,8 @@ impl CompletionQueue {
         let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
-            // surface whatever the provider left there as the cause.
+            // surface whatever the provider left there as the cause, but do not promote it to
+            // `Unsupported` (`Error::os`), as an `EOPNOTSUPP` there would be a stale one.
             return Err(Error::PollCompletionQueue(io::Error::last_os_error()));
         }
         Ok(&mut wc[..n as usize])
