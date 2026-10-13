@@ -2454,6 +2454,9 @@ impl<T: Transport> QueuePair<T> {
     /// meaningful only for the requested fields. The second return value describes the queue pair's
     /// configured capacities.
     ///
+    /// Query a given queue pair from one thread at a time: libibverbs updates the state it caches
+    /// in the queue pair without a lock (see [Thread safety](crate#thread-safety)).
+    ///
     /// # Errors
     ///
     ///  - [`QueryQueuePair`](Error::QueryQueuePair): `ibv_query_qp` failed.

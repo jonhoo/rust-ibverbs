@@ -106,7 +106,8 @@ impl CompletionChannel {
     /// back to the queue, which you then [`poll`](CompletionQueue::poll) and re-arm with
     /// [`req_notify`](CompletionQueue::req_notify). Give each queue a distinct
     /// [`set_context`](CompletionQueueBuilder::set_context) value so they can be told apart.
-    /// Acknowledgement is handled for you.
+    /// Acknowledgement is handled for you. Consume a given queue's notifications and re-arm it from
+    /// one thread at a time (see [Thread safety](crate#thread-safety)).
     ///
     /// # Errors
     ///
@@ -1207,6 +1208,9 @@ impl CompletionQueue {
     ///
     /// If `solicited_only` is set, only completions of work requests that asked for a solicited
     /// event generate a notification.
+    ///
+    /// Arm a given queue and consume its notifications from one thread at a time (see
+    /// [Thread safety](crate#thread-safety)).
     ///
     /// # Errors
     ///
