@@ -330,7 +330,7 @@ impl ProtectionDomain {
         assert!(n > 0);
         let mut data = vec![0u8; n].into_boxed_slice();
         let inner = unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags)? };
-        Ok(MemoryRegion { inner, owner: data })
+        Ok(MemoryRegion::new(inner, data))
     }
 
     /// Registers externally managed memory as a Memory Region (MR), with the given access
@@ -373,7 +373,7 @@ impl ProtectionDomain {
     ) -> Result<MemoryRegion<()>> {
         assert!(len > 0);
         let inner = unsafe { self.reg_mr(ptr as *mut c_void, len, access_flags) }?;
-        Ok(MemoryRegion { inner, owner: () })
+        Ok(MemoryRegion::new(inner, ()))
     }
 
     /// Registers an already allocated DMA-BUF as a memory region (MR) associated with this
@@ -422,7 +422,7 @@ impl ProtectionDomain {
                 mr,
                 addr: iova,
             };
-            Ok(MemoryRegion { inner, owner: () })
+            Ok(MemoryRegion::new(inner, ()))
         }
     }
 
