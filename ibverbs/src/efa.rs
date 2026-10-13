@@ -29,6 +29,22 @@ use crate::{AddressHandle, ProtectionDomain};
 /// [`build`](QueuePairBuilder::build), and bring it to ready with
 /// [`activate`](PreparedQueuePair::activate). Send with [`start_send`](QueuePair::start_send) and
 /// [`to(..)`](crate::SendBatch::to), receive with [`post_recv`](QueuePair::post_recv).
+///
+/// Every SRD work request generates a completion: EFA refuses unsignaled ones, so the queue pair
+/// is created to signal every send and [`signaled`](AddressedSendOp::signaled) is implied. Size
+/// the send completion queue for a completion per work request (see
+/// [`CompletionQueue::capacity`](crate::CompletionQueue::capacity)).
+///
+/// EFA also refuses the fence and solicited flags, so an SRD work request has no
+/// [`fenced`](AddressedSendOp::fenced) or [`solicited`](AddressedSendOp::solicited) modifier:
+///
+/// ```compile_fail,E0599
+/// // EFA refuses the fence flag: `fenced` exists only on UD.
+/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Srd>, ah: &ibverbs::AddressHandle) {
+///     let mut batch = qp.start_send();
+///     batch.to(ah, 1, 2).fenced();
+/// }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Srd;
 
@@ -70,6 +86,10 @@ impl QueuePairBuilder<Srd> {
                 max_inline_data: self.max_inline_data,
             },
             qp_type: ffi::ibv_qp_type::IBV_QPT_DRIVER,
+            // EFA rejects a work request without `IBV_SEND_SIGNALED` unless the queue pair signals
+            // every send, and requests a completion for every work request either way, so
+            // signaling all costs nothing and spares each request the flag.
+            sq_sig_all: 1,
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
             pd: self.pd.pd,
@@ -144,12 +164,16 @@ impl PreparedQueuePair<Srd> {
 }
 
 impl AddressedSendOp<'_, '_, Srd> {
-    /// Post an RDMA WRITE of `payload` into `remote`, with the immediate set by
-    /// [`imm`](Self::imm) if any.
+    /// Post an RDMA WRITE of `local` into `remote`, with the immediate set by [`imm`](Self::imm)
+    /// if any.
+    ///
+    /// The data must come from registered memory: EFA writes inline data only on a queue pair
+    /// created with its inline-write flag (`EFADV_QP_FLAGS_INLINE_WRITE`), which doubles the size
+    /// of every send work request and needs rdma-core 63, so this crate does not set it.
     #[inline]
-    pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
+    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         let imm = self.op.imm;
-        self.op.build(wr_id, payload.into(), move |q| unsafe {
+        self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {
             match imm {
                 Some(imm) => {
                     (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
