@@ -567,8 +567,6 @@ pub struct QueuePairBuilder<T: Transport> {
     /// the send operations to request at creation, or the transport's default set
     pub(crate) send_ops: Option<SendOps>,
 
-    qp_type: ffi::ibv_qp_type,
-
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
     pub(crate) traffic_class: u8,
@@ -605,13 +603,12 @@ impl<T: Transport> QueuePairBuilder<T> {
         max_send_wr: u32,
         recv: Arc<CompletionQueueInner>,
         max_recv_wr: u32,
-        qp_type: ffi::ibv_qp_type,
         max_send_sge: u32,
         max_recv_sge: u32,
         rd_atomic_limits: Option<(u8, u8)>,
     ) -> QueuePairBuilder<T> {
-        let reliable = qp_type == ffi::ibv_qp_type::IBV_QPT_RC;
-        let connected = reliable || qp_type == ffi::ibv_qp_type::IBV_QPT_UC;
+        let reliable = T::TYPE == QueuePairType::ReliableConnection;
+        let connected = reliable || T::TYPE == QueuePairType::UnreliableConnection;
         let mut init = QueuePairAttribute::new();
         init.set_state(QueuePairState::Init)
             .set_pkey_index(0)
@@ -651,8 +648,6 @@ impl<T: Transport> QueuePairBuilder<T> {
             max_recv_sge,
             max_inline_data: 0,
             send_ops: None,
-
-            qp_type,
 
             service_level: 0,
             bring_up: BringUp { init, rtr, rts },
@@ -804,7 +799,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
     pub fn send_ops(&self) -> SendOps {
         self.send_ops
-            .unwrap_or_else(|| default_send_ops(self.qp_type))
+            .unwrap_or_else(|| default_send_ops(T::TYPE.into()))
     }
 
     /// Refuses completion queues or a shared receive queue from another device context than the
@@ -853,7 +848,7 @@ impl<T: Transport> QueuePairBuilder<T> {
                 max_recv_sge: self.max_recv_sge,
                 max_inline_data: self.max_inline_data,
             },
-            qp_type: self.qp_type,
+            qp_type: T::TYPE.into(),
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
             pd: self.pd.pd,

@@ -8,7 +8,7 @@ use crate::completion::CompletionQueue;
 use crate::context::ContextInner;
 use crate::error::{Error, Result};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
-use crate::qp::{QueuePairBuilder, Transport};
+use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
 
 use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
 
@@ -241,9 +241,8 @@ impl ProtectionDomain {
         port_num: u8,
     ) -> Result<QueuePairBuilder<T>> {
         let port_attr = self.inner.ctx.query_port(port_num)?;
-        let qp_type: ffi::ibv_qp_type = T::TYPE.into();
         // Only reliable connections carry RDMA read and atomic limits.
-        let rd_atomic_limits = if qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+        let rd_atomic_limits = if T::TYPE == QueuePairType::ReliableConnection {
             Some(self.inner.ctx.rd_atomic_limits()?)
         } else {
             None
@@ -256,7 +255,6 @@ impl ProtectionDomain {
             1,
             recv.inner.clone(),
             1,
-            qp_type,
             1,
             1,
             rd_atomic_limits,
