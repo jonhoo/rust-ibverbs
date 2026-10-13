@@ -1835,9 +1835,9 @@ fn query_device_extended() {
     // not implement the extended verb (the C inline's legacy fallback fills only the base fields).
     let _ = ex.completion_timestamp_mask();
     let _ = ex.hca_core_clock_khz();
-    let _ = ex.pci_atomic_caps();
-    let _ = ex.packet_pacing_caps();
-    let _ = ex.raw_packet_caps();
+    let _ = ex.pci_atomic_caps;
+    let _ = ex.packet_pacing_caps;
+    let _ = ex.raw_packet_caps;
     let _ = ex.max_device_memory();
 
     // The Debug impl renders the wrapper and its nested base attributes.
