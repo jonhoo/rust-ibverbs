@@ -994,8 +994,7 @@ pub struct TagMatchingInfo {
 ///
 /// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
-/// call (which is why it cannot implement [`Iterator`]); [`for_each`](Self::for_each) runs a
-/// closure over the rest instead.
+/// call (which is why it cannot implement [`Iterator`]); consume it with a `while let` loop.
 ///
 /// # Deadlocks
 ///
@@ -1055,17 +1054,6 @@ impl Completions<'_> {
             _iter: std::marker::PhantomData,
         })
     }
-
-    /// Run `f` on each remaining work completion, then release the queue.
-    ///
-    /// The closure form of the `while let` loop over [`next`](Self::next):
-    /// `cq.poll()?.for_each(|wc| ..)`.
-    #[inline]
-    pub fn for_each(mut self, mut f: impl FnMut(WorkCompletion<'_>)) {
-        while let Some(wc) = self.next() {
-            f(wc);
-        }
-    }
 }
 
 impl Drop for Completions<'_> {
@@ -1124,8 +1112,6 @@ impl CompletionQueue {
     ///         eprintln!("work request {}: {e}", wc.wr_id());
     ///     }
     /// }
-    /// // Or, as a closure over the batch:
-    /// cq.poll()?.for_each(|wc| println!("work request {} completed", wc.wr_id()));
     /// # Ok(())
     /// # }
     /// ```
