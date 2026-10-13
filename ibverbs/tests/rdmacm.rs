@@ -1081,8 +1081,8 @@ fn private_data_beyond_any_limit_panics() {
 }
 
 /// The id options and the `cm_id` accessors of the blocking helpers: reuse-address lets bound ids
-/// share a port, and the type of service and ACK timeout set on a connector before resolving
-/// survive a connection round trip.
+/// share a port, the ACK timeout set on each side's id is its queue pair's, and the type of
+/// service set on the connector before resolving is the traffic class of both queue pairs' path.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn cm_id_options_and_accessors() {
@@ -1137,11 +1137,13 @@ fn cm_id_options_and_accessors() {
             .expect("server qp builder")
             .build()
             .expect("server qp");
-        let conn = incoming
+        let mut conn = incoming
             .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
         // The connection keeps the id the request arrived on.
         assert_eq!(conn.cm_id().peer_addr(), peer);
+        // The server's path, and so its traffic class, comes from the client's request.
+        check_options(&mut conn, "server");
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("client done");
@@ -1171,12 +1173,32 @@ fn cm_id_options_and_accessors() {
         .expect("client qp builder")
         .build()
         .expect("client qp");
-    let conn = resolved
+    let mut conn = resolved
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     assert_eq!(conn.cm_id().peer_addr(), Some(addr));
     // The connection keeps the id that resolved the route, bound to the same local address.
     assert_eq!(conn.cm_id().local_addr(), local);
+    check_options(&mut conn, "client");
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
+}
+
+/// Checks that `side`'s connected queue pair has the ACK timeout and the type of service (as its
+/// path's traffic class) that [`cm_id_options_and_accessors`] sets.
+fn check_options(conn: &mut Connection, side: &str) {
+    let (attr, _) = conn
+        .queue_pair()
+        .query(QueuePairAttributeMask::TIMEOUT | QueuePairAttributeMask::AV)
+        .expect("query the queue pair");
+    assert_eq!(
+        attr.timeout(),
+        AckTimeout::from_exponent(14),
+        "{side} ACK timeout"
+    );
+    assert_eq!(
+        attr.as_raw().ah_attr.grh.traffic_class,
+        0x08,
+        "{side} traffic class"
+    );
 }
