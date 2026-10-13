@@ -452,6 +452,7 @@ impl CmId {
         // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so an
         // empty one reports `EAGAIN`.
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
+        nix::errno::Errno::clear();
         let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
         if ret != 0 {
             let e = io::Error::last_os_error();
@@ -460,8 +461,20 @@ impl CmId {
             }
             return Err(Error::os(e, Error::ConnectionSetup));
         }
+        // The kernel reports a failure as a negative errno, but when librdmacm itself fails to
+        // finish an address or route resolution while reading the event (querying the device,
+        // address, or path), it sets the status to -1 and leaves the reason in `errno`, which is
+        // only readable now. `errno` was cleared above, so a -1 from the kernel (`-EPERM`) stays.
+        let mut status = unsafe { (*event).status };
+        if status == -1 {
+            let errno = nix::errno::Errno::last_raw();
+            if errno != 0 {
+                status = -errno;
+            }
+        }
         Ok(Some(CmEvent {
             event,
+            status,
             _id: self.clone(),
             taken: false,
         }))
@@ -912,6 +925,9 @@ impl AsFd for CmId {
 /// learns right away rather than after its retries time out.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
+    /// The event's status, with librdmacm's own failures turned into a negative errno (see
+    /// [`CmId::poll_cm_event`]).
+    status: i32,
     /// The id whose channel delivered the event (the listener, for a connection request).
     _id: CmId,
     /// Whether a connection request's new id has been taken over by
@@ -959,8 +975,11 @@ impl CmEvent {
     /// connection errors) or a transport-specific value (the reject reason for
     /// [`Rejected`](CmEventType::Rejected)). The blocking helpers carry it in
     /// [`Error::ConnectionManager`].
+    ///
+    /// librdmacm reports its own failures to finish an address or route resolution as a raw
+    /// status of -1 with the reason in `errno`; this returns that reason, negated, instead.
     pub fn status(&self) -> i32 {
-        unsafe { (*self.event).status }
+        self.status
     }
 
     /// The private data the peer attached to its connection request or reply
