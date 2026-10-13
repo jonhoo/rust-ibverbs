@@ -338,6 +338,17 @@ fn max_accept_private_data(ps: ffi::rdma_port_space) -> usize {
 /// The most private-data bytes a rejection (`rdma_reject`) can carry: the CM REJ payload.
 const MAX_REJECT_PRIVATE_DATA: usize = 148;
 
+/// Checks that `len` bytes of private data (`what`, for the error message) fit in `limit`.
+fn check_private_data(len: usize, limit: usize, what: &str) -> io::Result<()> {
+    if len > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{what} is limited to {limit} bytes, got {len}"),
+        ));
+    }
+    Ok(())
+}
+
 /// The blocking helpers only set up reliable connections; the datagram port spaces would make
 /// them wait for events that never come.
 fn require_connected_port_space(port_space: PortSpace, helper: &str) -> Result<()> {
@@ -676,17 +687,12 @@ impl CmId {
     ///    [`PortSpace::Ib`], 180 for the datagram port spaces), or the route has not resolved
     ///    yet.
     pub fn connect(&self, param: &ConnectionParameter) -> Result<()> {
-        let limit = max_connect_private_data(self.port_space());
-        if usize::from(param.param.private_data_len) > limit {
-            return Err(Error::Connect(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "connection request private data is limited to {limit} bytes in this port \
-                     space, got {}",
-                    param.param.private_data_len
-                ),
-            )));
-        }
+        check_private_data(
+            param.param.private_data_len.into(),
+            max_connect_private_data(self.port_space()),
+            "connection request private data in this port space",
+        )
+        .map_err(Error::Connect)?;
         self.device_or(Error::Connect)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
@@ -710,17 +716,12 @@ impl CmId {
     ///    [`PortSpace::Ib`], 136 for the datagram port spaces), or the id has no device (a
     ///    connection request's id always has one).
     pub fn accept(&self, param: &ConnectionParameter) -> Result<()> {
-        let limit = max_accept_private_data(self.port_space());
-        if usize::from(param.param.private_data_len) > limit {
-            return Err(Error::Accept(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "connection reply private data is limited to {limit} bytes in this port \
-                     space, got {}",
-                    param.param.private_data_len
-                ),
-            )));
-        }
+        check_private_data(
+            param.param.private_data_len.into(),
+            max_accept_private_data(self.port_space()),
+            "connection reply private data in this port space",
+        )
+        .map_err(Error::Accept)?;
         self.device_or(Error::Accept)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
@@ -742,15 +743,12 @@ impl CmId {
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_reject` failed, or `private_data`
     ///    is longer than a rejection can carry.
     pub fn reject(&self, private_data: &[u8]) -> Result<()> {
-        if private_data.len() > MAX_REJECT_PRIVATE_DATA {
-            return Err(Error::ConnectionSetup(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "rejection private data is limited to {MAX_REJECT_PRIVATE_DATA} bytes, got {}",
-                    private_data.len()
-                ),
-            )));
-        }
+        check_private_data(
+            private_data.len(),
+            MAX_REJECT_PRIVATE_DATA,
+            "rejection private data",
+        )
+        .map_err(Error::ConnectionSetup)?;
         let ret = unsafe {
             ffi::rdma_reject(
                 self.inner.id,
