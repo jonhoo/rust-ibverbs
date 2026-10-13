@@ -378,7 +378,7 @@ impl Drop for EventChannel {
 }
 
 /// The shared ownership of an `rdma_cm_id` and its event channel: destroyed once the last
-/// [`CmId`] clone (and every [`Context`] borrowed from it) drops.
+/// [`CmId`] clone drops.
 struct CmIdInner {
     channel: EventChannel,
     id: *mut ffi::rdma_cm_id,
@@ -409,7 +409,9 @@ impl Drop for CmIdInner {
 /// [`context`](Self::context) and transitioned with [`init_qp_attr`](Self::init_qp_attr).
 ///
 /// Cloning is cheap (reference counted); the id (and then its channel) is destroyed once the last
-/// clone — and every [`Context`] borrowed from it — drops.
+/// clone drops, which ends whatever it was doing: a listener stops listening, a request not yet
+/// accepted is declined, a connection is disconnected. Resources built on its
+/// [`context`](Self::context) do not keep it alive.
 #[derive(Clone)]
 pub struct CmId {
     inner: Arc<CmIdInner>,
@@ -473,14 +475,22 @@ impl CmId {
         }))
     }
 
-    /// The device the connection manager has bound this id to. Build the queue pair (and its
-    /// protection domain and completion queue) on this context. Only available once the address has
-    /// resolved (after [`CmEventType::AddressResolved`]).
+    /// A context on the device the connection manager has bound this id to. Build the queue pair
+    /// (and its protection domain and completion queue) on this context. Only available once the
+    /// address has resolved (after [`CmEventType::AddressResolved`]).
     ///
-    /// The returned [`Context`] keeps this id alive for as long as it — or anything built from it —
-    /// is in use, so the borrowed device cannot dangle.
+    /// The context is this crate's own, independent of the id: one per device, shared by every id
+    /// on that device while any of them uses it, so its asynchronous events
+    /// ([`Context::poll_async_event`]) are those of all of them. It does not keep this id alive:
+    /// dropping the id's last handle declines its request or disconnects its connection right
+    /// away, however long the queue pair and its resources live on.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): the id has no device yet.
+    ///  - [`OpenDevice`](Error::OpenDevice): opening the device failed (`ibv_open_device`).
     pub fn context(&self) -> Result<Context> {
-        Context::from_borrowed_context(self.verbs()?, self.inner.clone())
+        Context::shared(unsafe { (*self.verbs()?).device })
     }
 
     /// Computes the queue-pair attributes the connection manager derives for transitioning to
@@ -1351,7 +1361,8 @@ impl Acceptor {
 
 /// An incoming connection request, ready for its queue pair to be built and accepted (or
 /// rejected). Returned by [`Acceptor::accept`]. It carries its own event channel, so it is
-/// self-contained and can be handed to another thread. Dropping it declines the request.
+/// self-contained and can be handed to another thread. Dropping it declines the request, even
+/// while resources built on its [`context`](Self::context) live on.
 #[must_use = "dropping an incoming request declines it; `accept` or `reject` it"]
 pub struct Incoming {
     id: CmId,
@@ -1501,10 +1512,9 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Tell the peer now: the id itself is only destroyed (which would also send the
-        // disconnect) once every resource built on the borrowed device context has gone, which
-        // can be much later. Fails harmlessly if already disconnected. The queue pair is destroyed
-        // right after this, which flushes it.
+        // Tell the peer now: destroying the id would also send the disconnect, but a clone of it
+        // (from `cm_id`) can keep it alive much longer. Fails harmlessly if already disconnected.
+        // The queue pair is destroyed right after this, which flushes it.
         let _ = self.id.disconnect();
     }
 }
