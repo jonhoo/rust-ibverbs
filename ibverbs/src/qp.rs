@@ -606,6 +606,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// posted to the Receive Queue in that Queue Pair. Value must be in `[0..dev_cap.max_qp_wr]`.
     /// Some devices support fewer outstanding work requests for specific transport types than the
     /// maximum reported value. This value is ignored if the Queue Pair is associated with an SRQ.
+    ///
+    /// `rd_atomic_limits` is the device's `(initiator, responder)` RDMA read and atomic limit, the
+    /// default for a reliable connection; it is `None` for the other transports.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pd: Arc<ProtectionDomainInner>,
@@ -618,6 +621,7 @@ impl<T: Transport> QueuePairBuilder<T> {
         qp_type: ffi::ibv_qp_type,
         max_send_sge: u32,
         max_recv_sge: u32,
+        rd_atomic_limits: Option<(u8, u8)>,
     ) -> QueuePairBuilder<T> {
         let port_active_mtu = port_attr.active_mtu;
         QueuePairBuilder {
@@ -647,8 +651,8 @@ impl<T: Transport> QueuePairBuilder<T> {
             retry_count: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(6),
             rnr_retry: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(6),
             timeout: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(4),
-            max_rd_atomic: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(1),
-            max_dest_rd_atomic: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC).then_some(1),
+            max_rd_atomic: rd_atomic_limits.map(|(initiator, _)| initiator),
+            max_dest_rd_atomic: rd_atomic_limits.map(|(_, responder)| responder),
             path_mtu: (qp_type == ffi::ibv_qp_type::IBV_QPT_RC
                 || qp_type == ffi::ibv_qp_type::IBV_QPT_UC)
                 .then_some(port_active_mtu),
@@ -1003,17 +1007,26 @@ impl<T: Reliable> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the number of outstanding RDMA reads & atomic operations on the destination Queue Pair.
+    /// Set how many RDMA reads and atomic operations this queue pair may have outstanding as the
+    /// initiator. [`handshake`](PreparedQueuePair::handshake) lowers it to the responder resources
+    /// the peer advertises in its endpoint
+    /// ([`max_dest_rd_atomic`](QueuePairEndpoint::max_dest_rd_atomic)), since exceeding them is a
+    /// protocol error.
     ///
-    /// This defaults to 1.
+    /// Defaults to the device's limit (`max_qp_init_rd_atom` in
+    /// [`Context::query_device`](crate::Context::query_device)), as librdmacm does: with a single
+    /// outstanding operation, every read and atomic waits for the previous one's response.
     pub fn set_max_rd_atomic(&mut self, max_rd_atomic: u8) -> &mut Self {
         self.max_rd_atomic = Some(max_rd_atomic);
         self
     }
 
-    /// Set the number of responder resources for handling incoming RDMA reads & atomic operations.
+    /// Set how many incoming RDMA reads and atomic operations this queue pair can service at once
+    /// as the responder. [`PreparedQueuePair::endpoint`] advertises it, and the peer's handshake
+    /// caps its own [`max_rd_atomic`](Self::set_max_rd_atomic) to it.
     ///
-    /// This defaults to 1.
+    /// Defaults to the device's limit (`max_qp_rd_atom` in
+    /// [`Context::query_device`](crate::Context::query_device)).
     pub fn set_max_dest_rd_atomic(&mut self, max_dest_rd_atomic: u8) -> &mut Self {
         self.max_dest_rd_atomic = Some(max_dest_rd_atomic);
         self
@@ -1087,8 +1100,9 @@ pub struct PreparedQueuePair<T: Transport> {
 /// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
 /// rdmacm connection request's `private_data`.
 ///
-/// Internally, this contains the `QueuePair`'s `qp_num`, the context's `lid` and `gid`, and the
-/// packet sequence number the queue pair's send queue starts at.
+/// Internally, this contains the `QueuePair`'s `qp_num`, the context's `lid` and `gid`, the
+/// packet sequence number the queue pair's send queue starts at, and how many RDMA reads and
+/// atomics it services at once.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num`
@@ -1100,18 +1114,22 @@ pub struct QueuePairEndpoint {
     /// the packet sequence number this queue pair's send queue starts at, which the peer's receive
     /// queue must expect (see [`QueuePairBuilder::set_sq_psn`])
     pub psn: u32,
+    /// how many incoming RDMA reads and atomics this queue pair services at once (its responder
+    /// resources, see [`QueuePairBuilder::set_max_dest_rd_atomic`]); the peer issues at most this
+    /// many at a time. Zero for a transport without RDMA reads.
+    pub max_dest_rd_atomic: u8,
 }
 
 impl QueuePairEndpoint {
     /// The length of the wire encoding produced by [`to_bytes`](Self::to_bytes).
-    pub const WIRE_LEN: usize = 27;
+    pub const WIRE_LEN: usize = 28;
 
     /// Encodes this endpoint in the crate's stable wire format, for exchanging with the peer over
     /// any transport (it also fits an rdmacm connection request's 56-byte `private_data`).
     ///
     /// The layout, in network byte order: one flags byte (bit 0: a GID is present; all other bits
     /// zero), the queue pair number (4 bytes), the LID (2 bytes), the raw GID (16 bytes, zeroed
-    /// when absent), and the starting PSN (4 bytes). Adding fields to the format means a new,
+    /// when absent), the starting PSN (4 bytes), and the responder resources (1 byte). Adding fields to the format means a new,
     /// longer encoding — this one stays decodable.
     pub fn to_bytes(&self) -> [u8; Self::WIRE_LEN] {
         let mut out = [0u8; Self::WIRE_LEN];
@@ -1122,6 +1140,7 @@ impl QueuePairEndpoint {
             out[7..23].copy_from_slice(&<[u8; 16]>::from(gid));
         }
         out[23..27].copy_from_slice(&self.psn.to_be_bytes());
+        out[27] = self.max_dest_rd_atomic;
         out
     }
 
@@ -1145,6 +1164,7 @@ impl QueuePairEndpoint {
             lid: u16::from_be_bytes(bytes[5..7].try_into().expect("slice length is fixed")),
             gid,
             psn: u32::from_be_bytes(bytes[23..27].try_into().expect("slice length is fixed")),
+            max_dest_rd_atomic: bytes[27],
         })
     }
 }
@@ -1199,6 +1219,7 @@ impl<T: Transport> PreparedQueuePair<T> {
             lid: self.lid,
             gid,
             psn: self.psn,
+            max_dest_rd_atomic: self.max_dest_rd_atomic.unwrap_or(0),
         })
     }
 }
@@ -1292,10 +1313,11 @@ impl<T: Connected> PreparedQueuePair<T> {
         Ok(attr)
     }
 
-    /// The attributes [`handshake`](Self::handshake) applies to reach `RTS`: the send queue's
-    /// starting PSN (the one [`endpoint`](Self::endpoint) advertises) and the builder's ACK
-    /// timeout, retry counts, and initiator-side RDMA limit.
-    pub fn rts_attributes(&self) -> QueuePairAttribute {
+    /// The attributes [`handshake`](Self::handshake) applies to reach `RTS` with `remote`: the
+    /// send queue's starting PSN (the one [`endpoint`](Self::endpoint) advertises) and the
+    /// builder's ACK timeout, retry counts, and initiator-side RDMA limit, capped to the responder
+    /// resources `remote` advertises.
+    pub fn rts_attributes(&self, remote: &QueuePairEndpoint) -> QueuePairAttribute {
         let mut attr = QueuePairAttribute::new();
         attr.set_state(QueuePairState::ReadyToSend)
             .set_sq_psn(self.psn);
@@ -1309,7 +1331,9 @@ impl<T: Connected> PreparedQueuePair<T> {
             attr.set_rnr_retry(rnr_retry);
         }
         if let Some(max_rd_atomic) = self.max_rd_atomic {
-            attr.set_max_rd_atomic(max_rd_atomic);
+            // More outstanding reads and atomics than the peer has responder resources for is a
+            // protocol error, which the peer answers with an invalid-request NAK.
+            attr.set_max_rd_atomic(max_rd_atomic.min(remote.max_dest_rd_atomic));
         }
         attr
     }
@@ -1342,7 +1366,7 @@ impl<T: Connected> PreparedQueuePair<T> {
     pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair<T>> {
         let init = self.init_attributes();
         let rtr = self.rtr_attributes(&remote)?;
-        let rts = self.rts_attributes();
+        let rts = self.rts_attributes(&remote);
         let mut qp = self.qp;
         qp.modify(&init)?;
         if let Err(err) = qp.modify(&rtr) {
@@ -1623,7 +1647,11 @@ impl<T: Transport> SendOp<'_, '_, T> {
 
     /// Post one work request: set id and flags, run the opcode builder, then the optional datagram
     /// address, then the payload.
-    #[inline]
+    ///
+    /// Always inlined: once an opcode has more than one call site, LLVM otherwise outlines this,
+    /// and every work request then pays a call plus runtime branches on the destination and the
+    /// payload kind that the inlined form folds away at compile time.
+    #[inline(always)]
     pub(crate) fn build(
         self,
         wr_id: u64,
@@ -1649,6 +1677,11 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
             }
             match payload {
+                // A single entry goes through `wr_set_sge`, which providers implement without the
+                // list setter's loop, bounds checks, and copy of the entry through memory.
+                Payload::Sges([one]) => {
+                    (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
+                }
                 Payload::Sges(local) => (*qpx).wr_set_sge_list.unwrap()(
                     qpx,
                     local.len(),

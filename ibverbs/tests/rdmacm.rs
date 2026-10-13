@@ -17,8 +17,9 @@ use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
-    AccessFlags, AckTimeout, CompletionQueue, Context, Error, GidType, QueuePairAttributeMask,
-    QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice, WcStatus,
+    AccessFlags, AckTimeout, CompletionQueue, Context, Error, GidType, QueuePairAttribute,
+    QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice,
+    WcStatus,
 };
 
 /// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
@@ -701,6 +702,79 @@ fn accept_applies_rd_atomic_parameters() {
         2,
         "client responder resources = server initiator depth"
     );
+    done_tx.send(()).expect("signal done");
+    server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn default_parameters_use_the_device_rd_atomic_limits() {
+    // With default parameters, both sides negotiate as many outstanding RDMA reads and atomics as
+    // their devices support (one device here), as librdmacm's own defaults do.
+    let ctx = open_test_device();
+    let ip = IpAddr::V4(device_ipv4(&ctx));
+    let dev = ctx.query_device().expect("query device");
+    let limit = dev.max_qp_init_rd_atom.min(dev.max_qp_rd_atom).min(255);
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+    let rd_atomic =
+        QueuePairAttributeMask::MAX_QP_RD_ATOMIC | QueuePairAttributeMask::MAX_DEST_RD_ATOMIC;
+    // Providers may round the limits up (Soft-RoCE to a power of two), never down.
+    let check = move |attr: QueuePairAttribute, side: &str| {
+        assert!(
+            i32::from(attr.max_rd_atomic()) >= limit,
+            "{side} initiator depth {} below the device limit {limit}",
+            attr.max_rd_atomic()
+        );
+        assert!(
+            i32::from(attr.max_dest_rd_atomic()) >= limit,
+            "{side} responder resources {} below the device limit {limit}",
+            attr.max_dest_rd_atomic()
+        );
+    };
+
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let ctx = incoming.context().expect("server device context");
+        let pd = ctx.alloc_pd().expect("server pd");
+        let cq = ctx.create_cq(16).build().expect("server cq");
+        let qp = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("server qp builder")
+            .build()
+            .expect("server qp");
+        let mut conn = incoming
+            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+            .expect("accept");
+        let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
+        check(attr, "server");
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client done");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    let mut conn = resolved
+        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .expect("connect");
+    let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
+    check(attr, "client");
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }
