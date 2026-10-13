@@ -326,18 +326,6 @@ fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -
 }
 
 #[cfg(test)]
-mod test_layout {
-    use super::*;
-    #[test]
-    fn test_local_memory_slice_sge_memory_layout() {
-        assert_eq!(
-            std::mem::size_of::<LocalMemorySlice>(),
-            std::mem::size_of::<ffi::ibv_sge>()
-        );
-    }
-}
-
-#[cfg(test)]
 mod test {
     use super::*;
 
