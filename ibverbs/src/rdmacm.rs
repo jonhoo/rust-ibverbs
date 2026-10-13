@@ -887,8 +887,19 @@ impl CmId {
 
     /// Builds the queue pair from `prepared` and moves it from `RESET` to `INIT`. Finish the
     /// transition after the connection is set up with [`ready`](Self::ready).
+    ///
+    /// The queue pair must be on this id's device: the attributes the connection manager computes
+    /// (the port, the route) are that device's, and could misconfigure another device's queue
+    /// pair without failing.
     fn init_qp(&self, prepared: PreparedQueuePair<Rc>) -> Result<QueuePair<Rc>> {
         let mut qp = prepared.into_queue_pair();
+        let device = unsafe { (*self.verbs()?).device };
+        if unsafe { (*(*qp.as_raw()).context).device } != device {
+            return Err(Error::ModifyQueuePair(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the queue pair must come from the connection's device (the one `context` returns)",
+            )));
+        }
         self.transition(&mut qp, QueuePairState::Init)?;
         Ok(qp)
     }
@@ -1288,7 +1299,8 @@ impl Resolved {
     ///    its reject reason and private data), or was unreachable.
     ///  - [`Connect`](Error::Connect): `rdma_connect` failed, or the private data does not fit a
     ///    request (see [`ConnectionParameter::set_private_data`]).
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
+    ///    is not on the device of [`context`](Self::context).
     ///  - [`TimedOut`](Error::TimedOut): the response did not arrive in time.
     pub fn connect(
         self,
@@ -1448,7 +1460,8 @@ impl Incoming {
     ///    reply (see [`ConnectionParameter::set_private_data`]).
     ///  - [`ConnectionManager`](Error::ConnectionManager): the peer gave up after this side
     ///    replied, before the connection was established.
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
+    ///    is not on the device of [`context`](Self::context).
     ///  - [`TimedOut`](Error::TimedOut): the connection was not established in time.
     ///
     /// A peer that withdrew its request before this side replied (for example by dropping its id
