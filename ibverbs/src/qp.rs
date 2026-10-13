@@ -1421,6 +1421,21 @@ impl<'a> RecvRequest<'a> {
             _local: std::marker::PhantomData,
         }
     }
+
+    /// Links the non-empty `recvs` into the list `ibv_post_recv` and `ibv_post_srq_recv` walk, and
+    /// returns its head. Every link comes from one pointer to the slice: indexing the slice again
+    /// for each request would invalidate the links stored before it, which the provider then
+    /// follows.
+    pub(crate) fn link(recvs: &mut [RecvRequest<'_>]) -> *mut ffi::ibv_recv_wr {
+        let base = recvs.as_mut_ptr();
+        unsafe {
+            for i in 1..recvs.len() {
+                (*base.add(i - 1)).wr.next = &raw mut (*base.add(i)).wr;
+            }
+            (*base.add(recvs.len() - 1)).wr.next = ptr::null_mut();
+            &raw mut (*base).wr
+        }
+    }
 }
 
 /// A batch of send work requests being built on a [`QueuePair`]'s send queue.
@@ -2500,23 +2515,13 @@ impl<T: Transport> QueuePair<T> {
         if recvs.is_empty() {
             return Ok(());
         }
-        // Link the requests into the list `ibv_post_recv` expects.
-        for i in 0..recvs.len() - 1 {
-            let next = &mut recvs[i + 1].wr as *mut ffi::ibv_recv_wr;
-            recvs[i].wr.next = next;
-        }
-        recvs.last_mut().unwrap().wr.next = ptr::null_mut();
+        let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
         let ctx = unsafe { *self.qp }.context;
         let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_recv.as_mut().unwrap()(
-                self.qp,
-                &mut recvs[0].wr as *mut _,
-                &mut bad_wr as *mut _,
-            )
-        };
+        let errno =
+            unsafe { ops.post_recv.as_mut().unwrap()(self.qp, head, &mut bad_wr as *mut _) };
         if errno != 0 {
             Err(Error::errno(errno, Error::PostReceive))
         } else {
@@ -2650,6 +2655,37 @@ impl<T: Transport> Drop for QueuePair<T> {
             let e = io::Error::from_raw_os_error(errno);
             panic!("ibv_destroy_qp failed: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod test_recv_link {
+    use super::*;
+
+    /// Follow the list the way a provider does, from the head through each `next`.
+    fn walk(mut wr: *mut ffi::ibv_recv_wr) -> Vec<u64> {
+        let mut ids = Vec::new();
+        while !wr.is_null() {
+            unsafe {
+                ids.push((*wr).wr_id);
+                wr = (*wr).next;
+            }
+        }
+        ids
+    }
+
+    #[test]
+    fn link_chains_the_requests_in_order() {
+        let sges = [LocalMemorySlice::default()];
+        let mut recvs = [
+            RecvRequest::new(1, &sges),
+            RecvRequest::new(2, &sges),
+            RecvRequest::new(3, &sges),
+        ];
+        assert_eq!(walk(RecvRequest::link(&mut recvs)), [1, 2, 3]);
+
+        let mut one = [RecvRequest::new(4, &sges)];
+        assert_eq!(walk(RecvRequest::link(&mut one)), [4]);
     }
 }
 
