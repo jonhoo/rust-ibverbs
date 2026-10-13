@@ -311,25 +311,18 @@ impl CompletionQueueBuilder {
     }
 }
 
-pub(crate) struct CompletionQueueInner {
+struct CompletionQueueInner {
     _ctx: Context,
     cq_ex: *mut ffi::ibv_cq_ex,
     cc: Option<CompletionChannel>,
 }
 
-impl CompletionQueueInner {
-    /// The underlying `ibv_cq`. An `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this is
-    /// just a pointer cast (exactly what `ibv_cq_ex_to_cq` does in C). Used for the verbs that still
-    /// take a plain `ibv_cq`: queue-pair creation, completion-event notification, and teardown.
-    #[inline]
-    pub(crate) fn cq(&self) -> *mut ffi::ibv_cq {
-        self.cq_ex as *mut ffi::ibv_cq
-    }
-}
-
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_cq", unsafe { ffi::ibv_destroy_cq(self.cq()) });
+        // An `ibv_cq_ex` starts with the `ibv_cq` it extends (`ibv_cq_ex_to_cq` in C).
+        destroyed("ibv_destroy_cq", unsafe {
+            ffi::ibv_destroy_cq(self.cq_ex as *mut ffi::ibv_cq)
+        });
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
         // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel
@@ -1048,7 +1041,7 @@ impl Drop for Completions<'_> {
 #[must_use]
 #[derive(Clone)]
 pub struct CompletionQueue {
-    pub(crate) inner: Arc<CompletionQueueInner>,
+    inner: Arc<CompletionQueueInner>,
     /// `inner.cq_ex`, kept next to the `Arc` for the data path: read through it, the pointer is a
     /// dependent load that every opaque provider call makes the compiler repeat.
     cq_ex: *mut ffi::ibv_cq_ex,

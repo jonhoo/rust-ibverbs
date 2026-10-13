@@ -1,10 +1,9 @@
 use std::convert::TryInto;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut, RangeBounds};
-use std::sync::Arc;
 
 use crate::error::{Error, Result, destroyed};
-use crate::pd::ProtectionDomainInner;
+use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
 use crate::QueuePair;
@@ -54,7 +53,7 @@ impl AccessFlags {
 }
 
 pub(crate) struct MemoryRegionInner {
-    pub(crate) _pd: Arc<ProtectionDomainInner>,
+    pub(crate) _pd: ProtectionDomain,
     pub(crate) mr: *mut ffi::ibv_mr,
     pub(crate) addr: u64,
 }

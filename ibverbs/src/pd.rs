@@ -166,7 +166,7 @@ impl ProtectionDomain {
             Error::CreateAddressHandle,
         )?;
         Ok(AddressHandle {
-            _pd: self.inner.clone(),
+            _pd: self.clone(),
             ah,
         })
     }
@@ -253,11 +253,11 @@ impl ProtectionDomain {
             None
         };
         Ok(QueuePairBuilder::new(
-            self.inner.clone(),
+            self.clone(),
             &port_attr,
             port_num,
-            send.inner.clone(),
-            recv.inner.clone(),
+            send.clone(),
+            recv.clone(),
             rd_atomic_limits,
         ))
     }
@@ -279,7 +279,7 @@ impl ProtectionDomain {
             Error::RegisterMemoryRegion,
         )?;
         Ok(MemoryRegionInner {
-            _pd: self.inner.clone(),
+            _pd: self.clone(),
             mr,
             addr: ptr as u64,
         })
@@ -406,7 +406,7 @@ impl ProtectionDomain {
         // kernels that predate it, to Unsupported.
         let mr = nonnull(mr, Error::RegisterMemoryRegion)?;
         let inner = MemoryRegionInner {
-            _pd: self.inner.clone(),
+            _pd: self.clone(),
             mr,
             addr: iova,
         };
@@ -459,8 +459,8 @@ impl ProtectionDomain {
             Error::CreateSharedReceiveQueue,
         )?;
         Ok(SharedReceiveQueue {
-            inner: Arc::new(SharedReceiveQueueInner {
-                _pd: self.inner.clone(),
+            _inner: Arc::new(SharedReceiveQueueInner {
+                _pd: self.clone(),
                 srq,
             }),
             srq,

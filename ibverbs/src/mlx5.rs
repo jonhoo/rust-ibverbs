@@ -84,7 +84,7 @@ impl ProtectionDomain {
         }
         Ok(MemoryRegion::new(
             MemoryRegionInner {
-                _pd: self.inner.clone(),
+                _pd: self.clone(),
                 mr,
                 addr: iova,
             },

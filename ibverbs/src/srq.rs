@@ -2,11 +2,11 @@ use std::ptr;
 use std::sync::Arc;
 
 use crate::error::{Error, Result, destroyed};
-use crate::pd::ProtectionDomainInner;
+use crate::pd::ProtectionDomain;
 use crate::qp::RecvRequest;
 
 pub(crate) struct SharedReceiveQueueInner {
-    pub(crate) _pd: Arc<ProtectionDomainInner>,
+    pub(crate) _pd: ProtectionDomain,
     pub(crate) srq: *mut ffi::ibv_srq,
 }
 
@@ -51,12 +51,12 @@ impl SrqAttributes {
 #[derive(Clone)]
 #[must_use = "the shared receive queue is destroyed when dropped"]
 pub struct SharedReceiveQueue {
-    pub(crate) inner: Arc<SharedReceiveQueueInner>,
-    /// `inner.srq`, kept next to the `Arc` for the data path, as `CompletionQueue` does.
+    pub(crate) _inner: Arc<SharedReceiveQueueInner>,
+    /// `_inner.srq`, kept next to the `Arc` for the data path, as `CompletionQueue` does.
     pub(crate) srq: *mut ffi::ibv_srq,
 }
 
-// The pointer is a copy of `inner`'s, valid for as long as `inner` keeps the queue alive.
+// The pointer is a copy of `_inner`'s, valid for as long as `_inner` keeps the queue alive.
 unsafe impl Sync for SharedReceiveQueue {}
 unsafe impl Send for SharedReceiveQueue {}
 
