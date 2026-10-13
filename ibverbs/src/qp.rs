@@ -1623,7 +1623,11 @@ impl<T: Transport> SendOp<'_, '_, T> {
 
     /// Post one work request: set id and flags, run the opcode builder, then the optional datagram
     /// address, then the payload.
-    #[inline]
+    ///
+    /// Always inlined: once an opcode has more than one call site, LLVM otherwise outlines this,
+    /// and every work request then pays a call plus runtime branches on the destination and the
+    /// payload kind that the inlined form folds away at compile time.
+    #[inline(always)]
     pub(crate) fn build(
         self,
         wr_id: u64,
