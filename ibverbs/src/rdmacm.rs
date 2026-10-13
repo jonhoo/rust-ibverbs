@@ -683,7 +683,13 @@ impl CmId {
     /// Resolves the route to the destination (active side), after the address has resolved. On
     /// success a [`CmEventType::RouteResolved`] event is delivered, after which the queue pair can
     /// be built and [`connect`](Self::connect) called.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ResolveRoute`](Error::ResolveRoute): `rdma_resolve_route` failed, or the address has
+    ///    not resolved yet (the [`CmEventType::AddressResolved`] event has not been read).
     pub fn resolve_route(&self, timeout: Duration) -> Result<()> {
+        self.device_or(Error::ResolveRoute)?;
         let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout)) };
         if ret != 0 {
             return Err(Error::ResolveRoute(io::Error::last_os_error()));
@@ -700,9 +706,10 @@ impl CmId {
     ///
     /// # Errors
     ///
-    ///  - [`Connect`](Error::Connect): `rdma_connect` failed, or the private data exceeds what a
+    ///  - [`Connect`](Error::Connect): `rdma_connect` failed, the private data exceeds what a
     ///    request can carry in this id's port space (56 bytes for [`PortSpace::Tcp`], 92 for
-    ///    [`PortSpace::Ib`], 180 for the datagram port spaces).
+    ///    [`PortSpace::Ib`], 180 for the datagram port spaces), or the route has not resolved
+    ///    yet.
     pub fn connect(&self, param: &ConnectionParameter) -> Result<()> {
         let limit = max_connect_private_data(self.port_space());
         if usize::from(param.param.private_data_len) > limit {
@@ -715,6 +722,7 @@ impl CmId {
                 ),
             )));
         }
+        self.device_or(Error::Connect)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
@@ -732,9 +740,10 @@ impl CmId {
     ///
     /// # Errors
     ///
-    ///  - [`Accept`](Error::Accept): `rdma_accept` failed, or the private data exceeds what a
-    ///    reply can carry in this id's port space (196 bytes for [`PortSpace::Tcp`] and
-    ///    [`PortSpace::Ib`], 136 for the datagram port spaces).
+    ///  - [`Accept`](Error::Accept): `rdma_accept` failed, the private data exceeds what a reply
+    ///    can carry in this id's port space (196 bytes for [`PortSpace::Tcp`] and
+    ///    [`PortSpace::Ib`], 136 for the datagram port spaces), or the id has no device (a
+    ///    connection request's id always has one).
     pub fn accept(&self, param: &ConnectionParameter) -> Result<()> {
         let limit = max_accept_private_data(self.port_space());
         if usize::from(param.param.private_data_len) > limit {
@@ -747,6 +756,7 @@ impl CmId {
                 ),
             )));
         }
+        self.device_or(Error::Accept)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
@@ -927,10 +937,21 @@ impl CmId {
     /// The device context the connection manager bound this id to (its `verbs`). Only available once
     /// the address has resolved.
     fn verbs(&self) -> Result<*mut ffi::ibv_context> {
+        self.device_or(Error::ConnectionSetup)
+    }
+
+    /// The device context the connection manager bound this id to, or the error `wrap` makes of its
+    /// absence. Besides [`verbs`](Self::verbs), this guards the calls librdmacm makes assuming a
+    /// device: `rdma_resolve_route`, `rdma_connect`, and `rdma_accept` dereference the id's device
+    /// without checking for one, so on an id whose address has not resolved (or that is bound to a
+    /// wildcard address) they would crash.
+    fn device_or(&self, wrap: fn(io::Error) -> Error) -> Result<*mut ffi::ibv_context> {
         let verbs = unsafe { (*self.inner.id).verbs };
         if verbs.is_null() {
-            return Err(Error::ConnectionSetup(io::Error::other(
-                "connection manager has not bound a device yet",
+            return Err(wrap(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the connection manager has not bound this id to a device yet (its address has \
+                 not resolved, or it is bound to a wildcard address)",
             )));
         }
         Ok(verbs)
