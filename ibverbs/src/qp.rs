@@ -2158,36 +2158,23 @@ impl QueuePairAttribute {
 }
 
 /// The configured capacities of a queue pair, as returned by [`QueuePair::query`].
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct QueuePairInitAttribute {
+    /// The maximum number of outstanding send work requests.
+    pub max_send_wr: u32,
+    /// The maximum number of outstanding receive work requests.
+    pub max_recv_wr: u32,
+    /// The maximum number of scatter-gather entries per send work request.
+    pub max_send_sge: u32,
+    /// The maximum number of scatter-gather entries per receive work request.
+    pub max_recv_sge: u32,
+    /// The maximum amount of inline data, in bytes.
+    pub max_inline_data: u32,
     init_attr: ffi::ibv_qp_init_attr,
 }
 
 impl QueuePairInitAttribute {
-    /// The maximum number of outstanding send work requests.
-    pub fn max_send_wr(&self) -> u32 {
-        self.init_attr.cap.max_send_wr
-    }
-
-    /// The maximum number of outstanding receive work requests.
-    pub fn max_recv_wr(&self) -> u32 {
-        self.init_attr.cap.max_recv_wr
-    }
-
-    /// The maximum number of scatter-gather entries per send work request.
-    pub fn max_send_sge(&self) -> u32 {
-        self.init_attr.cap.max_send_sge
-    }
-
-    /// The maximum number of scatter-gather entries per receive work request.
-    pub fn max_recv_sge(&self) -> u32 {
-        self.init_attr.cap.max_recv_sge
-    }
-
-    /// The maximum amount of inline data, in bytes.
-    pub fn max_inline_data(&self) -> u32 {
-        self.init_attr.cap.max_inline_data
-    }
-
     /// The underlying `ibv_qp_init_attr`. Escape hatch for fields this crate does not wrap.
     pub fn as_raw(&self) -> &ffi::ibv_qp_init_attr {
         &self.init_attr
@@ -2425,9 +2412,17 @@ impl<T: Transport> QueuePair<T> {
         if errno != 0 {
             return Err(Error::errno(errno, Error::QueryQueuePair));
         }
+        let cap = init_attr.cap;
         Ok((
             QueuePairAttribute { attr, mask },
-            QueuePairInitAttribute { init_attr },
+            QueuePairInitAttribute {
+                max_send_wr: cap.max_send_wr,
+                max_recv_wr: cap.max_recv_wr,
+                max_send_sge: cap.max_send_sge,
+                max_recv_sge: cap.max_recv_sge,
+                max_inline_data: cap.max_inline_data,
+                init_attr,
+            },
         ))
     }
 
