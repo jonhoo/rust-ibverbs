@@ -99,7 +99,7 @@ pub enum Error {
     #[error("failed to query the device real-time values")]
     QueryRealTimeValues(#[source] io::Error),
 
-    /// Querying the mlx5 Data Direct sysfs path failed or returned malformed output.
+    /// Querying the mlx5 Data Direct sysfs path failed (`mlx5dv_get_data_direct_sysfs_path`).
     #[cfg(feature = "mlx5")]
     #[error("failed to query the mlx5 Data Direct sysfs path")]
     QueryMlx5DataDirectSysfsPath(#[source] io::Error),
