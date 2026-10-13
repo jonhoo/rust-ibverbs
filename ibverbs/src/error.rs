@@ -22,12 +22,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// The device or provider does not support the requested operation or work-completion field
-    /// (`EOPNOTSUPP`); `operation` names the verb that was declined.
-    #[error("{operation} is not supported by the device or provider")]
+    /// The device, provider, or kernel does not support the requested operation or
+    /// work-completion field (`EOPNOTSUPP`, or `EPROTONOSUPPORT` from a kernel older than the
+    /// request); `operation` names the verb that was declined.
+    #[error("{operation} is not supported by the device, provider, or kernel")]
     Unsupported {
-        /// The verb (or the capability it asked for) the device or provider declined. A reference
-        /// to the name rather than the name itself, so that `Error` stays two words.
+        /// The verb (or the capability it asked for) the device, provider, or kernel declined. A
+        /// reference to the name rather than the name itself, so that `Error` stays two words.
         operation: &'static &'static str,
     },
 
@@ -306,11 +307,23 @@ impl Error {
         }
     }
 
-    /// Build an [`Error`] from an OS error, promoting `EOPNOTSUPP` to [`Error::Unsupported`]
+    /// Whether `err` says the operation is unsupported: `EOPNOTSUPP` from the provider or kernel,
+    /// or `EPROTONOSUPPORT`, which the kernel's ioctl dispatch returns for a method or attribute
+    /// it does not know (a kernel older than the request) and reserves for exactly that: a
+    /// driver's own `EPROTONOSUPPORT` reaches userspace as `EINVAL` (`uverbs_ioctl.c`).
+    pub(crate) fn is_unsupported(err: &io::Error) -> bool {
+        matches!(
+            err.raw_os_error(),
+            Some(nix::libc::EOPNOTSUPP | nix::libc::EPROTONOSUPPORT)
+        )
+    }
+
+    /// Build an [`Error`] from an OS error, promoting an unsupported one (see
+    /// [`is_unsupported`](Error::is_unsupported)) to [`Error::Unsupported`]
     /// (naming the operation `wrap` identifies) and otherwise tagging it with `wrap` (the variant
     /// identifying the operation that failed).
     pub(crate) fn os(err: io::Error, wrap: impl FnOnce(io::Error) -> Error) -> Error {
-        let unsupported = err.raw_os_error() == Some(nix::libc::EOPNOTSUPP);
+        let unsupported = Error::is_unsupported(&err);
         let wrapped = wrap(err);
         if unsupported {
             Error::Unsupported {
@@ -354,7 +367,21 @@ mod tests {
         assert!(err.os_error().is_none());
         assert_eq!(
             err.to_string(),
-            "ibv_create_qp_ex is not supported by the device or provider"
+            "ibv_create_qp_ex is not supported by the device, provider, or kernel"
+        );
+    }
+
+    #[test]
+    fn an_older_kernel_is_unsupported_too() {
+        let err = Error::errno(nix::libc::EPROTONOSUPPORT, Error::RegisterMemoryRegion);
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported {
+                    operation: &"ibv_reg_mr"
+                }
+            ),
+            "{err:?}"
         );
     }
 
