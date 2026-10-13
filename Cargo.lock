@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "ibverbs-sys"
-version = "0.3.2+63.1"
+version = "0.3.2+65.0"
 dependencies = [
  "bindgen",
  "proc-macro2",
