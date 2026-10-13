@@ -2,14 +2,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-/// The quoted names in `no_default.bzl`, whose only Starlark is a list of string literals.
-fn no_default_types(bzl: &str) -> impl Iterator<Item = &str> {
-    bzl.lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix('"'))
-        .map(|line| line.trim_end_matches(',').trim_end_matches('"'))
-}
-
 /// The public rdma-core headers the bindings are generated from, each at the path its `#include`s
 /// use and at its place in the vendored checkout. An rdma-core build only links these into its
 /// include tree (nothing in them is generated), so laying them out is all the vendored build needs.
@@ -194,15 +186,6 @@ fn main() {
             .allowlist_type("rdma_.*")
             // the `rdma_set_option` levels and option names are anonymous enums
             .allowlist_var("RDMA_OPTION_.*");
-    }
-
-    // The types whose zero-filled fallback `Default` would be an invalid value; the list is shared
-    // with the Bazel build, which loads the same file. It lives in the package directory, so
-    // Cargo's default change tracking covers it (a `rerun-if-changed` here would replace that
-    // tracking and drop the headers from it).
-    let no_default = std::fs::read_to_string("no_default.bzl").expect("read no_default.bzl");
-    for name in no_default_types(&no_default) {
-        builder = builder.no_default(name);
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");

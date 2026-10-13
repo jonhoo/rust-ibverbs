@@ -1,7 +1,6 @@
 load("@rules_cc//cc:defs.bzl", "cc_library")
 load("@rules_rust//rust:defs.bzl", "rust_library")
 load("@rules_rust_bindgen//:defs.bzl", "rust_bindgen")
-load(":no_default.bzl", "NO_DEFAULT_TYPES")
 
 package(default_visibility = ["//visibility:public"])
 
@@ -60,7 +59,7 @@ rust_bindgen(
         "--default-enum-style=newtype",
         "--no-prepend-enum-name",
         "--blocklist-type=ibv_wc",
-    ] + ["--no-default=" + name for name in NO_DEFAULT_TYPES],
+    ],
     cc_lib = ":ibverbs_c",
     header = "@rdma_core//:libibverbs/verbs.h",
 )
