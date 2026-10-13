@@ -450,20 +450,10 @@ impl CmId {
     /// blocking channel it behaves like [`get_cm_event`](Self::get_cm_event), only ever returning
     /// `Some`.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
-        let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
-        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
-        if ret != 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
-            }
-            return Err(Error::ConnectionSetup(e));
+        match self.get_cm_event() {
+            Err(Error::ConnectionSetup(e)) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            event => event.map(Some),
         }
-        Ok(Some(CmEvent {
-            event,
-            _id: self.clone(),
-            taken: false,
-        }))
     }
 
     /// Switches this id's event channel between blocking and non-blocking delivery.
@@ -1373,24 +1363,14 @@ impl Acceptor {
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
-        loop {
-            let Some(event) = self.listener.get_cm_event_deadline(deadline)? else {
-                return Err(Error::TimedOut);
-            };
-            let kind = event.event_type();
-            if kind == CmEventType::ConnectRequest {
-                let private_data = event.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
-                return Ok(Incoming {
-                    id: event.connection_request()?,
-                    private_data,
-                });
-            }
-            if is_failure(kind) {
-                return Err(event.into_error());
-            }
-            // Only connection requests matter here; anything else is acknowledged and ignored
-            // when `event` drops.
-        }
+        let request = self
+            .listener
+            .wait_for(CmEventType::ConnectRequest, deadline)?;
+        let private_data = request.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
+        Ok(Incoming {
+            id: request.connection_request()?,
+            private_data,
+        })
     }
 }
 
