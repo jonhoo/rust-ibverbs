@@ -2236,10 +2236,11 @@ impl QueuePairInitAttribute {
 /// The required and optional attribute-mask bits for a `cur -> next` transition of a queue pair of
 /// the given type, or `None` if the transition is not valid.
 ///
-/// This mirrors the kernel's `qp_state_table` (drivers/infiniband/core/verbs.c): every queue pair
-/// may move to `RESET` or `ERR` from any state with only `IBV_QP_STATE`, and each type allows a
-/// specific set of forward transitions. It is used only to turn an `EINVAL` from `ibv_modify_qp`
-/// into a more precise [`Error`].
+/// This mirrors the kernel's `qp_state_table` and `ib_modify_qp_is_ok`
+/// (drivers/infiniband/core/verbs.c): every queue pair may move to `RESET` from any state, and to
+/// `ERR` from any state but `RESET`, with only `IBV_QP_STATE`; each type allows a specific set of
+/// forward transitions; and `IBV_QP_STATE` and `IBV_QP_RATE_LIMIT` are accepted on every one. It
+/// is used only to turn an `EINVAL` from `ibv_modify_qp` into a more precise [`Error`].
 fn qp_transition_masks(
     qp_type: ffi::ibv_qp_type,
     cur: ffi::ibv_qp_state,
@@ -2270,13 +2271,16 @@ fn qp_transition_masks(
     let rate = ffi::ibv_qp_attr_mask::IBV_QP_RATE_LIMIT.0;
     let sqd_async = ffi::ibv_qp_attr_mask::IBV_QP_EN_SQD_ASYNC_NOTIFY.0;
 
-    // Any state may move to RESET or ERR with only IBV_QP_STATE.
-    if let S::IBV_QPS_RESET | S::IBV_QPS_ERR = next {
-        return Some((state, 0));
+    // The kernel accepts IBV_QP_STATE and IBV_QP_RATE_LIMIT on every transition.
+    let accepted = state | rate;
+
+    // Any state may move to RESET, and any state but RESET to ERR, with only IBV_QP_STATE.
+    if next == S::IBV_QPS_RESET || (next == S::IBV_QPS_ERR && cur != S::IBV_QPS_RESET) {
+        return Some((state, accepted));
     }
 
-    match qp_type {
-        T::IBV_QPT_RC | T::IBV_QPT_XRC_SEND | T::IBV_QPT_XRC_RECV => match (cur, next) {
+    let masks = match qp_type {
+        T::IBV_QPT_RC => match (cur, next) {
             (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
             (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => Some((0, pkey | port | access)),
             (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => Some((
@@ -2323,9 +2327,8 @@ fn qp_transition_masks(
             (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => Some((0, cur_state | access | alt_path | mig)),
             (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => Some((state, sqd_async)),
             (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => Some((state, cur_state | access | alt_path | mig)),
-            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => {
-                Some((0, pkey | port | access | av | alt_path | mig))
-            }
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((0, pkey | access | av | alt_path | mig)),
+            (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => Some((state, cur_state | access)),
             _ => None,
         },
         T::IBV_QPT_UD => match (cur, next) {
@@ -2336,23 +2339,26 @@ fn qp_transition_masks(
             (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => Some((0, cur_state | qkey)),
             (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => Some((state, sqd_async)),
             (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => Some((state, cur_state | qkey)),
-            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((0, pkey | port | qkey)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((0, pkey | qkey)),
             (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => Some((state, cur_state | qkey)),
             _ => None,
         },
+        // Raw-packet queue pairs take no other attributes after RESET -> INIT.
         T::IBV_QPT_RAW_PACKET => match (cur, next) {
             (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => Some((state | port, 0)),
-            (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => Some((0, port)),
-            (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => Some((state, 0)),
-            (S::IBV_QPS_RTR, S::IBV_QPS_RTS) => Some((state, rate)),
-            (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => Some((0, rate)),
-            (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => Some((state, sqd_async)),
-            (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => Some((state, rate)),
-            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((0, port | rate)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_INIT)
+            | (S::IBV_QPS_RTS, S::IBV_QPS_RTS)
+            | (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((0, 0)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RTR)
+            | (S::IBV_QPS_RTR, S::IBV_QPS_RTS)
+            | (S::IBV_QPS_RTS, S::IBV_QPS_SQD)
+            | (S::IBV_QPS_SQD, S::IBV_QPS_RTS)
+            | (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => Some((state, 0)),
             _ => None,
         },
         _ => None,
-    }
+    };
+    masks.map(|(required, optional)| (required, optional | accepted))
 }
 
 /// A fully initialized and ready `QueuePair`. Created by the connected transports'
@@ -2486,15 +2492,13 @@ impl<T: Transport> QueuePair<T> {
         let raw = || Error::ModifyQueuePair(io::Error::from_raw_os_error(nix::libc::EINVAL));
         let cur = unsafe { (*self.qp).state };
         let qp_type = unsafe { (*self.qp).qp_type };
-        // Only the types with a transition table can be diagnosed; others (e.g. driver/SRD) fall
-        // back to the raw error.
+        // Only the types with a transition table can be diagnosed; others (driver/SRD, and XRC,
+        // which this crate does not create) fall back to the raw error.
         match qp_type {
             ffi::ibv_qp_type::IBV_QPT_RC
             | ffi::ibv_qp_type::IBV_QPT_UC
             | ffi::ibv_qp_type::IBV_QPT_UD
-            | ffi::ibv_qp_type::IBV_QPT_RAW_PACKET
-            | ffi::ibv_qp_type::IBV_QPT_XRC_SEND
-            | ffi::ibv_qp_type::IBV_QPT_XRC_RECV => {}
+            | ffi::ibv_qp_type::IBV_QPT_RAW_PACKET => {}
             _ => return raw(),
         }
         match qp_transition_masks(qp_type, cur, next) {
@@ -2957,13 +2961,40 @@ mod test_qp_transitions {
     #[test]
     fn any_state_to_reset_or_err_needs_only_state() {
         let state = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE);
+        let accepted = state | bit(ffi::ibv_qp_attr_mask::IBV_QP_RATE_LIMIT);
         assert_eq!(
             qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_RTS, S::IBV_QPS_ERR),
-            Some((state, 0))
+            Some((state, accepted))
         );
         assert_eq!(
             qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_INIT, S::IBV_QPS_RESET),
-            Some((state, 0))
+            Some((state, accepted))
         );
+        // The kernel lets RESET go only to RESET or INIT.
+        assert!(qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_RESET, S::IBV_QPS_ERR).is_none());
+    }
+
+    #[test]
+    fn rows_match_the_kernel_table() {
+        use ffi::ibv_qp_type as T;
+        let state = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE);
+        let port = bit(ffi::ibv_qp_attr_mask::IBV_QP_PORT);
+
+        // The state is accepted on a transition that keeps it.
+        let (_, optional) =
+            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_INIT, S::IBV_QPS_INIT).unwrap();
+        assert_eq!(optional & state, state);
+        // UC may leave SQE for RTS.
+        assert!(qp_transition_masks(T::IBV_QPT_UC, S::IBV_QPS_SQE, S::IBV_QPS_RTS).is_some());
+        // Neither UC nor UD may change its port in SQD, nor a raw-packet queue pair after RESET.
+        for (qp_type, cur) in [
+            (T::IBV_QPT_UC, S::IBV_QPS_SQD),
+            (T::IBV_QPT_UD, S::IBV_QPS_SQD),
+            (T::IBV_QPT_RAW_PACKET, S::IBV_QPS_INIT),
+            (T::IBV_QPT_RAW_PACKET, S::IBV_QPS_SQD),
+        ] {
+            let (_, optional) = qp_transition_masks(qp_type, cur, cur).unwrap();
+            assert_eq!(optional & port, 0, "{qp_type:?} in {cur:?}");
+        }
     }
 }
