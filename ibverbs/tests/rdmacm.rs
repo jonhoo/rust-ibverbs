@@ -160,8 +160,8 @@ fn connect_and_send() {
                 .expect("server recv mr");
             // The accepted connection keeps the listener's address, and its peer is the client on
             // the same device (the port is the client's ephemeral one).
-            assert_eq!(conn.local_addr(), Some(addr));
-            let peer = conn.peer_addr().expect("server peer address");
+            assert_eq!(conn.cm_id().local_addr(), Some(addr));
+            let peer = conn.cm_id().peer_addr().expect("server peer address");
             assert_eq!(peer.ip(), addr.ip());
             // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is
             // posted.
@@ -182,8 +182,8 @@ fn connect_and_send() {
             send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
             // The client's peer is the server's listen address; its own address is on the same
             // device.
-            assert_eq!(conn.peer_addr(), Some(addr));
-            let local = conn.local_addr().expect("client local address");
+            assert_eq!(conn.cm_id().peer_addr(), Some(addr));
+            let local = conn.cm_id().local_addr().expect("client local address");
             assert_eq!(local.ip(), addr.ip());
             let mut batch = conn.queue_pair().start_send();
             batch
@@ -1123,7 +1123,8 @@ fn cm_id_options_and_accessors() {
         ready_tx.send(addr).expect("signal ready");
         let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         assert_eq!(incoming.cm_id().local_addr(), Some(addr));
-        assert!(incoming.cm_id().peer_addr().is_some());
+        let peer = incoming.cm_id().peer_addr();
+        assert!(peer.is_some());
         incoming
             .cm_id()
             .set_ack_timeout(AckTimeout::from_exponent(14))
@@ -1139,7 +1140,8 @@ fn cm_id_options_and_accessors() {
         let conn = incoming
             .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
-        assert_eq!(conn.cm_id().peer_addr(), conn.peer_addr());
+        // The connection keeps the id the request arrived on.
+        assert_eq!(conn.cm_id().peer_addr(), peer);
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("client done");
@@ -1159,6 +1161,8 @@ fn cm_id_options_and_accessors() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     assert_eq!(resolved.cm_id().peer_addr(), Some(addr));
+    let local = resolved.cm_id().local_addr();
+    assert!(local.is_some());
     let ctx = resolved.context().expect("client device context");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
@@ -1171,7 +1175,8 @@ fn cm_id_options_and_accessors() {
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     assert_eq!(conn.cm_id().peer_addr(), Some(addr));
-    assert_eq!(conn.cm_id().local_addr(), conn.local_addr());
+    // The connection keeps the id that resolved the route, bound to the same local address.
+    assert_eq!(conn.cm_id().local_addr(), local);
     done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
 }

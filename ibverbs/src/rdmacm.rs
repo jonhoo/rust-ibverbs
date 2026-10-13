@@ -1466,7 +1466,9 @@ impl Connection {
 
     /// The connection's id, to watch what happens to it after establishment — the peer
     /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
-    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`].
+    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. Its
+    /// [`peer_addr`](CmId::peer_addr) and [`local_addr`](CmId::local_addr) are the connection's two
+    /// ends.
     pub fn cm_id(&self) -> &CmId {
         &self.id
     }
@@ -1495,18 +1497,6 @@ impl Connection {
         let mut error = QueuePairAttribute::new();
         error.set_state(QueuePairState::Error);
         self.qp.modify(&error)
-    }
-
-    /// The IP address and port of the remote end of this connection, or `None` if its address
-    /// family is neither IPv4 nor IPv6.
-    pub fn peer_addr(&self) -> Option<SocketAddr> {
-        self.id.peer_addr()
-    }
-
-    /// The local IP address and port of this connection, or `None` if its address family is
-    /// neither IPv4 nor IPv6.
-    pub fn local_addr(&self) -> Option<SocketAddr> {
-        self.id.local_addr()
     }
 }
 
