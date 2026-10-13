@@ -39,9 +39,6 @@ jobs:
   clippy:
     runs-on: ubuntu-latest
     name: ${{ matrix.toolchain }} / clippy
-    permissions:
-      contents: read
-      checks: write
     strategy:
       fail-fast: false
       matrix:
@@ -58,12 +55,10 @@ jobs:
         with:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
+      # Run clippy directly rather than through an annotation action: those report findings as
+      # review comments but pass the job regardless, even when clippy itself fails to build.
       - name: cargo clippy
-        uses: giraffate/clippy-action@v1
-        with:
-          reporter: 'github-pr-check'
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          clippy_flags: --all-features --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
   doc:
     # run docs generation on nightly rather than stable. This enables features like
     # https://doc.rust-lang.org/beta/unstable-book/language-features/doc-cfg.html which allows an
