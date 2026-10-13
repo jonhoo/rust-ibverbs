@@ -747,8 +747,7 @@ fn async_events_quiet_context() {
             .is_none(),
         "waiting on a quiet context times out with None"
     );
-    // poll(2) has millisecond granularity, so allow it to undershoot the timeout slightly.
-    assert!(before.elapsed() >= Duration::from_millis(45));
+    assert!(before.elapsed() >= Duration::from_millis(50));
 }
 
 /// The SRQ low-watermark event arrives as an asynchronous event: an SRQ armed with a limit raises

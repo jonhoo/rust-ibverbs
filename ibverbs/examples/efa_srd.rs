@@ -4,16 +4,18 @@
 //! activating, and the data path are the same API every other transport uses.
 //!
 //! Requires an AWS Elastic Fabric Adapter (EFA) device and the `efa` feature
-//! (`cargo run --features efa --example efa_srd`). This example follows the EFA documentation but
-//! has not been run on EFA hardware; validate before relying on it.
+//! (`cargo run --features efa --example efa_srd`); it uses the device `IBVERBS_TEST_DEVICE` names,
+//! or else the first one. This example follows the EFA documentation but has not been run on EFA
+//! hardware; validate before relying on it.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     const QKEY: u32 = 0x1111_2222;
 
+    let name = std::env::var("IBVERBS_TEST_DEVICE").unwrap_or_default();
     let device = ibverbs::devices()?
         .iter()
-        .next()
-        .ok_or("no RDMA device found")?
+        .find(|d| name.is_empty() || d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
+        .ok_or("no matching RDMA device found")?
         .open()?;
     let cq = device.create_cq(16).build()?;
     let pd = device.alloc_pd()?;

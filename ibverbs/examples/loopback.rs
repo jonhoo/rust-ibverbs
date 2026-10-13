@@ -1,15 +1,17 @@
 //! The smallest complete data-path program: a reliable-connected queue pair connected to itself,
 //! posting a receive and a send, and polling both completions.
 //!
-//! This runs against the first RDMA device; on a machine without one, create a SoftRoCE device
-//! with `rdma link add rxe0 type rxe netdev <netdev>`.
+//! This runs against the RDMA device `IBVERBS_TEST_DEVICE` names, or else the first one; on a
+//! machine without one, create a SoftRoCE device with
+//! `rdma link add rxe0 type rxe netdev <netdev>`.
 
 fn main() {
+    let name = std::env::var("IBVERBS_TEST_DEVICE").unwrap_or_default();
     let ctx = ibverbs::devices()
         .unwrap()
         .iter()
-        .next()
-        .expect("no rdma device available")
+        .find(|d| name.is_empty() || d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
+        .expect("no matching rdma device available")
         .open()
         .unwrap();
 

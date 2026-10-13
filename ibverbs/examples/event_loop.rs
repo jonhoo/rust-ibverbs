@@ -4,8 +4,9 @@
 //! the context cookie set at build time says which queue fired — the shape a server driving many
 //! connections from one `epoll`/reactor uses. Device-level async events are checked at the end.
 //!
-//! This runs against the first RDMA device; on a machine without one, create a SoftRoCE device
-//! with `rdma link add rxe0 type rxe netdev <netdev>`.
+//! This runs against the RDMA device `IBVERBS_TEST_DEVICE` names, or else the first one; on a
+//! machine without one, create a SoftRoCE device with
+//! `rdma link add rxe0 type rxe netdev <netdev>`.
 
 use std::time::Duration;
 
@@ -25,11 +26,12 @@ fn self_connected(pd: &ProtectionDomain, cq: &CompletionQueue, gid_index: u32) -
 }
 
 fn main() {
+    let name = std::env::var("IBVERBS_TEST_DEVICE").unwrap_or_default();
     let ctx = ibverbs::devices()
         .unwrap()
         .iter()
-        .next()
-        .expect("no rdma device available")
+        .find(|d| name.is_empty() || d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
+        .expect("no matching rdma device available")
         .open()
         .unwrap();
     let pd = ctx.alloc_pd().unwrap();
