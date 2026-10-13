@@ -125,6 +125,20 @@
 //! queue pair until submitted, and the views handed out during a poll ([`Completions`],
 //! [`WorkCompletion`]) borrow the queue and cannot outlive or escape it.
 //!
+//! A few calls keep unlocked bookkeeping in the provider, so the same object must not see two of
+//! them at once even though its type is `Sync`:
+//!
+//! - [`QueuePair::query`] updates the state libibverbs caches in the queue pair: query a given
+//!   queue pair from one thread at a time.
+//! - Arming a completion queue ([`CompletionQueue::req_notify`]) and consuming its notifications
+//!   ([`CompletionChannel::get_event`] or [`wait`](CompletionChannel::wait)) both update its arm
+//!   sequence number without a lock on mlx5: do both for a given queue from one thread at a time,
+//!   or an arm can be lost and its notification never arrive.
+//! - Setting `MLX5_SINGLE_THREADED=1` in the environment tells mlx5 the process is single threaded
+//!   and turns its locks into best-effort checks, which voids the `Sync` of completion queues,
+//!   queue pairs, and shared receive queues: do not set it in a program that uses them from
+//!   several threads.
+//!
 //! # Resource cleanup
 //!
 //! Wrappers return their resource to the device when dropped, in dependency order (internal
