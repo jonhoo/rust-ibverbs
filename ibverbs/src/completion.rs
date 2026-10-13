@@ -241,9 +241,10 @@ impl CompletionQueueBuilder {
     /// Request additional work-completion fields beyond the standard set.
     ///
     /// The standard fields (byte length, immediate data, QP number, and source QP) are always
-    /// requested so the [`WorkCompletion`] accessors work; the fields given here are requested *in
-    /// addition*. For example, pass [`WcFields::COMPLETION_TIMESTAMP`] to make
-    /// [`WorkCompletion::completion_timestamp`] available.
+    /// available, so their [`WorkCompletion`] accessors work on every queue without a flag; the
+    /// fields given here are requested *in addition*. For example, pass
+    /// [`WcFields::COMPLETION_TIMESTAMP`] to make [`WorkCompletion::completion_timestamp`]
+    /// available.
     ///
     /// Not every provider supports every optional field; [`build`](Self::build) then fails (typically
     /// with `EOPNOTSUPP`).
@@ -358,18 +359,12 @@ flags_newtype! {
     /// Optional work-completion fields to request when building a completion queue (the
     /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
     ///
-    /// The byte length, immediate data, QP number, and source QP are always requested; these flags
-    /// add fields on top, at the cost of a larger completion entry. Fields with an accessor on
-    /// [`WorkCompletion`] panic when read if they were not requested.
+    /// The byte length ([`WorkCompletion::len`]), immediate data ([`WorkCompletion::imm_data`]),
+    /// QP number ([`WorkCompletion::qp_num`]), and source QP ([`WorkCompletion::src_qp`]) are
+    /// always available and need no flag; these flags add fields on top, at the cost of a larger
+    /// completion entry. Fields with an accessor on [`WorkCompletion`] panic when read if they
+    /// were not requested.
     pub struct WcFields(ffi::ibv_create_cq_wc_flags) {
-        /// The number of bytes transferred ([`WorkCompletion::len`]; always requested).
-        BYTE_LEN = IBV_WC_EX_WITH_BYTE_LEN;
-        /// The immediate data ([`WorkCompletion::imm_data`]; always requested).
-        IMM = IBV_WC_EX_WITH_IMM;
-        /// The local QP number ([`WorkCompletion::qp_num`]; always requested).
-        QP_NUM = IBV_WC_EX_WITH_QP_NUM;
-        /// The source QP number ([`WorkCompletion::src_qp`]; always requested).
-        SRC_QP = IBV_WC_EX_WITH_SRC_QP;
         /// The source LID ([`WorkCompletion::slid`]).
         SLID = IBV_WC_EX_WITH_SLID;
         /// The service level ([`WorkCompletion::sl`]).
