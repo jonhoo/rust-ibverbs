@@ -30,7 +30,7 @@ fn rxe_rejects_mlx5_operations() {
         matches!(
             err,
             Error::Unsupported {
-                operation: "mlx5dv_get_data_direct_sysfs_path"
+                operation: &"mlx5dv_get_data_direct_sysfs_path"
             }
         ),
         "mlx5dv_get_data_direct_sysfs_path on {name} returned {err:?}"
@@ -51,7 +51,7 @@ fn rxe_rejects_mlx5_operations() {
             matches!(
                 err,
                 Error::Unsupported {
-                    operation: "mlx5dv_reg_dmabuf_mr"
+                    operation: &"mlx5dv_reg_dmabuf_mr"
                 }
             ),
             "mlx5dv_reg_dmabuf_mr on {name} with {flags:?} returned {err:?}"

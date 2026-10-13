@@ -143,7 +143,7 @@ impl QueuePairBuilder<Srd> {
         // the queue pair.
         if qp_ex.is_null() {
             return Err(Error::Unsupported {
-                operation: "ibv_qp_to_qp_ex",
+                operation: &"ibv_qp_to_qp_ex",
             });
         }
         Ok(prepared)

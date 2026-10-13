@@ -905,7 +905,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
             if qp_ex.is_null() {
                 return Err(Error::Unsupported {
-                    operation: "ibv_qp_to_qp_ex",
+                    operation: &"ibv_qp_to_qp_ex",
                 });
             }
             Ok(prepared)

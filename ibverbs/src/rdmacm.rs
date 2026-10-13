@@ -1036,14 +1036,30 @@ pub struct CmEvent {
 // librdmacm does not care which thread acknowledges an event.
 unsafe impl Send for CmEvent {}
 
+/// A failure event the connection manager reported while a blocking helper waited for the next
+/// setup step, carried by [`Error::ConnectionManager`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct CmFailure {
+    /// The failure event.
+    pub event: CmEventType,
+    /// The event's status: a negative `errno` for address, route, and connection errors, or the
+    /// transport's reject reason for [`Rejected`](CmEventType::Rejected) (28, "consumer defined",
+    /// when the peer declined the request itself).
+    pub status: i32,
+    /// The private data the peer attached to its rejection, padded by the transport to its wire
+    /// format; empty when there is none.
+    pub private_data: Vec<u8>,
+}
+
 impl CmEvent {
     /// The failure this event reports, for the blocking helpers to return.
     fn into_error(self) -> Error {
-        Error::ConnectionManager {
+        Error::ConnectionManager(Box::new(CmFailure {
             event: self.event_type(),
             status: self.status(),
             private_data: self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
-        }
+        }))
     }
 
     /// The kind of event. Match on the [`CmEventType`] to decide what to do next; see [`CmId`] for
