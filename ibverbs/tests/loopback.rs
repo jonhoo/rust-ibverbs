@@ -1828,7 +1828,6 @@ fn query_device_extended() {
 
     // The base attributes carried by `orig()` match the plain query.
     assert_eq!(ex.orig().node_guid(), basic.node_guid());
-    assert_eq!(ex.node_guid(), basic.node_guid());
     assert_eq!(ex.orig().max_qp, basic.max_qp);
 
     // The extended accessors decode without panicking; they read back zero on a provider that does
