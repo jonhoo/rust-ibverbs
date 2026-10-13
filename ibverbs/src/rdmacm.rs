@@ -100,28 +100,32 @@ pub enum PortSpace {
     Udp,
     /// The InfiniBand port space, for any port number.
     Ib,
+    /// A value this version of the crate does not know.
+    Unknown(u32),
 }
 
 impl From<ffi::rdma_port_space> for PortSpace {
     fn from(port_space: ffi::rdma_port_space) -> Self {
-        use ffi::rdma_port_space::*;
+        use ffi::rdma_port_space as E;
         match port_space {
-            RDMA_PS_IPOIB => PortSpace::Ipoib,
-            RDMA_PS_TCP => PortSpace::Tcp,
-            RDMA_PS_UDP => PortSpace::Udp,
-            RDMA_PS_IB => PortSpace::Ib,
+            E::RDMA_PS_IPOIB => PortSpace::Ipoib,
+            E::RDMA_PS_TCP => PortSpace::Tcp,
+            E::RDMA_PS_UDP => PortSpace::Udp,
+            E::RDMA_PS_IB => PortSpace::Ib,
+            other => PortSpace::Unknown(other.0),
         }
     }
 }
 
 impl From<PortSpace> for ffi::rdma_port_space {
     fn from(port_space: PortSpace) -> Self {
-        use ffi::rdma_port_space::*;
+        use ffi::rdma_port_space as E;
         match port_space {
-            PortSpace::Ipoib => RDMA_PS_IPOIB,
-            PortSpace::Tcp => RDMA_PS_TCP,
-            PortSpace::Udp => RDMA_PS_UDP,
-            PortSpace::Ib => RDMA_PS_IB,
+            PortSpace::Ipoib => E::RDMA_PS_IPOIB,
+            PortSpace::Tcp => E::RDMA_PS_TCP,
+            PortSpace::Udp => E::RDMA_PS_UDP,
+            PortSpace::Ib => E::RDMA_PS_IB,
+            PortSpace::Unknown(raw) => ffi::rdma_port_space(raw),
         }
     }
 }
@@ -173,60 +177,64 @@ pub enum CmEventType {
     User,
     /// An internal event.
     Internal,
+    /// A value this version of the crate does not know.
+    Unknown(u32),
 }
 
 impl From<ffi::rdma_cm_event_type> for CmEventType {
     fn from(event: ffi::rdma_cm_event_type) -> Self {
-        use ffi::rdma_cm_event_type::*;
+        use ffi::rdma_cm_event_type as E;
         match event {
-            RDMA_CM_EVENT_ADDR_RESOLVED => CmEventType::AddressResolved,
-            RDMA_CM_EVENT_ADDR_ERROR => CmEventType::AddressError,
-            RDMA_CM_EVENT_ROUTE_RESOLVED => CmEventType::RouteResolved,
-            RDMA_CM_EVENT_ROUTE_ERROR => CmEventType::RouteError,
-            RDMA_CM_EVENT_CONNECT_REQUEST => CmEventType::ConnectRequest,
-            RDMA_CM_EVENT_CONNECT_RESPONSE => CmEventType::ConnectResponse,
-            RDMA_CM_EVENT_CONNECT_ERROR => CmEventType::ConnectError,
-            RDMA_CM_EVENT_UNREACHABLE => CmEventType::Unreachable,
-            RDMA_CM_EVENT_REJECTED => CmEventType::Rejected,
-            RDMA_CM_EVENT_ESTABLISHED => CmEventType::Established,
-            RDMA_CM_EVENT_DISCONNECTED => CmEventType::Disconnected,
-            RDMA_CM_EVENT_DEVICE_REMOVAL => CmEventType::DeviceRemoval,
-            RDMA_CM_EVENT_MULTICAST_JOIN => CmEventType::MulticastJoin,
-            RDMA_CM_EVENT_MULTICAST_ERROR => CmEventType::MulticastError,
-            RDMA_CM_EVENT_ADDR_CHANGE => CmEventType::AddressChange,
-            RDMA_CM_EVENT_TIMEWAIT_EXIT => CmEventType::TimewaitExit,
-            RDMA_CM_EVENT_ADDRINFO_RESOLVED => CmEventType::AddressInfoResolved,
-            RDMA_CM_EVENT_ADDRINFO_ERROR => CmEventType::AddressInfoError,
-            RDMA_CM_EVENT_USER => CmEventType::User,
-            RDMA_CM_EVENT_INTERNAL => CmEventType::Internal,
+            E::RDMA_CM_EVENT_ADDR_RESOLVED => CmEventType::AddressResolved,
+            E::RDMA_CM_EVENT_ADDR_ERROR => CmEventType::AddressError,
+            E::RDMA_CM_EVENT_ROUTE_RESOLVED => CmEventType::RouteResolved,
+            E::RDMA_CM_EVENT_ROUTE_ERROR => CmEventType::RouteError,
+            E::RDMA_CM_EVENT_CONNECT_REQUEST => CmEventType::ConnectRequest,
+            E::RDMA_CM_EVENT_CONNECT_RESPONSE => CmEventType::ConnectResponse,
+            E::RDMA_CM_EVENT_CONNECT_ERROR => CmEventType::ConnectError,
+            E::RDMA_CM_EVENT_UNREACHABLE => CmEventType::Unreachable,
+            E::RDMA_CM_EVENT_REJECTED => CmEventType::Rejected,
+            E::RDMA_CM_EVENT_ESTABLISHED => CmEventType::Established,
+            E::RDMA_CM_EVENT_DISCONNECTED => CmEventType::Disconnected,
+            E::RDMA_CM_EVENT_DEVICE_REMOVAL => CmEventType::DeviceRemoval,
+            E::RDMA_CM_EVENT_MULTICAST_JOIN => CmEventType::MulticastJoin,
+            E::RDMA_CM_EVENT_MULTICAST_ERROR => CmEventType::MulticastError,
+            E::RDMA_CM_EVENT_ADDR_CHANGE => CmEventType::AddressChange,
+            E::RDMA_CM_EVENT_TIMEWAIT_EXIT => CmEventType::TimewaitExit,
+            E::RDMA_CM_EVENT_ADDRINFO_RESOLVED => CmEventType::AddressInfoResolved,
+            E::RDMA_CM_EVENT_ADDRINFO_ERROR => CmEventType::AddressInfoError,
+            E::RDMA_CM_EVENT_USER => CmEventType::User,
+            E::RDMA_CM_EVENT_INTERNAL => CmEventType::Internal,
+            other => CmEventType::Unknown(other.0),
         }
     }
 }
 
 impl From<CmEventType> for ffi::rdma_cm_event_type {
     fn from(event: CmEventType) -> Self {
-        use ffi::rdma_cm_event_type::*;
+        use ffi::rdma_cm_event_type as E;
         match event {
-            CmEventType::AddressResolved => RDMA_CM_EVENT_ADDR_RESOLVED,
-            CmEventType::AddressError => RDMA_CM_EVENT_ADDR_ERROR,
-            CmEventType::RouteResolved => RDMA_CM_EVENT_ROUTE_RESOLVED,
-            CmEventType::RouteError => RDMA_CM_EVENT_ROUTE_ERROR,
-            CmEventType::ConnectRequest => RDMA_CM_EVENT_CONNECT_REQUEST,
-            CmEventType::ConnectResponse => RDMA_CM_EVENT_CONNECT_RESPONSE,
-            CmEventType::ConnectError => RDMA_CM_EVENT_CONNECT_ERROR,
-            CmEventType::Unreachable => RDMA_CM_EVENT_UNREACHABLE,
-            CmEventType::Rejected => RDMA_CM_EVENT_REJECTED,
-            CmEventType::Established => RDMA_CM_EVENT_ESTABLISHED,
-            CmEventType::Disconnected => RDMA_CM_EVENT_DISCONNECTED,
-            CmEventType::DeviceRemoval => RDMA_CM_EVENT_DEVICE_REMOVAL,
-            CmEventType::MulticastJoin => RDMA_CM_EVENT_MULTICAST_JOIN,
-            CmEventType::MulticastError => RDMA_CM_EVENT_MULTICAST_ERROR,
-            CmEventType::AddressChange => RDMA_CM_EVENT_ADDR_CHANGE,
-            CmEventType::TimewaitExit => RDMA_CM_EVENT_TIMEWAIT_EXIT,
-            CmEventType::AddressInfoResolved => RDMA_CM_EVENT_ADDRINFO_RESOLVED,
-            CmEventType::AddressInfoError => RDMA_CM_EVENT_ADDRINFO_ERROR,
-            CmEventType::User => RDMA_CM_EVENT_USER,
-            CmEventType::Internal => RDMA_CM_EVENT_INTERNAL,
+            CmEventType::AddressResolved => E::RDMA_CM_EVENT_ADDR_RESOLVED,
+            CmEventType::AddressError => E::RDMA_CM_EVENT_ADDR_ERROR,
+            CmEventType::RouteResolved => E::RDMA_CM_EVENT_ROUTE_RESOLVED,
+            CmEventType::RouteError => E::RDMA_CM_EVENT_ROUTE_ERROR,
+            CmEventType::ConnectRequest => E::RDMA_CM_EVENT_CONNECT_REQUEST,
+            CmEventType::ConnectResponse => E::RDMA_CM_EVENT_CONNECT_RESPONSE,
+            CmEventType::ConnectError => E::RDMA_CM_EVENT_CONNECT_ERROR,
+            CmEventType::Unreachable => E::RDMA_CM_EVENT_UNREACHABLE,
+            CmEventType::Rejected => E::RDMA_CM_EVENT_REJECTED,
+            CmEventType::Established => E::RDMA_CM_EVENT_ESTABLISHED,
+            CmEventType::Disconnected => E::RDMA_CM_EVENT_DISCONNECTED,
+            CmEventType::DeviceRemoval => E::RDMA_CM_EVENT_DEVICE_REMOVAL,
+            CmEventType::MulticastJoin => E::RDMA_CM_EVENT_MULTICAST_JOIN,
+            CmEventType::MulticastError => E::RDMA_CM_EVENT_MULTICAST_ERROR,
+            CmEventType::AddressChange => E::RDMA_CM_EVENT_ADDR_CHANGE,
+            CmEventType::TimewaitExit => E::RDMA_CM_EVENT_TIMEWAIT_EXIT,
+            CmEventType::AddressInfoResolved => E::RDMA_CM_EVENT_ADDRINFO_RESOLVED,
+            CmEventType::AddressInfoError => E::RDMA_CM_EVENT_ADDRINFO_ERROR,
+            CmEventType::User => E::RDMA_CM_EVENT_USER,
+            CmEventType::Internal => E::RDMA_CM_EVENT_INTERNAL,
+            CmEventType::Unknown(raw) => ffi::rdma_cm_event_type(raw),
         }
     }
 }
@@ -240,6 +248,7 @@ impl std::fmt::Display for PortSpace {
             PortSpace::Tcp => "TCP",
             PortSpace::Udp => "UDP",
             PortSpace::Ib => "IB",
+            PortSpace::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(name)
     }
@@ -270,6 +279,7 @@ impl std::fmt::Display for CmEventType {
             CmEventType::AddressInfoError => "ADDR_INFO_ERROR",
             CmEventType::User => "USER",
             CmEventType::Internal => "INTERNAL",
+            CmEventType::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(name)
     }
@@ -342,21 +352,22 @@ const RDMA_MAX_INIT_DEPTH: u8 = 0xFF;
 /// the InfiniBand CM REQ (92 bytes) or, for the datagram port spaces, SIDR REQ (216 bytes) payload,
 /// minus the 36-byte header the connection manager prepends in the IP-based port spaces.
 fn max_connect_private_data(ps: ffi::rdma_port_space) -> usize {
-    use ffi::rdma_port_space::*;
+    use ffi::rdma_port_space as E;
     match ps {
-        RDMA_PS_TCP => 56,
-        RDMA_PS_IB => 92,
-        RDMA_PS_UDP | RDMA_PS_IPOIB => 180,
+        E::RDMA_PS_TCP => 56,
+        E::RDMA_PS_IB => 92,
+        E::RDMA_PS_UDP | E::RDMA_PS_IPOIB => 180,
+        _ => 56,
     }
 }
 
 /// The most private-data bytes a reply (`rdma_accept`) can carry in a port space: the CM REP
 /// (196 bytes) or SIDR REP (136 bytes) payload.
 fn max_accept_private_data(ps: ffi::rdma_port_space) -> usize {
-    use ffi::rdma_port_space::*;
+    use ffi::rdma_port_space as E;
     match ps {
-        RDMA_PS_TCP | RDMA_PS_IB => 196,
-        RDMA_PS_UDP | RDMA_PS_IPOIB => 136,
+        E::RDMA_PS_TCP | E::RDMA_PS_IB => 196,
+        _ => 136,
     }
 }
 
@@ -561,9 +572,8 @@ impl CmId {
     /// arrived: before the connection exists the `Init` attributes carry no remote-access flags,
     /// and only the second application grants the peer the RDMA access negotiated in the request.
     pub fn init_qp_attr(&self, target_state: QueuePairState) -> Result<QueuePairAttribute> {
-        // Start from the valid default (an all-zero `ibv_qp_attr` is not one: `path_mtu` has no
-        // zero variant). `rdma_init_qp_attr` reads the target state from the attribute and fills
-        // in the fields it reports in the mask.
+        // `rdma_init_qp_attr` reads the target state from the attribute and fills in the fields it
+        // reports in the mask.
         let mut attr = ffi::ibv_qp_attr {
             qp_state: target_state.into(),
             ..Default::default()
@@ -809,7 +819,7 @@ impl CmId {
         let ret = unsafe {
             ffi::rdma_set_option(
                 self.inner.id,
-                ffi::RDMA_OPTION_ID as c_int,
+                ffi::RDMA_OPTION_ID.0 as c_int,
                 option,
                 (&mut value as *mut T).cast::<c_void>(),
                 std::mem::size_of::<T>(),
@@ -829,7 +839,7 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
     pub fn set_tos(&self, tos: u8) -> Result<()> {
-        self.set_id_option(ffi::RDMA_OPTION_ID_TOS as c_int, tos)
+        self.set_id_option(ffi::RDMA_OPTION_ID_TOS.0 as c_int, tos)
     }
 
     /// Allow the local address to be shared, like `SO_REUSEADDR`: another id with the same
@@ -839,7 +849,7 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
     pub fn set_reuse_addr(&self, reuse: bool) -> Result<()> {
-        self.set_id_option(ffi::RDMA_OPTION_ID_REUSEADDR as c_int, c_int::from(reuse))
+        self.set_id_option(ffi::RDMA_OPTION_ID_REUSEADDR.0 as c_int, c_int::from(reuse))
     }
 
     /// Restrict an id bound to an IPv6 address to IPv6 peers, like `IPV6_V6ONLY`, instead of
@@ -849,7 +859,7 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
     pub fn set_af_only(&self, only: bool) -> Result<()> {
-        self.set_id_option(ffi::RDMA_OPTION_ID_AFONLY as c_int, c_int::from(only))
+        self.set_id_option(ffi::RDMA_OPTION_ID_AFONLY.0 as c_int, c_int::from(only))
     }
 
     /// Set the ACK timeout of the connection's queue pair, overriding the one the connection
@@ -859,7 +869,10 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
     pub fn set_ack_timeout(&self, timeout: AckTimeout) -> Result<()> {
-        self.set_id_option(ffi::RDMA_OPTION_ID_ACK_TIMEOUT as c_int, timeout.exponent())
+        self.set_id_option(
+            ffi::RDMA_OPTION_ID_ACK_TIMEOUT.0 as c_int,
+            timeout.exponent(),
+        )
     }
 
     /// Tell the connection manager that the queue pair saw the peer's first message arrive

@@ -472,68 +472,72 @@ pub enum WcStatus {
     TagMatchingError,
     /// A tag-matching rendezvous transfer did not complete.
     TagMatchingRendezvousIncomplete,
+    /// A value this version of the crate does not know.
+    Unknown(u32),
 }
 
 impl From<ffi::ibv_wc_status> for WcStatus {
     fn from(status: ffi::ibv_wc_status) -> Self {
-        use ffi::ibv_wc_status::*;
+        use ffi::ibv_wc_status as E;
         match status {
-            IBV_WC_SUCCESS => WcStatus::Success,
-            IBV_WC_LOC_LEN_ERR => WcStatus::LocalLengthError,
-            IBV_WC_LOC_QP_OP_ERR => WcStatus::LocalQpOperationError,
-            IBV_WC_LOC_EEC_OP_ERR => WcStatus::LocalEecOperationError,
-            IBV_WC_LOC_PROT_ERR => WcStatus::LocalProtectionError,
-            IBV_WC_WR_FLUSH_ERR => WcStatus::WorkRequestFlushed,
-            IBV_WC_MW_BIND_ERR => WcStatus::MemoryWindowBindError,
-            IBV_WC_BAD_RESP_ERR => WcStatus::BadResponse,
-            IBV_WC_LOC_ACCESS_ERR => WcStatus::LocalAccessError,
-            IBV_WC_REM_INV_REQ_ERR => WcStatus::RemoteInvalidRequest,
-            IBV_WC_REM_ACCESS_ERR => WcStatus::RemoteAccessError,
-            IBV_WC_REM_OP_ERR => WcStatus::RemoteOperationError,
-            IBV_WC_RETRY_EXC_ERR => WcStatus::RetryExceeded,
-            IBV_WC_RNR_RETRY_EXC_ERR => WcStatus::RnrRetryExceeded,
-            IBV_WC_LOC_RDD_VIOL_ERR => WcStatus::LocalRddViolation,
-            IBV_WC_REM_INV_RD_REQ_ERR => WcStatus::RemoteInvalidRdRequest,
-            IBV_WC_REM_ABORT_ERR => WcStatus::RemoteAborted,
-            IBV_WC_INV_EECN_ERR => WcStatus::InvalidEecn,
-            IBV_WC_INV_EEC_STATE_ERR => WcStatus::InvalidEecState,
-            IBV_WC_FATAL_ERR => WcStatus::Fatal,
-            IBV_WC_RESP_TIMEOUT_ERR => WcStatus::ResponseTimeout,
-            IBV_WC_GENERAL_ERR => WcStatus::GeneralError,
-            IBV_WC_TM_ERR => WcStatus::TagMatchingError,
-            IBV_WC_TM_RNDV_INCOMPLETE => WcStatus::TagMatchingRendezvousIncomplete,
+            E::IBV_WC_SUCCESS => WcStatus::Success,
+            E::IBV_WC_LOC_LEN_ERR => WcStatus::LocalLengthError,
+            E::IBV_WC_LOC_QP_OP_ERR => WcStatus::LocalQpOperationError,
+            E::IBV_WC_LOC_EEC_OP_ERR => WcStatus::LocalEecOperationError,
+            E::IBV_WC_LOC_PROT_ERR => WcStatus::LocalProtectionError,
+            E::IBV_WC_WR_FLUSH_ERR => WcStatus::WorkRequestFlushed,
+            E::IBV_WC_MW_BIND_ERR => WcStatus::MemoryWindowBindError,
+            E::IBV_WC_BAD_RESP_ERR => WcStatus::BadResponse,
+            E::IBV_WC_LOC_ACCESS_ERR => WcStatus::LocalAccessError,
+            E::IBV_WC_REM_INV_REQ_ERR => WcStatus::RemoteInvalidRequest,
+            E::IBV_WC_REM_ACCESS_ERR => WcStatus::RemoteAccessError,
+            E::IBV_WC_REM_OP_ERR => WcStatus::RemoteOperationError,
+            E::IBV_WC_RETRY_EXC_ERR => WcStatus::RetryExceeded,
+            E::IBV_WC_RNR_RETRY_EXC_ERR => WcStatus::RnrRetryExceeded,
+            E::IBV_WC_LOC_RDD_VIOL_ERR => WcStatus::LocalRddViolation,
+            E::IBV_WC_REM_INV_RD_REQ_ERR => WcStatus::RemoteInvalidRdRequest,
+            E::IBV_WC_REM_ABORT_ERR => WcStatus::RemoteAborted,
+            E::IBV_WC_INV_EECN_ERR => WcStatus::InvalidEecn,
+            E::IBV_WC_INV_EEC_STATE_ERR => WcStatus::InvalidEecState,
+            E::IBV_WC_FATAL_ERR => WcStatus::Fatal,
+            E::IBV_WC_RESP_TIMEOUT_ERR => WcStatus::ResponseTimeout,
+            E::IBV_WC_GENERAL_ERR => WcStatus::GeneralError,
+            E::IBV_WC_TM_ERR => WcStatus::TagMatchingError,
+            E::IBV_WC_TM_RNDV_INCOMPLETE => WcStatus::TagMatchingRendezvousIncomplete,
+            other => WcStatus::Unknown(other.0),
         }
     }
 }
 
 impl From<WcStatus> for ffi::ibv_wc_status {
     fn from(status: WcStatus) -> Self {
-        use ffi::ibv_wc_status::*;
+        use ffi::ibv_wc_status as E;
         match status {
-            WcStatus::Success => IBV_WC_SUCCESS,
-            WcStatus::LocalLengthError => IBV_WC_LOC_LEN_ERR,
-            WcStatus::LocalQpOperationError => IBV_WC_LOC_QP_OP_ERR,
-            WcStatus::LocalEecOperationError => IBV_WC_LOC_EEC_OP_ERR,
-            WcStatus::LocalProtectionError => IBV_WC_LOC_PROT_ERR,
-            WcStatus::WorkRequestFlushed => IBV_WC_WR_FLUSH_ERR,
-            WcStatus::MemoryWindowBindError => IBV_WC_MW_BIND_ERR,
-            WcStatus::BadResponse => IBV_WC_BAD_RESP_ERR,
-            WcStatus::LocalAccessError => IBV_WC_LOC_ACCESS_ERR,
-            WcStatus::RemoteInvalidRequest => IBV_WC_REM_INV_REQ_ERR,
-            WcStatus::RemoteAccessError => IBV_WC_REM_ACCESS_ERR,
-            WcStatus::RemoteOperationError => IBV_WC_REM_OP_ERR,
-            WcStatus::RetryExceeded => IBV_WC_RETRY_EXC_ERR,
-            WcStatus::RnrRetryExceeded => IBV_WC_RNR_RETRY_EXC_ERR,
-            WcStatus::LocalRddViolation => IBV_WC_LOC_RDD_VIOL_ERR,
-            WcStatus::RemoteInvalidRdRequest => IBV_WC_REM_INV_RD_REQ_ERR,
-            WcStatus::RemoteAborted => IBV_WC_REM_ABORT_ERR,
-            WcStatus::InvalidEecn => IBV_WC_INV_EECN_ERR,
-            WcStatus::InvalidEecState => IBV_WC_INV_EEC_STATE_ERR,
-            WcStatus::Fatal => IBV_WC_FATAL_ERR,
-            WcStatus::ResponseTimeout => IBV_WC_RESP_TIMEOUT_ERR,
-            WcStatus::GeneralError => IBV_WC_GENERAL_ERR,
-            WcStatus::TagMatchingError => IBV_WC_TM_ERR,
-            WcStatus::TagMatchingRendezvousIncomplete => IBV_WC_TM_RNDV_INCOMPLETE,
+            WcStatus::Success => E::IBV_WC_SUCCESS,
+            WcStatus::LocalLengthError => E::IBV_WC_LOC_LEN_ERR,
+            WcStatus::LocalQpOperationError => E::IBV_WC_LOC_QP_OP_ERR,
+            WcStatus::LocalEecOperationError => E::IBV_WC_LOC_EEC_OP_ERR,
+            WcStatus::LocalProtectionError => E::IBV_WC_LOC_PROT_ERR,
+            WcStatus::WorkRequestFlushed => E::IBV_WC_WR_FLUSH_ERR,
+            WcStatus::MemoryWindowBindError => E::IBV_WC_MW_BIND_ERR,
+            WcStatus::BadResponse => E::IBV_WC_BAD_RESP_ERR,
+            WcStatus::LocalAccessError => E::IBV_WC_LOC_ACCESS_ERR,
+            WcStatus::RemoteInvalidRequest => E::IBV_WC_REM_INV_REQ_ERR,
+            WcStatus::RemoteAccessError => E::IBV_WC_REM_ACCESS_ERR,
+            WcStatus::RemoteOperationError => E::IBV_WC_REM_OP_ERR,
+            WcStatus::RetryExceeded => E::IBV_WC_RETRY_EXC_ERR,
+            WcStatus::RnrRetryExceeded => E::IBV_WC_RNR_RETRY_EXC_ERR,
+            WcStatus::LocalRddViolation => E::IBV_WC_LOC_RDD_VIOL_ERR,
+            WcStatus::RemoteInvalidRdRequest => E::IBV_WC_REM_INV_RD_REQ_ERR,
+            WcStatus::RemoteAborted => E::IBV_WC_REM_ABORT_ERR,
+            WcStatus::InvalidEecn => E::IBV_WC_INV_EECN_ERR,
+            WcStatus::InvalidEecState => E::IBV_WC_INV_EEC_STATE_ERR,
+            WcStatus::Fatal => E::IBV_WC_FATAL_ERR,
+            WcStatus::ResponseTimeout => E::IBV_WC_RESP_TIMEOUT_ERR,
+            WcStatus::GeneralError => E::IBV_WC_GENERAL_ERR,
+            WcStatus::TagMatchingError => E::IBV_WC_TM_ERR,
+            WcStatus::TagMatchingRendezvousIncomplete => E::IBV_WC_TM_RNDV_INCOMPLETE,
+            WcStatus::Unknown(raw) => ffi::ibv_wc_status(raw),
         }
     }
 }
@@ -565,6 +569,7 @@ impl fmt::Display for WcStatus {
             WcStatus::GeneralError => "general error",
             WcStatus::TagMatchingError => "tag matching error",
             WcStatus::TagMatchingRendezvousIncomplete => "tag matching rendezvous incomplete",
+            WcStatus::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(msg)
     }
@@ -636,60 +641,64 @@ pub enum WcOpcode {
     Driver2,
     /// Provider-specific operation 3.
     Driver3,
+    /// A value this version of the crate does not know.
+    Unknown(u32),
 }
 
 impl From<ffi::ibv_wc_opcode> for WcOpcode {
     fn from(opcode: ffi::ibv_wc_opcode) -> Self {
-        use ffi::ibv_wc_opcode::*;
+        use ffi::ibv_wc_opcode as E;
         match opcode {
-            IBV_WC_SEND => WcOpcode::Send,
-            IBV_WC_RDMA_WRITE => WcOpcode::RdmaWrite,
-            IBV_WC_RDMA_READ => WcOpcode::RdmaRead,
-            IBV_WC_COMP_SWAP => WcOpcode::CompSwap,
-            IBV_WC_FETCH_ADD => WcOpcode::FetchAdd,
-            IBV_WC_BIND_MW => WcOpcode::BindMw,
-            IBV_WC_LOCAL_INV => WcOpcode::LocalInv,
-            IBV_WC_TSO => WcOpcode::Tso,
-            IBV_WC_FLUSH => WcOpcode::Flush,
-            IBV_WC_ATOMIC_WRITE => WcOpcode::AtomicWrite,
-            IBV_WC_RECV => WcOpcode::Recv,
-            IBV_WC_RECV_RDMA_WITH_IMM => WcOpcode::RecvRdmaWithImm,
-            IBV_WC_TM_ADD => WcOpcode::TmAdd,
-            IBV_WC_TM_DEL => WcOpcode::TmDel,
-            IBV_WC_TM_SYNC => WcOpcode::TmSync,
-            IBV_WC_TM_RECV => WcOpcode::TmRecv,
-            IBV_WC_TM_NO_TAG => WcOpcode::TmNoTag,
-            IBV_WC_DRIVER1 => WcOpcode::Driver1,
-            IBV_WC_DRIVER2 => WcOpcode::Driver2,
-            IBV_WC_DRIVER3 => WcOpcode::Driver3,
+            E::IBV_WC_SEND => WcOpcode::Send,
+            E::IBV_WC_RDMA_WRITE => WcOpcode::RdmaWrite,
+            E::IBV_WC_RDMA_READ => WcOpcode::RdmaRead,
+            E::IBV_WC_COMP_SWAP => WcOpcode::CompSwap,
+            E::IBV_WC_FETCH_ADD => WcOpcode::FetchAdd,
+            E::IBV_WC_BIND_MW => WcOpcode::BindMw,
+            E::IBV_WC_LOCAL_INV => WcOpcode::LocalInv,
+            E::IBV_WC_TSO => WcOpcode::Tso,
+            E::IBV_WC_FLUSH => WcOpcode::Flush,
+            E::IBV_WC_ATOMIC_WRITE => WcOpcode::AtomicWrite,
+            E::IBV_WC_RECV => WcOpcode::Recv,
+            E::IBV_WC_RECV_RDMA_WITH_IMM => WcOpcode::RecvRdmaWithImm,
+            E::IBV_WC_TM_ADD => WcOpcode::TmAdd,
+            E::IBV_WC_TM_DEL => WcOpcode::TmDel,
+            E::IBV_WC_TM_SYNC => WcOpcode::TmSync,
+            E::IBV_WC_TM_RECV => WcOpcode::TmRecv,
+            E::IBV_WC_TM_NO_TAG => WcOpcode::TmNoTag,
+            E::IBV_WC_DRIVER1 => WcOpcode::Driver1,
+            E::IBV_WC_DRIVER2 => WcOpcode::Driver2,
+            E::IBV_WC_DRIVER3 => WcOpcode::Driver3,
+            other => WcOpcode::Unknown(other.0),
         }
     }
 }
 
 impl From<WcOpcode> for ffi::ibv_wc_opcode {
     fn from(opcode: WcOpcode) -> Self {
-        use ffi::ibv_wc_opcode::*;
+        use ffi::ibv_wc_opcode as E;
         match opcode {
-            WcOpcode::Send => IBV_WC_SEND,
-            WcOpcode::RdmaWrite => IBV_WC_RDMA_WRITE,
-            WcOpcode::RdmaRead => IBV_WC_RDMA_READ,
-            WcOpcode::CompSwap => IBV_WC_COMP_SWAP,
-            WcOpcode::FetchAdd => IBV_WC_FETCH_ADD,
-            WcOpcode::BindMw => IBV_WC_BIND_MW,
-            WcOpcode::LocalInv => IBV_WC_LOCAL_INV,
-            WcOpcode::Tso => IBV_WC_TSO,
-            WcOpcode::Flush => IBV_WC_FLUSH,
-            WcOpcode::AtomicWrite => IBV_WC_ATOMIC_WRITE,
-            WcOpcode::Recv => IBV_WC_RECV,
-            WcOpcode::RecvRdmaWithImm => IBV_WC_RECV_RDMA_WITH_IMM,
-            WcOpcode::TmAdd => IBV_WC_TM_ADD,
-            WcOpcode::TmDel => IBV_WC_TM_DEL,
-            WcOpcode::TmSync => IBV_WC_TM_SYNC,
-            WcOpcode::TmRecv => IBV_WC_TM_RECV,
-            WcOpcode::TmNoTag => IBV_WC_TM_NO_TAG,
-            WcOpcode::Driver1 => IBV_WC_DRIVER1,
-            WcOpcode::Driver2 => IBV_WC_DRIVER2,
-            WcOpcode::Driver3 => IBV_WC_DRIVER3,
+            WcOpcode::Send => E::IBV_WC_SEND,
+            WcOpcode::RdmaWrite => E::IBV_WC_RDMA_WRITE,
+            WcOpcode::RdmaRead => E::IBV_WC_RDMA_READ,
+            WcOpcode::CompSwap => E::IBV_WC_COMP_SWAP,
+            WcOpcode::FetchAdd => E::IBV_WC_FETCH_ADD,
+            WcOpcode::BindMw => E::IBV_WC_BIND_MW,
+            WcOpcode::LocalInv => E::IBV_WC_LOCAL_INV,
+            WcOpcode::Tso => E::IBV_WC_TSO,
+            WcOpcode::Flush => E::IBV_WC_FLUSH,
+            WcOpcode::AtomicWrite => E::IBV_WC_ATOMIC_WRITE,
+            WcOpcode::Recv => E::IBV_WC_RECV,
+            WcOpcode::RecvRdmaWithImm => E::IBV_WC_RECV_RDMA_WITH_IMM,
+            WcOpcode::TmAdd => E::IBV_WC_TM_ADD,
+            WcOpcode::TmDel => E::IBV_WC_TM_DEL,
+            WcOpcode::TmSync => E::IBV_WC_TM_SYNC,
+            WcOpcode::TmRecv => E::IBV_WC_TM_RECV,
+            WcOpcode::TmNoTag => E::IBV_WC_TM_NO_TAG,
+            WcOpcode::Driver1 => E::IBV_WC_DRIVER1,
+            WcOpcode::Driver2 => E::IBV_WC_DRIVER2,
+            WcOpcode::Driver3 => E::IBV_WC_DRIVER3,
+            WcOpcode::Unknown(raw) => ffi::ibv_wc_opcode(raw),
         }
     }
 }
@@ -719,6 +728,7 @@ impl std::fmt::Display for WcOpcode {
             WcOpcode::Driver1 => "DRIVER1",
             WcOpcode::Driver2 => "DRIVER2",
             WcOpcode::Driver3 => "DRIVER3",
+            WcOpcode::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(name)
     }

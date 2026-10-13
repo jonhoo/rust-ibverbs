@@ -57,7 +57,7 @@ rust_bindgen(
         "--bitfield-enum=ibv_wq_attr_mask",
         "--bitfield-enum=ibv_wq_flags",
         "--bitfield-enum=ibv_xrcd_init_attr_mask",
-        "--default-enum-style=rust",
+        "--default-enum-style=newtype",
         "--no-prepend-enum-name",
         "--blocklist-type=ibv_wc",
     ] + ["--no-default=" + name for name in NO_DEFAULT_TYPES],

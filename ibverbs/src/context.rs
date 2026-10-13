@@ -554,7 +554,7 @@ impl Context {
         // SAFETY: `ibv_values_ex` is a plain C struct (a mask plus a `timespec`); all-zero is a valid
         // initial value.
         let mut values: ffi::ibv_values_ex = unsafe { std::mem::zeroed() };
-        values.comp_mask = ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK as u32;
+        values.comp_mask = ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK.0;
         let errno = unsafe { ffi::ibv_query_rt_values_ex(self.inner.ctx, &mut values as *mut _) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::QueryRealTimeValues));
@@ -695,62 +695,66 @@ pub enum AsyncEventType {
     WqFatal,
     /// The device's link speed changed.
     DeviceSpeedChange,
+    /// A value this version of the crate does not know.
+    Unknown(u32),
 }
 
 impl From<ffi::ibv_event_type> for AsyncEventType {
     fn from(event: ffi::ibv_event_type) -> Self {
-        use ffi::ibv_event_type::*;
+        use ffi::ibv_event_type as E;
         match event {
-            IBV_EVENT_CQ_ERR => AsyncEventType::CqError,
-            IBV_EVENT_QP_FATAL => AsyncEventType::QpFatal,
-            IBV_EVENT_QP_REQ_ERR => AsyncEventType::QpRequestError,
-            IBV_EVENT_QP_ACCESS_ERR => AsyncEventType::QpAccessError,
-            IBV_EVENT_COMM_EST => AsyncEventType::CommEstablished,
-            IBV_EVENT_SQ_DRAINED => AsyncEventType::SqDrained,
-            IBV_EVENT_PATH_MIG => AsyncEventType::PathMigrated,
-            IBV_EVENT_PATH_MIG_ERR => AsyncEventType::PathMigrationError,
-            IBV_EVENT_DEVICE_FATAL => AsyncEventType::DeviceFatal,
-            IBV_EVENT_PORT_ACTIVE => AsyncEventType::PortActive,
-            IBV_EVENT_PORT_ERR => AsyncEventType::PortError,
-            IBV_EVENT_LID_CHANGE => AsyncEventType::LidChange,
-            IBV_EVENT_PKEY_CHANGE => AsyncEventType::PkeyChange,
-            IBV_EVENT_SM_CHANGE => AsyncEventType::SmChange,
-            IBV_EVENT_SRQ_ERR => AsyncEventType::SrqError,
-            IBV_EVENT_SRQ_LIMIT_REACHED => AsyncEventType::SrqLimitReached,
-            IBV_EVENT_QP_LAST_WQE_REACHED => AsyncEventType::QpLastWqeReached,
-            IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
-            IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
-            IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
-            IBV_EVENT_DEVICE_SPEED_CHANGE => AsyncEventType::DeviceSpeedChange,
+            E::IBV_EVENT_CQ_ERR => AsyncEventType::CqError,
+            E::IBV_EVENT_QP_FATAL => AsyncEventType::QpFatal,
+            E::IBV_EVENT_QP_REQ_ERR => AsyncEventType::QpRequestError,
+            E::IBV_EVENT_QP_ACCESS_ERR => AsyncEventType::QpAccessError,
+            E::IBV_EVENT_COMM_EST => AsyncEventType::CommEstablished,
+            E::IBV_EVENT_SQ_DRAINED => AsyncEventType::SqDrained,
+            E::IBV_EVENT_PATH_MIG => AsyncEventType::PathMigrated,
+            E::IBV_EVENT_PATH_MIG_ERR => AsyncEventType::PathMigrationError,
+            E::IBV_EVENT_DEVICE_FATAL => AsyncEventType::DeviceFatal,
+            E::IBV_EVENT_PORT_ACTIVE => AsyncEventType::PortActive,
+            E::IBV_EVENT_PORT_ERR => AsyncEventType::PortError,
+            E::IBV_EVENT_LID_CHANGE => AsyncEventType::LidChange,
+            E::IBV_EVENT_PKEY_CHANGE => AsyncEventType::PkeyChange,
+            E::IBV_EVENT_SM_CHANGE => AsyncEventType::SmChange,
+            E::IBV_EVENT_SRQ_ERR => AsyncEventType::SrqError,
+            E::IBV_EVENT_SRQ_LIMIT_REACHED => AsyncEventType::SrqLimitReached,
+            E::IBV_EVENT_QP_LAST_WQE_REACHED => AsyncEventType::QpLastWqeReached,
+            E::IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
+            E::IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
+            E::IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
+            E::IBV_EVENT_DEVICE_SPEED_CHANGE => AsyncEventType::DeviceSpeedChange,
+            other => AsyncEventType::Unknown(other.0),
         }
     }
 }
 
 impl From<AsyncEventType> for ffi::ibv_event_type {
     fn from(event: AsyncEventType) -> Self {
-        use ffi::ibv_event_type::*;
+        use ffi::ibv_event_type as E;
         match event {
-            AsyncEventType::CqError => IBV_EVENT_CQ_ERR,
-            AsyncEventType::QpFatal => IBV_EVENT_QP_FATAL,
-            AsyncEventType::QpRequestError => IBV_EVENT_QP_REQ_ERR,
-            AsyncEventType::QpAccessError => IBV_EVENT_QP_ACCESS_ERR,
-            AsyncEventType::CommEstablished => IBV_EVENT_COMM_EST,
-            AsyncEventType::SqDrained => IBV_EVENT_SQ_DRAINED,
-            AsyncEventType::PathMigrated => IBV_EVENT_PATH_MIG,
-            AsyncEventType::PathMigrationError => IBV_EVENT_PATH_MIG_ERR,
-            AsyncEventType::DeviceFatal => IBV_EVENT_DEVICE_FATAL,
-            AsyncEventType::PortActive => IBV_EVENT_PORT_ACTIVE,
-            AsyncEventType::PortError => IBV_EVENT_PORT_ERR,
-            AsyncEventType::LidChange => IBV_EVENT_LID_CHANGE,
-            AsyncEventType::PkeyChange => IBV_EVENT_PKEY_CHANGE,
-            AsyncEventType::SmChange => IBV_EVENT_SM_CHANGE,
-            AsyncEventType::SrqError => IBV_EVENT_SRQ_ERR,
-            AsyncEventType::SrqLimitReached => IBV_EVENT_SRQ_LIMIT_REACHED,
-            AsyncEventType::QpLastWqeReached => IBV_EVENT_QP_LAST_WQE_REACHED,
-            AsyncEventType::ClientReregister => IBV_EVENT_CLIENT_REREGISTER,
-            AsyncEventType::GidChange => IBV_EVENT_GID_CHANGE,
-            AsyncEventType::WqFatal => IBV_EVENT_WQ_FATAL,
-            AsyncEventType::DeviceSpeedChange => IBV_EVENT_DEVICE_SPEED_CHANGE,
+            AsyncEventType::CqError => E::IBV_EVENT_CQ_ERR,
+            AsyncEventType::QpFatal => E::IBV_EVENT_QP_FATAL,
+            AsyncEventType::QpRequestError => E::IBV_EVENT_QP_REQ_ERR,
+            AsyncEventType::QpAccessError => E::IBV_EVENT_QP_ACCESS_ERR,
+            AsyncEventType::CommEstablished => E::IBV_EVENT_COMM_EST,
+            AsyncEventType::SqDrained => E::IBV_EVENT_SQ_DRAINED,
+            AsyncEventType::PathMigrated => E::IBV_EVENT_PATH_MIG,
+            AsyncEventType::PathMigrationError => E::IBV_EVENT_PATH_MIG_ERR,
+            AsyncEventType::DeviceFatal => E::IBV_EVENT_DEVICE_FATAL,
+            AsyncEventType::PortActive => E::IBV_EVENT_PORT_ACTIVE,
+            AsyncEventType::PortError => E::IBV_EVENT_PORT_ERR,
+            AsyncEventType::LidChange => E::IBV_EVENT_LID_CHANGE,
+            AsyncEventType::PkeyChange => E::IBV_EVENT_PKEY_CHANGE,
+            AsyncEventType::SmChange => E::IBV_EVENT_SM_CHANGE,
+            AsyncEventType::SrqError => E::IBV_EVENT_SRQ_ERR,
+            AsyncEventType::SrqLimitReached => E::IBV_EVENT_SRQ_LIMIT_REACHED,
+            AsyncEventType::QpLastWqeReached => E::IBV_EVENT_QP_LAST_WQE_REACHED,
+            AsyncEventType::ClientReregister => E::IBV_EVENT_CLIENT_REREGISTER,
+            AsyncEventType::GidChange => E::IBV_EVENT_GID_CHANGE,
+            AsyncEventType::WqFatal => E::IBV_EVENT_WQ_FATAL,
+            AsyncEventType::DeviceSpeedChange => E::IBV_EVENT_DEVICE_SPEED_CHANGE,
+            AsyncEventType::Unknown(raw) => ffi::ibv_event_type(raw),
         }
     }
 }
@@ -781,6 +785,7 @@ impl std::fmt::Display for AsyncEventType {
             AsyncEventType::GidChange => "GID_CHANGE",
             AsyncEventType::WqFatal => "WQ_FATAL",
             AsyncEventType::DeviceSpeedChange => "DEVICE_SPEED_CHANGE",
+            AsyncEventType::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(name)
     }
@@ -831,10 +836,12 @@ pub enum Mtu {
     Mtu2048,
     /// 4096 bytes.
     Mtu4096,
+    /// A value this version of the crate does not know (0 from a query that did not fill it in).
+    Unknown(u32),
 }
 
 impl Mtu {
-    /// The MTU in bytes.
+    /// The MTU in bytes, or 0 for an [`Unknown`](Mtu::Unknown) encoding.
     pub fn bytes(self) -> usize {
         match self {
             Mtu::Mtu256 => 256,
@@ -842,6 +849,7 @@ impl Mtu {
             Mtu::Mtu1024 => 1024,
             Mtu::Mtu2048 => 2048,
             Mtu::Mtu4096 => 4096,
+            Mtu::Unknown(_) => 0,
         }
     }
 }
@@ -854,6 +862,7 @@ impl From<ffi::ibv_mtu> for Mtu {
             ffi::ibv_mtu::IBV_MTU_1024 => Mtu::Mtu1024,
             ffi::ibv_mtu::IBV_MTU_2048 => Mtu::Mtu2048,
             ffi::ibv_mtu::IBV_MTU_4096 => Mtu::Mtu4096,
+            other => Mtu::Unknown(other.0),
         }
     }
 }
@@ -866,6 +875,7 @@ impl From<Mtu> for ffi::ibv_mtu {
             Mtu::Mtu1024 => ffi::ibv_mtu::IBV_MTU_1024,
             Mtu::Mtu2048 => ffi::ibv_mtu::IBV_MTU_2048,
             Mtu::Mtu4096 => ffi::ibv_mtu::IBV_MTU_4096,
+            Mtu::Unknown(raw) => ffi::ibv_mtu(raw),
         }
     }
 }
@@ -892,6 +902,8 @@ pub enum PortState {
     Active,
     /// The port is active, but temporarily deferring packet transmission.
     ActiveDefer,
+    /// A value this version of the crate does not know.
+    Unknown(u32),
 }
 
 impl From<ffi::ibv_port_state> for PortState {
@@ -903,6 +915,7 @@ impl From<ffi::ibv_port_state> for PortState {
             ffi::ibv_port_state::IBV_PORT_ARMED => PortState::Armed,
             ffi::ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
             ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
+            other => PortState::Unknown(other.0),
         }
     }
 }
@@ -916,6 +929,7 @@ impl From<PortState> for ffi::ibv_port_state {
             PortState::Armed => ffi::ibv_port_state::IBV_PORT_ARMED,
             PortState::Active => ffi::ibv_port_state::IBV_PORT_ACTIVE,
             PortState::ActiveDefer => ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER,
+            PortState::Unknown(raw) => ffi::ibv_port_state(raw),
         }
     }
 }
@@ -929,6 +943,7 @@ impl fmt::Display for PortState {
             PortState::Armed => "Armed",
             PortState::Active => "Active",
             PortState::ActiveDefer => "ActiveDefer",
+            PortState::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(name)
     }

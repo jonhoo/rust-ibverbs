@@ -125,7 +125,7 @@ impl SharedReceiveQueue {
 
     /// `ibv_modify_srq` for the attributes `mask` selects in `attr`.
     fn modify(&self, attr: &mut ffi::ibv_srq_attr, mask: ffi::ibv_srq_attr_mask) -> Result<()> {
-        let errno = unsafe { ffi::ibv_modify_srq(self.inner.srq, attr, mask as i32) };
+        let errno = unsafe { ffi::ibv_modify_srq(self.inner.srq, attr, mask.0 as i32) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::ModifySharedReceiveQueue));
         }
