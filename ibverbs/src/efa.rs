@@ -164,12 +164,16 @@ impl PreparedQueuePair<Srd> {
 }
 
 impl AddressedSendOp<'_, '_, Srd> {
-    /// Post an RDMA WRITE of `payload` into `remote`, with the immediate set by
-    /// [`imm`](Self::imm) if any.
+    /// Post an RDMA WRITE of `local` into `remote`, with the immediate set by [`imm`](Self::imm)
+    /// if any.
+    ///
+    /// The data must come from registered memory: EFA writes inline data only on a queue pair
+    /// created with its inline-write flag (`EFADV_QP_FLAGS_INLINE_WRITE`), which doubles the size
+    /// of every send work request and needs rdma-core 63, so this crate does not set it.
     #[inline]
-    pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
+    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         let imm = self.op.imm;
-        self.op.build(wr_id, payload.into(), move |q| unsafe {
+        self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {
             match imm {
                 Some(imm) => {
                     (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())

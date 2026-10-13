@@ -1790,8 +1790,8 @@ impl<T: Reliable> SendOp<'_, '_, T> {
 /// Chain the modifiers ([`signaled`](Self::signaled), [`imm`](Self::imm), and on UD
 /// [`fenced`](Self::fenced) and [`solicited`](Self::solicited)) and finish with an opcode method,
 /// which posts the request immediately. UD supports SEND (with any [`Payload`]); SRD (behind the
-/// `efa` feature) additionally supports RDMA write and read, but not the fence and solicited
-/// flags, which EFA refuses.
+/// `efa` feature) additionally supports RDMA write (from registered memory) and read, but not the
+/// fence and solicited flags, which EFA refuses.
 #[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
 pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
     pub(crate) op: SendOp<'b, 'qp, T>,
