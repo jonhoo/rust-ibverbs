@@ -994,9 +994,25 @@ pub struct TagMatchingInfo {
 /// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
 /// call (which is why it cannot implement [`Iterator`]); [`for_each`](Self::for_each) runs a
-/// closure over the rest instead. The provider holds the queue's poll lock from the poll's start
-/// until the `Completions` is dropped (`ibv_end_poll`), so keep it short-lived; a poll of an
-/// empty queue holds nothing.
+/// closure over the rest instead.
+///
+/// # Deadlocks
+///
+/// The provider holds the queue's poll lock from the poll's start until the `Completions` is
+/// dropped (`ibv_end_poll`), so keep it short-lived; a poll of an empty queue holds nothing. The
+/// lock is not reentrant, and other calls take it too (on mlx5, for one), so while a
+/// `Completions` of a queue is alive, the same thread must not:
+///
+/// - poll that queue again ([`poll`](CompletionQueue::poll) or
+///   [`poll_into`](CompletionQueue::poll_into));
+/// - drop a queue pair whose completions go to that queue, or move one to `RESET` with
+///   [`QueuePair::modify`](crate::QueuePair::modify): both clean its entries out of the queue
+///   under the lock;
+/// - post to such a queue pair while its send or receive queue is full or nearly so: the
+///   provider then re-checks how full it is under the lock before accepting the post.
+///
+/// Posting a reply or reposting a receive from inside the loop is fine while the work queue has
+/// room; when it may be full, drop the `Completions` first.
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
