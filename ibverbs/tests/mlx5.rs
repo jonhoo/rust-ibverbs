@@ -1,5 +1,8 @@
 #![cfg(feature = "mlx5")]
 
+mod common;
+
+use common::open_test_device;
 use ibverbs::{AccessFlags, Error, Mlx5DmabufAccessFlags};
 
 #[test]
@@ -11,18 +14,7 @@ fn rxe_rejects_mlx5_operations() {
         name.starts_with("rxe"),
         "IBVERBS_TEST_DEVICE={name:?} must name a Soft-RoCE device starting with rxe"
     );
-    let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = devices
-        .iter()
-        .find(|device| {
-            device
-                .name()
-                .is_some_and(|candidate| candidate.to_bytes() == name.as_bytes())
-        })
-        .unwrap_or_else(|| panic!("IBVERBS_TEST_DEVICE={name} is not an available RDMA device"));
-    let ctx = device
-        .open()
-        .unwrap_or_else(|err| panic!("failed to open IBVERBS_TEST_DEVICE={name}: {err:?}"));
+    let ctx = open_test_device();
     let err = ctx
         .mlx5_data_direct_sysfs_path()
         .expect_err("rxe must reject mlx5dv_get_data_direct_sysfs_path");

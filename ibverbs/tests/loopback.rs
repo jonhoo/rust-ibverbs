@@ -7,8 +7,11 @@
 //! (but still compile-checks them); `cargo test -- --ignored` runs them. They use the first
 //! available device, or `IBVERBS_TEST_DEVICE` (e.g. `rxe0`) if set.
 
+mod common;
+
 use std::time::{Duration, Instant};
 
+use common::{open_test_device, test_device};
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
     LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
@@ -21,25 +24,6 @@ struct Loopback<T: Connected> {
     qp: QueuePair<T>,
     cq: CompletionQueue,
     pd: ProtectionDomain,
-}
-
-/// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one. Panics if absent;
-/// these tests only run when explicitly requested, so a missing device is a real setup error.
-fn open_test_device() -> Context {
-    let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
-        Ok(name) if !name.is_empty() => devices
-            .iter()
-            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
-            .unwrap_or_else(|| {
-                panic!("IBVERBS_TEST_DEVICE={name} is not among the available RDMA devices")
-            }),
-        _ => devices
-            .iter()
-            .next()
-            .expect("no RDMA device available (attach one or set IBVERBS_TEST_DEVICE)"),
-    };
-    device.open().expect("failed to open the RDMA device")
 }
 
 /// Soft-RoCE's vendor ID (the kernel's `RXE_VENDOR_ID`).
@@ -1745,13 +1729,7 @@ fn event_driven_completion() {
 fn gid_and_device_introspection() {
     // Select the same device `open_test_device` would, so we can read its transport type first.
     let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
-        Ok(name) if !name.is_empty() => devices
-            .iter()
-            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
-            .expect("IBVERBS_TEST_DEVICE is not among the available devices"),
-        _ => devices.iter().next().expect("no RDMA device available"),
-    };
+    let device = test_device(&devices);
     // RoCE (including Soft-RoCE) presents the InfiniBand transport.
     assert_eq!(device.transport_type(), TransportType::Ib);
 
@@ -1972,13 +1950,7 @@ fn query_device_extended() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn debug_formatting() {
     let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
-        Ok(name) if !name.is_empty() => devices
-            .iter()
-            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
-            .expect("IBVERBS_TEST_DEVICE is not among the available devices"),
-        _ => devices.iter().next().expect("no RDMA device available"),
-    };
+    let device = test_device(&devices);
     assert!(format!("{device:?}").contains("Device"), "{device:?}");
 
     let ctx = device.open().expect("failed to open the RDMA device");

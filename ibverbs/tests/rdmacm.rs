@@ -7,12 +7,15 @@
 //! `cargo test --features rdmacm -- --ignored`. It uses the first device, or `IBVERBS_TEST_DEVICE`.
 #![cfg(feature = "rdmacm")]
 
+mod common;
+
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
+use common::open_test_device;
 use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
@@ -21,22 +24,6 @@ use ibverbs::{
     QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice,
     WcStatus,
 };
-
-/// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one.
-fn open_test_device() -> Context {
-    let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
-        Ok(name) if !name.is_empty() => devices
-            .iter()
-            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
-            .unwrap_or_else(|| panic!("IBVERBS_TEST_DEVICE={name} is not available")),
-        _ => devices
-            .iter()
-            .next()
-            .expect("no RDMA device available (attach one or set IBVERBS_TEST_DEVICE)"),
-    };
-    device.open().expect("failed to open the RDMA device")
-}
 
 /// The device's RoCEv2 IPv4 address, read from its GID table. The connection manager needs to
 /// route over an IP address; prefer the RoCEv2 entry holding the interface's IPv4 address (an
