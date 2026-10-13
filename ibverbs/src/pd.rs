@@ -412,7 +412,8 @@ impl ProtectionDomain {
         };
 
         if mr.is_null() {
-            // Promotes the EOPNOTSUPP of devices/kernels without DMA-BUF support to Unsupported.
+            // Promotes the EOPNOTSUPP of devices without DMA-BUF support, and the EPROTONOSUPPORT
+            // of kernels that predate it, to Unsupported.
             Err(Error::os(
                 io::Error::last_os_error(),
                 Error::RegisterMemoryRegion,

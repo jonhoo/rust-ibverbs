@@ -29,7 +29,8 @@ impl ProtectionDomain {
     /// a compatible DMA-BUF exporter (for example, a PCIe-mapped GPU export).
     /// No fallback to ordinary registration occurs on failure.
     ///
-    /// Requires the `mlx5` feature and rdma-core 54 or newer. Unsupported providers return
+    /// Requires the `mlx5` feature, rdma-core 54 or newer, and (for the mlx5 access flags)
+    /// Linux 6.12 or newer. Unsupported providers and older kernels return
     /// [`Error::Unsupported`]; other registration errors retain their OS error.
     pub fn register_dmabuf_mlx5(
         &self,
@@ -72,8 +73,9 @@ impl Context {
     /// Returns the provider's path unchanged, without the `/sys` mount prefix. Path bytes
     /// need not be UTF-8. The caller decides how to use the path for device selection.
     ///
-    /// Requires the `mlx5` feature and rdma-core 54 or newer. Unsupported providers return
-    /// [`Error::Unsupported`]. Other errors, including `ENODEV` (no associated Data Direct
+    /// Requires the `mlx5` feature, rdma-core 54 or newer, and Linux 6.12 or newer. Unsupported
+    /// providers and older kernels return [`Error::Unsupported`]. Other errors, including
+    /// `ENODEV` (no associated Data Direct
     /// device) and `ENOSPC` (insufficient buffer), retain their OS error. Empty or
     /// unterminated success output returns an [`io::ErrorKind::InvalidData`] source.
     pub fn mlx5_data_direct_sysfs_path(&self) -> Result<PathBuf> {
@@ -91,7 +93,7 @@ impl Context {
 }
 
 fn registration_error(err: io::Error) -> Error {
-    if err.raw_os_error() == Some(nix::libc::EOPNOTSUPP) {
+    if Error::is_unsupported(&err) {
         Error::Unsupported {
             operation: &"mlx5dv_reg_dmabuf_mr",
         }

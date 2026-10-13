@@ -100,18 +100,21 @@ fn data_direct_path_preserves_return_code_as_os_error() {
 
 #[test]
 fn data_direct_path_unsupported_names_the_mlx5_operation() {
-    let err = data_direct_path(nix::libc::EOPNOTSUPP, b"").unwrap_err();
-    assert!(matches!(
-        err,
-        Error::Unsupported {
-            operation: &"mlx5dv_get_data_direct_sysfs_path"
-        }
-    ));
-    assert!(err.os_error().is_none());
-    assert_eq!(
-        err.to_string(),
-        "mlx5dv_get_data_direct_sysfs_path is not supported by the device or provider"
-    );
+    // EPROTONOSUPPORT: a kernel older than the Data Direct query (Linux 6.12).
+    for errno in [nix::libc::EOPNOTSUPP, nix::libc::EPROTONOSUPPORT] {
+        let err = data_direct_path(errno, b"").unwrap_err();
+        assert!(matches!(
+            err,
+            Error::Unsupported {
+                operation: &"mlx5dv_get_data_direct_sysfs_path"
+            }
+        ));
+        assert!(err.os_error().is_none());
+        assert_eq!(
+            err.to_string(),
+            "mlx5dv_get_data_direct_sysfs_path is not supported by the device, provider, or kernel"
+        );
+    }
 }
 
 #[test]
@@ -125,18 +128,21 @@ fn registration_preserves_os_errors() {
 
 #[test]
 fn registration_unsupported_names_the_mlx5_operation() {
-    let err = registration_error(io::Error::from_raw_os_error(nix::libc::EOPNOTSUPP));
-    assert!(matches!(
-        err,
-        Error::Unsupported {
-            operation: &"mlx5dv_reg_dmabuf_mr"
-        }
-    ));
-    assert!(err.os_error().is_none());
-    assert_eq!(
-        err.to_string(),
-        "mlx5dv_reg_dmabuf_mr is not supported by the device or provider"
-    );
+    // EPROTONOSUPPORT: a kernel older than the mlx5 access-flags attribute (Linux 6.12).
+    for errno in [nix::libc::EOPNOTSUPP, nix::libc::EPROTONOSUPPORT] {
+        let err = registration_error(io::Error::from_raw_os_error(errno));
+        assert!(matches!(
+            err,
+            Error::Unsupported {
+                operation: &"mlx5dv_reg_dmabuf_mr"
+            }
+        ));
+        assert!(err.os_error().is_none());
+        assert_eq!(
+            err.to_string(),
+            "mlx5dv_reg_dmabuf_mr is not supported by the device, provider, or kernel"
+        );
+    }
 }
 
 #[test]
