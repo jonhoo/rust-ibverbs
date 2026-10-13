@@ -34,6 +34,17 @@ use crate::{AddressHandle, ProtectionDomain};
 /// is created to signal every send and [`signaled`](AddressedSendOp::signaled) is implied. Size
 /// the send completion queue for a completion per work request (see
 /// [`CompletionQueue::capacity`](crate::CompletionQueue::capacity)).
+///
+/// EFA also refuses the fence and solicited flags, so an SRD work request has no
+/// [`fenced`](AddressedSendOp::fenced) or [`solicited`](AddressedSendOp::solicited) modifier:
+///
+/// ```compile_fail,E0599
+/// // EFA refuses the fence flag: `fenced` exists only on UD.
+/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Srd>, ah: &ibverbs::AddressHandle) {
+///     let mut batch = qp.start_send();
+///     batch.to(ah, 1, 2).fenced();
+/// }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct Srd;
 
