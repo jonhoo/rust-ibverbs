@@ -319,3 +319,70 @@ pub mod rdmacm;
 /// not cover — without adding a separate dependency on `ibverbs-sys` and keeping its version in
 /// sync.
 pub use ffi;
+
+#[cfg(test)]
+mod test_flags_newtype {
+    //! The surface `flags_newtype!` generates, tested once on [`AccessFlags`] rather than on every
+    //! flag type.
+    use crate::AccessFlags;
+
+    /// A bit no `IBV_ACCESS_*` flag uses.
+    const UNKNOWN: u32 = 1 << 30;
+
+    #[test]
+    fn empty_and_contains() {
+        let empty = AccessFlags::empty();
+        let write = AccessFlags::LOCAL_WRITE;
+        let both = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ;
+        assert_eq!(empty, AccessFlags::default());
+        assert!(empty.contains(empty));
+        assert!(!empty.contains(write));
+        assert!(write.contains(empty));
+        assert!(both.contains(write));
+        assert!(both.contains(both));
+        assert!(!write.contains(both));
+        assert!(!both.contains(AccessFlags::REMOTE_ATOMIC));
+    }
+
+    #[test]
+    fn bit_operators() {
+        let mut flags = AccessFlags::empty();
+        flags |= AccessFlags::LOCAL_WRITE;
+        flags |= AccessFlags::REMOTE_WRITE;
+        assert_eq!(flags, AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE);
+        assert_eq!(flags | AccessFlags::empty(), flags);
+        assert_eq!(flags & AccessFlags::LOCAL_WRITE, AccessFlags::LOCAL_WRITE);
+        assert_eq!(flags & AccessFlags::REMOTE_ATOMIC, AccessFlags::empty());
+        // Bits without a name survive the operators.
+        let unknown = AccessFlags(UNKNOWN);
+        assert!((flags | unknown).contains(unknown));
+        assert_eq!((flags | unknown) & unknown, unknown);
+    }
+
+    #[test]
+    fn debug_names_known_and_unknown_bits() {
+        assert_eq!(format!("{:?}", AccessFlags::empty()), "AccessFlags(0)");
+        assert_eq!(
+            format!("{:?}", AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ),
+            "AccessFlags(LOCAL_WRITE | REMOTE_READ)"
+        );
+        // Unknown bits are kept visible as a hex remainder.
+        assert_eq!(
+            format!("{:?}", AccessFlags(UNKNOWN)),
+            "AccessFlags(0x40000000)"
+        );
+        assert_eq!(
+            format!("{:?}", AccessFlags(AccessFlags::LOCAL_WRITE.0 | UNKNOWN)),
+            "AccessFlags(LOCAL_WRITE | 0x40000000)"
+        );
+    }
+
+    #[test]
+    fn ffi_round_trip_keeps_every_bit() {
+        for bits in [0, AccessFlags::LOCAL_WRITE.0, UNKNOWN, u32::MAX] {
+            let flags = AccessFlags::from(ffi::ibv_access_flags(bits));
+            assert_eq!(flags.0, bits);
+            assert_eq!(ffi::ibv_access_flags::from(flags).0, bits);
+        }
+    }
+}
