@@ -3,7 +3,6 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use crate::mr::MemoryRegionInner;
 use crate::{AccessFlags, Context, Error, MemoryRegion, ProtectionDomain, Result};
 
 flags_newtype! {
@@ -82,14 +81,7 @@ impl ProtectionDomain {
             }
             return Err(registration_error(err));
         }
-        Ok(MemoryRegion::new(
-            MemoryRegionInner {
-                _pd: self.clone(),
-                mr,
-                addr: iova,
-            },
-            (),
-        ))
+        Ok(MemoryRegion::new(self.clone(), mr, iova, ()))
     }
 }
 

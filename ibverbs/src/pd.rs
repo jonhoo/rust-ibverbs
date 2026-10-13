@@ -6,10 +6,9 @@ use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
 use crate::context::{Context, PortAttr, PortState};
 use crate::error::{Error, Result, destroyed, nonnull};
-use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
+use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion};
 use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
-
-use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
+use crate::srq::SharedReceiveQueue;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,9 +112,9 @@ impl From<MrAdviseFlags> for u32 {
     }
 }
 
-pub(crate) struct ProtectionDomainInner {
-    pub(crate) ctx: Context,
-    pub(crate) pd: *mut ffi::ibv_pd,
+struct ProtectionDomainInner {
+    ctx: Context,
+    pd: *mut ffi::ibv_pd,
 }
 
 impl Drop for ProtectionDomainInner {
@@ -131,10 +130,17 @@ unsafe impl Send for ProtectionDomainInner {}
 #[must_use]
 #[derive(Clone)]
 pub struct ProtectionDomain {
-    pub(crate) inner: Arc<ProtectionDomainInner>,
+    inner: Arc<ProtectionDomainInner>,
 }
 
 impl ProtectionDomain {
+    /// Wraps `pd`, allocated on `ctx` (for [`Context::alloc_pd`]).
+    pub(crate) fn new(ctx: Context, pd: *mut ffi::ibv_pd) -> ProtectionDomain {
+        ProtectionDomain {
+            inner: Arc::new(ProtectionDomainInner { ctx, pd }),
+        }
+    }
+
     /// Returns the underlying `ibv_pd` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
@@ -165,10 +171,7 @@ impl ProtectionDomain {
             unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) },
             Error::CreateAddressHandle,
         )?;
-        Ok(AddressHandle {
-            _pd: self.clone(),
-            ah,
-        })
+        Ok(AddressHandle::new(self.clone(), ah))
     }
 
     /// Give advice to the kernel about an address range in memory regions registered under this
@@ -262,27 +265,24 @@ impl ProtectionDomain {
         ))
     }
 
-    /// Register `[ptr, ptr + len)` and wrap the resulting MR handle, deduplicating the
-    /// `ibv_reg_mr` call and null check shared by the registration entry points.
+    /// Register `[ptr, ptr + len)` as a region owned by `owner`, deduplicating the `ibv_reg_mr`
+    /// call and null check shared by the registration entry points.
     ///
     /// # Safety
     ///
-    /// `ptr` must be valid for `len` bytes and outlive the returned `MemoryRegionInner`.
-    unsafe fn reg_mr(
+    /// `ptr` must be valid for `len` bytes and outlive the returned region.
+    unsafe fn reg_mr<O>(
         &self,
         ptr: *mut c_void,
         len: usize,
         access_flags: AccessFlags,
-    ) -> Result<MemoryRegionInner> {
+        owner: O,
+    ) -> Result<MemoryRegion<O>> {
         let mr = nonnull(
             unsafe { ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32) },
             Error::RegisterMemoryRegion,
         )?;
-        Ok(MemoryRegionInner {
-            _pd: self.clone(),
-            mr,
-            addr: ptr as u64,
-        })
+        Ok(MemoryRegion::new(self.clone(), mr, ptr as u64, owner))
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`, with
@@ -323,8 +323,7 @@ impl ProtectionDomain {
     pub fn allocate(&self, n: usize, access_flags: AccessFlags) -> Result<MemoryRegion<Box<[u8]>>> {
         assert!(n > 0);
         let mut data = vec![0u8; n].into_boxed_slice();
-        let inner = unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags)? };
-        Ok(MemoryRegion::new(inner, data))
+        unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags, data) }
     }
 
     /// Registers externally managed memory as a Memory Region (MR), with the given access
@@ -366,8 +365,7 @@ impl ProtectionDomain {
         access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
         assert!(len > 0);
-        let inner = unsafe { self.reg_mr(ptr as *mut c_void, len, access_flags) }?;
-        Ok(MemoryRegion::new(inner, ()))
+        unsafe { self.reg_mr(ptr as *mut c_void, len, access_flags, ()) }
     }
 
     /// Registers an already allocated DMA-BUF as a memory region (MR) associated with this
@@ -405,12 +403,7 @@ impl ProtectionDomain {
         // Promotes the EOPNOTSUPP of devices without DMA-BUF support, and the EPROTONOSUPPORT of
         // kernels that predate it, to Unsupported.
         let mr = nonnull(mr, Error::RegisterMemoryRegion)?;
-        let inner = MemoryRegionInner {
-            _pd: self.clone(),
-            mr,
-            addr: iova,
-        };
-        Ok(MemoryRegion::new(inner, ()))
+        Ok(MemoryRegion::new(self.clone(), mr, iova, ()))
     }
 
     /// Creates a shared receive queue (SRQ) associated with this protection domain.
@@ -458,13 +451,7 @@ impl ProtectionDomain {
             unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) },
             Error::CreateSharedReceiveQueue,
         )?;
-        Ok(SharedReceiveQueue {
-            _inner: Arc::new(SharedReceiveQueueInner {
-                _pd: self.clone(),
-                srq,
-            }),
-            srq,
-        })
+        Ok(SharedReceiveQueue::new(self.clone(), srq))
     }
 }
 

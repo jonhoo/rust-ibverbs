@@ -205,17 +205,30 @@ impl AsFd for CompletionChannel {
 /// [`build`](Self::build) to create the queue.
 #[must_use]
 pub struct CompletionQueueBuilder {
-    pub(crate) ctx: Context,
-    pub(crate) min_cq_entries: u32,
-    pub(crate) cq_context: u64,
-    pub(crate) comp_vector: u32,
+    ctx: Context,
+    min_cq_entries: u32,
+    cq_context: u64,
+    comp_vector: u32,
     /// extra work-completion fields requested on top of the always-present standard set
-    pub(crate) wc_flags: u32,
+    wc_flags: u32,
     /// the completion channel to deliver notifications on, if any
-    pub(crate) comp_channel: Option<CompletionChannel>,
+    comp_channel: Option<CompletionChannel>,
 }
 
 impl CompletionQueueBuilder {
+    /// Begin building a queue on `ctx` with room for at least `min_cq_entries` entries (for
+    /// [`Context::create_cq`]), with the defaults the setters document.
+    pub(crate) fn new(ctx: Context, min_cq_entries: u32) -> CompletionQueueBuilder {
+        CompletionQueueBuilder {
+            ctx,
+            min_cq_entries,
+            cq_context: 0,
+            comp_vector: 0,
+            wc_flags: 0,
+            comp_channel: None,
+        }
+    }
+
     /// Set an opaque context value associated with the completion queue.
     ///
     /// Defaults to 0.

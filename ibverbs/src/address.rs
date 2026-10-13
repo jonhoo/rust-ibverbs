@@ -612,14 +612,19 @@ impl AddressHandleAttribute {
 #[must_use = "the address handle is destroyed when dropped"]
 pub struct AddressHandle {
     // Keeps the protection domain (and so its context) alive until the handle is destroyed.
-    pub(crate) _pd: ProtectionDomain,
-    pub(crate) ah: *mut ffi::ibv_ah,
+    _pd: ProtectionDomain,
+    ah: *mut ffi::ibv_ah,
 }
 
 unsafe impl Send for AddressHandle {}
 unsafe impl Sync for AddressHandle {}
 
 impl AddressHandle {
+    /// Wraps `ah`, created on `pd` (for [`ProtectionDomain::create_address_handle`]).
+    pub(crate) fn new(pd: ProtectionDomain, ah: *mut ffi::ibv_ah) -> AddressHandle {
+        AddressHandle { _pd: pd, ah }
+    }
+
     /// Returns the underlying `ibv_ah` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this

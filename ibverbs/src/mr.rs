@@ -52,10 +52,10 @@ impl AccessFlags {
     );
 }
 
-pub(crate) struct MemoryRegionInner {
-    pub(crate) _pd: ProtectionDomain,
-    pub(crate) mr: *mut ffi::ibv_mr,
-    pub(crate) addr: u64,
+struct MemoryRegionInner {
+    _pd: ProtectionDomain,
+    mr: *mut ffi::ibv_mr,
+    addr: u64,
 }
 
 unsafe impl Sync for MemoryRegionInner {}
@@ -93,9 +93,10 @@ impl<O> Drop for MemoryRegion<O> {
 }
 
 impl<O> MemoryRegion<O> {
-    pub(crate) fn new(inner: MemoryRegionInner, owner: O) -> Self {
+    /// Wraps `mr`, registered on `pd` at `addr`, together with the `owner` of the memory behind it.
+    pub(crate) fn new(pd: ProtectionDomain, mr: *mut ffi::ibv_mr, addr: u64, owner: O) -> Self {
         MemoryRegion {
-            inner: ManuallyDrop::new(inner),
+            inner: ManuallyDrop::new(MemoryRegionInner { _pd: pd, mr, addr }),
             owner: ManuallyDrop::new(owner),
         }
     }

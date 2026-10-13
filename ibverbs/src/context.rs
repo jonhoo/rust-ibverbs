@@ -12,7 +12,7 @@ use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
 use crate::error::{Error, Result, check, destroyed, nonnull};
-use crate::pd::{ProtectionDomain, ProtectionDomainInner};
+use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
 use crate::{Device, QueuePairBuilder, WorkCompletion};
@@ -135,14 +135,7 @@ impl Context {
     /// # }
     /// ```
     pub fn create_cq(&self, min_cq_entries: u32) -> CompletionQueueBuilder {
-        CompletionQueueBuilder {
-            ctx: self.clone(),
-            min_cq_entries,
-            cq_context: 0,
-            comp_vector: 0,
-            wc_flags: 0,
-            comp_channel: None,
-        }
+        CompletionQueueBuilder::new(self.clone(), min_cq_entries)
     }
 
     /// Create a completion channel: the file descriptor that delivers completion notifications for
@@ -266,12 +259,7 @@ impl Context {
             unsafe { ffi::ibv_alloc_pd(self.inner.ctx) },
             Error::AllocProtectionDomain,
         )?;
-        Ok(ProtectionDomain {
-            inner: Arc::new(ProtectionDomainInner {
-                ctx: self.clone(),
-                pd,
-            }),
-        })
+        Ok(ProtectionDomain::new(self.clone(), pd))
     }
 
     /// Returns the valid GID table entries of this RDMA device context.
