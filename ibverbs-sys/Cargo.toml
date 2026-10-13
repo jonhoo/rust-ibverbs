@@ -10,7 +10,6 @@ authors = [
     "Jon Gjengset <jon@thesquareplanet.com>",
     "Jonathan Behrens <fintelia@gmail.com>",
 ]
-build = "build.rs"
 links = "ibverbs"
 
 homepage = "https://github.com/jonhoo/rust-ibverbs"
