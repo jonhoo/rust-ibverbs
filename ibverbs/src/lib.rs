@@ -83,8 +83,8 @@
 //! - `rdmacm`: the `rdmacm` module, wrapping the `librdmacm` connection manager: connection setup
 //!   over IP addresses, blocking or event-loop driven, instead of an out-of-band endpoint
 //!   exchange. Links `librdmacm`.
-//! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via
-//!   `ProtectionDomain::create_srd_qp`. Links `libefa`.
+//! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via the `Srd` transport
+//!   (`ProtectionDomain::create_qp::<Srd>`). Links `libefa`.
 //!
 //! # Library dependency
 //!

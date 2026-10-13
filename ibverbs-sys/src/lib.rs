@@ -361,6 +361,29 @@ unsafe fn verbs_get_ctx(context: *mut ibv_context) -> *mut verbs_context {
     }
 }
 
+/// The provider's implementation of the extended op `$op` on `$context`, or `None` when the
+/// provider leaves it out or its `verbs_context` predates it (rdma-core's `verbs_get_ctx_op`).
+/// New ops are added at the front of `verbs_context`, so the size check comes first: an op the
+/// provider's (older) struct does not have lies before its start and must not be read. Expands to
+/// unsafe operations; `$context` must be a valid `ibv_context`.
+macro_rules! verbs_get_ctx_op {
+    ($context:expr, $op:ident) => {{
+        let vctx = verbs_get_ctx($context);
+        let need =
+            ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, $op);
+        if (*vctx).sz >= need {
+            (*vctx).$op
+        } else {
+            None
+        }
+    }};
+}
+
+// The errno values the shims report or recognize, as on Linux, the only platform rdma-core targets.
+const EINVAL: ::std::os::raw::c_int = 22;
+const ENOSYS: ::std::os::raw::c_int = 38;
+const EOPNOTSUPP: ::std::os::raw::c_int = 95;
+
 /// Query a port's attributes, including the extended fields (rdma-core's `___ibv_query_port`,
 /// which the `ibv_query_port` macro resolves to in C).
 ///
@@ -380,18 +403,15 @@ pub unsafe fn ___ibv_query_port(
     port_num: u8,
     port_attr: *mut ibv_port_attr,
 ) -> ::std::os::raw::c_int {
-    let need =
-        ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, query_port);
     unsafe {
-        let vctx = verbs_get_ctx(context);
-        match (*vctx).query_port {
-            Some(query_port) if (*vctx).sz >= need => query_port(
+        match verbs_get_ctx_op!(context, query_port) {
+            Some(query_port) => query_port(
                 context,
                 port_num,
                 port_attr,
                 ::std::mem::size_of::<ibv_port_attr>(),
             ),
-            _ => {
+            None => {
                 ::std::ptr::write_bytes(port_attr, 0, 1);
                 ibv_query_port(context, port_num, port_attr.cast())
             }
@@ -425,15 +445,11 @@ pub unsafe fn ibv_create_cq_ex(
     context: *mut ibv_context,
     cq_attr: *mut ibv_cq_init_attr_ex,
 ) -> *mut ibv_cq_ex {
-    let need = ::std::mem::size_of::<verbs_context>()
-        - ::std::mem::offset_of!(verbs_context, create_cq_ex);
     unsafe {
-        let vctx = verbs_get_ctx(context);
-        match (*vctx).create_cq_ex {
-            Some(create_cq_ex) if (*vctx).sz >= need => create_cq_ex(context, cq_attr),
-            _ => {
-                // EOPNOTSUPP, 95 on Linux, the only platform rdma-core targets.
-                set_errno(95);
+        match verbs_get_ctx_op!(context, create_cq_ex) {
+            Some(create_cq_ex) => create_cq_ex(context, cq_attr),
+            None => {
+                set_errno(EOPNOTSUPP);
                 ::std::ptr::null_mut()
             }
         }
@@ -453,15 +469,11 @@ pub unsafe fn ibv_create_qp_ex(
     context: *mut ibv_context,
     qp_attr: *mut ibv_qp_init_attr_ex,
 ) -> *mut ibv_qp {
-    let need = ::std::mem::size_of::<verbs_context>()
-        - ::std::mem::offset_of!(verbs_context, create_qp_ex);
     unsafe {
-        let vctx = verbs_get_ctx(context);
-        match (*vctx).create_qp_ex {
-            Some(create_qp_ex) if (*vctx).sz >= need => create_qp_ex(context, qp_attr),
-            _ => {
-                // EOPNOTSUPP, 95 on Linux, the only platform rdma-core targets.
-                set_errno(95);
+        match verbs_get_ctx_op!(context, create_qp_ex) {
+            Some(create_qp_ex) => create_qp_ex(context, qp_attr),
+            None => {
+                set_errno(EOPNOTSUPP);
                 ::std::ptr::null_mut()
             }
         }
@@ -484,15 +496,11 @@ pub unsafe fn ibv_advise_mr(
     sg_list: *mut ibv_sge,
     num_sge: u32,
 ) -> ::std::os::raw::c_int {
-    let need =
-        ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, advise_mr);
     unsafe {
-        let vctx = verbs_get_ctx((*pd).context);
-        match (*vctx).advise_mr {
-            Some(advise_mr) if (*vctx).sz >= need => advise_mr(pd, advice, flags, sg_list, num_sge),
-            // The provider does not implement advise_mr; mirror the C inline's `return EOPNOTSUPP`
-            // (95 on Linux, the only platform rdma-core targets).
-            _ => 95,
+        match verbs_get_ctx_op!((*pd).context, advise_mr) {
+            Some(advise_mr) => advise_mr(pd, advice, flags, sg_list, num_sge),
+            // The provider does not implement advise_mr; mirror the C inline's `return EOPNOTSUPP`.
+            None => EOPNOTSUPP,
         }
     }
 }
@@ -510,15 +518,12 @@ pub unsafe fn ibv_query_rt_values_ex(
     context: *mut ibv_context,
     values: *mut ibv_values_ex,
 ) -> ::std::os::raw::c_int {
-    let need = ::std::mem::size_of::<verbs_context>()
-        - ::std::mem::offset_of!(verbs_context, query_rt_values);
     unsafe {
-        let vctx = verbs_get_ctx(context);
-        match (*vctx).query_rt_values {
-            Some(query_rt_values) if (*vctx).sz >= need => query_rt_values(context, values),
-            // The provider does not implement query_rt_values; mirror the C inline's `return EOPNOTSUPP`
-            // (95 on Linux, the only platform rdma-core targets).
-            _ => 95,
+        match verbs_get_ctx_op!(context, query_rt_values) {
+            Some(query_rt_values) => query_rt_values(context, values),
+            // The provider does not implement query_rt_values; mirror the C inline's
+            // `return EOPNOTSUPP`.
+            None => EOPNOTSUPP,
         }
     }
 }
@@ -539,28 +544,23 @@ pub unsafe fn ibv_query_device_ex(
     input: *const ibv_query_device_ex_input,
     attr: *mut ibv_device_attr_ex,
 ) -> ::std::os::raw::c_int {
-    // The only component mask the input may carry is reserved; reject anything set with EINVAL
-    // (22 on Linux, the only platform rdma-core targets), matching the C inline.
+    // The only component mask the input may carry is reserved; reject anything set with EINVAL,
+    // matching the C inline.
     if !input.is_null() && unsafe { (*input).comp_mask } != 0 {
-        return 22;
+        return EINVAL;
     }
-    let need = ::std::mem::size_of::<verbs_context>()
-        - ::std::mem::offset_of!(verbs_context, query_device_ex);
     unsafe {
-        let vctx = verbs_get_ctx(context);
-        if let Some(query_device_ex) = (*vctx).query_device_ex {
-            if (*vctx).sz >= need {
-                let ret = query_device_ex(
-                    context,
-                    input,
-                    attr,
-                    ::std::mem::size_of::<ibv_device_attr_ex>(),
-                );
-                // EOPNOTSUPP (95) or ENOSYS (38) means the provider does not really implement the
-                // extended verb; fall through to the legacy query like the C inline does.
-                if ret != 95 && ret != 38 {
-                    return ret;
-                }
+        if let Some(query_device_ex) = verbs_get_ctx_op!(context, query_device_ex) {
+            let ret = query_device_ex(
+                context,
+                input,
+                attr,
+                ::std::mem::size_of::<ibv_device_attr_ex>(),
+            );
+            // EOPNOTSUPP or ENOSYS means the provider does not really implement the extended verb;
+            // fall through to the legacy query like the C inline does.
+            if ret != EOPNOTSUPP && ret != ENOSYS {
+                return ret;
             }
         }
         // Legacy fallback: zero the whole struct, then fill only the base attributes.

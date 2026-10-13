@@ -1589,7 +1589,7 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
         remote_qkey: u32,
     ) -> AddressedSendOp<'b, 'qp, T> {
         assert!(
-            unsafe { (*ah.as_ptr()).context == (*self.qpx).qp_base.context },
+            unsafe { (*ah.as_raw()).context == (*self.qpx).qp_base.context },
             "the address handle must come from the queue pair's device context"
         );
         AddressedSendOp {
@@ -1597,7 +1597,7 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
                 batch: self,
                 flags: 0,
                 imm: None,
-                dest: Some((ah.as_ptr(), remote_qpn, remote_qkey)),
+                dest: Some((ah.as_raw(), remote_qpn, remote_qkey)),
             },
         }
     }

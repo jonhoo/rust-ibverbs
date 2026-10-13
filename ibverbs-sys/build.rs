@@ -87,25 +87,24 @@ fn main() {
     if let Ok(rdma_core_lib_dir) = env::var("RDMA_CORE_LIB_DIR") {
         println!("cargo:rustc-link-search=native={rdma_core_lib_dir}");
     }
-    let rdma_core_include_dir = if let Ok(rdma_core_include_dir) = env::var("RDMA_CORE_INCLUDE_DIR")
-    {
+    let rdma_core_include_dir = env::var("RDMA_CORE_INCLUDE_DIR").ok();
+    let ibverbs_header_dir = env::var("IBVERBS_HEADER_DIR").ok();
+    if rdma_core_include_dir.is_none() || ibverbs_header_dir.is_none() {
+        update_submodule();
+    }
+    let rdma_core_include_dir = if let Some(rdma_core_include_dir) = rdma_core_include_dir {
         env::var("RDMA_CORE_LIB_DIR").expect(
             "When supplying RDMA_CORE_INCLUDE_DIR, you also need to supply RDMA_CORE_LIB_DIR",
         );
         PathBuf::from(rdma_core_include_dir)
     } else {
-        update_submodule();
         vendored_include_dir()
     };
     // exported to dependents as `DEP_IBVERBS_INCLUDE`
     println!("cargo:include={}", rdma_core_include_dir.display());
 
-    let ibverbs_header_dir = if let Ok(ibverbs_header_dir) = env::var("IBVERBS_HEADER_DIR") {
-        ibverbs_header_dir
-    } else {
-        update_submodule();
-        "vendor/rdma-core/libibverbs".to_string()
-    };
+    let ibverbs_header_dir =
+        ibverbs_header_dir.unwrap_or_else(|| "vendor/rdma-core/libibverbs".to_string());
 
     // generate the bindings
     eprintln!("run bindgen");

@@ -621,15 +621,11 @@ unsafe impl Send for AddressHandle {}
 unsafe impl Sync for AddressHandle {}
 
 impl AddressHandle {
-    #[inline]
-    pub(crate) fn as_ptr(&self) -> *mut ffi::ibv_ah {
-        self.ah
-    }
-
     /// Returns the underlying `ibv_ah` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
     /// [`AddressHandle`] and stays valid only while it is alive; do not destroy it.
+    #[inline]
     pub fn as_raw(&self) -> *mut ffi::ibv_ah {
         self.ah
     }
