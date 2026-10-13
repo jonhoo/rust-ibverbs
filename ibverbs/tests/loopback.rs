@@ -7,13 +7,16 @@
 //! (but still compile-checks them); `cargo test -- --ignored` runs them. They use the first
 //! available device, or `IBVERBS_TEST_DEVICE` (e.g. `rxe0`) if set.
 
+mod common;
+
 use std::time::{Duration, Instant};
 
+use common::{open_test_device, poll_until, test_device};
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
     LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
-    QueuePairAttribute, QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, RnrTimer, SendOps,
-    TransportType, Uc, Ud, WcFields,
+    QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
+    QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, TransportType, Uc, Ud, WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -21,25 +24,6 @@ struct Loopback<T: Connected> {
     qp: QueuePair<T>,
     cq: CompletionQueue,
     pd: ProtectionDomain,
-}
-
-/// Open the device named by `IBVERBS_TEST_DEVICE`, or the first available one. Panics if absent;
-/// these tests only run when explicitly requested, so a missing device is a real setup error.
-fn open_test_device() -> Context {
-    let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
-        Ok(name) if !name.is_empty() => devices
-            .iter()
-            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
-            .unwrap_or_else(|| {
-                panic!("IBVERBS_TEST_DEVICE={name} is not among the available RDMA devices")
-            }),
-        _ => devices
-            .iter()
-            .next()
-            .expect("no RDMA device available (attach one or set IBVERBS_TEST_DEVICE)"),
-    };
-    device.open().expect("failed to open the RDMA device")
 }
 
 /// Soft-RoCE's vendor ID (the kernel's `RXE_VENDOR_ID`).
@@ -74,9 +58,65 @@ fn gid_index(ctx: &Context) -> u32 {
         .gid_index
 }
 
-/// Build a self-connected queue pair of the given connected transport, with generous queue/SGE
-/// limits and the given remote-access grants so the tests can post batches, multi-SGE lists, and
-/// one-sided operations (which loop back to this same QP).
+/// Local write plus remote read and write access, for one-sided operations (which loop back to
+/// the same QP).
+fn read_write() -> AccessFlags {
+    AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ
+}
+
+/// Configures generous queue/SGE limits, so the tests can post batches and multi-SGE lists, and
+/// grants `access`.
+fn generous<T: Connected>(access: AccessFlags) -> impl FnOnce(&mut QueuePairBuilder<T>) {
+    move |builder| {
+        builder
+            .set_max_send_wr(16)
+            .set_max_recv_wr(16)
+            .set_max_send_sge(4)
+            .set_max_recv_sge(4)
+            .set_access(access);
+    }
+}
+
+/// Build a queue pair of the connected transport `T` on `pd` and `cq`, routed from `gid_index` and
+/// otherwise configured by `configure`, and connect it to its own endpoint.
+fn connect_self<T: Connected>(
+    pd: &ProtectionDomain,
+    cq: &CompletionQueue,
+    gid_index: u32,
+    configure: impl FnOnce(&mut QueuePairBuilder<T>),
+) -> QueuePair<T> {
+    let mut builder = pd
+        .create_qp::<T>(cq, cq, 1)
+        .expect("failed to create queue pair");
+    configure(builder.set_gid_index(gid_index));
+    let prepared = builder.build().expect("failed to build queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    prepared
+        .handshake(endpoint)
+        .expect("failed to transition queue pair to RTS")
+}
+
+/// Build a UD queue pair on `pd` and `cq`, routed from `gid_index`, and activate it with `qkey`.
+/// Returns it with its own endpoint, to address datagrams back to it.
+fn activate_self(
+    pd: &ProtectionDomain,
+    cq: &CompletionQueue,
+    gid_index: u32,
+    qkey: u32,
+) -> (QueuePair<Ud>, QueuePairEndpoint) {
+    let prepared = pd
+        .create_qp::<Ud>(cq, cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build()
+        .expect("failed to build UD QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let qp = prepared.activate(qkey).expect("failed to activate UD QP");
+    (qp, endpoint)
+}
+
+/// A self-connected queue pair of the connected transport `T` on fresh resources, with
+/// [`generous`] limits and the given access grants.
 fn loopback_of<T: Connected>(access: AccessFlags) -> Loopback<T> {
     let ctx = open_test_device();
     let cq = ctx
@@ -86,59 +126,14 @@ fn loopback_of<T: Connected>(access: AccessFlags) -> Loopback<T> {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-
-    let mut builder = pd
-        .create_qp::<T>(&cq, &cq, 1)
-        .expect("failed to create queue pair");
-    builder
-        .set_gid_index(gid_index(&ctx))
-        .set_max_send_wr(16)
-        .set_max_recv_wr(16)
-        .set_max_send_sge(4)
-        .set_max_recv_sge(4)
-        .set_access(access);
-
-    let prepared = builder.build().expect("failed to build queue pair");
-    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
-    let qp = prepared
-        .handshake(endpoint)
-        .expect("failed to transition queue pair to RTS");
-
+    let qp = connect_self(&pd, &cq, gid_index(&ctx), generous(access));
     Loopback { qp, cq, pd }
 }
 
 /// A reliable-connected self-loopback queue pair (the common case). Besides remote read/write, it
 /// grants remote-atomic access, which the atomic loopback additionally requires (RC only).
 fn loopback() -> Loopback<Rc> {
-    loopback_of::<Rc>(
-        AccessFlags::LOCAL_WRITE
-            | AccessFlags::REMOTE_WRITE
-            | AccessFlags::REMOTE_READ
-            | AccessFlags::REMOTE_ATOMIC,
-    )
-}
-
-/// Build a reliable-connected self-loopback queue pair on a caller-provided protection domain and
-/// completion queue (rather than fresh ones), so several queue pairs can share resources — used to
-/// test a completion channel shared across queues.
-fn loopback_on(pd: &ProtectionDomain, cq: &CompletionQueue, gid_index: u32) -> QueuePair {
-    let mut builder = pd
-        .create_qp::<Rc>(cq, cq, 1)
-        .expect("failed to create queue pair");
-    builder
-        .set_gid_index(gid_index)
-        .set_max_send_wr(16)
-        .set_max_recv_wr(16)
-        .set_max_send_sge(4)
-        .set_max_recv_sge(4)
-        .set_access(
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-        );
-    let prepared = builder.build().expect("failed to build queue pair");
-    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
-    prepared
-        .handshake(endpoint)
-        .expect("failed to transition queue pair to RTS")
+    loopback_of::<Rc>(read_write() | AccessFlags::REMOTE_ATOMIC)
 }
 
 /// An owned snapshot of the completion fields the tests inspect (the borrowed `WorkCompletion`
@@ -165,29 +160,20 @@ impl Completed {
 /// seconds if they don't (loopback completes in microseconds).
 fn drain(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     let mut observed = Vec::with_capacity(n);
-    let deadline = Instant::now() + Duration::from_secs(5);
-
-    loop {
-        let mut completions = cq.poll().expect("failed to poll CQ");
-        while let Some(wc) = completions.next() {
-            if let Err(e) = wc.ok() {
-                panic!("work request {} failed: {e}", wc.wr_id());
-            }
-            observed.push(Completed {
-                wr_id: wc.wr_id(),
-                len: wc.len(),
-                imm_data: wc.imm_data(),
-            });
-        }
-        if observed.len() >= n {
-            return observed;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for completions: got {} of {n}",
-            observed.len()
-        );
-    }
+    let arrived = poll_until(cq, |wc| {
+        observed.push(Completed {
+            wr_id: wc.wr_id(),
+            len: wc.len(),
+            imm_data: wc.imm_data(),
+        });
+        observed.len() >= n
+    });
+    assert!(
+        arrived,
+        "timed out waiting for completions: got {} of {n}",
+        observed.len()
+    );
+    observed
 }
 
 /// Like [`drain`], but through the standard `ibv_poll_cq` batch path ([`CompletionQueue::poll_into`])
@@ -614,7 +600,7 @@ fn wait_for_completion() {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-    let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(read_write()));
 
     let mut recv = pd
         .allocate(16, AccessFlags::PERMISSIVE)
@@ -664,9 +650,7 @@ fn wait_for_completion() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn unreliable_connection() {
-    let mut lb = loopback_of::<Uc>(
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-    );
+    let mut lb = loopback_of::<Uc>(read_write());
 
     let mut recv = lb
         .pd
@@ -707,15 +691,9 @@ fn shared_receive_queue() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
 
-    let prepared = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP")
-        .set_gid_index(gid_index(&ctx))
-        .set_srq(&srq)
-        .build()
-        .expect("failed to build QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to connect QP");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_srq(&srq);
+    });
 
     let mut recv = pd
         .allocate(64, AccessFlags::PERMISSIVE)
@@ -798,16 +776,9 @@ fn srq_limit_reached_async_event() {
         Err(e) => eprintln!("SRQ resize not available here: {e}"),
     }
 
-    let prepared = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP")
-        .set_gid_index(gid_index(&ctx))
-        .set_srq(&srq)
-        .set_max_send_wr(8)
-        .build()
-        .expect("failed to build QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to connect QP");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_srq(&srq).set_max_send_wr(8);
+    });
 
     let recv = pd
         .allocate(64, AccessFlags::PERMISSIVE)
@@ -913,16 +884,7 @@ fn address_handle_from_another_context_is_refused() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let gid_index = gid_index(&ctx);
-    let prepared = pd
-        .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
-        .set_gid_index(gid_index)
-        .build()
-        .expect("failed to build UD QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared
-        .activate(0x1234_5678)
-        .expect("failed to activate UD QP");
+    let (mut qp, endpoint) = activate_self(&pd, &cq, gid_index, 0x1234_5678);
 
     let mut ah_attr = AddressHandleAttribute::new(1);
     ah_attr.set_grh(
@@ -950,15 +912,7 @@ fn unreliable_datagram() {
 
     let gid_index = gid_index(&ctx);
     const QKEY: u32 = 0x1234_5678;
-
-    let prepared = pd
-        .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
-        .set_gid_index(gid_index)
-        .build()
-        .expect("failed to build UD QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.activate(QKEY).expect("failed to activate UD QP");
+    let (mut qp, endpoint) = activate_self(&pd, &cq, gid_index, QKEY);
 
     // Address handle pointing at our own GID, so the datagram loops back to us.
     let my_gid = endpoint.gid.expect("RoCE requires a GID");
@@ -1387,16 +1341,7 @@ fn raw_handles() {
     assert!(!srq.as_raw().is_null());
 
     // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
-    let prepared = pd
-        .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
-        .set_gid_index(gid_index(&ctx))
-        .build()
-        .expect("failed to build UD QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let qp = prepared
-        .activate(0x1234_5678)
-        .expect("failed to activate UD QP");
+    let (qp, endpoint) = activate_self(&pd, &cq, gid_index(&ctx), 0x1234_5678);
     assert!(!qp.as_raw().is_null());
     assert!(!qp.as_raw_ex().is_null());
 
@@ -1416,18 +1361,9 @@ fn inline_send() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create RC QP");
-    builder
-        .set_gid_index(gid_index(&ctx))
-        .set_max_inline_data(64)
-        .set_access(
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-        );
-    let prepared = builder.build().expect("failed to build QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_max_inline_data(64).set_access(read_write());
+    });
 
     // Inline SEND: the payload lives only in this stack array, never in a registered MR.
     let recv = pd
@@ -1467,15 +1403,9 @@ fn queue_pair_on_explicit_port() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP on port 1");
-    builder.set_gid_index(gid_index(&ctx)).set_access(
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-    );
-    let prepared = builder.build().expect("failed to build QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_access(read_write());
+    });
 
     let recv = pd
         .allocate(64, AccessFlags::PERMISSIVE)
@@ -1519,15 +1449,9 @@ fn completion_timestamps() {
         return;
     };
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP");
-    builder.set_gid_index(gid_index(&ctx)).set_access(
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-    );
-    let prepared = builder.build().expect("failed to build QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_access(read_write());
+    });
 
     let recv = pd
         .allocate(64, AccessFlags::PERMISSIVE)
@@ -1543,18 +1467,11 @@ fn completion_timestamps() {
 
     // Each completion carries a hardware timestamp; reading it must succeed (not panic).
     let mut stamps = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while stamps.len() < 2 {
-        let mut comps = cq.poll().expect("failed to poll CQ");
-        while let Some(wc) = comps.next() {
-            wc.ok().expect("work request failed");
-            stamps.push(wc.completion_timestamp());
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for completions"
-        );
-    }
+    let arrived = poll_until(&cq, |wc| {
+        stamps.push(wc.completion_timestamp());
+        stamps.len() == 2
+    });
+    assert!(arrived, "timed out waiting for completions");
     // Timestamps are raw HCA-clock readings; their difference is a tick count.
     let earliest = *stamps.iter().min().expect("have completions");
     let latest = *stamps.iter().max().expect("have completions");
@@ -1576,15 +1493,9 @@ fn extended_wc_fields() {
         .expect("failed to create a CQ with the addressing fields");
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP");
-    builder.set_gid_index(gid_index(&ctx)).set_access(
-        AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-    );
-    let prepared = builder.build().expect("failed to build QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_access(read_write());
+    });
 
     let recv = pd
         .allocate(64, AccessFlags::PERMISSIVE)
@@ -1601,31 +1512,24 @@ fn extended_wc_fields() {
     // Exercise the accessors on each completion. The addressing values are device-defined (and zero
     // on RoCE), so just ensure the reads succeed; an RC completion never carries a GRH.
     let mut seen = 0;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while seen < 2 {
-        let mut comps = cq.poll().expect("failed to poll CQ");
-        while let Some(wc) = comps.next() {
-            wc.ok().expect("work request failed");
-            let _ = wc.wc_flags();
-            let _ = wc.has_grh();
-            let _ = wc.slid();
-            let _ = wc.sl();
-            let _ = wc.dlid_path_bits();
-            assert_eq!(
-                wc.invalidated_rkey(),
-                None,
-                "a plain send invalidates nothing"
-            );
-            let raw = wc.as_raw();
-            assert!(!raw.is_null());
-            assert_eq!(unsafe { (*raw).wr_id }, wc.wr_id());
-            seen += 1;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for completions"
+    let arrived = poll_until(&cq, |wc| {
+        let _ = wc.wc_flags();
+        let _ = wc.has_grh();
+        let _ = wc.slid();
+        let _ = wc.sl();
+        let _ = wc.dlid_path_bits();
+        assert_eq!(
+            wc.invalidated_rkey(),
+            None,
+            "a plain send invalidates nothing"
         );
-    }
+        let raw = wc.as_raw();
+        assert!(!raw.is_null());
+        assert_eq!(unsafe { (*raw).wr_id }, wc.wr_id());
+        seen += 1;
+        seen == 2
+    });
+    assert!(arrived, "timed out waiting for completions");
     assert!(
         cq.capacity() >= 16,
         "the device grants at least what was asked"
@@ -1640,27 +1544,20 @@ fn extended_wc_fields() {
             .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
             .build(),
     ) {
-        let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
+        let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(read_write()));
         unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
             .expect("post_recv failed");
         let mut batch = qp.start_send();
         batch.op().signaled().send(2, &[send.slice(..4)]);
         unsafe { batch.submit() }.expect("send failed");
         let mut seen = 0;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while seen < 2 {
-            let mut comps = cq.poll().expect("failed to poll CQ");
-            while let Some(wc) = comps.next() {
-                wc.ok().expect("work request failed");
-                let _ = wc.cvlan();
-                let _ = wc.flow_tag();
-                seen += 1;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for completions"
-            );
-        }
+        let arrived = poll_until(&cq, |wc| {
+            let _ = wc.cvlan();
+            let _ = wc.flow_tag();
+            seen += 1;
+            seen == 2
+        });
+        assert!(arrived, "timed out waiting for completions");
     }
 }
 
@@ -1692,7 +1589,7 @@ fn event_driven_completion() {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-    let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(read_write()));
 
     let mut recv = pd
         .allocate(64, AccessFlags::PERMISSIVE)
@@ -1745,13 +1642,7 @@ fn event_driven_completion() {
 fn gid_and_device_introspection() {
     // Select the same device `open_test_device` would, so we can read its transport type first.
     let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
-        Ok(name) if !name.is_empty() => devices
-            .iter()
-            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
-            .expect("IBVERBS_TEST_DEVICE is not among the available devices"),
-        _ => devices.iter().next().expect("no RDMA device available"),
-    };
+    let device = test_device(&devices);
     // RoCE (including Soft-RoCE) presents the InfiniBand transport.
     assert_eq!(device.transport_type(), TransportType::Ib);
 
@@ -1876,18 +1767,9 @@ fn inline_send_list() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create RC QP");
-    builder
-        .set_gid_index(gid_index(&ctx))
-        .set_max_inline_data(64)
-        .set_access(
-            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
-        );
-    let prepared = builder.build().expect("failed to build QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_max_inline_data(64).set_access(read_write());
+    });
 
     // Gathered inline SEND: the payload is assembled from three separate stack buffers.
     let recv = pd
@@ -1972,13 +1854,7 @@ fn query_device_extended() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn debug_formatting() {
     let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = match std::env::var("IBVERBS_TEST_DEVICE") {
-        Ok(name) if !name.is_empty() => devices
-            .iter()
-            .find(|d| d.name().is_some_and(|n| n.to_bytes() == name.as_bytes()))
-            .expect("IBVERBS_TEST_DEVICE is not among the available devices"),
-        _ => devices.iter().next().expect("no RDMA device available"),
-    };
+    let device = test_device(&devices);
     assert!(format!("{device:?}").contains("Device"), "{device:?}");
 
     let ctx = device.open().expect("failed to open the RDMA device");
@@ -2036,8 +1912,8 @@ fn shared_completion_channel() {
     );
 
     let pd = ctx.alloc_pd().expect("failed to allocate pd");
-    let mut qp_a = loopback_on(&pd, &cq_a, gid_index(&ctx));
-    let mut qp_b = loopback_on(&pd, &cq_b, gid_index(&ctx));
+    let mut qp_a = connect_self::<Rc>(&pd, &cq_a, gid_index(&ctx), generous(read_write()));
+    let mut qp_b = connect_self::<Rc>(&pd, &cq_b, gid_index(&ctx), generous(read_write()));
 
     let mut recv_a = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv a");
     let mut recv_b = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv b");
@@ -2303,21 +2179,15 @@ fn send_ops_subset() {
     let ctx = open_test_device();
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP");
-    let default = builder.send_ops();
-    assert!(
-        default.contains(SendOps::SEND | SendOps::RDMA_READ | SendOps::ATOMIC_FETCH_AND_ADD),
-        "an RC queue pair requests the full set by default: {default:?}"
-    );
-    builder
-        .set_gid_index(gid_index(&ctx))
-        .set_send_ops(SendOps::SEND);
-    assert_eq!(builder.send_ops(), SendOps::SEND);
-    let prepared = builder.build().expect("failed to build a send-only QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.handshake(endpoint).expect("failed to reach RTS");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        let default = builder.send_ops();
+        assert!(
+            default.contains(SendOps::SEND | SendOps::RDMA_READ | SendOps::ATOMIC_FETCH_AND_ADD),
+            "an RC queue pair requests the full set by default: {default:?}"
+        );
+        builder.set_send_ops(SendOps::SEND);
+        assert_eq!(builder.send_ops(), SendOps::SEND);
+    });
 
     let recv = pd
         .allocate(16, AccessFlags::PERMISSIVE)
@@ -2345,15 +2215,7 @@ fn reply_through_address_handle_from_wc() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let gid_index = gid_index(&ctx);
     const QKEY: u32 = 0x1234_5678;
-
-    let prepared = pd
-        .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
-        .set_gid_index(gid_index)
-        .build()
-        .expect("failed to build UD QP");
-    let endpoint = prepared.endpoint().expect("failed to read endpoint");
-    let mut qp = prepared.activate(QKEY).expect("failed to activate UD QP");
+    let (mut qp, endpoint) = activate_self(&pd, &cq, gid_index, QKEY);
 
     // The "request" goes to our own GID through an explicitly built address handle.
     let my_gid = endpoint.gid.expect("RoCE requires a GID");

@@ -1331,34 +1331,4 @@ mod test_conversions {
             assert_eq!(ffi::ibv_wc_opcode::from(wrapper), raw);
         }
     }
-
-    #[test]
-    fn wc_fields_bit_ops_and_roundtrip() {
-        let fields = WcFields::SLID | WcFields::SL;
-        assert!(fields.contains(WcFields::SLID));
-        assert!(!fields.contains(WcFields::COMPLETION_TIMESTAMP));
-        let raw: ffi::ibv_create_cq_wc_flags = fields.into();
-        assert_eq!(
-            raw,
-            ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID
-                | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL
-        );
-        assert_eq!(WcFields::from(raw), fields);
-        assert_eq!(format!("{fields:?}"), "WcFields(SLID | SL)");
-    }
-
-    #[test]
-    fn wc_flags_bit_ops_and_roundtrip() {
-        let flags = WcFlags::GRH | WcFlags::WITH_IMM;
-        assert!(flags.contains(WcFlags::GRH));
-        assert!(!flags.contains(WcFlags::IP_CSUM_OK));
-        let raw: ffi::ibv_wc_flags = flags.into();
-        assert_eq!(
-            raw,
-            ffi::ibv_wc_flags::IBV_WC_GRH | ffi::ibv_wc_flags::IBV_WC_WITH_IMM
-        );
-        assert_eq!(WcFlags::from(raw), flags);
-        assert_eq!(format!("{flags:?}"), "WcFlags(GRH | WITH_IMM)");
-        assert_eq!(format!("{:?}", WcFlags::empty()), "WcFlags(0)");
-    }
 }

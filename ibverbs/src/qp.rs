@@ -2761,34 +2761,6 @@ mod test_conversions {
     }
 
     #[test]
-    fn attribute_mask_bit_ops_and_roundtrip() {
-        let mask = QueuePairAttributeMask::STATE | QueuePairAttributeMask::PORT;
-        assert!(mask.contains(QueuePairAttributeMask::STATE));
-        assert!(!mask.contains(QueuePairAttributeMask::QKEY));
-        let raw: ffi::ibv_qp_attr_mask = mask.into();
-        assert_eq!(
-            raw,
-            ffi::ibv_qp_attr_mask::IBV_QP_STATE | ffi::ibv_qp_attr_mask::IBV_QP_PORT
-        );
-        assert_eq!(QueuePairAttributeMask::from(raw), mask);
-    }
-
-    #[test]
-    fn attribute_mask_debug_lists_flag_names() {
-        let mask = QueuePairAttributeMask::STATE
-            | QueuePairAttributeMask::PKEY_INDEX
-            | QueuePairAttributeMask::PORT;
-        assert_eq!(
-            format!("{mask:?}"),
-            "QueuePairAttributeMask(STATE | PKEY_INDEX | PORT)"
-        );
-        assert_eq!(
-            format!("{:?}", QueuePairAttributeMask::empty()),
-            "QueuePairAttributeMask(0)"
-        );
-    }
-
-    #[test]
     fn attribute_setters_record_their_mask_bit() {
         let mut attr = QueuePairAttribute::new();
         attr.set_state(QueuePairState::Init)

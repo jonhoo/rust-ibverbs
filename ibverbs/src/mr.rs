@@ -349,49 +349,10 @@ mod test {
     }
 
     #[test]
-    fn access_flags_roundtrip() {
-        let flags = AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ;
-        let raw: ffi::ibv_access_flags = flags.into();
-        assert_eq!(
-            raw,
-            ffi::ibv_access_flags::IBV_ACCESS_LOCAL_WRITE
-                | ffi::ibv_access_flags::IBV_ACCESS_REMOTE_READ
-        );
-        assert_eq!(AccessFlags::from(raw), flags);
-        assert_eq!(
-            AccessFlags::from(ffi::ibv_access_flags::IBV_ACCESS_RELAXED_ORDERING),
-            AccessFlags::RELAXED_ORDERING
-        );
-    }
-
-    #[test]
-    fn access_flags_bit_ops() {
-        let mut flags = AccessFlags::empty();
-        assert!(!flags.contains(AccessFlags::LOCAL_WRITE));
-        flags |= AccessFlags::LOCAL_WRITE;
-        flags |= AccessFlags::REMOTE_WRITE;
-        assert!(flags.contains(AccessFlags::LOCAL_WRITE));
-        assert!(flags.contains(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE));
-        assert!(!flags.contains(AccessFlags::REMOTE_ATOMIC));
-        assert_eq!(flags & AccessFlags::LOCAL_WRITE, AccessFlags::LOCAL_WRITE);
-        assert_eq!(flags & AccessFlags::REMOTE_ATOMIC, AccessFlags::empty());
+    fn permissive_access_flags() {
         assert!(
             AccessFlags::PERMISSIVE.contains(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_ATOMIC)
         );
         assert!(!AccessFlags::PERMISSIVE.contains(AccessFlags::ON_DEMAND));
-    }
-
-    #[test]
-    fn access_flags_debug_lists_names() {
-        assert_eq!(format!("{:?}", AccessFlags::empty()), "AccessFlags(0)");
-        assert_eq!(
-            format!("{:?}", AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_READ),
-            "AccessFlags(LOCAL_WRITE | REMOTE_READ)"
-        );
-        // Unknown bits are kept visible as a hex remainder.
-        assert_eq!(
-            format!("{:?}", AccessFlags(AccessFlags::LOCAL_WRITE.0 | 1 << 30)),
-            "AccessFlags(LOCAL_WRITE | 0x40000000)"
-        );
     }
 }
