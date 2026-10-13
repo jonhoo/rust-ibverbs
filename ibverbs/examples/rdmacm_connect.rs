@@ -68,7 +68,7 @@ fn server(addr: SocketAddr) {
             Some(Duration::from_secs(10)),
         )
         .unwrap();
-    println!("connected to {:?}", conn.peer_addr());
+    println!("connected to {:?}", conn.cm_id().peer_addr());
     // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
     unsafe {
         conn.queue_pair()
