@@ -174,23 +174,13 @@ impl SharedReceiveQueue {
         if recvs.is_empty() {
             return Ok(());
         }
-        // Link the requests into the list `ibv_post_srq_recv` expects.
-        for i in 0..recvs.len() - 1 {
-            let next = &mut recvs[i + 1].wr as *mut ffi::ibv_recv_wr;
-            recvs[i].wr.next = next;
-        }
-        recvs.last_mut().unwrap().wr.next = ptr::null_mut();
+        let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
         let ctx = unsafe { *self.srq }.context;
         let ops = &mut unsafe { *ctx }.ops;
-        let errno = unsafe {
-            ops.post_srq_recv.as_mut().unwrap()(
-                self.srq,
-                &mut recvs[0].wr as *mut _,
-                &mut bad_wr as *mut _,
-            )
-        };
+        let errno =
+            unsafe { ops.post_srq_recv.as_mut().unwrap()(self.srq, head, &mut bad_wr as *mut _) };
         if errno != 0 {
             Err(Error::errno(errno, Error::PostReceive))
         } else {
