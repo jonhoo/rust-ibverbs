@@ -52,7 +52,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install ${{ matrix.toolchain }}
         uses: dtolnay/rust-toolchain@master
         with:
@@ -63,6 +63,7 @@ jobs:
         with:
           reporter: 'github-pr-check'
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          clippy_flags: --all-features --all-targets -- -D warnings
   doc:
     # run docs generation on nightly rather than stable. This enables features like
     # https://doc.rust-lang.org/beta/unstable-book/language-features/doc-cfg.html which allows an
@@ -74,7 +75,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install nightly
         uses: dtolnay/rust-toolchain@nightly
       - name: cargo doc
@@ -95,7 +96,7 @@ jobs:
           submodules: true
           fetch-depth: 0
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
       - name: cargo install cargo-semver-checks
@@ -105,8 +106,8 @@ jobs:
           # The baseline is built from a scratch checkout without the vendored submodule, so point
           # every header lookup at this workspace's copy (mirroring configure-ci.sh's values as
           # real environment variables, which apply to the baseline build too).
-          RDMA_CORE_INCLUDE_DIR: ${{ github.workspace }}/ibverbs-sys/vendor/rdma-core/build/include
-          RDMA_CORE_LIB_DIR: /usr/lib/x86_64-linux-gnu
+          RDMA_CORE_INCLUDE_DIR: ${{ github.workspace }}/rdma-core-build/include
+          RDMA_CORE_LIB_DIR: ${{ github.workspace }}/rdma-core-build/lib
           IBVERBS_HEADER_DIR: ${{ github.workspace }}/ibverbs-sys/vendor/rdma-core/libibverbs
         run: cargo semver-checks --package ibverbs --baseline-rev ${{ github.event.pull_request.base.sha }}
   package:
@@ -137,7 +138,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install stable
         uses: dtolnay/rust-toolchain@stable
       - name: cargo install cargo-hack
@@ -160,10 +161,14 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install ${{ matrix.msrv }}
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.msrv }}
       - name: cargo +${{ matrix.msrv }} check
         run: cargo check
+      - name: cargo check --no-default-features --features mlx5
+        run: cargo check --no-default-features --features mlx5
+      - name: cargo check --all-features --all-targets
+        run: cargo check --all-features --all-targets

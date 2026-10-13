@@ -280,6 +280,12 @@ mod efa;
 #[cfg(feature = "efa")]
 pub use efa::Srd;
 
+#[cfg(feature = "mlx5")]
+mod mlx5;
+
+#[cfg(feature = "mlx5")]
+pub use mlx5::Mlx5DmabufAccessFlags;
+
 pub use address::*;
 pub use completion::*;
 pub use context::*;

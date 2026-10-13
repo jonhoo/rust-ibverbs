@@ -15,7 +15,7 @@ fn no_default_types(bzl: &str) -> impl Iterator<Item = &str> {
 ///
 /// rdma-core publishes its public headers into the build tree at cmake *configure* time
 /// (`buildlib/publish_headers.cmake`), so configuring is all it takes to generate bindings from
-/// them; nothing is compiled, and the crate links the system `libibverbs` regardless.
+/// them; nothing is compiled.
 fn configure_vendored_rdma() -> PathBuf {
     let build_dir =
         PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("rdma-core");
@@ -74,6 +74,11 @@ fn main() {
         println!("cargo:rustc-link-lib=efa");
     }
 
+    let mlx5 = env::var("CARGO_FEATURE_MLX5").is_ok();
+    if mlx5 {
+        println!("cargo:rustc-link-lib=mlx5");
+    }
+
     let rdmacm = env::var("CARGO_FEATURE_RDMACM").is_ok();
     if rdmacm {
         // The `rdma_*` connection-manager functions are exported from librdmacm.
@@ -83,12 +88,14 @@ fn main() {
     // Where `verbs.h`'s own includes (`<infiniband/verbs_api.h>` and friends) come from: either
     // pre-generated rdma-core headers named by the caller, or the ones cmake generates from the
     // vendored checkout.
+    if let Ok(rdma_core_lib_dir) = env::var("RDMA_CORE_LIB_DIR") {
+        println!("cargo:rustc-link-search=native={rdma_core_lib_dir}");
+    }
     let rdma_core_include_dir = if let Ok(rdma_core_include_dir) = env::var("RDMA_CORE_INCLUDE_DIR")
     {
-        let rdma_core_lib_dir = env::var("RDMA_CORE_LIB_DIR").expect(
+        env::var("RDMA_CORE_LIB_DIR").expect(
             "When supplying RDMA_CORE_INCLUDE_DIR, you also need to supply RDMA_CORE_LIB_DIR",
         );
-        println!("cargo:rustc-link-search=native={rdma_core_lib_dir}");
         PathBuf::from(rdma_core_include_dir)
     } else {
         update_submodule();
@@ -159,6 +166,15 @@ fn main() {
             .allowlist_function("efadv_.*")
             .allowlist_type("efadv_.*")
             .allowlist_var("EFADV_QP_DRIVER_TYPE_.*");
+    }
+
+    if mlx5 {
+        builder = builder
+            .header_contents("mlx5dv_wrapper.h", "#include <infiniband/mlx5dv.h>")
+            .allowlist_function("mlx5dv_reg_dmabuf_mr")
+            .allowlist_function("mlx5dv_get_data_direct_sysfs_path")
+            .allowlist_type("mlx5_ib_uapi_reg_dmabuf_flags")
+            .bitfield_enum("mlx5_ib_uapi_reg_dmabuf_flags");
     }
 
     if rdmacm {

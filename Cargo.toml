@@ -1,6 +1,3 @@
 [workspace]
 resolver = "2"
-members = [
-    "ibverbs",
-    "ibverbs-sys",
-]
+members = ["ibverbs", "ibverbs-sys"]

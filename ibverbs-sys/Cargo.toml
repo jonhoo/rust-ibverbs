@@ -8,7 +8,7 @@ description = "Raw, FFI bindings for RDMA ibverbs through rdma-core"
 readme = "../README.md"
 authors = [
     "Jon Gjengset <jon@thesquareplanet.com>",
-    "Jonathan Behrens <fintelia@gmail.com>"
+    "Jonathan Behrens <fintelia@gmail.com>",
 ]
 build = "build.rs"
 links = "ibverbs"
@@ -24,24 +24,25 @@ license = "MIT OR Apache-2.0"
 exclude = ["vendor/rdma-core/build/"]
 
 [package.metadata.docs.rs]
-# so docs.rs shows the rdmacm and efadv bindings too
 all-features = true
 
 [features]
 # Bind and link the EFA provider direct-verbs (`efadv`), for AWS Elastic Fabric Adapter SRD queue
 # pairs. Requires `libefa` at build and run time.
 efa = []
+# Bind and link mlx5 direct verbs for DMA-BUF registration and Data Direct device queries.
+# Requires `libmlx5` from rdma-core 54+ at build and run time.
+mlx5 = []
 # Bind and link the RDMA connection manager (`librdmacm`, `rdma_cma.h`). Requires `librdmacm` at
 # build and run time.
 rdmacm = []
+
+# to make -Zminimal-versions work
+[target.'cfg(any())'.dependencies]
+proc-macro2 = { version = "1.0.80", optional = true }
 
 [build-dependencies]
 bindgen = "0.72"
 
 [dev-dependencies]
 syn = { version = "2.0", features = ["full"] }
-
-# to make -Zminimal-versions work
-[target.'cfg(any())'.dependencies]
-# https://github.com/rust-lang/rust-bindgen/pull/3048
-proc-macro2 = { version = "1.0.80", optional = true }

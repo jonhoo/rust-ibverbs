@@ -23,7 +23,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install nightly
         uses: dtolnay/rust-toolchain@nightly
       - name: cargo generate-lockfile
@@ -48,7 +48,7 @@ jobs:
         with:
           submodules: true
       - name: Configure CI host
-        run: ./configure-ci.sh
+        run: ./configure-ci.sh --vendored-libs
       - name: Install beta
         if: hashFiles('Cargo.lock') != ''
         uses: dtolnay/rust-toolchain@beta

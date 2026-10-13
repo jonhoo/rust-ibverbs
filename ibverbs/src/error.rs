@@ -89,6 +89,11 @@ pub enum Error {
     #[error("failed to query the device real-time values")]
     QueryRealTimeValues(#[source] io::Error),
 
+    /// Querying the mlx5 Data Direct sysfs path failed or returned malformed output.
+    #[cfg(feature = "mlx5")]
+    #[error("failed to query the mlx5 Data Direct sysfs path")]
+    QueryMlx5DataDirectSysfsPath(#[source] io::Error),
+
     /// Allocating a protection domain failed (`ibv_alloc_pd`).
     #[error("failed to allocate a protection domain")]
     AllocProtectionDomain(#[source] io::Error),
@@ -270,6 +275,8 @@ impl Error {
             Error::QueryGid { .. } => "ibv_query_gid",
             Error::QueryGidTable(_) => "ibv_query_gid_table",
             Error::QueryRealTimeValues(_) => "ibv_query_rt_values_ex",
+            #[cfg(feature = "mlx5")]
+            Error::QueryMlx5DataDirectSysfsPath(_) => "mlx5dv_get_data_direct_sysfs_path",
             Error::AllocProtectionDomain(_) => "ibv_alloc_pd",
             Error::RegisterMemoryRegion(_) => "ibv_reg_mr",
             Error::AdviseMemoryRegion(_) => "ibv_advise_mr",
