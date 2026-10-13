@@ -10,10 +10,10 @@
 use std::time::{Duration, Instant};
 
 use ibverbs::{
-    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh, MrAdvice,
-    MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair, QueuePairAttribute,
-    QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, TransportType, Uc,
-    Ud, WcFields,
+    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
+    LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
+    QueuePairAttribute, QueuePairAttributeMask, QueuePairState, Rc, RecvRequest, RnrTimer, SendOps,
+    TransportType, Uc, Ud, WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -2156,6 +2156,33 @@ fn rd_atomic_defaults_follow_the_device() {
     assert_eq!(i32::from(remote.max_dest_rd_atomic), responder);
     remote.max_dest_rd_atomic = 1;
     assert_eq!(prepared.rts_attributes(&remote).max_rd_atomic(), 1);
+}
+
+/// RoCE routes every packet by GID, so a handshake with an endpoint that carries none is refused
+/// with a typed error rather than the kernel's bare `EINVAL`. (InfiniBand routes by LID, so there
+/// is nothing to check on an InfiniBand port.)
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn roce_handshake_needs_a_gid() {
+    let ctx = open_test_device();
+    let port = ctx.query_port(1).expect("failed to query port");
+    if port.link_layer() != LinkLayer::Ethernet {
+        return;
+    }
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    // No GID index, so the endpoint carries no GID.
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP")
+        .build()
+        .expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    assert!(endpoint.gid.is_none());
+    match prepared.handshake(endpoint) {
+        Err(Error::GidRequired) => {}
+        other => panic!("expected GidRequired, got {:?}", other.err()),
+    }
 }
 
 #[test]
