@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::completion::WorkCompletion;
 use crate::context::Context;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, destroyed};
 use crate::pd::ProtectionDomainInner;
 
 #[cfg(doc)]
@@ -633,11 +633,7 @@ impl AddressHandle {
 
 impl Drop for AddressHandle {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_ah(self.ah) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_ah failed: {e}");
-        }
+        destroyed("ibv_destroy_ah", unsafe { ffi::ibv_destroy_ah(self.ah) });
     }
 }
 

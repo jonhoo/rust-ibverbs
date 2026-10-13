@@ -569,6 +569,45 @@ pub unsafe fn ibv_query_device_ex(
     }
 }
 
+// `ibv_poll_cq` and `ibv_req_notify_cq` are `static inline` as well, but dispatch through the
+// legacy op table in `ibv_context` itself, which libibverbs fills completely (with a stub that
+// fails for any op the provider leaves out), so they need no availability check.
+
+/// Poll a completion queue for up to `num_entries` work completions, copying them into `wc`
+/// (`ibv_poll_cq`).
+///
+/// Returns the number of completions copied (0 when none are ready), or a negative value on
+/// failure, which does not set `errno`.
+///
+/// # Safety
+///
+/// `cq` must be a valid completion queue, and `wc` must be valid for writes of `num_entries`
+/// entries.
+#[inline]
+pub unsafe fn ibv_poll_cq(
+    cq: *mut ibv_cq,
+    num_entries: ::std::os::raw::c_int,
+    wc: *mut ibv_wc,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*cq).context).ops.poll_cq.unwrap()(cq, num_entries, wc) }
+}
+
+/// Arm a completion queue so its next completion, or its next solicited one if `solicited_only`
+/// is nonzero, raises a notification on its completion channel (`ibv_req_notify_cq`).
+///
+/// Returns 0 on success, or the `errno` value on failure.
+///
+/// # Safety
+///
+/// `cq` must be a valid completion queue.
+#[inline]
+pub unsafe fn ibv_req_notify_cq(
+    cq: *mut ibv_cq,
+    solicited_only: ::std::os::raw::c_int,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*cq).context).ops.req_notify_cq.unwrap()(cq, solicited_only) }
+}
+
 // `rdma_get_local_addr` and `rdma_get_peer_addr` are `static inline` in rdma_cma.h: they return
 // pointers into the id's own `route.addr` storage, so there is no exported symbol for bindgen to
 // bind. The functions below reimplement them.

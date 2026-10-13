@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::context::{ContextInner, HcaClock};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, destroyed, nonnull};
 
 #[cfg(doc)]
 use crate::Context;
@@ -56,11 +56,9 @@ unsafe impl Sync for CompletionChannelInner {}
 
 impl Drop for CompletionChannelInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_comp_channel failed: {e}");
-        }
+        destroyed("ibv_destroy_comp_channel", unsafe {
+            ffi::ibv_destroy_comp_channel(self.cc)
+        });
     }
 }
 
@@ -69,10 +67,10 @@ impl CompletionChannel {
     /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
     /// instead of blocking.
     pub(crate) fn new(ctx: &Arc<ContextInner>) -> Result<CompletionChannel> {
-        let cc = unsafe { ffi::ibv_create_comp_channel(ctx.ctx) };
-        if cc.is_null() {
-            return Err(Error::CreateCompletionChannel(io::Error::last_os_error()));
-        }
+        let cc = nonnull(
+            unsafe { ffi::ibv_create_comp_channel(ctx.ctx) },
+            Error::CreateCompletionChannel,
+        )?;
         let channel = CompletionChannel {
             inner: Arc::new(CompletionChannelInner {
                 _ctx: ctx.clone(),
@@ -121,7 +119,7 @@ impl CompletionChannel {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::PollCompletionQueue(e));
+            return Err(Error::os(e, Error::PollCompletionQueue));
         }
         // Every event from ibv_get_cq_event() must eventually be acknowledged.
         unsafe { ffi::ibv_ack_cq_events(out_cq, 1) };
@@ -301,23 +299,18 @@ impl CompletionQueueBuilder {
             wc_flags: wc_flags as u64,
             ..Default::default()
         };
-        let cq_ex = unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr) };
-
-        if cq_ex.is_null() {
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateCompletionQueue,
-            ))
-        } else {
-            Ok(CompletionQueue {
-                inner: Arc::new(CompletionQueueInner {
-                    _ctx: self.ctx.clone(),
-                    cc,
-                    cq_ex,
-                }),
+        let cq_ex = nonnull(
+            unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr) },
+            Error::CreateCompletionQueue,
+        )?;
+        Ok(CompletionQueue {
+            inner: Arc::new(CompletionQueueInner {
+                _ctx: self.ctx.clone(),
+                cc,
                 cq_ex,
-            })
-        }
+            }),
+            cq_ex,
+        })
     }
 }
 
@@ -339,11 +332,7 @@ impl CompletionQueueInner {
 
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_cq(self.cq()) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_cq failed: {e}");
-        }
+        destroyed("ibv_destroy_cq", unsafe { ffi::ibv_destroy_cq(self.cq()) });
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
         // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel
@@ -732,6 +721,19 @@ impl std::fmt::Display for WcOpcode {
     }
 }
 
+/// Read an optional work-completion field through the provider's lazy `read_*` reader on `$cq`,
+/// passing it any further arguments. The provider installs a field's reader only on a queue that
+/// requested the field, so on any other queue this panics, naming the field.
+macro_rules! wc_reader {
+    ($cq:expr, $reader:ident, $field:literal $(, $arg:expr)*) => {
+        unsafe {
+            (*$cq)
+                .$reader
+                .expect(concat!("completion queue did not request ", $field))($cq $(, $arg)*)
+        }
+    };
+}
+
 /// A single work completion, borrowed from the completion queue being polled.
 ///
 /// Returned by [`Completions::next`]. Fields are read lazily through the extended completion-queue
@@ -813,11 +815,11 @@ impl WorkCompletion<'_> {
     /// completion queue panics, because the provider did not install the timestamp reader.
     #[inline]
     pub fn completion_timestamp(&self) -> HcaClock {
-        HcaClock(unsafe {
-            (*self.cq)
-                .read_completion_ts
-                .expect("completion queue was not created with timestamps")(self.cq)
-        })
+        HcaClock(wc_reader!(
+            self.cq,
+            read_completion_ts,
+            "the completion timestamp"
+        ))
     }
 
     /// The wallclock hardware timestamp (in nanoseconds) captured when this work request completed.
@@ -828,13 +830,11 @@ impl WorkCompletion<'_> {
     /// completion queue, because the provider did not install the reader.
     #[inline]
     pub fn completion_wallclock_ns(&self) -> u64 {
-        unsafe {
-            (*self.cq)
-                .read_completion_wallclock_ns
-                .expect("completion queue was not created with wallclock timestamps")(
-                self.cq
-            )
-        }
+        wc_reader!(
+            self.cq,
+            read_completion_wallclock_ns,
+            "the wallclock completion timestamp"
+        )
     }
 
     /// The work-completion flags (`IBV_WC_*`), such as whether a GRH is present or immediate
@@ -857,11 +857,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn slid(&self) -> u32 {
-        unsafe {
-            (*self.cq)
-                .read_slid
-                .expect("completion queue did not request the source LID")(self.cq)
-        }
+        wc_reader!(self.cq, read_slid, "the source LID")
     }
 
     /// The service level this message was sent with (relevant for datagram receive completions).
@@ -870,11 +866,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn sl(&self) -> u8 {
-        unsafe {
-            (*self.cq)
-                .read_sl
-                .expect("completion queue did not request the service level")(self.cq)
-        }
+        wc_reader!(self.cq, read_sl, "the service level")
     }
 
     /// The destination LID path bits (relevant for datagram receive completions).
@@ -883,11 +875,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn dlid_path_bits(&self) -> u8 {
-        unsafe {
-            (*self.cq)
-                .read_dlid_path_bits
-                .expect("completion queue did not request the DLID path bits")(self.cq)
-        }
+        wc_reader!(self.cq, read_dlid_path_bits, "the DLID path bits")
     }
 
     /// The remote key a SEND-with-invalidate invalidated, if this completion reports one
@@ -908,11 +896,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn cvlan(&self) -> u16 {
-        unsafe {
-            (*self.cq)
-                .read_cvlan
-                .expect("completion queue did not request the customer VLAN")(self.cq)
-        }
+        wc_reader!(self.cq, read_cvlan, "the customer VLAN")
     }
 
     /// The flow tag the device's steering rules attached to the incoming packet.
@@ -921,11 +905,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn flow_tag(&self) -> u32 {
-        unsafe {
-            (*self.cq)
-                .read_flow_tag
-                .expect("completion queue did not request the flow tag")(self.cq)
-        }
+        wc_reader!(self.cq, read_flow_tag, "the flow tag")
     }
 
     /// The tag-matching information of a tag-matching receive: the tag and the opaque user data
@@ -936,13 +916,12 @@ impl WorkCompletion<'_> {
     #[inline]
     pub fn tag_matching(&self) -> TagMatchingInfo {
         let mut info = ffi::ibv_wc_tm_info::default();
-        unsafe {
-            (*self.cq)
-                .read_tm_info
-                .expect("completion queue did not request the tag-matching information")(
-                self.cq, &mut info,
-            )
-        };
+        wc_reader!(
+            self.cq,
+            read_tm_info,
+            "the tag-matching information",
+            &mut info
+        );
         TagMatchingInfo {
             tag: info.tag,
             private: info.priv_,
@@ -1181,16 +1160,14 @@ impl CompletionQueue {
     /// ```
     #[inline]
     pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
-        let cq = self.as_raw();
-        // `ibv_poll_cq` is a `static inline` in verbs.h that dispatches through the context op
-        // table; an `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
+        // An `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
         // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
-        let ctx = unsafe { (*cq).context };
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
-        let n = unsafe { (*ctx).ops.poll_cq.unwrap()(cq, num_entries, wc.as_mut_ptr()) };
+        let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
-            // surface whatever the provider left there as the cause.
+            // surface whatever the provider left there as the cause, but do not promote it to
+            // `Unsupported` (`Error::os`), as an `EOPNOTSUPP` there would be a stale one.
             return Err(Error::PollCompletionQueue(io::Error::last_os_error()));
         }
         Ok(&mut wc[..n as usize])
@@ -1219,9 +1196,7 @@ impl CompletionQueue {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     #[inline]
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
-        let cq = self.as_raw();
-        let ctx = unsafe { *cq }.context;
-        let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, solicited_only as i32) };
+        let errno = unsafe { ffi::ibv_req_notify_cq(self.as_raw(), solicited_only as i32) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::PollCompletionQueue));
         }

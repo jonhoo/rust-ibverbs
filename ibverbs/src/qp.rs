@@ -8,7 +8,7 @@ use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueueInner;
 use crate::context::Mtu;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, check, destroyed, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomainInner;
 use crate::srq::SharedReceiveQueue;
@@ -824,19 +824,14 @@ impl<T: Transport> QueuePairBuilder<T> {
         Ok(())
     }
 
-    /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
-    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
-    fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
-        self.check_same_context()?;
-        // The extended send operations driven through the doorbell post API: the transport's
-        // default set, or whatever the builder was told to request instead.
-        let send_ops_flags = self.send_ops().0;
-
-        let mut attr = ffi::ibv_qp_init_attr_ex {
+    /// The creation attributes both `ibv_create_qp_ex` and `efadv_create_qp_ex` take: the
+    /// builder's context value, completion queues, capacities, and send operations, in its
+    /// protection domain. The shared receive queue is left to the caller.
+    pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
+        ffi::ibv_qp_init_attr_ex {
             qp_context: self.ctx as usize as *mut c_void,
             send_cq: self.send.cq(),
             recv_cq: self.recv.cq(),
-            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.inner.srq),
             cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
@@ -848,45 +843,53 @@ impl<T: Transport> QueuePairBuilder<T> {
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
             pd: self.pd.pd,
-            send_ops_flags: send_ops_flags as u64,
+            // The extended send operations driven through the doorbell post API: the transport's
+            // default set, or whatever the builder was told to request instead.
+            send_ops_flags: self.send_ops().0 as u64,
             ..Default::default()
-        };
-        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) };
-        if qp.is_null() {
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::CreateQueuePair,
-            ))
-        } else {
-            let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-            let prepared = PreparedQueuePair {
-                lid: self.lid,
-                roce: self.roce,
-                port_num: self.port_num,
-                qp: QueuePair {
-                    pd: self.pd.clone(),
-                    _srq: self.srq.clone(),
-                    _send_cq: self.send.clone(),
-                    _recv_cq: self.recv.clone(),
-                    qp,
-                    qp_ex,
-                    _transport: std::marker::PhantomData,
-                },
-                gid_index: self.gid_index,
-                traffic_class: self.traffic_class,
-                service_level: self.service_level,
-                bring_up: self.bring_up.clone(),
-            };
-            // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
-            // work-request table; one that accepted the send-operations mask without doing so has
-            // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
-            if qp_ex.is_null() {
-                return Err(Error::Unsupported {
-                    operation: &"ibv_qp_to_qp_ex",
-                });
-            }
-            Ok(prepared)
         }
+    }
+
+    /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
+    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
+    fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
+        self.check_same_context()?;
+        let mut attr = ffi::ibv_qp_init_attr_ex {
+            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.inner.srq),
+            ..self.init_attr_ex()
+        };
+        let qp = nonnull(
+            unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) },
+            Error::CreateQueuePair,
+        )?;
+        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
+        let prepared = PreparedQueuePair {
+            lid: self.lid,
+            roce: self.roce,
+            port_num: self.port_num,
+            qp: QueuePair {
+                pd: self.pd.clone(),
+                _srq: self.srq.clone(),
+                _send_cq: self.send.clone(),
+                _recv_cq: self.recv.clone(),
+                qp,
+                qp_ex,
+                _transport: std::marker::PhantomData,
+            },
+            gid_index: self.gid_index,
+            traffic_class: self.traffic_class,
+            service_level: self.service_level,
+            bring_up: self.bring_up.clone(),
+        };
+        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
+        // work-request table; one that accepted the send-operations mask without doing so has
+        // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
+        if qp_ex.is_null() {
+            return Err(Error::Unsupported {
+                operation: &"ibv_qp_to_qp_ex",
+            });
+        }
+        Ok(prepared)
     }
 }
 
@@ -1203,13 +1206,11 @@ impl<T: Transport> PreparedQueuePair<T> {
                     &mut gid,
                 )
             };
-            if rc < 0 {
-                return Err(Error::os(io::Error::last_os_error(), |e| Error::QueryGid {
-                    port_num: self.port_num,
-                    gid_index,
-                    source: e,
-                }));
-            }
+            check(rc, |e| Error::QueryGid {
+                port_num: self.port_num,
+                gid_index,
+                source: e,
+            })?;
             Some(Gid::from(gid))
         } else {
             None
@@ -2650,11 +2651,7 @@ impl<T: Transport> RecvQueue<'_, T> {
 impl<T: Transport> Drop for QueuePair<T> {
     fn drop(&mut self) {
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
-        let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_qp failed: {e}");
-        }
+        destroyed("ibv_destroy_qp", unsafe { ffi::ibv_destroy_qp(self.qp) });
     }
 }
 

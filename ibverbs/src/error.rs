@@ -353,6 +353,33 @@ impl Error {
     }
 }
 
+/// `ptr`, or the error `wrap` makes of `errno` if it is null: for the verbs that return null and
+/// set `errno` on failure.
+pub(crate) fn nonnull<T>(ptr: *mut T, wrap: impl FnOnce(io::Error) -> Error) -> Result<*mut T> {
+    if ptr.is_null() {
+        return Err(Error::os(io::Error::last_os_error(), wrap));
+    }
+    Ok(ptr)
+}
+
+/// `Ok` if `ret` is 0, else the error `wrap` makes of `errno`: for the verbs that return -1 and set
+/// `errno` on failure. (The verbs that return the `errno` itself go through [`Error::errno`].)
+pub(crate) fn check(ret: i32, wrap: impl FnOnce(io::Error) -> Error) -> Result<()> {
+    if ret != 0 {
+        return Err(Error::os(io::Error::last_os_error(), wrap));
+    }
+    Ok(())
+}
+
+/// Panics with the error a destroy verb (`ibv_destroy_qp`, `ibv_dereg_mr`, ...) returned, if any:
+/// the `Drop` impls cannot report it, and must not carry on as if the object were gone.
+#[track_caller]
+pub(crate) fn destroyed(verb: &str, errno: i32) {
+    if errno != 0 {
+        panic!("{verb} failed: {}", io::Error::from_raw_os_error(errno));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

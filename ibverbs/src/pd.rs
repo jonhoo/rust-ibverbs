@@ -1,4 +1,3 @@
-use std::io;
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -6,7 +5,7 @@ use std::sync::Arc;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
 use crate::context::ContextInner;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, destroyed, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
 use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
 
@@ -124,11 +123,7 @@ pub(crate) struct ProtectionDomainInner {
 
 impl Drop for ProtectionDomainInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_dealloc_pd failed: {e}");
-        }
+        destroyed("ibv_dealloc_pd", unsafe { ffi::ibv_dealloc_pd(self.pd) });
     }
 }
 
@@ -161,17 +156,17 @@ impl ProtectionDomain {
     ///
     ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): `ibv_create_ah` failed (`EINVAL`
     ///    for an invalid value in `attr`, `ENOMEM` when out of resources).
+    ///  - [`Unsupported`](Error::Unsupported): the provider has no address handles (`EOPNOTSUPP`).
     pub fn create_address_handle(&self, attr: &AddressHandleAttribute) -> Result<AddressHandle> {
         let mut ah_attr = attr.attr;
-        let ah = unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) };
-        if ah.is_null() {
-            Err(Error::CreateAddressHandle(io::Error::last_os_error()))
-        } else {
-            Ok(AddressHandle {
-                _pd: self.inner.clone(),
-                ah,
-            })
-        }
+        let ah = nonnull(
+            unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) },
+            Error::CreateAddressHandle,
+        )?;
+        Ok(AddressHandle {
+            _pd: self.inner.clone(),
+            ah,
+        })
     }
 
     /// Give advice to the kernel about an address range in memory regions registered under this
@@ -269,22 +264,15 @@ impl ProtectionDomain {
         len: usize,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegionInner> {
-        let mr = unsafe { ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32) };
-        // ibv_reg_mr() returns a pointer to the registered MR, or NULL if the request fails.
-        if mr.is_null() {
-            // Promotes EOPNOTSUPP (an access flag the device cannot honor) to Unsupported, like
-            // register_dmabuf and the other verbs.
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::RegisterMemoryRegion,
-            ))
-        } else {
-            Ok(MemoryRegionInner {
-                _pd: self.inner.clone(),
-                mr,
-                addr: ptr as u64,
-            })
-        }
+        let mr = nonnull(
+            unsafe { ffi::ibv_reg_mr(self.inner.pd, ptr, len, access_flags.0 as i32) },
+            Error::RegisterMemoryRegion,
+        )?;
+        Ok(MemoryRegionInner {
+            _pd: self.inner.clone(),
+            mr,
+            addr: ptr as u64,
+        })
     }
 
     /// Allocates and registers a Memory Region (MR) associated with this `ProtectionDomain`, with
@@ -404,22 +392,15 @@ impl ProtectionDomain {
         let mr = unsafe {
             ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
         };
-
-        if mr.is_null() {
-            // Promotes the EOPNOTSUPP of devices without DMA-BUF support, and the EPROTONOSUPPORT
-            // of kernels that predate it, to Unsupported.
-            Err(Error::os(
-                io::Error::last_os_error(),
-                Error::RegisterMemoryRegion,
-            ))
-        } else {
-            let inner = MemoryRegionInner {
-                _pd: self.inner.clone(),
-                mr,
-                addr: iova,
-            };
-            Ok(MemoryRegion::new(inner, ()))
-        }
+        // Promotes the EOPNOTSUPP of devices without DMA-BUF support, and the EPROTONOSUPPORT of
+        // kernels that predate it, to Unsupported.
+        let mr = nonnull(mr, Error::RegisterMemoryRegion)?;
+        let inner = MemoryRegionInner {
+            _pd: self.inner.clone(),
+            mr,
+            addr: iova,
+        };
+        Ok(MemoryRegion::new(inner, ()))
     }
 
     /// Creates a shared receive queue (SRQ) associated with this protection domain.
@@ -442,6 +423,8 @@ impl ProtectionDomain {
     ///
     ///  - [`CreateSharedReceiveQueue`](Error::CreateSharedReceiveQueue): `ibv_create_srq` failed,
     ///    for example because `max_wr` or `max_sge` exceed the device capabilities.
+    ///  - [`Unsupported`](Error::Unsupported): the provider has no shared receive queues
+    ///    (`EOPNOTSUPP`; EFA, for one).
     ///
     /// See also [RDMAmojo's `ibv_create_srq` documentation][1] and the [man page][2].
     ///
@@ -461,18 +444,17 @@ impl ProtectionDomain {
                 srq_limit,
             },
         };
-        let srq = unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) };
-        if srq.is_null() {
-            Err(Error::CreateSharedReceiveQueue(io::Error::last_os_error()))
-        } else {
-            Ok(SharedReceiveQueue {
-                inner: Arc::new(SharedReceiveQueueInner {
-                    _pd: self.inner.clone(),
-                    srq,
-                }),
+        let srq = nonnull(
+            unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) },
+            Error::CreateSharedReceiveQueue,
+        )?;
+        Ok(SharedReceiveQueue {
+            inner: Arc::new(SharedReceiveQueueInner {
+                _pd: self.inner.clone(),
                 srq,
-            })
-        }
+            }),
+            srq,
+        })
     }
 }
 
