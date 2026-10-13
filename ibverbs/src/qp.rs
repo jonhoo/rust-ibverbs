@@ -1653,6 +1653,11 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
             }
             match payload {
+                // A single entry goes through `wr_set_sge`, which providers implement without the
+                // list setter's loop, bounds checks, and copy of the entry through memory.
+                Payload::Sges([one]) => {
+                    (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
+                }
                 Payload::Sges(local) => (*qpx).wr_set_sge_list.unwrap()(
                     qpx,
                     local.len(),
