@@ -488,8 +488,7 @@ impl Context {
     ///  - [`QueryDevice`](Error::QueryDevice): `ibv_query_device_ex` failed (`EINVAL` for invalid
     ///    arguments).
     pub fn query_device_ex(&self) -> Result<DeviceAttrEx> {
-        // `ibv_device_attr_ex` embeds unions, so it has no `Default`; all-zero is a valid start.
-        let mut device_attr: ffi::ibv_device_attr_ex = unsafe { std::mem::zeroed() };
+        let mut device_attr = ffi::ibv_device_attr_ex::default();
         let errno = unsafe {
             ffi::ibv_query_device_ex(self.inner.ctx, std::ptr::null(), &mut device_attr as *mut _)
         };
@@ -551,10 +550,10 @@ impl Context {
     ///  - [`QueryRealTimeValues`](Error::QueryRealTimeValues): `ibv_query_rt_values_ex` failed
     ///    (every non-`EOPNOTSUPP` errno).
     pub fn query_rt_values_ex(&self) -> Result<HcaClock> {
-        // SAFETY: `ibv_values_ex` is a plain C struct (a mask plus a `timespec`); all-zero is a valid
-        // initial value.
-        let mut values: ffi::ibv_values_ex = unsafe { std::mem::zeroed() };
-        values.comp_mask = ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK.0;
+        let mut values = ffi::ibv_values_ex {
+            comp_mask: ffi::ibv_values_mask::IBV_VALUES_MASK_RAW_CLOCK.0,
+            ..Default::default()
+        };
         let errno = unsafe { ffi::ibv_query_rt_values_ex(self.inner.ctx, &mut values as *mut _) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::QueryRealTimeValues));
@@ -1485,7 +1484,7 @@ mod test_display {
     fn device_attr_ex_debug_labels() {
         // A zeroed value is valid (`query_device_ex` starts from one); check the Debug impl renders
         // the wrapper's labels and the nested base attributes.
-        let attr = DeviceAttrEx(unsafe { std::mem::zeroed() });
+        let attr = DeviceAttrEx(Default::default());
         let s = format!("{attr:?}");
         assert!(s.contains("DeviceAttrEx"), "{s}");
         assert!(s.contains("completion_timestamp_mask"), "{s}");

@@ -72,41 +72,35 @@ impl QueuePairBuilder<Srd> {
         // default set), or whatever the builder was told to request instead.
         let send_ops_flags = self.send_ops().0;
 
-        // As in the generic `build_impl` in qp.rs: zero the storage and write only the fields the
-        // driver reads, handing the pointer to C without `assume_init` (the `qp_type` enum has no
-        // zero variant).
-        let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr_ex>::zeroed();
-        let p = attr.as_mut_ptr();
-        unsafe {
-            (*p).qp_context = self.ctx as usize as *mut c_void;
-            (*p).send_cq = self.send.cq();
-            (*p).recv_cq = self.recv.cq();
-            (*p).cap = ffi::ibv_qp_cap {
+        let mut attr = ffi::ibv_qp_init_attr_ex {
+            qp_context: self.ctx as usize as *mut c_void,
+            send_cq: self.send.cq(),
+            recv_cq: self.recv.cq(),
+            cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
                 max_send_sge: self.max_send_sge,
                 max_recv_sge: self.max_recv_sge,
                 max_inline_data: self.max_inline_data,
-            };
-            (*p).qp_type = ffi::ibv_qp_type::IBV_QPT_DRIVER;
-            (*p).comp_mask = ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
-                | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0;
-            (*p).pd = self.pd.pd;
-            (*p).send_ops_flags = send_ops_flags as u64;
-        }
-
-        // Zero the EFA attributes and set only the driver queue-pair type rather than naming every
-        // field: rdma-core adds fields to this struct over time (64.0 added `wr_flags`), and the
-        // provider reads only as much as the passed-in length covers.
-        let mut efa_attr = std::mem::MaybeUninit::<ffi::efadv_qp_init_attr>::zeroed();
-        unsafe {
-            (*efa_attr.as_mut_ptr()).driver_qp_type = ffi::EFADV_QP_DRIVER_TYPE_SRD.0;
-        }
+            },
+            qp_type: ffi::ibv_qp_type::IBV_QPT_DRIVER,
+            comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
+                | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
+            pd: self.pd.pd,
+            send_ops_flags: send_ops_flags as u64,
+            ..Default::default()
+        };
+        // rdma-core adds fields to this struct over time (64.0 added `wr_flags`); the provider
+        // reads only as much as the passed-in length covers.
+        let mut efa_attr = ffi::efadv_qp_init_attr {
+            driver_qp_type: ffi::EFADV_QP_DRIVER_TYPE_SRD.0,
+            ..Default::default()
+        };
         let qp = unsafe {
             ffi::efadv_create_qp_ex(
                 self.pd.ctx.ctx,
-                attr.as_mut_ptr(),
-                efa_attr.as_mut_ptr(),
+                &mut attr,
+                &mut efa_attr,
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
             )
         };

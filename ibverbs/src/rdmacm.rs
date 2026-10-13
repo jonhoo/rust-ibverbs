@@ -1151,13 +1151,14 @@ impl Default for ConnectionParameter {
     /// as both devices support (librdmacm's `RDMA_MAX_RESP_RES` / `RDMA_MAX_INIT_DEPTH`), the
     /// maximum retry counts, and no private data.
     fn default() -> Self {
-        let mut param: ffi::rdma_conn_param = unsafe { std::mem::zeroed() };
-        param.responder_resources = RDMA_MAX_RESP_RES;
-        param.initiator_depth = RDMA_MAX_INIT_DEPTH;
-        param.retry_count = 7;
-        param.rnr_retry_count = 7;
         ConnectionParameter {
-            param,
+            param: ffi::rdma_conn_param {
+                responder_resources: RDMA_MAX_RESP_RES,
+                initiator_depth: RDMA_MAX_INIT_DEPTH,
+                retry_count: 7,
+                rnr_retry_count: 7,
+                ..Default::default()
+            },
             private_data: [0; MAX_PRIVATE_DATA],
         }
     }
