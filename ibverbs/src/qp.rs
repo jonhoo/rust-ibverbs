@@ -908,9 +908,43 @@ impl<T: Transport> QueuePairBuilder<T> {
                     operation: "ibv_qp_to_qp_ex",
                 });
             }
+            let datagram = self.qp_type == ffi::ibv_qp_type::IBV_QPT_UD;
+            if let Some(missing) = unsafe { missing_wr_entry_point(qp_ex, datagram) } {
+                return Err(Error::Unsupported { operation: missing });
+            }
             Ok(prepared)
         }
     }
+}
+
+/// The first work-request entry point that posting calls without checking (see
+/// [`verified`](crate::verified)) and the provider left unset, if any: the batch bracket, the
+/// payload setters, and on a datagram queue pair the destination setter. Every provider in rdma-core
+/// that installs the work-request table installs all of them.
+///
+/// # Safety
+///
+/// `qpx` must point to a live `ibv_qp_ex`.
+pub(crate) unsafe fn missing_wr_entry_point(
+    qpx: *const ffi::ibv_qp_ex,
+    datagram: bool,
+) -> Option<&'static str> {
+    let q = unsafe { &*qpx };
+    [
+        (q.wr_start.is_none(), "ibv_wr_start"),
+        (q.wr_complete.is_none(), "ibv_wr_complete"),
+        (q.wr_abort.is_none(), "ibv_wr_abort"),
+        (q.wr_set_sge.is_none(), "ibv_wr_set_sge"),
+        (q.wr_set_sge_list.is_none(), "ibv_wr_set_sge_list"),
+        (q.wr_set_inline_data.is_none(), "ibv_wr_set_inline_data"),
+        (
+            q.wr_set_inline_data_list.is_none(),
+            "ibv_wr_set_inline_data_list",
+        ),
+        (datagram && q.wr_set_ud_addr.is_none(), "ibv_wr_set_ud_addr"),
+    ]
+    .into_iter()
+    .find_map(|(missing, name)| missing.then_some(name))
 }
 
 impl<T: Connected> QueuePairBuilder<T> {
@@ -948,7 +982,8 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///    with this Transport Service Type).
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
     ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
+    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle, or one of
+    ///    its entry points is unset).
     pub fn build(&self) -> Result<PreparedQueuePair<T>> {
         self.build_impl()
     }
@@ -970,7 +1005,8 @@ impl QueuePairBuilder<Ud> {
     ///    with this Transport Service Type).
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
     ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
+    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle, or one of
+    ///    its entry points is unset).
     pub fn build(&self) -> Result<PreparedQueuePair<Ud>> {
         self.build_impl()
     }
@@ -1609,7 +1645,7 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
         // are about to `wr_complete`.
         std::mem::forget(self);
-        let ret = unsafe { (*qpx).wr_complete.unwrap()(qpx) };
+        let ret = unsafe { crate::verified((*qpx).wr_complete)(qpx) };
         if ret != 0 {
             Err(Error::errno(ret, Error::PostSend))
         } else {
@@ -1622,7 +1658,7 @@ impl<T: Transport> Drop for SendBatch<'_, T> {
     fn drop(&mut self) {
         // Reached only when the batch was started (`wr_start`) but not submitted; `submit` forgets
         // the batch to skip this. Abort the open work-request block.
-        unsafe { (*self.qpx).wr_abort.unwrap()(self.qpx) };
+        unsafe { crate::verified((*self.qpx).wr_abort)(self.qpx) };
     }
 }
 
@@ -1709,22 +1745,25 @@ impl<T: Transport> SendOp<'_, '_, T> {
             };
             op(qpx);
             if let Some((ah, qpn, qkey)) = self.dest {
-                (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
+                crate::verified((*qpx).wr_set_ud_addr)(qpx, ah, qpn, qkey);
             }
             match payload {
                 // A single entry goes through `wr_set_sge`, which providers implement without the
                 // list setter's loop, bounds checks, and copy of the entry through memory.
-                Payload::Sges([one]) => {
-                    (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
-                }
-                Payload::Sges(local) => (*qpx).wr_set_sge_list.unwrap()(
+                Payload::Sges([one]) => crate::verified((*qpx).wr_set_sge)(
+                    qpx,
+                    one.lkey(),
+                    one.addr(),
+                    one.len() as u32,
+                ),
+                Payload::Sges(local) => crate::verified((*qpx).wr_set_sge_list)(
                     qpx,
                     local.len(),
                     local.as_ptr() as *const ffi::ibv_sge,
                 ),
                 // The bytes are copied during this call, so the payload need not outlive the work
                 // completion.
-                Payload::Inline(data) => (*qpx).wr_set_inline_data.unwrap()(
+                Payload::Inline(data) => crate::verified((*qpx).wr_set_inline_data)(
                     qpx,
                     data.as_ptr() as *mut c_void,
                     data.len(),
@@ -1733,7 +1772,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 // only platform rdma-core targets), and `ibv_data_buf` has the same layout as
                 // `iovec` (an address and a length), so the buffer list passes straight through
                 // without copying it into a temporary array.
-                Payload::InlineList(bufs) => (*qpx).wr_set_inline_data_list.unwrap()(
+                Payload::InlineList(bufs) => crate::verified((*qpx).wr_set_inline_data_list)(
                     qpx,
                     bufs.len(),
                     bufs.as_ptr() as *const ffi::ibv_data_buf,
@@ -2550,7 +2589,7 @@ impl<T: Transport> QueuePair<T> {
         let ctx = unsafe { *self.qp }.context;
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
-            ops.post_recv.as_mut().unwrap()(
+            crate::verified(ops.post_recv)(
                 self.qp,
                 &mut recvs[0].wr as *mut _,
                 &mut bad_wr as *mut _,
@@ -2589,7 +2628,7 @@ impl<T: Transport> QueuePair<T> {
     #[inline]
     pub fn start_send(&mut self) -> SendBatch<'_, T> {
         let qpx = self.qp_ex;
-        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        unsafe { crate::verified((*qpx).wr_start)(qpx) };
         SendBatch {
             qpx,
             _qp: std::marker::PhantomData,

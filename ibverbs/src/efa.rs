@@ -67,7 +67,8 @@ impl QueuePairBuilder<Srd> {
     ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
     ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
+    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle, or one of
+    ///    its entry points is unset).
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
         self.check_same_context()?;
         // SRD supports send and one-sided RDMA, including the immediate variants (the transport's
@@ -145,6 +146,9 @@ impl QueuePairBuilder<Srd> {
             return Err(Error::Unsupported {
                 operation: "ibv_qp_to_qp_ex",
             });
+        }
+        if let Some(missing) = unsafe { crate::qp::missing_wr_entry_point(qp_ex, true) } {
+            return Err(Error::Unsupported { operation: missing });
         }
         Ok(prepared)
     }

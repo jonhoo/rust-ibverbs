@@ -263,6 +263,20 @@ macro_rules! flags_newtype {
     };
 }
 
+/// Unwraps a provider entry point the data path calls without checking it each time: either one the
+/// queue's creation verified is set (the work-request bracket and payload setters of a queue pair,
+/// the poll loop and the always-requested readers of a completion queue), or a legacy context op
+/// (`post_recv`, `poll_cq`, ...), which libibverbs fills with a stub wherever the provider leaves
+/// one out (`verbs_init_context` in `libibverbs/device.c`). Providers never unset them afterwards.
+///
+/// # Safety
+///
+/// `f` must be one of those entry points.
+#[inline(always)]
+unsafe fn verified<F>(f: Option<F>) -> F {
+    unsafe { f.unwrap_unchecked() }
+}
+
 mod address;
 mod completion;
 mod context;

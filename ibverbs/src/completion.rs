@@ -273,7 +273,8 @@ impl CompletionQueueBuilder {
     /// # Errors
     ///
     ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
-    ///    work-completion field (`EOPNOTSUPP`).
+    ///    work-completion field (`EOPNOTSUPP`), or the provider left one of the polling entry
+    ///    points unset.
     ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `ibv_create_cq_ex` failed
     ///    (`EINVAL` for an invalid `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`,
     ///    or an invalid completion vector, `ENOMEM` when out of resources).
@@ -308,15 +309,41 @@ impl CompletionQueueBuilder {
                 Error::CreateCompletionQueue,
             ))
         } else {
-            Ok(CompletionQueue {
+            let cq = CompletionQueue {
                 inner: Arc::new(CompletionQueueInner {
                     _ctx: self.ctx.clone(),
                     cc,
                     cq_ex,
                 }),
-            })
+            };
+            // Dropping `cq` destroys the queue.
+            if let Some(missing) = missing_poll_entry_point(cq_ex) {
+                return Err(Error::Unsupported { operation: missing });
+            }
+            Ok(cq)
         }
     }
+}
+
+/// The first entry point that polling calls without checking (see [`verified`](crate::verified))
+/// and the provider left unset, if any: the poll loop, and the readers of the fields every queue
+/// requests. Every provider in rdma-core with extended completion queues installs all of them.
+fn missing_poll_entry_point(cq: *const ffi::ibv_cq_ex) -> Option<&'static str> {
+    let cq = unsafe { &*cq };
+    [
+        (cq.start_poll.is_none(), "ibv_start_poll"),
+        (cq.next_poll.is_none(), "ibv_next_poll"),
+        (cq.end_poll.is_none(), "ibv_end_poll"),
+        (cq.read_opcode.is_none(), "ibv_wc_read_opcode"),
+        (cq.read_vendor_err.is_none(), "ibv_wc_read_vendor_err"),
+        (cq.read_byte_len.is_none(), "ibv_wc_read_byte_len"),
+        (cq.read_imm_data.is_none(), "ibv_wc_read_imm_data"),
+        (cq.read_qp_num.is_none(), "ibv_wc_read_qp_num"),
+        (cq.read_src_qp.is_none(), "ibv_wc_read_src_qp"),
+        (cq.read_wc_flags.is_none(), "ibv_wc_read_wc_flags"),
+    ]
+    .into_iter()
+    .find_map(|(missing, name)| missing.then_some(name))
 }
 
 pub(crate) struct CompletionQueueInner {
@@ -757,7 +784,7 @@ impl WorkCompletion<'_> {
             ffi::ibv_wc_status::IBV_WC_SUCCESS => Ok(()),
             status => Err(WcError {
                 status: status.into(),
-                vendor_err: unsafe { (*self.cq).read_vendor_err.unwrap()(self.cq) },
+                vendor_err: unsafe { crate::verified((*self.cq).read_vendor_err)(self.cq) },
             }),
         }
     }
@@ -769,13 +796,13 @@ impl WorkCompletion<'_> {
     /// [`wr_id`](Self::wr_id) and the status are defined.
     #[inline]
     pub fn opcode(&self) -> WcOpcode {
-        unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }.into()
+        unsafe { crate::verified((*self.cq).read_opcode)(self.cq) }.into()
     }
 
     /// The number of bytes transferred, for a successful completion.
     #[inline]
     pub fn len(&self) -> usize {
-        unsafe { (*self.cq).read_byte_len.unwrap()(self.cq) as usize }
+        unsafe { crate::verified((*self.cq).read_byte_len)(self.cq) as usize }
     }
 
     /// The 32-bit immediate value (host byte order) if one was carried ([`WcFlags::WITH_IMM`]).
@@ -783,7 +810,7 @@ impl WorkCompletion<'_> {
     pub fn imm_data(&self) -> Option<u32> {
         if self.ok().is_ok() && self.wc_flags().contains(WcFlags::WITH_IMM) {
             Some(u32::from_be(unsafe {
-                (*self.cq).read_imm_data.unwrap()(self.cq)
+                crate::verified((*self.cq).read_imm_data)(self.cq)
             }))
         } else {
             None
@@ -793,13 +820,13 @@ impl WorkCompletion<'_> {
     /// The local QP number of the completed work request.
     #[inline]
     pub fn qp_num(&self) -> u32 {
-        unsafe { (*self.cq).read_qp_num.unwrap()(self.cq) }
+        unsafe { crate::verified((*self.cq).read_qp_num)(self.cq) }
     }
 
     /// The source (remote) QP number, relevant for datagram receive completions.
     #[inline]
     pub fn src_qp(&self) -> u32 {
-        unsafe { (*self.cq).read_src_qp.unwrap()(self.cq) }
+        unsafe { crate::verified((*self.cq).read_src_qp)(self.cq) }
     }
 
     /// The hardware timestamp captured when this work request completed, as a reading of the
@@ -839,7 +866,7 @@ impl WorkCompletion<'_> {
     /// data is carried. Always available.
     #[inline]
     pub fn wc_flags(&self) -> WcFlags {
-        WcFlags(unsafe { (*self.cq).read_wc_flags.unwrap()(self.cq) })
+        WcFlags(unsafe { crate::verified((*self.cq).read_wc_flags)(self.cq) })
     }
 
     /// Whether the receive completion carries a 40-byte Global Routing Header (GRH) at the front of
@@ -894,7 +921,7 @@ impl WorkCompletion<'_> {
     #[inline]
     pub fn invalidated_rkey(&self) -> Option<u32> {
         if self.ok().is_ok() && self.wc_flags().contains(WcFlags::WITH_INV) {
-            Some(unsafe { (*self.cq).read_imm_data.unwrap()(self.cq) })
+            Some(unsafe { crate::verified((*self.cq).read_imm_data)(self.cq) })
         } else {
             None
         }
@@ -1027,7 +1054,7 @@ impl Completions<'_> {
         }
         if self.first {
             self.first = false;
-        } else if unsafe { (*self.cq).next_poll.unwrap()(self.cq) } != 0 {
+        } else if unsafe { crate::verified((*self.cq).next_poll)(self.cq) } != 0 {
             // ENOENT (no more) or an error: either way the poll is finished.
             self.done = true;
             return None;
@@ -1056,7 +1083,7 @@ impl Drop for Completions<'_> {
     #[inline]
     fn drop(&mut self) {
         if self.open {
-            unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+            unsafe { crate::verified((*self.cq).end_poll)(self.cq) };
         }
     }
 }
@@ -1110,7 +1137,7 @@ impl CompletionQueue {
         let mut attr = ffi::ibv_poll_cq_attr::default();
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
         // paired with `end_poll`) when the queue is empty.
-        match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
+        match unsafe { crate::verified((*cq).start_poll)(cq, &mut attr as *mut _) } {
             0 => Ok(Completions {
                 cq,
                 open: true,
@@ -1176,7 +1203,7 @@ impl CompletionQueue {
         // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
         let ctx = unsafe { (*cq).context };
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
-        let n = unsafe { (*ctx).ops.poll_cq.unwrap()(cq, num_entries, wc.as_mut_ptr()) };
+        let n = unsafe { crate::verified((*ctx).ops.poll_cq)(cq, num_entries, wc.as_mut_ptr()) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
             // surface whatever the provider left there as the cause.
@@ -1207,7 +1234,7 @@ impl CompletionQueue {
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
         let cq = self.inner.cq();
         let ctx = unsafe { *cq }.context;
-        let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, solicited_only as i32) };
+        let errno = unsafe { crate::verified((*ctx).ops.req_notify_cq)(cq, solicited_only as i32) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::PollCompletionQueue));
         }

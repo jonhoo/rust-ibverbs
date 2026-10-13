@@ -179,7 +179,7 @@ impl SharedReceiveQueue {
         let ctx = unsafe { *self.inner.srq }.context;
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
-            ops.post_srq_recv.as_mut().unwrap()(
+            crate::verified(ops.post_srq_recv)(
                 self.inner.srq,
                 &mut recvs[0].wr as *mut _,
                 &mut bad_wr as *mut _,
