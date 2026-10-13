@@ -1027,7 +1027,7 @@ fn atomic_operations() {
     // Fetch-and-add on a fresh zeroed counter returns the old value and adds in place.
     let mut counter = lb
         .pd
-        .allocate(8, AccessFlags::PERMISSIVE)
+        .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
         .expect("failed to register counter MR");
     {
         let sg = [local.slice(..)];
