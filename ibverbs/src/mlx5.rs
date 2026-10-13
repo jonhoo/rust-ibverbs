@@ -26,12 +26,21 @@ impl ProtectionDomain {
     ///
     /// `access_flags` grants ordinary verbs access; `mlx5_access_flags` selects provider
     /// behavior. [`Mlx5DmabufAccessFlags::DATA_DIRECT`] requires a supported device and
-    /// a compatible DMA-BUF exporter (for example, a PCIe-mapped GPU export).
+    /// a compatible DMA-BUF exporter (for example, a PCIe-mapped GPU export), a page-aligned
+    /// `iova`, and no [`ON_DEMAND`](AccessFlags::ON_DEMAND) access.
     /// No fallback to ordinary registration occurs on failure.
     ///
     /// Requires the `mlx5` feature, rdma-core 54 or newer, and (for the mlx5 access flags)
-    /// Linux 6.12 or newer. Unsupported providers and older kernels return
-    /// [`Error::Unsupported`]; other registration errors retain their OS error.
+    /// Linux 6.12 or newer.
+    ///
+    /// # Errors
+    ///
+    ///  - [`Unsupported`](Error::Unsupported): the provider is not mlx5, the kernel is older than
+    ///    the mlx5 access flags, or Data Direct was requested on a device without a Data Direct
+    ///    device.
+    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): the registration failed, with its
+    ///    OS error; [`io::ErrorKind::InvalidInput`] for a Data Direct request whose `iova` is not
+    ///    page aligned or whose `access_flags` include `ON_DEMAND`.
     pub fn register_dmabuf_mlx5(
         &self,
         fd: i32,
@@ -41,6 +50,12 @@ impl ProtectionDomain {
         access_flags: AccessFlags,
         mlx5_access_flags: Mlx5DmabufAccessFlags,
     ) -> Result<MemoryRegion<()>> {
+        let data_direct = mlx5_access_flags.contains(Mlx5DmabufAccessFlags::DATA_DIRECT);
+        if data_direct {
+            // SAFETY: `sysconf` only reads a system constant.
+            let page_size = unsafe { nix::libc::sysconf(nix::libc::_SC_PAGESIZE) } as u64;
+            check_data_direct_arguments(iova, access_flags, page_size)?;
+        }
         // SAFETY: the PD is live; the provider validates the DMA-BUF descriptor and ranges.
         let mr = unsafe {
             ffi::mlx5dv_reg_dmabuf_mr(
@@ -54,7 +69,18 @@ impl ProtectionDomain {
             )
         };
         if mr.is_null() {
-            return Err(registration_error(io::Error::last_os_error()));
+            let err = io::Error::last_os_error();
+            // The kernel reports a device without a Data Direct device as `EINVAL`, like a bad
+            // argument; its Data Direct query tells the two apart by reporting `ENODEV`.
+            if data_direct
+                && err.raw_os_error() == Some(nix::libc::EINVAL)
+                && !has_data_direct_device(self.inner.ctx.ctx)
+            {
+                return Err(Error::Unsupported {
+                    operation: &"mlx5dv_reg_dmabuf_mr",
+                });
+            }
+            return Err(registration_error(err));
         }
         Ok(MemoryRegion {
             inner: MemoryRegionInner {
@@ -90,6 +116,34 @@ impl Context {
         };
         data_direct_path(rc, &buf)
     }
+}
+
+/// Refuses what the kernel refuses for a Data Direct registration with `EOPNOTSUPP`, which would
+/// otherwise read as an unsupported device: the hardware maps Data Direct regions in whole pages,
+/// so the IOVA must be page aligned, and it cannot fault pages in on demand (mlx5's
+/// `reg_user_mr_dmabuf_by_data_direct`).
+fn check_data_direct_arguments(iova: u64, access_flags: AccessFlags, page_size: u64) -> Result<()> {
+    let problem = if iova % page_size != 0 {
+        "a Data Direct registration needs a page-aligned iova"
+    } else if access_flags.contains(AccessFlags::ON_DEMAND) {
+        "a Data Direct registration cannot use on-demand paging"
+    } else {
+        return Ok(());
+    };
+    Err(Error::RegisterMemoryRegion(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        problem,
+    )))
+}
+
+/// Whether the device behind `ctx` has a Data Direct device: false only when the provider's query
+/// says it has none (`ENODEV`).
+fn has_data_direct_device(ctx: *mut ffi::ibv_context) -> bool {
+    let mut buf = [0u8; nix::libc::PATH_MAX as usize];
+    // SAFETY: the context is live and `buf` is writable for the supplied length.
+    let rc =
+        unsafe { ffi::mlx5dv_get_data_direct_sysfs_path(ctx, buf.as_mut_ptr().cast(), buf.len()) };
+    rc != nix::libc::ENODEV
 }
 
 fn registration_error(err: io::Error) -> Error {
