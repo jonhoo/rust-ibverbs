@@ -821,36 +821,26 @@ impl<T: Transport> QueuePairBuilder<T> {
         // default set, or whatever the builder was told to request instead.
         let send_ops_flags = self.send_ops().0;
 
-        // `ibv_qp_init_attr_ex` has a `qp_type` field with no zero variant plus fields we never use
-        // (XRC, TSO, RX hashing). Zero the storage, write only the fields the driver reads, and hand
-        // the pointer to C without `assume_init`, so the untouched enum fields never become a Rust
-        // value.
-        let mut attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr_ex>::zeroed();
-        let p = attr.as_mut_ptr();
-        unsafe {
-            (*p).qp_context = self.ctx as usize as *mut c_void;
-            (*p).send_cq = self.send.cq();
-            (*p).recv_cq = self.recv.cq();
-            (*p).srq = self
-                .srq
-                .as_ref()
-                .map(|s| s.inner.srq)
-                .unwrap_or(ptr::null_mut());
-            (*p).cap = ffi::ibv_qp_cap {
+        let mut attr = ffi::ibv_qp_init_attr_ex {
+            qp_context: self.ctx as usize as *mut c_void,
+            send_cq: self.send.cq(),
+            recv_cq: self.recv.cq(),
+            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.inner.srq),
+            cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
                 max_send_sge: self.max_send_sge,
                 max_recv_sge: self.max_recv_sge,
                 max_inline_data: self.max_inline_data,
-            };
-            (*p).qp_type = self.qp_type;
-            (*p).comp_mask = ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
-                | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0;
-            (*p).pd = self.pd.pd;
-            (*p).send_ops_flags = send_ops_flags as u64;
-        }
-
-        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, attr.as_mut_ptr()) };
+            },
+            qp_type: self.qp_type,
+            comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
+                | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
+            pd: self.pd.pd,
+            send_ops_flags: send_ops_flags as u64,
+            ..Default::default()
+        };
+        let qp = unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) };
         if qp.is_null() {
             Err(Error::os(
                 io::Error::last_os_error(),
@@ -2433,21 +2423,11 @@ impl<T: Transport> QueuePair<T> {
     ) -> Result<(QueuePairAttribute, QueuePairInitAttribute)> {
         let mask = ffi::ibv_qp_attr_mask::from(mask);
         let mut attr = ffi::ibv_qp_attr::default();
-        // `ibv_qp_init_attr` has no valid all-zero representation (its `qp_type` enum has no 0
-        // variant), so zero the storage and only `assume_init` once `ibv_query_qp` has filled it in.
-        let mut init_attr = std::mem::MaybeUninit::<ffi::ibv_qp_init_attr>::zeroed();
-        let errno = unsafe {
-            ffi::ibv_query_qp(
-                self.qp,
-                &mut attr as *mut _,
-                mask.0 as i32,
-                init_attr.as_mut_ptr(),
-            )
-        };
+        let mut init_attr = ffi::ibv_qp_init_attr::default();
+        let errno = unsafe { ffi::ibv_query_qp(self.qp, &mut attr, mask.0 as i32, &mut init_attr) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::QueryQueuePair));
         }
-        let init_attr = unsafe { init_attr.assume_init() };
         Ok((
             QueuePairAttribute { attr, mask },
             QueuePairInitAttribute { init_attr },
