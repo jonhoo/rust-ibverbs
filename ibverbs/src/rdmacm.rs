@@ -104,19 +104,6 @@ pub enum PortSpace {
     Unknown(u32),
 }
 
-impl From<ffi::rdma_port_space> for PortSpace {
-    fn from(port_space: ffi::rdma_port_space) -> Self {
-        use ffi::rdma_port_space as E;
-        match port_space {
-            E::RDMA_PS_IPOIB => PortSpace::Ipoib,
-            E::RDMA_PS_TCP => PortSpace::Tcp,
-            E::RDMA_PS_UDP => PortSpace::Udp,
-            E::RDMA_PS_IB => PortSpace::Ib,
-            other => PortSpace::Unknown(other.0),
-        }
-    }
-}
-
 impl From<PortSpace> for ffi::rdma_port_space {
     fn from(port_space: PortSpace) -> Self {
         use ffi::rdma_port_space as E;
@@ -206,35 +193,6 @@ impl From<ffi::rdma_cm_event_type> for CmEventType {
             E::RDMA_CM_EVENT_USER => CmEventType::User,
             E::RDMA_CM_EVENT_INTERNAL => CmEventType::Internal,
             other => CmEventType::Unknown(other.0),
-        }
-    }
-}
-
-impl From<CmEventType> for ffi::rdma_cm_event_type {
-    fn from(event: CmEventType) -> Self {
-        use ffi::rdma_cm_event_type as E;
-        match event {
-            CmEventType::AddressResolved => E::RDMA_CM_EVENT_ADDR_RESOLVED,
-            CmEventType::AddressError => E::RDMA_CM_EVENT_ADDR_ERROR,
-            CmEventType::RouteResolved => E::RDMA_CM_EVENT_ROUTE_RESOLVED,
-            CmEventType::RouteError => E::RDMA_CM_EVENT_ROUTE_ERROR,
-            CmEventType::ConnectRequest => E::RDMA_CM_EVENT_CONNECT_REQUEST,
-            CmEventType::ConnectResponse => E::RDMA_CM_EVENT_CONNECT_RESPONSE,
-            CmEventType::ConnectError => E::RDMA_CM_EVENT_CONNECT_ERROR,
-            CmEventType::Unreachable => E::RDMA_CM_EVENT_UNREACHABLE,
-            CmEventType::Rejected => E::RDMA_CM_EVENT_REJECTED,
-            CmEventType::Established => E::RDMA_CM_EVENT_ESTABLISHED,
-            CmEventType::Disconnected => E::RDMA_CM_EVENT_DISCONNECTED,
-            CmEventType::DeviceRemoval => E::RDMA_CM_EVENT_DEVICE_REMOVAL,
-            CmEventType::MulticastJoin => E::RDMA_CM_EVENT_MULTICAST_JOIN,
-            CmEventType::MulticastError => E::RDMA_CM_EVENT_MULTICAST_ERROR,
-            CmEventType::AddressChange => E::RDMA_CM_EVENT_ADDR_CHANGE,
-            CmEventType::TimewaitExit => E::RDMA_CM_EVENT_TIMEWAIT_EXIT,
-            CmEventType::AddressInfoResolved => E::RDMA_CM_EVENT_ADDRINFO_RESOLVED,
-            CmEventType::AddressInfoError => E::RDMA_CM_EVENT_ADDRINFO_ERROR,
-            CmEventType::User => E::RDMA_CM_EVENT_USER,
-            CmEventType::Internal => E::RDMA_CM_EVENT_INTERNAL,
-            CmEventType::Unknown(raw) => ffi::rdma_cm_event_type(raw),
         }
     }
 }
@@ -1601,20 +1559,19 @@ mod test_conversions {
     use super::*;
 
     #[test]
-    fn port_space_roundtrip() {
+    fn port_space_to_raw() {
         for (wrapper, raw) in [
             (PortSpace::Tcp, ffi::rdma_port_space::RDMA_PS_TCP),
             (PortSpace::Udp, ffi::rdma_port_space::RDMA_PS_UDP),
             (PortSpace::Ipoib, ffi::rdma_port_space::RDMA_PS_IPOIB),
             (PortSpace::Ib, ffi::rdma_port_space::RDMA_PS_IB),
         ] {
-            assert_eq!(PortSpace::from(raw), wrapper);
             assert_eq!(ffi::rdma_port_space::from(wrapper), raw);
         }
     }
 
     #[test]
-    fn cm_event_type_roundtrip() {
+    fn cm_event_type_from_raw() {
         for (wrapper, raw) in [
             (
                 CmEventType::AddressResolved,
@@ -1634,7 +1591,6 @@ mod test_conversions {
             ),
         ] {
             assert_eq!(CmEventType::from(raw), wrapper);
-            assert_eq!(ffi::rdma_cm_event_type::from(wrapper), raw);
         }
     }
 
