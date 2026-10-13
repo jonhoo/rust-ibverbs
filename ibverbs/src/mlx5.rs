@@ -3,7 +3,6 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use crate::mr::MemoryRegionInner;
 use crate::{AccessFlags, Context, Error, MemoryRegion, ProtectionDomain, Result};
 
 flags_newtype! {
@@ -74,7 +73,7 @@ impl ProtectionDomain {
             // argument; its Data Direct query tells the two apart by reporting `ENODEV`.
             if data_direct
                 && err.raw_os_error() == Some(nix::libc::EINVAL)
-                && !has_data_direct_device(self.inner.ctx.ctx)
+                && !has_data_direct_device(self.context().as_raw())
             {
                 return Err(Error::Unsupported {
                     operation: &"mlx5dv_reg_dmabuf_mr",
@@ -82,14 +81,7 @@ impl ProtectionDomain {
             }
             return Err(registration_error(err));
         }
-        Ok(MemoryRegion::new(
-            MemoryRegionInner {
-                _pd: self.inner.clone(),
-                mr,
-                addr: iova,
-            },
-            (),
-        ))
+        Ok(MemoryRegion::new(self.clone(), mr, iova, ()))
     }
 }
 

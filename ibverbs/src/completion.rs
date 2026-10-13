@@ -6,11 +6,8 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::context::{ContextInner, HcaClock};
+use crate::context::{Context, HcaClock};
 use crate::error::{Error, Result, destroyed, nonnull};
-
-#[cfg(doc)]
-use crate::Context;
 
 /// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
 /// granularity) lasts at least the requested duration instead of returning fractionally early.
@@ -47,7 +44,7 @@ pub struct CompletionChannel {
 
 struct CompletionChannelInner {
     // Kept so the device outlives the channel.
-    _ctx: Arc<ContextInner>,
+    _ctx: Context,
     cc: *mut ffi::ibv_comp_channel,
 }
 
@@ -66,9 +63,9 @@ impl CompletionChannel {
     /// Create a completion channel on `ctx` (for [`Context::create_comp_channel`]), with its file
     /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
     /// instead of blocking.
-    pub(crate) fn new(ctx: &Arc<ContextInner>) -> Result<CompletionChannel> {
+    pub(crate) fn new(ctx: &Context) -> Result<CompletionChannel> {
         let cc = nonnull(
-            unsafe { ffi::ibv_create_comp_channel(ctx.ctx) },
+            unsafe { ffi::ibv_create_comp_channel(ctx.as_raw()) },
             Error::CreateCompletionChannel,
         )?;
         let channel = CompletionChannel {
@@ -208,17 +205,30 @@ impl AsFd for CompletionChannel {
 /// [`build`](Self::build) to create the queue.
 #[must_use]
 pub struct CompletionQueueBuilder {
-    pub(crate) ctx: Arc<ContextInner>,
-    pub(crate) min_cq_entries: u32,
-    pub(crate) cq_context: u64,
-    pub(crate) comp_vector: u32,
+    ctx: Context,
+    min_cq_entries: u32,
+    cq_context: u64,
+    comp_vector: u32,
     /// extra work-completion fields requested on top of the always-present standard set
-    pub(crate) wc_flags: u32,
+    wc_flags: u32,
     /// the completion channel to deliver notifications on, if any
-    pub(crate) comp_channel: Option<CompletionChannel>,
+    comp_channel: Option<CompletionChannel>,
 }
 
 impl CompletionQueueBuilder {
+    /// Begin building a queue on `ctx` with room for at least `min_cq_entries` entries (for
+    /// [`Context::create_cq`]), with the defaults the setters document.
+    pub(crate) fn new(ctx: Context, min_cq_entries: u32) -> CompletionQueueBuilder {
+        CompletionQueueBuilder {
+            ctx,
+            min_cq_entries,
+            cq_context: 0,
+            comp_vector: 0,
+            wc_flags: 0,
+            comp_channel: None,
+        }
+    }
+
     /// Set an opaque context value associated with the completion queue.
     ///
     /// Defaults to 0.
@@ -300,7 +310,7 @@ impl CompletionQueueBuilder {
             ..Default::default()
         };
         let cq_ex = nonnull(
-            unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr) },
+            unsafe { ffi::ibv_create_cq_ex(self.ctx.as_raw(), &mut cq_attr) },
             Error::CreateCompletionQueue,
         )?;
         Ok(CompletionQueue {
@@ -314,25 +324,18 @@ impl CompletionQueueBuilder {
     }
 }
 
-pub(crate) struct CompletionQueueInner {
-    _ctx: Arc<ContextInner>,
+struct CompletionQueueInner {
+    _ctx: Context,
     cq_ex: *mut ffi::ibv_cq_ex,
     cc: Option<CompletionChannel>,
 }
 
-impl CompletionQueueInner {
-    /// The underlying `ibv_cq`. An `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this is
-    /// just a pointer cast (exactly what `ibv_cq_ex_to_cq` does in C). Used for the verbs that still
-    /// take a plain `ibv_cq`: queue-pair creation, completion-event notification, and teardown.
-    #[inline]
-    pub(crate) fn cq(&self) -> *mut ffi::ibv_cq {
-        self.cq_ex as *mut ffi::ibv_cq
-    }
-}
-
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_cq", unsafe { ffi::ibv_destroy_cq(self.cq()) });
+        // An `ibv_cq_ex` starts with the `ibv_cq` it extends (`ibv_cq_ex_to_cq` in C).
+        destroyed("ibv_destroy_cq", unsafe {
+            ffi::ibv_destroy_cq(self.cq_ex as *mut ffi::ibv_cq)
+        });
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
         // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel
@@ -1051,7 +1054,7 @@ impl Drop for Completions<'_> {
 #[must_use]
 #[derive(Clone)]
 pub struct CompletionQueue {
-    pub(crate) inner: Arc<CompletionQueueInner>,
+    inner: Arc<CompletionQueueInner>,
     /// `inner.cq_ex`, kept next to the `Arc` for the data path: read through it, the pointer is a
     /// dependent load that every opaque provider call makes the compiler repeat.
     cq_ex: *mut ffi::ibv_cq_ex,

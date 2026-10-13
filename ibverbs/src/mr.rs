@@ -1,10 +1,9 @@
 use std::convert::TryInto;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut, RangeBounds};
-use std::sync::Arc;
 
 use crate::error::{Error, Result, destroyed};
-use crate::pd::ProtectionDomainInner;
+use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
 use crate::QueuePair;
@@ -53,10 +52,10 @@ impl AccessFlags {
     );
 }
 
-pub(crate) struct MemoryRegionInner {
-    pub(crate) _pd: Arc<ProtectionDomainInner>,
-    pub(crate) mr: *mut ffi::ibv_mr,
-    pub(crate) addr: u64,
+struct MemoryRegionInner {
+    _pd: ProtectionDomain,
+    mr: *mut ffi::ibv_mr,
+    addr: u64,
 }
 
 unsafe impl Sync for MemoryRegionInner {}
@@ -94,9 +93,10 @@ impl<O> Drop for MemoryRegion<O> {
 }
 
 impl<O> MemoryRegion<O> {
-    pub(crate) fn new(inner: MemoryRegionInner, owner: O) -> Self {
+    /// Wraps `mr`, registered on `pd` at `addr`, together with the `owner` of the memory behind it.
+    pub(crate) fn new(pd: ProtectionDomain, mr: *mut ffi::ibv_mr, addr: u64, owner: O) -> Self {
         MemoryRegion {
-            inner: ManuallyDrop::new(inner),
+            inner: ManuallyDrop::new(MemoryRegionInner { _pd: pd, mr, addr }),
             owner: ManuallyDrop::new(owner),
         }
     }

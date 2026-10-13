@@ -1,20 +1,16 @@
 use std::io;
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
-use crate::completion::CompletionQueueInner;
+use crate::completion::CompletionQueue;
 use crate::context::Mtu;
-use crate::error::{Error, Result, check, destroyed, nonnull};
+use crate::error::{Error, Result, destroyed, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
-use crate::pd::ProtectionDomainInner;
+use crate::pd::ProtectionDomain;
 use crate::srq::SharedReceiveQueue;
-
-#[cfg(doc)]
-use crate::{CompletionQueue, ProtectionDomain};
 
 /// The transport service type of a queue pair.
 ///
@@ -553,7 +549,7 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
 #[must_use = "a queue-pair builder creates nothing until `build` is called"]
 pub struct QueuePairBuilder<T: Transport> {
     pub(crate) ctx: isize,
-    pub(crate) pd: Arc<ProtectionDomainInner>,
+    pub(crate) pd: ProtectionDomain,
     /// port local identifier
     pub(crate) lid: u16,
     /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
@@ -561,9 +557,9 @@ pub struct QueuePairBuilder<T: Transport> {
     /// the device port this queue pair is associated with (numbered from 1)
     pub(crate) port_num: u8,
 
-    pub(crate) send: Arc<CompletionQueueInner>,
+    pub(crate) send: CompletionQueue,
     pub(crate) max_send_wr: u32,
-    pub(crate) recv: Arc<CompletionQueueInner>,
+    pub(crate) recv: CompletionQueue,
     pub(crate) max_recv_wr: u32,
 
     pub(crate) gid_index: Option<u32>,
@@ -592,11 +588,11 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// `rd_atomic_limits` is the device's `(initiator, responder)` RDMA read and atomic limit, the
     /// default for a reliable connection; it is `None` for the other transports.
     pub(crate) fn new(
-        pd: Arc<ProtectionDomainInner>,
+        pd: ProtectionDomain,
         port_attr: &ffi::ibv_port_attr,
         port_num: u8,
-        send: Arc<CompletionQueueInner>,
-        recv: Arc<CompletionQueueInner>,
+        send: CompletionQueue,
+        recv: CompletionQueue,
         rd_atomic_limits: Option<(u8, u8)>,
     ) -> QueuePairBuilder<T> {
         let reliable = T::TYPE == QueuePairType::ReliableConnection;
@@ -808,14 +804,14 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// the provider keeps operating on the foreign one (misrouted completions, and type confusion
     /// across providers).
     pub(crate) fn check_same_context(&self) -> Result<()> {
-        let ctx = self.pd.ctx.ctx;
+        let ctx = self.pd.context().as_raw();
         let foreign = unsafe {
-            (*self.send.cq()).context != ctx
-                || (*self.recv.cq()).context != ctx
+            (*self.send.as_raw()).context != ctx
+                || (*self.recv.as_raw()).context != ctx
                 || self
                     .srq
                     .as_ref()
-                    .is_some_and(|s| (*s.inner.srq).context != ctx)
+                    .is_some_and(|s| (*s.as_raw()).context != ctx)
         };
         if foreign {
             return Err(Error::CreateQueuePair(io::Error::new(
@@ -833,8 +829,8 @@ impl<T: Transport> QueuePairBuilder<T> {
     pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
         ffi::ibv_qp_init_attr_ex {
             qp_context: self.ctx as usize as *mut c_void,
-            send_cq: self.send.cq(),
-            recv_cq: self.recv.cq(),
+            send_cq: self.send.as_raw(),
+            recv_cq: self.recv.as_raw(),
             cap: ffi::ibv_qp_cap {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
@@ -845,7 +841,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             qp_type: T::TYPE.into(),
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
-            pd: self.pd.pd,
+            pd: self.pd.as_raw(),
             // The extended send operations driven through the doorbell post API: the transport's
             // default set, or whatever the builder was told to request instead.
             send_ops_flags: self.send_ops().0 as u64,
@@ -858,11 +854,11 @@ impl<T: Transport> QueuePairBuilder<T> {
     fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
         self.check_same_context()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
-            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.inner.srq),
+            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
             ..self.init_attr_ex()
         };
         let qp = nonnull(
-            unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) },
+            unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
             Error::CreateQueuePair,
         )?;
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
@@ -1202,21 +1198,7 @@ impl<T: Transport> PreparedQueuePair<T> {
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
         let qp_num = unsafe { &*self.qp.qp }.qp_num;
         let gid = if let Some(gid_index) = self.gid_index {
-            let mut gid = ffi::ibv_gid::default();
-            let rc = unsafe {
-                ffi::ibv_query_gid(
-                    self.qp.pd.ctx.ctx,
-                    self.port_num,
-                    gid_index as i32,
-                    &mut gid,
-                )
-            };
-            check(rc, |e| Error::QueryGid {
-                port_num: self.port_num,
-                gid_index,
-                source: e,
-            })?;
-            Some(Gid::from(gid))
+            Some(self.qp.pd.context().query_gid(self.port_num, gid_index)?)
         } else {
             None
         };
@@ -2381,12 +2363,12 @@ fn qp_transition_masks(
 /// as one socket binds a TCP or UDP port).
 #[must_use = "QueuePair is immediately destroyed via drop() unless assigned to a variable"]
 pub struct QueuePair<T: Transport = Rc> {
-    pub(crate) pd: Arc<ProtectionDomainInner>,
+    pub(crate) pd: ProtectionDomain,
     pub(crate) _srq: Option<SharedReceiveQueue>,
     // Keep the completion queues alive while the queue pair references them; `ibv_destroy_cq` fails
     // with EBUSY if a queue pair is still attached.
-    pub(crate) _send_cq: Arc<CompletionQueueInner>,
-    pub(crate) _recv_cq: Arc<CompletionQueueInner>,
+    pub(crate) _send_cq: CompletionQueue,
+    pub(crate) _recv_cq: CompletionQueue,
     pub(crate) qp: *mut ffi::ibv_qp,
     // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
     // this aliases `qp` and lives exactly as long.
