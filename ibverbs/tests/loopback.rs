@@ -330,8 +330,10 @@ fn send_recv_large() {
     assert_eq!(recv.bytes(), send.bytes());
 }
 
-/// Scatter-gather: a send gathers two non-contiguous source slices, and the receive scatters the
-/// resulting contiguous message into two non-contiguous destination slices.
+/// Scatter-gather: a send gathers two non-contiguous source slices of different lengths, and the
+/// receive scatters the resulting contiguous message into two non-contiguous destination slices
+/// split at a different point. Unequal lengths matter: a provider that sizes the message from the
+/// first entry alone (Soft-RoCE before rdma-core 63.1) only gets equal ones right.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn scatter_gather() {
@@ -345,19 +347,19 @@ fn scatter_gather() {
         .pd
         .allocate(64, AccessFlags::PERMISSIVE)
         .expect("failed to register recv MR");
-    send.bytes_mut()[0..4].copy_from_slice(b"AAAA");
-    send.bytes_mut()[16..20].copy_from_slice(b"BBBB");
+    send.bytes_mut()[0..3].copy_from_slice(b"AAA");
+    send.bytes_mut()[16..21].copy_from_slice(b"BBBBB");
 
     unsafe {
         lb.qp
-            .post_recv([RecvRequest::new(1, &[recv.slice(0..4), recv.slice(32..36)])])
+            .post_recv([RecvRequest::new(1, &[recv.slice(0..5), recv.slice(32..35)])])
     }
     .expect("post_recv failed");
     let mut batch = lb.qp.start_send();
     batch
         .op()
         .signaled()
-        .send(2, &[send.slice(0..4), send.slice(16..20)]);
+        .send(2, &[send.slice(0..3), send.slice(16..21)]);
     unsafe { batch.submit() }.expect("send failed");
 
     let comps = drain(&lb.cq, 2);
@@ -366,9 +368,9 @@ fn scatter_gather() {
         .find(|wc| wc.wr_id() == 1)
         .expect("missing recv completion");
     assert_eq!(recv_wc.len(), 8, "scattered byte length mismatch");
-    // The 8-byte gathered message "AAAABBBB" is scattered into the two receive slices in order.
-    assert_eq!(&recv.bytes_mut()[0..4], b"AAAA");
-    assert_eq!(&recv.bytes_mut()[32..36], b"BBBB");
+    // The 8-byte gathered message "AAABBBBB" is scattered into the two receive slices in order.
+    assert_eq!(&recv.bytes_mut()[0..5], b"AAABB");
+    assert_eq!(&recv.bytes_mut()[32..35], b"BBB");
 }
 
 /// One-sided RDMA WRITE: the initiator writes directly into a remote memory region.
@@ -1765,14 +1767,8 @@ fn inline_send_list() {
         .expect("missing recv")
         .len();
     assert!(comps.iter().any(|c| c.wr_id() == 2), "missing send");
-
-    // Soft-RoCE's `wr_set_inline_data_list` copies the payload but forgets to accumulate the total
-    // length (providers/rxe/rxe.c omits `tot_length += length`), so it transmits a zero-length
-    // message. The gather call and the completions still succeed; only check the delivered bytes
-    // on a provider that reports the real length.
-    if recv_len == 0 {
-        return;
-    }
+    // Soft-RoCE before rdma-core 63.1 never accumulated the gathered length in
+    // `wr_set_inline_data_list`, and so sent an empty message.
     assert_eq!(
         recv_len, 9,
         "gathered inline send delivered a partial payload"

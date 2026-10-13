@@ -1,6 +1,6 @@
 [package]
 name = "ibverbs-sys"
-version = "0.3.2+63.0"
+version = "0.3.2+63.1"
 edition = "2024"
 rust-version = "1.85" # edition 2024
 
