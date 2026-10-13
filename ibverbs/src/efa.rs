@@ -29,6 +29,11 @@ use crate::{AddressHandle, ProtectionDomain};
 /// [`build`](QueuePairBuilder::build), and bring it to ready with
 /// [`activate`](PreparedQueuePair::activate). Send with [`start_send`](QueuePair::start_send) and
 /// [`to(..)`](crate::SendBatch::to), receive with [`post_recv`](QueuePair::post_recv).
+///
+/// Every SRD work request generates a completion: EFA refuses unsignaled ones, so the queue pair
+/// is created to signal every send and [`signaled`](AddressedSendOp::signaled) is implied. Size
+/// the send completion queue for a completion per work request (see
+/// [`CompletionQueue::capacity`](crate::CompletionQueue::capacity)).
 #[derive(Debug, Clone, Copy)]
 pub struct Srd;
 
@@ -70,6 +75,10 @@ impl QueuePairBuilder<Srd> {
                 max_inline_data: self.max_inline_data,
             },
             qp_type: ffi::ibv_qp_type::IBV_QPT_DRIVER,
+            // EFA rejects a work request without `IBV_SEND_SIGNALED` unless the queue pair signals
+            // every send, and requests a completion for every work request either way, so
+            // signaling all costs nothing and spares each request the flag.
+            sq_sig_all: 1,
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
             pd: self.pd.pd,

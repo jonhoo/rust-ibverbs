@@ -1798,6 +1798,8 @@ pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
 
 impl<T: Datagram> AddressedSendOp<'_, '_, T> {
     /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
+    ///
+    /// On SRD every work request generates a completion, so this is implied there.
     #[inline]
     pub fn signaled(self) -> Self {
         AddressedSendOp {
