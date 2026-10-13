@@ -30,14 +30,14 @@ impl ProtectionDomain {
     /// `iova`, and no [`ON_DEMAND`](AccessFlags::ON_DEMAND) access.
     /// No fallback to ordinary registration occurs on failure.
     ///
-    /// Requires the `mlx5` feature, rdma-core 54 or newer, and (for the mlx5 access flags)
-    /// Linux 6.12 or newer.
+    /// Requires the `mlx5` feature, rdma-core 54 or newer, and Linux 6.12 or newer, even with
+    /// empty `mlx5_access_flags`: rdma-core always passes the mlx5 access flags to the kernel, and
+    /// older kernels refuse the registration rather than ignore them.
     ///
     /// # Errors
     ///
     ///  - [`Unsupported`](Error::Unsupported): the provider is not mlx5, the kernel is older than
-    ///    the mlx5 access flags, or Data Direct was requested on a device without a Data Direct
-    ///    device.
+    ///    6.12, or Data Direct was requested on a device without a Data Direct device.
     ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): the registration failed, with its
     ///    OS error; [`io::ErrorKind::InvalidInput`] for a Data Direct request whose `iova` is not
     ///    page aligned or whose `access_flags` include `ON_DEMAND`.
