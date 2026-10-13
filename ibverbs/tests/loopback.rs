@@ -42,6 +42,29 @@ fn open_test_device() -> Context {
     device.open().expect("failed to open the RDMA device")
 }
 
+/// Soft-RoCE's vendor ID (the kernel's `RXE_VENDOR_ID`).
+const SOFT_ROCE_VENDOR_ID: u32 = 0xff_ffff;
+
+/// The outcome of using an optional device feature (`what`). Soft-RoCE, the device CI runs on,
+/// implements none of the optional features the tests use, so there the refusal is asserted and
+/// `None` returned; any other device under test must support the feature. Either way, a test never
+/// skips silently.
+fn optional_feature<T>(ctx: &Context, what: &str, result: Result<T, Error>) -> Option<T> {
+    let soft_roce = ctx
+        .query_device()
+        .expect("failed to query device")
+        .vendor_id
+        == SOFT_ROCE_VENDOR_ID;
+    match (soft_roce, result) {
+        (true, Err(Error::Unsupported { .. })) => None,
+        (true, Ok(_)) => {
+            panic!("Soft-RoCE now supports {what}; drop it from the expected refusals")
+        }
+        (false, Ok(value)) => Some(value),
+        (_, Err(e)) => panic!("{what} failed: {e}"),
+    }
+}
+
 /// The GID index the tests route from on port 1: the device's routable entry (its IPv4 RoCE v2
 /// one on Soft-RoCE).
 fn gid_index(ctx: &Context) -> u32 {
@@ -330,8 +353,10 @@ fn send_recv_large() {
     assert_eq!(recv.bytes(), send.bytes());
 }
 
-/// Scatter-gather: a send gathers two non-contiguous source slices, and the receive scatters the
-/// resulting contiguous message into two non-contiguous destination slices.
+/// Scatter-gather: a send gathers two non-contiguous source slices of different lengths, and the
+/// receive scatters the resulting contiguous message into two non-contiguous destination slices
+/// split at a different point. Unequal lengths matter: a provider that sizes the message from the
+/// first entry alone (Soft-RoCE before rdma-core 63.1) only gets equal ones right.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn scatter_gather() {
@@ -345,19 +370,19 @@ fn scatter_gather() {
         .pd
         .allocate(64, AccessFlags::PERMISSIVE)
         .expect("failed to register recv MR");
-    send.bytes_mut()[0..4].copy_from_slice(b"AAAA");
-    send.bytes_mut()[16..20].copy_from_slice(b"BBBB");
+    send.bytes_mut()[0..3].copy_from_slice(b"AAA");
+    send.bytes_mut()[16..21].copy_from_slice(b"BBBBB");
 
     unsafe {
         lb.qp
-            .post_recv([RecvRequest::new(1, &[recv.slice(0..4), recv.slice(32..36)])])
+            .post_recv([RecvRequest::new(1, &[recv.slice(0..5), recv.slice(32..35)])])
     }
     .expect("post_recv failed");
     let mut batch = lb.qp.start_send();
     batch
         .op()
         .signaled()
-        .send(2, &[send.slice(0..4), send.slice(16..20)]);
+        .send(2, &[send.slice(0..3), send.slice(16..21)]);
     unsafe { batch.submit() }.expect("send failed");
 
     let comps = drain(&lb.cq, 2);
@@ -366,9 +391,9 @@ fn scatter_gather() {
         .find(|wc| wc.wr_id() == 1)
         .expect("missing recv completion");
     assert_eq!(recv_wc.len(), 8, "scattered byte length mismatch");
-    // The 8-byte gathered message "AAAABBBB" is scattered into the two receive slices in order.
-    assert_eq!(&recv.bytes_mut()[0..4], b"AAAA");
-    assert_eq!(&recv.bytes_mut()[32..36], b"BBBB");
+    // The 8-byte gathered message "AAABBBBB" is scattered into the two receive slices in order.
+    assert_eq!(&recv.bytes_mut()[0..5], b"AAABB");
+    assert_eq!(&recv.bytes_mut()[32..35], b"BBB");
 }
 
 /// One-sided RDMA WRITE: the initiator writes directly into a remote memory region.
@@ -1332,36 +1357,27 @@ fn queue_pair_on_explicit_port() {
     assert_eq!(&recv.bytes()[..4], b"port");
 }
 
-/// The device clock and per-completion hardware timestamps, where the device supports them.
+/// The device clock and per-completion hardware timestamps.
 ///
-/// Both are optional features (Soft-RoCE, for instance, supports neither), so the test skips the
-/// parts the device does not implement rather than failing.
+/// Both are optional device features: Soft-RoCE implements neither, so there the test asserts the
+/// refusal, and any other device under test must provide them (see `optional_feature`).
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn completion_timestamps() {
     let ctx = open_test_device();
 
-    match ctx.query_rt_values_ex() {
-        Ok(clock) => {
-            let _ticks: u64 = clock.ticks();
-        }
-        Err(ibverbs::Error::Unsupported { .. }) => {
-            eprintln!("device does not support query_rt_values_ex; skipping that check");
-        }
-        Err(e) => panic!("query_rt_values_ex failed: {e}"),
+    if let Some(clock) = optional_feature(&ctx, "the device clock", ctx.query_rt_values_ex()) {
+        let _ticks: u64 = clock.ticks();
     }
 
-    let cq = match ctx
-        .create_cq(16)
-        .set_wc_flags(WcFields::COMPLETION_TIMESTAMP)
-        .build()
-    {
-        Ok(cq) => cq,
-        Err(ibverbs::Error::Unsupported { .. }) => {
-            eprintln!("device does not support completion timestamps; skipping");
-            return;
-        }
-        Err(e) => panic!("create_cq with timestamps failed: {e}"),
+    let Some(cq) = optional_feature(
+        &ctx,
+        "completion timestamps",
+        ctx.create_cq(16)
+            .set_wc_flags(WcFields::COMPLETION_TIMESTAMP)
+            .build(),
+    ) else {
+        return;
     };
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut builder = pd
@@ -1406,26 +1422,19 @@ fn completion_timestamps() {
     let _delta: u64 = latest - earliest;
 }
 
-/// The extended work-completion accessors: the always-available GRH flag, plus the optional
-/// SL / source-LID / DLID-path-bits fields requested through the completion-queue builder. The
-/// addressing fields are optional, so the test skips them on a device that cannot request them.
+/// The extended work-completion accessors: the always-available GRH flag, the SL / source-LID /
+/// DLID-path-bits fields requested through the completion-queue builder (standard fields every
+/// provider of extended completion queues accepts), and the optional packet-classification fields.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn extended_wc_fields() {
     let ctx = open_test_device();
 
-    let cq = match ctx
+    let cq = ctx
         .create_cq(16)
         .set_wc_flags(WcFields::SLID | WcFields::SL | WcFields::DLID_PATH_BITS)
         .build()
-    {
-        Ok(cq) => cq,
-        Err(ibverbs::Error::Unsupported { .. }) => {
-            eprintln!("device does not support these completion fields; skipping");
-            return;
-        }
-        Err(e) => panic!("create_cq failed: {e}"),
-    };
+        .expect("failed to create a CQ with the addressing fields");
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut builder = pd
@@ -1483,40 +1492,36 @@ fn extended_wc_fields() {
         "the device grants at least what was asked"
     );
 
-    // The packet-classification fields exist only on hardware that classifies; read them where
-    // the device offers them, and accept a refusal elsewhere (Soft-RoCE has none).
-    match ctx
-        .create_cq(16)
-        .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
-        .build()
-    {
-        Ok(cq) => {
-            let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
-            unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
-                .expect("post_recv failed");
-            let mut batch = qp.start_send();
-            batch.op().signaled().send(2, &[send.slice(..4)]);
-            unsafe { batch.submit() }.expect("send failed");
-            let mut seen = 0;
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while seen < 2 {
-                let mut comps = cq.poll().expect("failed to poll CQ");
-                while let Some(wc) = comps.next() {
-                    wc.ok().expect("work request failed");
-                    let _ = wc.cvlan();
-                    let _ = wc.flow_tag();
-                    seen += 1;
-                }
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for completions"
-                );
+    // The packet-classification fields exist only on hardware that classifies packets (not on
+    // Soft-RoCE, see `optional_feature`).
+    if let Some(cq) = optional_feature(
+        &ctx,
+        "packet-classification completion fields",
+        ctx.create_cq(16)
+            .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
+            .build(),
+    ) {
+        let mut qp = loopback_on(&pd, &cq, gid_index(&ctx));
+        unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
+            .expect("post_recv failed");
+        let mut batch = qp.start_send();
+        batch.op().signaled().send(2, &[send.slice(..4)]);
+        unsafe { batch.submit() }.expect("send failed");
+        let mut seen = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen < 2 {
+            let mut comps = cq.poll().expect("failed to poll CQ");
+            while let Some(wc) = comps.next() {
+                wc.ok().expect("work request failed");
+                let _ = wc.cvlan();
+                let _ = wc.flow_tag();
+                seen += 1;
             }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for completions"
+            );
         }
-        Err(ibverbs::Error::Unsupported { .. }) => {
-            eprintln!("device does not classify packets (no VLAN/flow-tag fields); skipping");
-        }
-        Err(e) => panic!("create_cq failed: {e}"),
     }
 }
 
@@ -1765,14 +1770,8 @@ fn inline_send_list() {
         .expect("missing recv")
         .len();
     assert!(comps.iter().any(|c| c.wr_id() == 2), "missing send");
-
-    // Soft-RoCE's `wr_set_inline_data_list` copies the payload but forgets to accumulate the total
-    // length (providers/rxe/rxe.c omits `tot_length += length`), so it transmits a zero-length
-    // message. The gather call and the completions still succeed; only check the delivered bytes
-    // on a provider that reports the real length.
-    if recv_len == 0 {
-        return;
-    }
+    // Soft-RoCE before rdma-core 63.1 never accumulated the gathered length in
+    // `wr_set_inline_data_list`, and so sent an empty message.
     assert_eq!(
         recv_len, 9,
         "gathered inline send delivered a partial payload"

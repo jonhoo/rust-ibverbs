@@ -52,9 +52,9 @@ http_archive = use_repo_rule("@bazel_tools//tools/build_defs/repo:http.bzl", "ht
 # headers do not have.
 http_archive(
     name = "rdma_core",
-    urls = ["https://github.com/linux-rdma/rdma-core/archive/refs/tags/v63.0.tar.gz"],
-    strip_prefix = "rdma-core-63.0",
-    sha256 = "3a1808f419bad566b33d844b532dd9c899500c7e008615f7a1c0d0ca26b4f1be",
+    urls = ["https://github.com/linux-rdma/rdma-core/archive/refs/tags/v63.1.tar.gz"],
+    strip_prefix = "rdma-core-63.1",
+    sha256 = "d1bb53261b1c0ceeeb2d659a88a5b7b38f6a012550e4fea1f39385a7be4b1556",
     build_file = "//:third_party/rdma_core.BUILD.bazel",
 )
 
