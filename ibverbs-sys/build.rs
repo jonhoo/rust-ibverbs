@@ -111,8 +111,11 @@ fn main() {
     eprintln!("run bindgen");
     let mut builder = bindgen::Builder::default()
         .header(format!("{ibverbs_header_dir}/verbs.h"))
-        // the crate's edition and MSRV; `wrap_unsafe_ops` keeps the generated `unsafe fn` bodies
-        // clean under 2024's `unsafe_op_in_unsafe_fn`
+        // Generate for the crate's MSRV and edition rather than for whichever toolchain runs the
+        // build (bindgen's default), so the output does not vary with it and matches the Bazel
+        // build's. `wrap_unsafe_ops` has nothing to act on today (the bindings contain no `unsafe
+        // fn` bodies); it keeps any bindgen emits later, such as bitfield accessors, clean under
+        // 2024's `unsafe_op_in_unsafe_fn`.
         .rust_target(bindgen::RustTarget::stable(85, 0).expect("1.85 is a known release"))
         .rust_edition(bindgen::RustEdition::Edition2024)
         .wrap_unsafe_ops(true)

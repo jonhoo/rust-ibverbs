@@ -20,11 +20,13 @@ rust_bindgen(
     name = "bindings",
     bindgen_flags = [
         "--no-layout-tests",
-        # `--rust-target` is the crate's MSRV; `--wrap-unsafe-ops` keeps the generated `unsafe fn`
-        # bodies clean under 2024's `unsafe_op_in_unsafe_fn`. No `--rust-edition` here: rust_bindgen
-        # always appends one from `rust.toolchain(edition = ...)` in MODULE.bazel (its check for a
-        # caller-supplied flag compares against "--rust-edition " with a trailing space, so it never
-        # matches), and bindgen rejects the flag twice.
+        # `--rust-target` is the crate's MSRV, as in build.rs, so both builds generate the same
+        # code; `--wrap-unsafe-ops` has nothing to act on today (the bindings contain no `unsafe fn`
+        # bodies) and keeps any bindgen emits later clean under 2024's `unsafe_op_in_unsafe_fn`.
+        # No `--rust-edition` here: rust_bindgen always appends one from `rust.toolchain(edition =
+        # ...)` in MODULE.bazel (its check for a caller-supplied flag compares against
+        # "--rust-edition " with a trailing space, so it never matches), and bindgen rejects the
+        # flag twice.
         "--rust-target=1.85",
         "--wrap-unsafe-ops",
         "--with-derive-default",
