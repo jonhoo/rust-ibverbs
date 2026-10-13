@@ -723,7 +723,13 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// Set the maximum number of send requests in the work queue.
     ///
     /// Defaults to 1.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_send_wr` is 0. mlx5 then creates the send queue without room for a single
+    /// request, and the first one posted to it writes through a null pointer.
     pub fn set_max_send_wr(&mut self, max_send_wr: u32) -> &mut Self {
+        assert!(max_send_wr > 0, "the send queue needs room for one request");
         self.max_send_wr = max_send_wr;
         self
     }
