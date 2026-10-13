@@ -1181,13 +1181,10 @@ impl CompletionQueue {
     /// ```
     #[inline]
     pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
-        let cq = self.as_raw();
-        // `ibv_poll_cq` is a `static inline` in verbs.h that dispatches through the context op
-        // table; an `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
+        // An `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
         // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
-        let ctx = unsafe { (*cq).context };
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
-        let n = unsafe { (*ctx).ops.poll_cq.unwrap()(cq, num_entries, wc.as_mut_ptr()) };
+        let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
             // surface whatever the provider left there as the cause.
@@ -1219,9 +1216,7 @@ impl CompletionQueue {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     #[inline]
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
-        let cq = self.as_raw();
-        let ctx = unsafe { *cq }.context;
-        let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, solicited_only as i32) };
+        let errno = unsafe { ffi::ibv_req_notify_cq(self.as_raw(), solicited_only as i32) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::PollCompletionQueue));
         }
