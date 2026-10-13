@@ -1567,7 +1567,8 @@ impl Drop for Connection {
         // Tell the peer now: destroying the id would also send the disconnect, but a clone of it
         // (from `cm_id`) can keep it alive much longer. The result is ignored: a drop cannot
         // report it, and on InfiniBand and RoCE this succeeds even if the connection is down.
-        // The queue pair is destroyed right after this, which flushes it.
+        // The queue pair is destroyed right after this, which discards its outstanding work
+        // requests without completing them (only `disconnect` flushes them as completions).
         let _ = self.id.disconnect();
     }
 }
