@@ -877,6 +877,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
             let prepared = PreparedQueuePair {
                 lid: self.port_attr.lid,
+                roce: self.port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET.0 as u8,
                 port_num: self.port_num,
                 qp: QueuePair {
                     pd: self.pd.clone(),
@@ -1093,6 +1094,8 @@ pub struct PreparedQueuePair<T: Transport> {
     pub(crate) qp: QueuePair<T>,
     /// port local identifier
     pub(crate) lid: u16,
+    /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
+    pub(crate) roce: bool,
     /// the device port this queue pair is associated with (numbered from 1)
     pub(crate) port_num: u8,
     // carried from builder
@@ -1211,7 +1214,9 @@ impl<T: Transport> PreparedQueuePair<T> {
 
     /// Get the network endpoint for this `QueuePair`.
     ///
-    /// This endpoint will need to be communicated to the `QueuePair` on the remote end.
+    /// This endpoint will need to be communicated to the `QueuePair` on the remote end. On RoCE,
+    /// set a GID index on the builder ([`QueuePairBuilder::set_gid_index`]) first: the endpoint
+    /// carries a GID only then, and the peer cannot route to one without it.
     ///
     /// # Errors
     ///
@@ -1313,6 +1318,7 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///
     ///  - [`GidMismatch`](Error::GidMismatch): `remote` carries a GID, but no `gid_index` was
     ///    set on the builder to route from.
+    ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but `remote` carries no GID.
     pub fn rtr_attributes(&self, remote: &QueuePairEndpoint) -> Result<QueuePairAttribute> {
         let mut path = AddressHandleAttribute::new(self.port_num);
         path.set_dest_lid(remote.lid)
@@ -1320,6 +1326,10 @@ impl<T: Connected> PreparedQueuePair<T> {
         if let Some(gid) = remote.gid {
             let sgid_index = self.gid_index.ok_or(Error::GidMismatch)?;
             path.set_grh(gid, sgid_index as u8, 0xff, self.traffic_class);
+        } else if self.roce {
+            // RoCE routes every packet by GID; the kernel refuses an address vector without one
+            // with nothing but `EINVAL`.
+            return Err(Error::GidRequired);
         }
         let mut attr = QueuePairAttribute::new();
         attr.set_state(QueuePairState::ReadyToReceive)
@@ -1383,6 +1393,8 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///
     ///  - [`GidMismatch`](Error::GidMismatch): the remote endpoint carries a GID, but no
     ///    `gid_index` was set on the builder to route from.
+    ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but the remote endpoint carries
+    ///    no GID.
     ///  - The errors of [`QueuePair::modify`]: [`ModifyQueuePair`](Error::ModifyQueuePair) when
     ///    a transition fails (for example because the remote endpoint is unreachable — on RoCE,
     ///    the error spells out the route that failed), or its typed diagnoses of a rejected

@@ -41,6 +41,14 @@ pub enum Error {
     #[error("a GID was set for the remote endpoint but not the local one")]
     GidMismatch,
 
+    /// The local port is RoCE (Ethernet), which routes every packet by GID, but the remote endpoint
+    /// carries none: set a GID index on the builders of both ends
+    /// ([`QueuePairBuilder::set_gid_index`](crate::QueuePairBuilder::set_gid_index)).
+    #[error(
+        "RoCE routes by GID, but the remote endpoint carries none (set a GID index on both ends)"
+    )]
+    GidRequired,
+
     /// The device does not expose a stable kernel index.
     #[error("the device index is not known")]
     DeviceIndexUnavailable,
@@ -257,7 +265,7 @@ impl Error {
         match self {
             Error::Unsupported { operation } => operation,
             Error::PortNotActive(_) => &"port activation",
-            Error::GidMismatch => &"GID routing",
+            Error::GidMismatch | Error::GidRequired => &"GID routing",
             Error::DeviceIndexUnavailable => &"the device index",
             Error::GetDeviceList(_) => &"ibv_get_device_list",
             Error::OpenDevice(_) => &"ibv_open_device",
