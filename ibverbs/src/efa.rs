@@ -82,7 +82,7 @@ impl QueuePairBuilder<Srd> {
         };
         let qp = unsafe {
             ffi::efadv_create_qp_ex(
-                self.pd.ctx.ctx,
+                self.pd.ctx.as_raw(),
                 &mut attr,
                 &mut efa_attr,
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,

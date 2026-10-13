@@ -4,15 +4,12 @@ use std::sync::Arc;
 
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
-use crate::context::ContextInner;
+use crate::context::{Context, PortAttr, PortState};
 use crate::error::{Error, Result, destroyed, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
 use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
 
 use crate::srq::{SharedReceiveQueue, SharedReceiveQueueInner};
-
-#[cfg(doc)]
-use crate::Context;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,7 +114,7 @@ impl From<MrAdviseFlags> for u32 {
 }
 
 pub(crate) struct ProtectionDomainInner {
-    pub(crate) ctx: Arc<ContextInner>,
+    pub(crate) ctx: Context,
     pub(crate) pd: *mut ffi::ibv_pd,
 }
 
@@ -145,6 +142,11 @@ impl ProtectionDomain {
     /// do not deallocate it.
     pub fn as_raw(&self) -> *mut ffi::ibv_pd {
         self.inner.pd
+    }
+
+    /// The device context this protection domain was allocated on.
+    pub fn context(&self) -> &Context {
+        &self.inner.ctx
     }
 
     /// Create an [`AddressHandle`] for the destination described by `attr`.
@@ -235,10 +237,18 @@ impl ProtectionDomain {
         recv: &CompletionQueue,
         port_num: u8,
     ) -> Result<QueuePairBuilder<T>> {
-        let port_attr = self.inner.ctx.query_port(port_num)?;
+        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
+        //
+        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
+        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
+        //   recommended avoiding saving the result of this query, or to flush them when a new SM
+        //   (re)configures the subnet.
+        //
+        let port_attr = self.context().query_port(port_num)?;
+        require_active(port_num, &port_attr)?;
         // Only reliable connections carry RDMA read and atomic limits.
         let rd_atomic_limits = if T::TYPE == QueuePairType::ReliableConnection {
-            Some(self.inner.ctx.rd_atomic_limits()?)
+            Some(self.context().rd_atomic_limits()?)
         } else {
             None
         };
@@ -455,6 +465,20 @@ impl ProtectionDomain {
             }),
             srq,
         })
+    }
+}
+
+/// Refuses a port that is neither `ACTIVE` nor `ARMED`, for [`ProtectionDomain::create_qp`].
+fn require_active(port_num: u8, port_attr: &PortAttr) -> Result<()> {
+    // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
+    //
+    //   The content of the GID table is valid only when the port_attr.state is either
+    //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
+    //   table is indeterminate.
+    //
+    match port_attr.state() {
+        PortState::Active | PortState::Armed => Ok(()),
+        _ => Err(Error::PortNotActive(port_num)),
     }
 }
 

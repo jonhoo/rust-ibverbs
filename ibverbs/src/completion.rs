@@ -6,11 +6,8 @@ use std::ptr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::context::{ContextInner, HcaClock};
+use crate::context::{Context, HcaClock};
 use crate::error::{Error, Result, destroyed, nonnull};
-
-#[cfg(doc)]
-use crate::Context;
 
 /// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
 /// granularity) lasts at least the requested duration instead of returning fractionally early.
@@ -47,7 +44,7 @@ pub struct CompletionChannel {
 
 struct CompletionChannelInner {
     // Kept so the device outlives the channel.
-    _ctx: Arc<ContextInner>,
+    _ctx: Context,
     cc: *mut ffi::ibv_comp_channel,
 }
 
@@ -66,9 +63,9 @@ impl CompletionChannel {
     /// Create a completion channel on `ctx` (for [`Context::create_comp_channel`]), with its file
     /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
     /// instead of blocking.
-    pub(crate) fn new(ctx: &Arc<ContextInner>) -> Result<CompletionChannel> {
+    pub(crate) fn new(ctx: &Context) -> Result<CompletionChannel> {
         let cc = nonnull(
-            unsafe { ffi::ibv_create_comp_channel(ctx.ctx) },
+            unsafe { ffi::ibv_create_comp_channel(ctx.as_raw()) },
             Error::CreateCompletionChannel,
         )?;
         let channel = CompletionChannel {
@@ -208,7 +205,7 @@ impl AsFd for CompletionChannel {
 /// [`build`](Self::build) to create the queue.
 #[must_use]
 pub struct CompletionQueueBuilder {
-    pub(crate) ctx: Arc<ContextInner>,
+    pub(crate) ctx: Context,
     pub(crate) min_cq_entries: u32,
     pub(crate) cq_context: u64,
     pub(crate) comp_vector: u32,
@@ -300,7 +297,7 @@ impl CompletionQueueBuilder {
             ..Default::default()
         };
         let cq_ex = nonnull(
-            unsafe { ffi::ibv_create_cq_ex(self.ctx.ctx, &mut cq_attr) },
+            unsafe { ffi::ibv_create_cq_ex(self.ctx.as_raw(), &mut cq_attr) },
             Error::CreateCompletionQueue,
         )?;
         Ok(CompletionQueue {
@@ -315,7 +312,7 @@ impl CompletionQueueBuilder {
 }
 
 pub(crate) struct CompletionQueueInner {
-    _ctx: Arc<ContextInner>,
+    _ctx: Context,
     cq_ex: *mut ffi::ibv_cq_ex,
     cc: Option<CompletionChannel>,
 }

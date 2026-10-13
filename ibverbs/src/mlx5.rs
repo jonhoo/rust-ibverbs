@@ -74,7 +74,7 @@ impl ProtectionDomain {
             // argument; its Data Direct query tells the two apart by reporting `ENODEV`.
             if data_direct
                 && err.raw_os_error() == Some(nix::libc::EINVAL)
-                && !has_data_direct_device(self.inner.ctx.ctx)
+                && !has_data_direct_device(self.context().as_raw())
             {
                 return Err(Error::Unsupported {
                     operation: &"mlx5dv_reg_dmabuf_mr",

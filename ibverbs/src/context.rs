@@ -17,62 +17,8 @@ use crate::pd::{ProtectionDomain, ProtectionDomainInner};
 #[cfg(doc)]
 use crate::{Device, QueuePairBuilder, WorkCompletion};
 
-pub(crate) struct ContextInner {
-    pub(crate) ctx: *mut ffi::ibv_context,
-}
-
-impl ContextInner {
-    pub(crate) fn query_device(&self) -> Result<ffi::ibv_device_attr> {
-        let mut device_attr = ffi::ibv_device_attr::default();
-        let errno = unsafe { ffi::ibv_query_device(self.ctx, &mut device_attr as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
-        Ok(device_attr)
-    }
-
-    /// The most outstanding RDMA reads and atomics a queue pair on this device can issue as the
-    /// initiator and service as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`),
-    /// clamped to the `u8` the queue-pair attributes carry.
-    pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
-        let attr = self.query_device()?;
-        let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
-        Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
-    }
-
-    pub(crate) fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr> {
-        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
-        //
-        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
-        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
-        //   recommended avoiding saving the result of this query, or to flush them when a new SM
-        //   (re)configures the subnet.
-        //
-        let mut port_attr = ffi::ibv_port_attr::default();
-        // The shim (rdma-core's `___ibv_query_port` inline) also fills the extended fields, such
-        // as `active_speed_ex`, which the exported compat `ibv_query_port` symbol leaves zeroed.
-        let errno = unsafe { ffi::___ibv_query_port(self.ctx, port_num, &mut port_attr) };
-        if errno != 0 {
-            return Err(Error::errno(errno, |e| Error::QueryPort {
-                port_num,
-                source: e,
-            }));
-        }
-
-        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
-        //
-        //   The content of the GID table is valid only when the port_attr.state is either
-        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
-        //   table is indeterminate.
-        //
-        match port_attr.state {
-            ffi::ibv_port_state::IBV_PORT_ACTIVE | ffi::ibv_port_state::IBV_PORT_ARMED => {}
-            _ => {
-                return Err(Error::PortNotActive(port_num));
-            }
-        }
-        Ok(port_attr)
-    }
+struct ContextInner {
+    ctx: *mut ffi::ibv_context,
 }
 
 impl Drop for ContextInner {
@@ -190,7 +136,7 @@ impl Context {
     /// ```
     pub fn create_cq(&self, min_cq_entries: u32) -> CompletionQueueBuilder {
         CompletionQueueBuilder {
-            ctx: self.inner.clone(),
+            ctx: self.clone(),
             min_cq_entries,
             cq_context: 0,
             comp_vector: 0,
@@ -213,7 +159,7 @@ impl Context {
     ///  - [`CreateCompletionChannel`](Error::CreateCompletionChannel): creating the channel or
     ///    setting its descriptor non-blocking failed.
     pub fn create_comp_channel(&self) -> Result<CompletionChannel> {
-        CompletionChannel::new(&self.inner)
+        CompletionChannel::new(self)
     }
 
     /// The file descriptor that delivers the device's asynchronous events, for handing to an
@@ -322,7 +268,7 @@ impl Context {
         )?;
         Ok(ProtectionDomain {
             inner: Arc::new(ProtectionDomainInner {
-                ctx: self.inner.clone(),
+                ctx: self.clone(),
                 pd,
             }),
         })
@@ -435,12 +381,21 @@ impl Context {
     ///  - [`QueryDevice`](Error::QueryDevice): `ibv_query_device` failed (`EINVAL` for invalid
     ///    arguments).
     pub fn query_device(&self) -> Result<DeviceAttr> {
-        self.inner.query_device().map(DeviceAttr)
+        let mut device_attr = ffi::ibv_device_attr::default();
+        let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::QueryDevice));
+        }
+        Ok(DeviceAttr(device_attr))
     }
 
-    #[cfg(feature = "rdmacm")]
+    /// The most outstanding RDMA reads and atomics a queue pair on this device can issue as the
+    /// initiator and service as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`),
+    /// clamped to the `u8` the queue-pair attributes carry.
     pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
-        self.inner.rd_atomic_limits()
+        let attr = self.query_device()?;
+        let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
+        Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
     }
 
     /// Query the extended attributes and capabilities of this context's device

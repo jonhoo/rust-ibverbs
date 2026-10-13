@@ -805,7 +805,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// the provider keeps operating on the foreign one (misrouted completions, and type confusion
     /// across providers).
     pub(crate) fn check_same_context(&self) -> Result<()> {
-        let ctx = self.pd.ctx.ctx;
+        let ctx = self.pd.ctx.as_raw();
         let foreign = unsafe {
             (*self.send.cq()).context != ctx
                 || (*self.recv.cq()).context != ctx
@@ -859,7 +859,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             ..self.init_attr_ex()
         };
         let qp = nonnull(
-            unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.ctx, &mut attr) },
+            unsafe { ffi::ibv_create_qp_ex(self.pd.ctx.as_raw(), &mut attr) },
             Error::CreateQueuePair,
         )?;
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
@@ -1200,7 +1200,7 @@ impl<T: Transport> PreparedQueuePair<T> {
             let mut gid = ffi::ibv_gid::default();
             let rc = unsafe {
                 ffi::ibv_query_gid(
-                    self.qp.pd.ctx.ctx,
+                    self.qp.pd.ctx.as_raw(),
                     self.port_num,
                     gid_index as i32,
                     &mut gid,
