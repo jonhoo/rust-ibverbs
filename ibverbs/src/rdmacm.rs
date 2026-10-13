@@ -818,6 +818,12 @@ impl CmId {
     /// manager cannot see on its own; forwarding it here lets the passive side treat the
     /// connection as established when the peer's ready-to-use message was lost.
     ///
+    /// The ids on one device share one [`context`](Self::context), so its asynchronous events are
+    /// those of every connection's queue pair, and each goes to whichever reader takes it first:
+    /// one waiting loop per connection would take the others' events. Read them in one place per
+    /// context instead, and hand each event to the connection whose queue pair it names
+    /// ([`AsyncEvent::as_raw`](crate::AsyncEvent::as_raw)).
+    ///
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_notify` failed (for example
