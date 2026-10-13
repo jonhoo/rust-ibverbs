@@ -2039,6 +2039,41 @@ fn routable_gid() {
 /// adjust one, and still reach a working queue pair.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn rd_atomic_defaults_follow_the_device() {
+    // A reliable connection defaults to as many outstanding RDMA reads and atomics as the device
+    // supports, instead of one at a time.
+    let ctx = open_test_device();
+    let dev = ctx.query_device().expect("failed to query device");
+    let responder = dev.max_qp_rd_atom.min(255);
+    let initiator = dev.max_qp_init_rd_atom.min(255);
+    let lb = loopback();
+    let (attr, _) = lb
+        .qp
+        .query(
+            QueuePairAttributeMask::MAX_QP_RD_ATOMIC | QueuePairAttributeMask::MAX_DEST_RD_ATOMIC,
+        )
+        .expect("query");
+    // Providers may round the limits up (Soft-RoCE to a power of two), never down.
+    assert!(i32::from(attr.max_dest_rd_atomic()) >= responder);
+    // Self-connected, so the initiator side is capped to this same device's responder resources.
+    assert!(i32::from(attr.max_rd_atomic()) >= initiator.min(responder));
+
+    // The endpoint advertises the responder resources, and the peer's handshake caps its initiator
+    // side to them.
+    let mut builder = lb
+        .pd
+        .create_qp::<Rc>(&lb.cq, &lb.cq, 1)
+        .expect("failed to create QP");
+    builder.set_gid_index(gid_index(&ctx));
+    let prepared = builder.build().expect("failed to build QP");
+    let mut remote = prepared.endpoint().expect("failed to read endpoint");
+    assert_eq!(i32::from(remote.max_dest_rd_atomic), responder);
+    remote.max_dest_rd_atomic = 1;
+    assert_eq!(prepared.rts_attributes(&remote).max_rd_atomic(), 1);
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn manual_bringup_from_handshake_attributes() {
     let ctx = open_test_device();
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
@@ -2060,7 +2095,7 @@ fn manual_bringup_from_handshake_attributes() {
     assert_eq!(rtr.rq_psn(), endpoint.psn);
     // Adjust one attribute on the way: a shorter RNR timer than the builder's default.
     rtr.set_min_rnr_timer(RnrTimer::at_least(Duration::from_micros(10)));
-    let mut rts = prepared.rts_attributes();
+    let mut rts = prepared.rts_attributes(&endpoint);
     assert_eq!(rts.sq_psn(), endpoint.psn);
     rts.set_retry_count(3);
 

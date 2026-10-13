@@ -332,8 +332,9 @@ fn timeout_ms(timeout: Duration) -> c_int {
 }
 
 /// The `RDMA_MAX_RESP_RES` / `RDMA_MAX_INIT_DEPTH` sentinels of `rdma_cma.h`: a connection
-/// parameter of this value means "whatever the connection manager negotiated", and the queue pair
-/// is left with the attributes `rdma_init_qp_attr` computed.
+/// parameter of this value means "as many as the device supports, negotiated with the peer", and
+/// the queue pair gets the attributes `rdma_init_qp_attr` computed, capped to the device's
+/// limits.
 const RDMA_MAX_RESP_RES: u8 = 0xFF;
 const RDMA_MAX_INIT_DEPTH: u8 = 0xFF;
 
@@ -935,21 +936,23 @@ impl CmId {
     /// Like librdmacm, `responder_resources` and `initiator_depth` override the outstanding-RDMA
     /// limits the connection manager computed (`max_dest_rd_atomic` at `RTR`, `max_rd_atomic` at
     /// `RTS`), so the queue pair is configured with the values this side advertises in its reply.
+    /// Without an override, the computed limits are capped to this device's, as `rdma_accept`
+    /// does: on the passive side they are the peer's request, which may exceed what this device
+    /// supports.
     fn ready(
         &self,
         qp: &mut QueuePair<Rc>,
         responder_resources: Option<u8>,
         initiator_depth: Option<u8>,
     ) -> Result<()> {
+        let (max_initiator_depth, max_responder_resources) = self.context()?.rd_atomic_limits()?;
         let mut rtr = self.init_qp_attr(QueuePairState::ReadyToReceive)?;
-        if let Some(responder_resources) = responder_resources {
-            rtr.set_max_dest_rd_atomic(responder_resources);
-        }
+        let negotiated = rtr.max_dest_rd_atomic().min(max_responder_resources);
+        rtr.set_max_dest_rd_atomic(responder_resources.unwrap_or(negotiated));
         qp.modify(&rtr)?;
         let mut rts = self.init_qp_attr(QueuePairState::ReadyToSend)?;
-        if let Some(initiator_depth) = initiator_depth {
-            rts.set_max_rd_atomic(initiator_depth);
-        }
+        let negotiated = rts.max_rd_atomic().min(max_initiator_depth);
+        rts.set_max_rd_atomic(initiator_depth.unwrap_or(negotiated));
         qp.modify(&rts)
     }
 
@@ -1131,12 +1134,13 @@ pub struct ConnectionParameter {
 }
 
 impl Default for ConnectionParameter {
-    /// Reliable-connection defaults: one outstanding RDMA read/atomic in each direction, the
+    /// Reliable-connection defaults: as many outstanding RDMA reads and atomics in each direction
+    /// as both devices support (librdmacm's `RDMA_MAX_RESP_RES` / `RDMA_MAX_INIT_DEPTH`), the
     /// maximum retry counts, and no private data.
     fn default() -> Self {
         let mut param: ffi::rdma_conn_param = unsafe { std::mem::zeroed() };
-        param.responder_resources = 1;
-        param.initiator_depth = 1;
+        param.responder_resources = RDMA_MAX_RESP_RES;
+        param.initiator_depth = RDMA_MAX_INIT_DEPTH;
         param.retry_count = 7;
         param.rnr_retry_count = 7;
         ConnectionParameter {
@@ -1148,14 +1152,14 @@ impl Default for ConnectionParameter {
 
 impl ConnectionParameter {
     /// Sets the number of outstanding RDMA read/atomic operations the local side can service as a
-    /// responder.
+    /// responder. Defaults to the device's limit, negotiated down to what the peer issues.
     pub fn set_responder_resources(mut self, responder_resources: u8) -> Self {
         self.param.responder_resources = responder_resources;
         self
     }
 
     /// Sets the number of outstanding RDMA read/atomic operations the local side can issue as an
-    /// initiator.
+    /// initiator. Defaults to the device's limit, negotiated down to what the peer services.
     pub fn set_initiator_depth(mut self, initiator_depth: u8) -> Self {
         self.param.initiator_depth = initiator_depth;
         self

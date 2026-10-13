@@ -243,6 +243,8 @@ impl ProtectionDomain {
     ///  - [`QueryPort`](Error::QueryPort): querying `port_num` failed (`ibv_query_port`).
     ///  - [`PortNotActive`](Error::PortNotActive): `port_num` is not in the `ACTIVE` or `ARMED`
     ///    state, so its GID table and routing are unusable.
+    ///  - [`QueryDevice`](Error::QueryDevice): querying the device's RDMA read and atomic limits,
+    ///    which a reliable connection defaults to, failed (`ibv_query_device`).
     pub fn create_qp<T: Transport>(
         &self,
         send: &CompletionQueue,
@@ -250,6 +252,13 @@ impl ProtectionDomain {
         port_num: u8,
     ) -> Result<QueuePairBuilder<T>> {
         let port_attr = self.inner.ctx.query_port(port_num)?;
+        let qp_type: ffi::ibv_qp_type = T::TYPE.into();
+        // Only reliable connections carry RDMA read and atomic limits.
+        let rd_atomic_limits = if qp_type == ffi::ibv_qp_type::IBV_QPT_RC {
+            Some(self.inner.ctx.rd_atomic_limits()?)
+        } else {
+            None
+        };
         Ok(QueuePairBuilder::new(
             self.inner.clone(),
             port_attr,
@@ -258,9 +267,10 @@ impl ProtectionDomain {
             1,
             recv.inner.clone(),
             1,
-            T::TYPE.into(),
+            qp_type,
             1,
             1,
+            rd_atomic_limits,
         ))
     }
 

@@ -36,6 +36,24 @@ enum ContextOwnership {
 }
 
 impl ContextInner {
+    pub(crate) fn query_device(&self) -> Result<ffi::ibv_device_attr> {
+        let mut device_attr = ffi::ibv_device_attr::default();
+        let errno = unsafe { ffi::ibv_query_device(self.ctx, &mut device_attr as *mut _) };
+        if errno != 0 {
+            return Err(Error::errno(errno, Error::QueryDevice));
+        }
+        Ok(device_attr)
+    }
+
+    /// The most outstanding RDMA reads and atomics a queue pair on this device can issue as the
+    /// initiator and service as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`),
+    /// clamped to the `u8` the queue-pair attributes carry.
+    pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
+        let attr = self.query_device()?;
+        let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
+        Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
+    }
+
     pub(crate) fn query_port(&self, port_num: u8) -> Result<ffi::ibv_port_attr> {
         // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
         //
@@ -447,12 +465,12 @@ impl Context {
     ///  - [`QueryDevice`](Error::QueryDevice): `ibv_query_device` failed (`EINVAL` for invalid
     ///    arguments).
     pub fn query_device(&self) -> Result<DeviceAttr> {
-        let mut device_attr = ffi::ibv_device_attr::default();
-        let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
-        Ok(DeviceAttr(device_attr))
+        self.inner.query_device().map(DeviceAttr)
+    }
+
+    #[cfg(feature = "rdmacm")]
+    pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
+        self.inner.rd_atomic_limits()
     }
 
     /// Query the extended attributes and capabilities of this context's device
