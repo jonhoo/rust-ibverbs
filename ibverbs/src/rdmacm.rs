@@ -737,6 +737,12 @@ impl CmId {
     /// move it to the error state the way it would a connection-manager-created one. Do that
     /// yourself with [`QueuePair::modify`] so outstanding work requests are flushed (the blocking
     /// [`Connection::disconnect`] does).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed. On InfiniBand
+    ///    and RoCE that happens only on an id that never took part in a connection: disconnecting
+    ///    one that is already down succeeds.
     pub fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.inner.id) };
         check(ret, Error::ConnectionSetup)
@@ -1519,8 +1525,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed (for example
-    ///    because the connection is already down).
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed. On InfiniBand
+    ///    and RoCE it does not, even when the connection is already down.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): moving the queue pair to the error state
     ///    failed.
     pub fn disconnect(&mut self) -> Result<()> {
@@ -1534,7 +1540,8 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         // Tell the peer now: destroying the id would also send the disconnect, but a clone of it
-        // (from `cm_id`) can keep it alive much longer. Fails harmlessly if already disconnected.
+        // (from `cm_id`) can keep it alive much longer. The result is ignored: a drop cannot
+        // report it, and on InfiniBand and RoCE this succeeds even if the connection is down.
         // The queue pair is destroyed right after this, which flushes it.
         let _ = self.id.disconnect();
     }
