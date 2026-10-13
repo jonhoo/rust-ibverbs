@@ -1164,6 +1164,58 @@ fn register_from_raw() {
 
 /// Batched receive: two receives posted in one `post_recv` (caller-owned array) catch two sends, in
 /// order, on the same RC queue pair.
+/// A split queue pair: one thread posts the receives and another sends into them.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn split_queue_pair_across_threads() {
+    const N: u64 = 8;
+    let mut lb = loopback();
+    let recv = lb
+        .pd
+        .allocate(N as usize * 8, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = lb
+        .pd
+        .allocate(N as usize * 8, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    for (i, chunk) in send.bytes_mut().chunks_mut(8).enumerate() {
+        chunk.copy_from_slice(&(i as u64).to_le_bytes());
+    }
+
+    let (mut sends, recvs) = lb.qp.split();
+    let posted = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for i in 0..N {
+                let range = i as usize * 8..(i as usize + 1) * 8;
+                unsafe { recvs.post_recv([RecvRequest::new(i, &[recv.slice(range)])]) }
+                    .expect("post_recv failed");
+            }
+            posted.wait();
+        });
+        s.spawn(|| {
+            // RC delivers in order, so send once every receive is in place.
+            posted.wait();
+            for i in 0..N {
+                let range = i as usize * 8..(i as usize + 1) * 8;
+                let mut batch = sends.start_send();
+                batch.op().signaled().send(100 + i, &[send.slice(range)]);
+                unsafe { batch.submit() }.expect("send failed");
+            }
+        });
+    });
+
+    let comps = drain(&lb.cq, 2 * N as usize);
+    for i in 0..N {
+        assert!(comps.iter().any(|c| c.wr_id() == i), "missing recv {i}");
+        assert!(
+            comps.iter().any(|c| c.wr_id() == 100 + i),
+            "missing send {i}"
+        );
+    }
+    assert_eq!(recv.bytes(), send.bytes());
+}
+
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn batched_recv() {

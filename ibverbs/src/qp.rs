@@ -2524,6 +2524,10 @@ impl<T: Transport> QueuePair<T> {
     /// scatter buffers, so the payload starts at offset 40. If the queue pair uses a shared receive
     /// queue, post to the [`SharedReceiveQueue`] instead; its own receive queue is unused.
     ///
+    /// Takes `&self`: the provider serializes posts to the receive queue, so several threads may
+    /// post at once. To post receives while a send batch is open, [`split`](Self::split) the
+    /// queue pair.
+    ///
     /// # Safety
     ///
     /// Each referenced memory region must stay valid until a work completion has been polled for the
@@ -2534,7 +2538,7 @@ impl<T: Transport> QueuePair<T> {
     ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
     ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
     ///    resources).
-    pub unsafe fn post_recv<'a>(&mut self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
+    pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
             return Ok(());
@@ -2588,12 +2592,96 @@ impl<T: Transport> QueuePair<T> {
     /// ```
     #[inline]
     pub fn start_send(&mut self) -> SendBatch<'_, T> {
+        self.open_batch()
+    }
+
+    /// Splits the queue pair into its send and receive halves, so that one thread can build and
+    /// submit send batches while others post receives. The providers lock the two queues
+    /// separately, so neither half waits for the other.
+    ///
+    /// Both halves borrow the queue pair, which is usable again once they are dropped.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ibverbs::{LocalMemorySlice, QueuePair, RecvRequest};
+    /// # fn f(qp: &mut QueuePair, inbox: &[LocalMemorySlice], outbox: &[LocalMemorySlice]) {
+    /// let (mut sends, recvs) = qp.split();
+    /// std::thread::scope(|s| {
+    ///     s.spawn(move || unsafe { recvs.post_recv([RecvRequest::new(1, inbox)]) });
+    ///     s.spawn(move || {
+    ///         let mut batch = sends.start_send();
+    ///         batch.op().signaled().send(2, outbox);
+    ///         unsafe { batch.submit() }
+    ///     });
+    /// });
+    /// # }
+    /// ```
+    pub fn split(&mut self) -> (SendQueue<'_, T>, RecvQueue<'_, T>) {
+        (SendQueue { qp: self }, RecvQueue { qp: self })
+    }
+
+    /// Opens a work-request block on the send queue (`wr_start`). Every caller holds the send
+    /// queue exclusively (a `&mut` to the queue pair or to its [`SendQueue`]), which is what keeps
+    /// at most one block open at a time.
+    #[inline]
+    fn open_batch(&self) -> SendBatch<'_, T> {
         let qpx = self.qp_ex;
         unsafe { (*qpx).wr_start.unwrap()(qpx) };
         SendBatch {
             qpx,
             _qp: std::marker::PhantomData,
         }
+    }
+}
+
+/// The send half of a [`QueuePair`], from [`QueuePair::split`].
+///
+/// It starts send batches the way [`QueuePair::start_send`] does, and keeps the same rule that at
+/// most one is open at a time:
+///
+/// ```compile_fail,E0499
+/// # fn two_batches(qp: &mut ibverbs::QueuePair) {
+/// let (mut sends, _recvs) = qp.split();
+/// let first = sends.start_send();
+/// let second = sends.start_send(); // error: `sends` is already mutably borrowed by `first`
+/// let _ = (first, second);
+/// # }
+/// ```
+pub struct SendQueue<'qp, T: Transport> {
+    qp: &'qp QueuePair<T>,
+}
+
+impl<T: Transport> SendQueue<'_, T> {
+    /// Begin a batch of send work requests, as [`QueuePair::start_send`] does.
+    #[inline]
+    pub fn start_send(&mut self) -> SendBatch<'_, T> {
+        self.qp.open_batch()
+    }
+}
+
+/// The receive half of a [`QueuePair`], from [`QueuePair::split`]. It can be shared between
+/// threads: each may post receives.
+pub struct RecvQueue<'qp, T: Transport> {
+    qp: &'qp QueuePair<T>,
+}
+
+impl<T: Transport> RecvQueue<'_, T> {
+    /// Posts a batch of receive work requests, as [`QueuePair::post_recv`] does.
+    ///
+    /// # Safety
+    ///
+    /// Each referenced memory region must stay valid until a work completion has been polled for
+    /// the corresponding `wr_id`.
+    ///
+    /// # Errors
+    ///
+    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
+    ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
+    ///    resources).
+    #[inline]
+    pub unsafe fn post_recv<'a>(&self, recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
+        unsafe { self.qp.post_recv(recvs) }
     }
 }
 
@@ -2611,6 +2699,15 @@ impl<T: Transport> Drop for QueuePair<T> {
 #[cfg(test)]
 mod test_conversions {
     use super::*;
+
+    #[test]
+    fn split_halves_cross_threads() {
+        fn send<T: Send>() {}
+        fn sync<T: Sync>() {}
+        send::<SendQueue<'static, Rc>>();
+        send::<RecvQueue<'static, Rc>>();
+        sync::<RecvQueue<'static, Rc>>();
+    }
 
     #[test]
     fn queue_pair_type_roundtrip() {

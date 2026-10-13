@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .set_gid_index(gid_index)
         .build()?;
     let receiver_endpoint = receiver_prepared.endpoint()?;
-    let mut receiver = receiver_prepared.activate(QKEY)?;
+    let receiver = receiver_prepared.activate(QKEY)?;
 
     // Address the receiver by its GID.
     let receiver_gid = receiver_endpoint.gid.ok_or("EFA requires a GID")?;
