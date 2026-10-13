@@ -1045,6 +1045,9 @@ impl Completions<'_> {
 }
 
 impl Drop for Completions<'_> {
+    // Inlined so a poll, even an empty one, does not pay a call into this crate on top of the
+    // provider's.
+    #[inline]
     fn drop(&mut self) {
         if self.open {
             unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
@@ -1194,6 +1197,7 @@ impl CompletionQueue {
     /// # Errors
     ///
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
+    #[inline]
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
         let cq = self.inner.cq();
         let ctx = unsafe { *cq }.context;
