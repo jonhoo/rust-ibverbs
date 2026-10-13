@@ -732,6 +732,19 @@ impl std::fmt::Display for WcOpcode {
     }
 }
 
+/// Read an optional work-completion field through the provider's lazy `read_*` reader on `$cq`,
+/// passing it any further arguments. The provider installs a field's reader only on a queue that
+/// requested the field, so on any other queue this panics, naming the field.
+macro_rules! wc_reader {
+    ($cq:expr, $reader:ident, $field:literal $(, $arg:expr)*) => {
+        unsafe {
+            (*$cq)
+                .$reader
+                .expect(concat!("completion queue did not request ", $field))($cq $(, $arg)*)
+        }
+    };
+}
+
 /// A single work completion, borrowed from the completion queue being polled.
 ///
 /// Returned by [`Completions::next`]. Fields are read lazily through the extended completion-queue
@@ -813,11 +826,11 @@ impl WorkCompletion<'_> {
     /// completion queue panics, because the provider did not install the timestamp reader.
     #[inline]
     pub fn completion_timestamp(&self) -> HcaClock {
-        HcaClock(unsafe {
-            (*self.cq)
-                .read_completion_ts
-                .expect("completion queue was not created with timestamps")(self.cq)
-        })
+        HcaClock(wc_reader!(
+            self.cq,
+            read_completion_ts,
+            "the completion timestamp"
+        ))
     }
 
     /// The wallclock hardware timestamp (in nanoseconds) captured when this work request completed.
@@ -828,13 +841,11 @@ impl WorkCompletion<'_> {
     /// completion queue, because the provider did not install the reader.
     #[inline]
     pub fn completion_wallclock_ns(&self) -> u64 {
-        unsafe {
-            (*self.cq)
-                .read_completion_wallclock_ns
-                .expect("completion queue was not created with wallclock timestamps")(
-                self.cq
-            )
-        }
+        wc_reader!(
+            self.cq,
+            read_completion_wallclock_ns,
+            "the wallclock completion timestamp"
+        )
     }
 
     /// The work-completion flags (`IBV_WC_*`), such as whether a GRH is present or immediate
@@ -857,11 +868,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn slid(&self) -> u32 {
-        unsafe {
-            (*self.cq)
-                .read_slid
-                .expect("completion queue did not request the source LID")(self.cq)
-        }
+        wc_reader!(self.cq, read_slid, "the source LID")
     }
 
     /// The service level this message was sent with (relevant for datagram receive completions).
@@ -870,11 +877,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn sl(&self) -> u8 {
-        unsafe {
-            (*self.cq)
-                .read_sl
-                .expect("completion queue did not request the service level")(self.cq)
-        }
+        wc_reader!(self.cq, read_sl, "the service level")
     }
 
     /// The destination LID path bits (relevant for datagram receive completions).
@@ -883,11 +886,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn dlid_path_bits(&self) -> u8 {
-        unsafe {
-            (*self.cq)
-                .read_dlid_path_bits
-                .expect("completion queue did not request the DLID path bits")(self.cq)
-        }
+        wc_reader!(self.cq, read_dlid_path_bits, "the DLID path bits")
     }
 
     /// The remote key a SEND-with-invalidate invalidated, if this completion reports one
@@ -908,11 +907,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn cvlan(&self) -> u16 {
-        unsafe {
-            (*self.cq)
-                .read_cvlan
-                .expect("completion queue did not request the customer VLAN")(self.cq)
-        }
+        wc_reader!(self.cq, read_cvlan, "the customer VLAN")
     }
 
     /// The flow tag the device's steering rules attached to the incoming packet.
@@ -921,11 +916,7 @@ impl WorkCompletion<'_> {
     /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
     #[inline]
     pub fn flow_tag(&self) -> u32 {
-        unsafe {
-            (*self.cq)
-                .read_flow_tag
-                .expect("completion queue did not request the flow tag")(self.cq)
-        }
+        wc_reader!(self.cq, read_flow_tag, "the flow tag")
     }
 
     /// The tag-matching information of a tag-matching receive: the tag and the opaque user data
@@ -936,13 +927,12 @@ impl WorkCompletion<'_> {
     #[inline]
     pub fn tag_matching(&self) -> TagMatchingInfo {
         let mut info = ffi::ibv_wc_tm_info::default();
-        unsafe {
-            (*self.cq)
-                .read_tm_info
-                .expect("completion queue did not request the tag-matching information")(
-                self.cq, &mut info,
-            )
-        };
+        wc_reader!(
+            self.cq,
+            read_tm_info,
+            "the tag-matching information",
+            &mut info
+        );
         TagMatchingInfo {
             tag: info.tag,
             private: info.priv_,
