@@ -1440,10 +1440,16 @@ impl Incoming {
     ///
     ///  - [`Accept`](Error::Accept): `rdma_accept` failed, or the private data does not fit a
     ///    reply (see [`ConnectionParameter::set_private_data`]).
-    ///  - [`ConnectionManager`](Error::ConnectionManager): the peer gave up before the connection
-    ///    was established.
+    ///  - [`ConnectionManager`](Error::ConnectionManager): the peer gave up after this side
+    ///    replied, before the connection was established.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed.
     ///  - [`TimedOut`](Error::TimedOut): the connection was not established in time.
+    ///
+    /// A peer that withdrew its request before this side replied (for example by dropping its id
+    /// after its connect timed out) shows up as `EINVAL` instead: in
+    /// [`ModifyQueuePair`](Error::ModifyQueuePair) when the connection manager refuses to compute
+    /// the queue pair's attributes (`rdma_init_qp_attr`), or in [`Accept`](Error::Accept) when the
+    /// request went away between those transitions and the reply.
     pub fn accept(
         self,
         qp: PreparedQueuePair<Rc>,
