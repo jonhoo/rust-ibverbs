@@ -57,7 +57,13 @@ impl SrqAttributes {
 #[must_use = "the shared receive queue is destroyed when dropped"]
 pub struct SharedReceiveQueue {
     pub(crate) inner: Arc<SharedReceiveQueueInner>,
+    /// `inner.srq`, kept next to the `Arc` for the data path, as `CompletionQueue` does.
+    pub(crate) srq: *mut ffi::ibv_srq,
 }
+
+// The pointer is a copy of `inner`'s, valid for as long as `inner` keeps the queue alive.
+unsafe impl Sync for SharedReceiveQueue {}
+unsafe impl Send for SharedReceiveQueue {}
 
 impl SharedReceiveQueue {
     /// Returns the underlying `ibv_srq` pointer.
@@ -65,7 +71,7 @@ impl SharedReceiveQueue {
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer is owned by this
     /// [`SharedReceiveQueue`] and stays valid only while it is alive; do not destroy it.
     pub fn as_raw(&self) -> *mut ffi::ibv_srq {
-        self.inner.srq
+        self.srq
     }
 
     /// The queue's current attributes (`ibv_query_srq`): its capacity, the scatter/gather entries
@@ -76,7 +82,7 @@ impl SharedReceiveQueue {
     ///  - [`QuerySharedReceiveQueue`](Error::QuerySharedReceiveQueue): `ibv_query_srq` failed.
     pub fn query(&self) -> Result<SrqAttributes> {
         let mut attr = ffi::ibv_srq_attr::default();
-        let errno = unsafe { ffi::ibv_query_srq(self.inner.srq, &mut attr) };
+        let errno = unsafe { ffi::ibv_query_srq(self.srq, &mut attr) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::QuerySharedReceiveQueue));
         }
@@ -125,7 +131,7 @@ impl SharedReceiveQueue {
 
     /// `ibv_modify_srq` for the attributes `mask` selects in `attr`.
     fn modify(&self, attr: &mut ffi::ibv_srq_attr, mask: ffi::ibv_srq_attr_mask) -> Result<()> {
-        let errno = unsafe { ffi::ibv_modify_srq(self.inner.srq, attr, mask.0 as i32) };
+        let errno = unsafe { ffi::ibv_modify_srq(self.srq, attr, mask.0 as i32) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::ModifySharedReceiveQueue));
         }
@@ -176,11 +182,11 @@ impl SharedReceiveQueue {
         recvs.last_mut().unwrap().wr.next = ptr::null_mut();
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let ctx = unsafe { *self.inner.srq }.context;
+        let ctx = unsafe { *self.srq }.context;
         let ops = &mut unsafe { *ctx }.ops;
         let errno = unsafe {
             ops.post_srq_recv.as_mut().unwrap()(
-                self.inner.srq,
+                self.srq,
                 &mut recvs[0].wr as *mut _,
                 &mut bad_wr as *mut _,
             )

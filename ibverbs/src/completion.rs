@@ -314,6 +314,7 @@ impl CompletionQueueBuilder {
                     cc,
                     cq_ex,
                 }),
+                cq_ex,
             })
         }
     }
@@ -1067,7 +1068,14 @@ impl Drop for Completions<'_> {
 #[derive(Clone)]
 pub struct CompletionQueue {
     pub(crate) inner: Arc<CompletionQueueInner>,
+    /// `inner.cq_ex`, kept next to the `Arc` for the data path: read through it, the pointer is a
+    /// dependent load that every opaque provider call makes the compiler repeat.
+    cq_ex: *mut ffi::ibv_cq_ex,
 }
+
+// The pointer is a copy of `inner`'s, valid for as long as `inner` keeps the queue alive.
+unsafe impl Send for CompletionQueue {}
+unsafe impl Sync for CompletionQueue {}
 
 impl CompletionQueue {
     /// Poll for the work completions that are ready, through the extended interface.
@@ -1106,7 +1114,7 @@ impl CompletionQueue {
     /// ```
     #[inline]
     pub fn poll(&self) -> Result<Completions<'_>> {
-        let cq = self.inner.cq_ex;
+        let cq = self.cq_ex;
         let mut attr = ffi::ibv_poll_cq_attr::default();
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
         // paired with `end_poll`) when the queue is empty.
@@ -1170,7 +1178,7 @@ impl CompletionQueue {
     /// ```
     #[inline]
     pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
-        let cq = self.inner.cq();
+        let cq = self.as_raw();
         // `ibv_poll_cq` is a `static inline` in verbs.h that dispatches through the context op
         // table; an `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
         // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
@@ -1205,7 +1213,7 @@ impl CompletionQueue {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     #[inline]
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
-        let cq = self.inner.cq();
+        let cq = self.as_raw();
         let ctx = unsafe { *cq }.context;
         let errno = unsafe { (*ctx).ops.req_notify_cq.unwrap()(cq, solicited_only as i32) };
         if errno != 0 {
@@ -1225,7 +1233,7 @@ impl CompletionQueue {
     /// requests in flight across the queue pairs sharing this queue, or it overruns
     /// (`IBV_EVENT_CQ_ERR`) and stops working.
     pub fn capacity(&self) -> u32 {
-        unsafe { (*self.inner.cq_ex).cqe }.max(0) as u32
+        unsafe { (*self.cq_ex).cqe }.max(0) as u32
     }
 
     /// Returns the underlying `ibv_cq` pointer.
@@ -1234,8 +1242,10 @@ impl CompletionQueue {
     /// through the extended interface; an `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this
     /// is the same handle viewed as a plain completion queue (see [`as_raw_ex`](Self::as_raw_ex)).
     /// The pointer stays valid only while this [`CompletionQueue`] is alive; do not destroy it.
+    #[inline]
     pub fn as_raw(&self) -> *mut ffi::ibv_cq {
-        self.inner.cq()
+        // An `ibv_cq_ex` starts with the `ibv_cq` it extends (`ibv_cq_ex_to_cq` in C).
+        self.cq_ex as *mut ffi::ibv_cq
     }
 
     /// Returns the underlying `ibv_cq_ex` pointer (the extended completion queue this is built on).
@@ -1243,7 +1253,7 @@ impl CompletionQueue {
     /// This is an escape hatch for verbs this crate does not yet wrap. The pointer stays valid only
     /// while this [`CompletionQueue`] is alive; do not destroy it.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_cq_ex {
-        self.inner.cq_ex
+        self.cq_ex
     }
 }
 

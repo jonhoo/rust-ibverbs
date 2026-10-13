@@ -475,6 +475,7 @@ impl ProtectionDomain {
                     _pd: self.inner.clone(),
                     srq,
                 }),
+                srq,
             })
         }
     }
