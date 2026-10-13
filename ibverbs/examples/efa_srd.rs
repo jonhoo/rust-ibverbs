@@ -1,7 +1,7 @@
 //! Minimal EFA SRD example: two SRD queue pairs on one device, one sends a datagram to the other.
 //!
-//! The only EFA-specific call is `create_srd_qp`; from there, building, activating, and the data
-//! path are the same API every other transport uses.
+//! The only EFA-specific part is the `Srd` transport (`create_qp::<Srd>`); from there, building,
+//! activating, and the data path are the same API every other transport uses.
 //!
 //! Requires an AWS Elastic Fabric Adapter (EFA) device and the `efa` feature
 //! (`cargo run --features efa --example efa_srd`). This example follows the EFA documentation but
@@ -21,13 +21,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Two SRD queue pairs. SRD is connectionless, so each is just brought to ready with a Q_Key.
     let mut sender = pd
-        .create_srd_qp(&cq, &cq, 1)?
+        .create_qp::<ibverbs::Srd>(&cq, &cq, 1)?
         .set_gid_index(gid_index)
         .build()?
         .activate(QKEY)?;
 
     let receiver_prepared = pd
-        .create_srd_qp(&cq, &cq, 1)?
+        .create_qp::<ibverbs::Srd>(&cq, &cq, 1)?
         .set_gid_index(gid_index)
         .build()?;
     let receiver_endpoint = receiver_prepared.endpoint()?;

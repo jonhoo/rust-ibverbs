@@ -11,21 +11,24 @@
 use std::io;
 use std::os::raw::c_void;
 
-use crate::completion::CompletionQueue;
 use crate::error::{Error, Result};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
-use crate::pd::ProtectionDomain;
 use crate::qp::{
     AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
     QueuePairType, Transport, sealed,
 };
 
 #[cfg(doc)]
-use crate::AddressHandle;
+use crate::{AddressHandle, ProtectionDomain};
 
 /// The EFA SRD (Scalable Reliable Datagram) transport: reliable like RC but connectionless and
-/// addressed like UD ([`QueuePairType::Driver`], created through
-/// [`ProtectionDomain::create_srd_qp`]).
+/// addressed like UD ([`QueuePairType::Driver`]).
+///
+/// Begin building an SRD queue pair with [`ProtectionDomain::create_qp`]`::<Srd>`, configure it
+/// like any other queue pair (GID index, queue/SGE limits), create it with
+/// [`build`](QueuePairBuilder::build), and bring it to ready with
+/// [`activate`](PreparedQueuePair::activate). Send with [`start_send`](QueuePair::start_send) and
+/// [`to(..)`](crate::SendBatch::to), receive with [`post_recv`](QueuePair::post_recv).
 #[derive(Debug, Clone, Copy)]
 pub struct Srd;
 
@@ -34,25 +37,6 @@ impl sealed::Sealed for Srd {
 }
 impl Transport for Srd {}
 impl Datagram for Srd {}
-
-impl ProtectionDomain {
-    /// Begin building an EFA SRD queue pair associated with `port_num` (numbered from 1) on this
-    /// protection domain's device.
-    ///
-    /// Configure it like any other queue pair (GID index, queue/SGE limits), then create it with
-    /// [`build`](QueuePairBuilder::build) and bring it to ready with
-    /// [`activate`](PreparedQueuePair::activate). Send with
-    /// [`start_send`](QueuePair::start_send) and [`to(..)`](crate::SendBatch::to), receive with
-    /// [`post_recv`](QueuePair::post_recv).
-    pub fn create_srd_qp(
-        &self,
-        send: &CompletionQueue,
-        recv: &CompletionQueue,
-        port_num: u8,
-    ) -> Result<QueuePairBuilder<Srd>> {
-        self.create_qp::<Srd>(send, recv, port_num)
-    }
-}
 
 impl QueuePairBuilder<Srd> {
     /// Create the EFA SRD queue pair described by this builder (`efadv_create_qp_ex`).
