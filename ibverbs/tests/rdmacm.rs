@@ -10,34 +10,33 @@
 mod common;
 
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
 use common::{open_test_device, poll_until};
 use ibverbs::rdmacm::{
-    Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
+    Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
-    AccessFlags, AckTimeout, CompletionQueue, Context, Error, GidType, QueuePairAttribute,
+    AccessFlags, AckTimeout, CompletionQueue, Context, Error, ProtectionDomain, QueuePairAttribute,
     QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice,
     WcStatus,
 };
 
-/// The device's RoCEv2 IPv4 address, read from its GID table. The connection manager needs to
-/// route over an IP address; prefer the RoCEv2 entry holding the interface's IPv4 address (an
-/// IPv4-mapped GID).
-fn device_ipv4(ctx: &Context) -> Ipv4Addr {
-    let gids = ctx.gid_table().expect("failed to read GID table");
-    for entry in gids {
-        if entry.gid_type == GidType::RoceV2 && entry.gid.is_ipv4_mapped() {
-            if let Some(ipv4) = std::net::Ipv6Addr::from(entry.gid).to_ipv4_mapped() {
-                return ipv4;
-            }
-        }
-    }
-    panic!("no RoCEv2 IPv4 GID found; the connection manager test needs an IP-addressed device");
+/// The device's IPv4 address, from its routable GID on port 1 (the IPv4-mapped RoCEv2 entry of the
+/// interface's address). The connection manager needs to route over an IP address.
+fn device_ip(ctx: &Context) -> IpAddr {
+    let gid = ctx
+        .routable_gid(1)
+        .expect("failed to read GID table")
+        .expect("no GID on port 1")
+        .gid;
+    Ipv6Addr::from(gid)
+        .to_ipv4_mapped()
+        .map(IpAddr::V4)
+        .expect("no IPv4 GID on port 1; the connection manager needs an IP-addressed device")
 }
 
 /// Poll `cq` until a completion with `wr_id` arrives (or time out), checking it succeeded.
@@ -59,58 +58,56 @@ const SETUP_TIMEOUT: Option<Duration> = Some(Duration::from_secs(10));
 /// the interface's address with the device, and reports that as "no such device".
 const BIND_RETRY: Duration = Duration::from_secs(5);
 
-/// Whether a bind failure is the transient `ENODEV` worth retrying.
-fn is_transient_bind_error(err: &Error) -> bool {
-    matches!(err, Error::BindAddress(e) if e.raw_os_error() == Some(nix::libc::ENODEV))
-}
-
-/// Binds a listening acceptor on an ephemeral port of `ip` (so concurrent test runs never collide
-/// on a port), retrying a transient `ENODEV` for a while. Read the actual address back with
-/// [`Acceptor::local_addr`].
-fn bind_acceptor(ip: IpAddr, backlog: u32) -> Acceptor {
+/// Binds with `bind` to an ephemeral port of `ip` (so concurrent test runs never collide on a
+/// port), retrying a transient `ENODEV` for up to [`BIND_RETRY`].
+fn retry_enodev<T>(ip: IpAddr, mut bind: impl FnMut(SocketAddr) -> ibverbs::Result<T>) -> T {
     let addr = SocketAddr::new(ip, 0);
     let deadline = Instant::now() + BIND_RETRY;
     loop {
-        match Acceptor::bind(addr, PortSpace::Tcp, backlog) {
-            Ok(acceptor) => return acceptor,
-            Err(e) if is_transient_bind_error(&e) && Instant::now() < deadline => {
+        match bind(addr) {
+            Ok(bound) => return bound,
+            Err(Error::BindAddress(e))
+                if e.raw_os_error() == Some(nix::libc::ENODEV) && Instant::now() < deadline =>
+            {
                 std::thread::sleep(Duration::from_millis(100));
             }
             Err(e) => panic!("bind {addr}: {e:?}"),
         }
     }
+}
+
+/// Binds a listening acceptor on an ephemeral port of `ip`. Read the actual address back with
+/// [`Acceptor::local_addr`].
+fn bind_acceptor(ip: IpAddr, backlog: u32) -> Acceptor {
+    retry_enodev(ip, |addr| Acceptor::bind(addr, PortSpace::Tcp, backlog))
 }
 
 /// The low-level counterpart of [`bind_acceptor`]: a bound (not yet listening) [`CmId`] on an
 /// ephemeral port of `ip`.
 fn bind_listener(ip: IpAddr) -> CmId {
-    let addr = SocketAddr::new(ip, 0);
-    let deadline = Instant::now() + BIND_RETRY;
-    loop {
+    retry_enodev(ip, |addr| {
         let id = CmId::create(PortSpace::Tcp).expect("listener");
-        match id.bind_addr(addr) {
-            Ok(()) => return id,
-            Err(e) if is_transient_bind_error(&e) && Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(e) => panic!("bind {addr}: {e:?}"),
-        }
-    }
+        id.bind_addr(addr).map(|()| id)
+    })
 }
 
-#[test]
-#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
-fn connect_and_send() {
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+/// Connects a client to a server thread listening on `ip`, each side building a default queue pair
+/// on a fresh protection domain and completion queue, the server accepting with `server_param` and
+/// the client connecting with the defaults. Then runs `server` and `client` on their side's
+/// connection, completion queue, and protection domain, given the listen address. The server's
+/// side stays connected until the client's body has finished.
+fn connect_pair<S, C>(ip: IpAddr, server_param: fn() -> ConnectionParameter, server: S, client: C)
+where
+    S: FnOnce(&mut Connection, &CompletionQueue, &ProtectionDomain, SocketAddr) + Send + 'static,
+    C: FnOnce(&mut Connection, &CompletionQueue, &ProtectionDomain, SocketAddr),
+{
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
 
-    // Passive side: bind, accept, receive the message.
     let server = std::thread::spawn(move || {
         let acceptor = bind_acceptor(ip, 1);
         let addr = acceptor.local_addr().expect("listen address");
         ready_tx.send(addr).expect("signal ready");
-
         let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
         let pd = ctx.alloc_pd().expect("server pd");
@@ -120,31 +117,15 @@ fn connect_and_send() {
             .expect("server qp builder")
             .build()
             .expect("server qp");
-        let mut recv = pd
-            .allocate(64, AccessFlags::PERMISSIVE)
-            .expect("server recv mr");
-
         let mut conn = incoming
-            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+            .accept(qp, server_param(), SETUP_TIMEOUT)
             .expect("accept");
-        // The accepted connection keeps the listener's address, and its peer is the client on
-        // the same device (the port is the client's ephemeral one).
-        assert_eq!(conn.local_addr(), Some(addr));
-        let peer = conn.peer_addr().expect("server peer address");
-        assert_eq!(peer.ip(), addr.ip());
-        // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
-        unsafe {
-            conn.queue_pair()
-                .post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
-        }
-        .expect("post_recv");
-
-        wait_for(&cq, 1);
-        assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
-        done_tx.send(()).expect("signal done");
+        server(&mut conn, &cq, &pd, addr);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client done");
     });
 
-    // Active side: connect and send.
     let addr = ready_rx.recv().expect("server ready");
     let resolved = Connector::new(PortSpace::Tcp)
         .expect("connector")
@@ -158,38 +139,68 @@ fn connect_and_send() {
         .expect("client qp builder")
         .build()
         .expect("client qp");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("client send mr");
-    send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
-
     let mut conn = resolved
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
-    // The client's peer is the server's listen address; its own address is on the same device.
-    assert_eq!(conn.peer_addr(), Some(addr));
-    let local = conn.local_addr().expect("client local address");
-    assert_eq!(local.ip(), addr.ip());
-    let mut batch = conn.queue_pair().start_send();
-    batch
-        .op()
-        .signaled()
-        .send(2, &[send.slice(..MESSAGE.len())]);
-    unsafe { batch.submit() }.expect("send");
-    wait_for(&cq, 2);
-
-    done_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("server received the message");
-    conn.disconnect().ok();
+    client(&mut conn, &cq, &pd, addr);
+    done_tx.send(()).expect("signal done");
     server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn connect_and_send() {
+    connect_pair(
+        device_ip(&open_test_device()),
+        ConnectionParameter::default,
+        // Passive side: receive the message.
+        |conn, cq, pd, addr| {
+            let mut recv = pd
+                .allocate(64, AccessFlags::PERMISSIVE)
+                .expect("server recv mr");
+            // The accepted connection keeps the listener's address, and its peer is the client on
+            // the same device (the port is the client's ephemeral one).
+            assert_eq!(conn.local_addr(), Some(addr));
+            let peer = conn.peer_addr().expect("server peer address");
+            assert_eq!(peer.ip(), addr.ip());
+            // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is
+            // posted.
+            unsafe {
+                conn.queue_pair()
+                    .post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
+            }
+            .expect("post_recv");
+
+            wait_for(cq, 1);
+            assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
+        },
+        // Active side: send the message.
+        |conn, cq, pd, addr| {
+            let mut send = pd
+                .allocate(64, AccessFlags::PERMISSIVE)
+                .expect("client send mr");
+            send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
+            // The client's peer is the server's listen address; its own address is on the same
+            // device.
+            assert_eq!(conn.peer_addr(), Some(addr));
+            let local = conn.local_addr().expect("client local address");
+            assert_eq!(local.ip(), addr.ip());
+            let mut batch = conn.queue_pair().start_send();
+            batch
+                .op()
+                .signaled()
+                .send(2, &[send.slice(..MESSAGE.len())]);
+            unsafe { batch.submit() }.expect("send");
+            wait_for(cq, 2);
+        },
+    );
 }
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn accept_times_out() {
     // An acceptor with a timeout and no client reports TimedOut instead of blocking forever.
-    let acceptor = bind_acceptor(IpAddr::V4(device_ipv4(&open_test_device())), 1);
+    let acceptor = bind_acceptor(device_ip(&open_test_device()), 1);
     let before = Instant::now();
     match acceptor.accept(Some(Duration::from_millis(50))) {
         Err(ibverbs::Error::TimedOut) => {}
@@ -206,7 +217,7 @@ fn two_connections() {
     // first connection is being set up: with a per-connection event channel each connection's events
     // are isolated, so the listener channel never loses a request. (A shared channel would discard
     // the second request while waiting for the first's establishment.)
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
     // Holds every side connected until all three threads have finished their transfer, so no
     // connection is torn down early.
@@ -340,7 +351,7 @@ fn low_level_connect_and_send() {
     // side runs its channel non-blocking and pumps events off the file descriptor the way an event
     // loop would. Proves the low-level escape hatch can set up a working connection, and that
     // private data crosses it in both directions.
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
 
@@ -528,7 +539,7 @@ fn server_writes_into_client() {
     // remote slice in its request's private data, the server RDMA-writes the message into it and
     // then sends a one-byte notification, which the client receives before checking the buffer.
     // Catches an active-side queue pair brought up without its remote-access flags.
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
 
@@ -619,67 +630,34 @@ fn server_writes_into_client() {
 fn accept_applies_rd_atomic_parameters() {
     // The outstanding-RDMA limits the passive side advertises in its reply are also what its queue
     // pair is configured with, and the active side ends up with the matching (swapped) pair.
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel();
     let rd_atomic =
         QueuePairAttributeMask::MAX_QP_RD_ATOMIC | QueuePairAttributeMask::MAX_DEST_RD_ATOMIC;
-
-    let server = std::thread::spawn(move || {
-        let acceptor = bind_acceptor(ip, 1);
-        ready_tx
-            .send(acceptor.local_addr().expect("listen address"))
-            .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
-        let ctx = incoming.context().expect("server device context");
-        let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16).build().expect("server cq");
-        let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("server qp builder")
-            .build()
-            .expect("server qp");
-        let param = ConnectionParameter::default()
-            .set_responder_resources(4)
-            .set_initiator_depth(2);
-        let mut conn = incoming.accept(qp, param, SETUP_TIMEOUT).expect("accept");
-        let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
-        assert_eq!(attr.max_dest_rd_atomic(), 4, "server responder resources");
-        assert_eq!(attr.max_rd_atomic(), 2, "server initiator depth");
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("client done");
-    });
-
-    let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
-    let mut conn = resolved
-        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
-        .expect("connect");
-    let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
-    assert_eq!(
-        attr.max_rd_atomic(),
-        4,
-        "client initiator depth = server responder resources"
+    connect_pair(
+        device_ip(&open_test_device()),
+        || {
+            ConnectionParameter::default()
+                .set_responder_resources(4)
+                .set_initiator_depth(2)
+        },
+        move |conn, _, _, _| {
+            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
+            assert_eq!(attr.max_dest_rd_atomic(), 4, "server responder resources");
+            assert_eq!(attr.max_rd_atomic(), 2, "server initiator depth");
+        },
+        |conn, _, _, _| {
+            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
+            assert_eq!(
+                attr.max_rd_atomic(),
+                4,
+                "client initiator depth = server responder resources"
+            );
+            assert_eq!(
+                attr.max_dest_rd_atomic(),
+                2,
+                "client responder resources = server initiator depth"
+            );
+        },
     );
-    assert_eq!(
-        attr.max_dest_rd_atomic(),
-        2,
-        "client responder resources = server initiator depth"
-    );
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
 }
 
 #[test]
@@ -688,11 +666,9 @@ fn default_parameters_use_the_device_rd_atomic_limits() {
     // With default parameters, both sides negotiate as many outstanding RDMA reads and atomics as
     // their devices support (one device here), as librdmacm's own defaults do.
     let ctx = open_test_device();
-    let ip = IpAddr::V4(device_ipv4(&ctx));
+    let ip = device_ip(&ctx);
     let dev = ctx.query_device().expect("query device");
     let limit = dev.max_qp_init_rd_atom.min(dev.max_qp_rd_atom).min(255);
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel();
     let rd_atomic =
         QueuePairAttributeMask::MAX_QP_RD_ATOMIC | QueuePairAttributeMask::MAX_DEST_RD_ATOMIC;
     // Providers may round the limits up (Soft-RoCE to a power of two), never down.
@@ -709,56 +685,24 @@ fn default_parameters_use_the_device_rd_atomic_limits() {
         );
     };
 
-    let server = std::thread::spawn(move || {
-        let acceptor = bind_acceptor(ip, 1);
-        ready_tx
-            .send(acceptor.local_addr().expect("listen address"))
-            .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
-        let ctx = incoming.context().expect("server device context");
-        let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16).build().expect("server cq");
-        let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("server qp builder")
-            .build()
-            .expect("server qp");
-        let mut conn = incoming
-            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
-            .expect("accept");
-        let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
-        check(attr, "server");
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("client done");
-    });
-
-    let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
-    let mut conn = resolved
-        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
-        .expect("connect");
-    let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
-    check(attr, "client");
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    connect_pair(
+        ip,
+        ConnectionParameter::default,
+        move |conn, _, _, _| {
+            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
+            check(attr, "server");
+        },
+        |conn, _, _, _| {
+            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
+            check(attr, "client");
+        },
+    );
 }
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn rejected_request_reports_reason_and_private_data() {
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
 
@@ -809,7 +753,7 @@ fn rejected_request_reports_reason_and_private_data() {
 fn dropped_connect_request_is_rejected() {
     // A listener that drops a connection-request event without taking its id declines the
     // request, so the peer fails fast instead of retrying until its timeout.
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
     let (done_tx, done_rx) = mpsc::channel();
 
@@ -857,75 +801,38 @@ fn dropped_connect_request_is_rejected() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn disconnect_flushes_outstanding_receives() {
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let (done_tx, done_rx) = mpsc::channel();
-
-    let server = std::thread::spawn(move || {
-        let acceptor = bind_acceptor(ip, 1);
-        ready_tx
-            .send(acceptor.local_addr().expect("listen address"))
-            .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
-        let ctx = incoming.context().expect("server device context");
-        let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16).build().expect("server cq");
-        let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("server qp builder")
-            .build()
-            .expect("server qp");
-        let _conn = incoming
-            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
-            .expect("accept");
-        done_rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("client done");
-    });
-
-    let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
-    let recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("client recv mr");
-    let mut conn = resolved
-        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
-        .expect("connect");
-    unsafe {
-        conn.queue_pair()
-            .post_recv([RecvRequest::new(7, &[recv.slice(..)])])
-    }
-    .expect("post_recv");
-    conn.disconnect().expect("disconnect");
-
-    // The receive never got a message; disconnecting flushes it with an error completion.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let status = 'flushed: loop {
-        let mut completions = cq.poll().expect("poll");
-        while let Some(wc) = completions.next() {
-            if wc.wr_id() == 7 {
-                break 'flushed wc.ok().map_err(|e| e.status);
+    connect_pair(
+        device_ip(&open_test_device()),
+        ConnectionParameter::default,
+        |_, _, _, _| {},
+        |conn, cq, pd, _| {
+            let recv = pd
+                .allocate(64, AccessFlags::PERMISSIVE)
+                .expect("client recv mr");
+            unsafe {
+                conn.queue_pair()
+                    .post_recv([RecvRequest::new(7, &[recv.slice(..)])])
             }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for the flushed receive"
-        );
-    };
-    assert_eq!(status, Err(WcStatus::WorkRequestFlushed));
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+            .expect("post_recv");
+            conn.disconnect().expect("disconnect");
+
+            // The receive never got a message; disconnecting flushes it with an error completion.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let status = 'flushed: loop {
+                let mut completions = cq.poll().expect("poll");
+                while let Some(wc) = completions.next() {
+                    if wc.wr_id() == 7 {
+                        break 'flushed wc.ok().map_err(|e| e.status);
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for the flushed receive"
+                );
+            };
+            assert_eq!(status, Err(WcStatus::WorkRequestFlushed));
+        },
+    );
 }
 
 #[test]
@@ -933,7 +840,7 @@ fn disconnect_flushes_outstanding_receives() {
 fn dropping_connection_disconnects_peer() {
     // Dropping a `Connection` sends the disconnect right away, even though other resources built
     // on the same device context (which keep the underlying id alive) are still around.
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
 
     let server = std::thread::spawn(move || {
@@ -1049,7 +956,7 @@ fn private_data_beyond_any_limit_panics() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn cm_id_options_and_accessors() {
-    let ip = IpAddr::V4(device_ipv4(&open_test_device()));
+    let ip = device_ip(&open_test_device());
 
     // Two bound ids share a port when both allow reuse; a third without the option is refused.
     let first = bind_listener(ip);
