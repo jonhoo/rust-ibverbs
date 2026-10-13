@@ -304,6 +304,7 @@ impl From<ffi::ibv_transport_type> for TransportType {
             ffi::ibv_transport_type::IBV_TRANSPORT_USNIC => TransportType::Usnic,
             ffi::ibv_transport_type::IBV_TRANSPORT_USNIC_UDP => TransportType::UsnicUdp,
             ffi::ibv_transport_type::IBV_TRANSPORT_UNSPECIFIED => TransportType::Unspecified,
+            _ => TransportType::Unknown,
         }
     }
 }

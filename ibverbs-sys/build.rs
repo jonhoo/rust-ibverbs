@@ -149,8 +149,12 @@ fn main() {
         .bitfield_enum("ibv_wq_attr_mask")
         .bitfield_enum("ibv_wq_flags")
         .bitfield_enum("ibv_xrcd_init_attr_mask")
-        .default_enum_style(bindgen::EnumVariation::Rust {
-            non_exhaustive: false,
+        // C fills these in, and kernels and providers newer than the headers can hand back values
+        // the headers do not name; a newtype holds any value, so neither that nor a zeroed
+        // `Default` is ever an invalid enum
+        .default_enum_style(bindgen::EnumVariation::NewType {
+            is_bitfield: false,
+            is_global: false,
         })
         .derive_default(true)
         .derive_debug(true)

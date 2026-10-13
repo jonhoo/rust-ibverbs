@@ -341,34 +341,6 @@ impl Default for ibv_wc {
     }
 }
 
-/// `ibv_qp_attr` has no valid all-zero representation: its `path_mtu` is an `ibv_mtu`, whose
-/// smallest variant is `IBV_MTU_256 = 1`, so bindgen's zeroed fallback `Default` would materialize
-/// an invalid enum value. This zeroes everything else and sets `path_mtu` to that smallest
-/// variant; a modify only reads the fields named in its attribute mask, so the value is inert
-/// unless `IBV_QP_PATH_MTU` is set.
-impl Default for ibv_qp_attr {
-    fn default() -> Self {
-        let mut attr = ::std::mem::MaybeUninit::<Self>::zeroed();
-        unsafe {
-            (*attr.as_mut_ptr()).path_mtu = ibv_mtu::IBV_MTU_256;
-            attr.assume_init()
-        }
-    }
-}
-
-/// `ibv_port_attr` has no valid all-zero representation: `max_mtu` and `active_mtu` are
-/// `ibv_mtu`. Both are set to the smallest variant; a port query overwrites every field.
-impl Default for ibv_port_attr {
-    fn default() -> Self {
-        let mut attr = ::std::mem::MaybeUninit::<Self>::zeroed();
-        unsafe {
-            (*attr.as_mut_ptr()).max_mtu = ibv_mtu::IBV_MTU_256;
-            (*attr.as_mut_ptr()).active_mtu = ibv_mtu::IBV_MTU_256;
-            attr.assume_init()
-        }
-    }
-}
-
 // `ibv_create_cq_ex` and `ibv_create_qp_ex` are `static inline` in verbs.h: they reach the provider
 // through the op table embedded in `verbs_context`, so there is no exported symbol for bindgen to
 // bind. The functions below reimplement that dispatch (the `verbs_get_ctx` container_of and the

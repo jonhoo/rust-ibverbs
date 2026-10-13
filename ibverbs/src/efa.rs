@@ -100,7 +100,7 @@ impl QueuePairBuilder<Srd> {
         // provider reads only as much as the passed-in length covers.
         let mut efa_attr = std::mem::MaybeUninit::<ffi::efadv_qp_init_attr>::zeroed();
         unsafe {
-            (*efa_attr.as_mut_ptr()).driver_qp_type = ffi::EFADV_QP_DRIVER_TYPE_SRD as u32;
+            (*efa_attr.as_mut_ptr()).driver_qp_type = ffi::EFADV_QP_DRIVER_TYPE_SRD.0;
         }
         let qp = unsafe {
             ffi::efadv_create_qp_ex(

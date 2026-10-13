@@ -28,24 +28,13 @@ pub enum MrAdvice {
     PrefetchNoFault,
 }
 
-impl From<ffi::ib_uverbs_advise_mr_advice> for MrAdvice {
-    fn from(advice: ffi::ib_uverbs_advise_mr_advice) -> Self {
-        use ffi::ib_uverbs_advise_mr_advice::*;
-        match advice {
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH => MrAdvice::Prefetch,
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE => MrAdvice::PrefetchWrite,
-            IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT => MrAdvice::PrefetchNoFault,
-        }
-    }
-}
-
 impl From<MrAdvice> for ffi::ib_uverbs_advise_mr_advice {
     fn from(advice: MrAdvice) -> Self {
-        use ffi::ib_uverbs_advise_mr_advice::*;
+        use ffi::ib_uverbs_advise_mr_advice as A;
         match advice {
-            MrAdvice::Prefetch => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
-            MrAdvice::PrefetchWrite => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE,
-            MrAdvice::PrefetchNoFault => IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT,
+            MrAdvice::Prefetch => A::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH,
+            MrAdvice::PrefetchWrite => A::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_WRITE,
+            MrAdvice::PrefetchNoFault => A::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT,
         }
     }
 }
@@ -57,7 +46,7 @@ pub struct MrAdviseFlags(pub(crate) u32);
 impl MrAdviseFlags {
     /// Perform the advise synchronously: the call returns only once the operation has completed.
     pub const FLUSHABLE: MrAdviseFlags =
-        MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH as u32);
+        MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH.0);
 
     /// No flags set.
     #[must_use]
@@ -118,7 +107,7 @@ impl std::fmt::Debug for MrAdviseFlags {
 
 impl From<ffi::ib_uverbs_advise_mr_flag> for MrAdviseFlags {
     fn from(flag: ffi::ib_uverbs_advise_mr_flag) -> Self {
-        MrAdviseFlags(flag as u32)
+        MrAdviseFlags(flag.0)
     }
 }
 
@@ -496,7 +485,7 @@ mod test_conversions {
     use super::*;
 
     #[test]
-    fn mr_advice_roundtrip() {
+    fn mr_advice_to_ffi() {
         for (wrapper, raw) in [
             (
                 MrAdvice::Prefetch,
@@ -511,7 +500,6 @@ mod test_conversions {
                 ffi::ib_uverbs_advise_mr_advice::IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH_NO_FAULT,
             ),
         ] {
-            assert_eq!(MrAdvice::from(raw), wrapper);
             assert_eq!(ffi::ib_uverbs_advise_mr_advice::from(wrapper), raw);
         }
     }

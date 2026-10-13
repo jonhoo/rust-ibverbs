@@ -11,31 +11,7 @@
 # so keep it a plain list of one quoted name per line. It is the union across features; a name
 # absent from the current feature set is inert. `tests/no_default.rs` checks it against the
 # generated bindings.
+#
+# The list is empty since the enums are generated as newtypes, which every value is valid for.
 NO_DEFAULT_TYPES = [
-    "ibv_device",
-    "ibv_flow_spec",
-    "ibv_flow_spec__bindgen_ty_1",
-    "ibv_flow_spec__bindgen_ty_1__bindgen_ty_1",
-    "ibv_flow_spec_action_drop",
-    "ibv_flow_spec_action_handle",
-    "ibv_flow_spec_action_tag",
-    "ibv_flow_spec_counter_action",
-    "ibv_flow_spec_esp",
-    "ibv_flow_spec_eth",
-    "ibv_flow_spec_gre",
-    "ibv_flow_spec_ipv4",
-    "ibv_flow_spec_ipv4_ext",
-    "ibv_flow_spec_ipv6",
-    "ibv_flow_spec_mpls",
-    "ibv_flow_spec_tcp_udp",
-    "ibv_flow_spec_tunnel",
-    "ibv_mw",
-    "ibv_port_attr",
-    "ibv_qp",
-    "ibv_qp_attr",
-    "ibv_qp_ex",
-    "ibv_qp_init_attr",
-    "ibv_qp_init_attr_ex",
-    "ibv_qp_open_attr",
-    "rdma_cm_id",
 ]

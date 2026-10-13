@@ -45,34 +45,38 @@ pub enum QueuePairType {
     XrcRecv,
     /// A provider-specific ("driver") queue pair, such as EFA's SRD.
     Driver,
+    /// A value this version of the crate does not know.
+    Unknown(u32),
 }
 
 impl From<ffi::ibv_qp_type> for QueuePairType {
     fn from(qp_type: ffi::ibv_qp_type) -> Self {
-        use ffi::ibv_qp_type::*;
+        use ffi::ibv_qp_type as T;
         match qp_type {
-            IBV_QPT_RC => QueuePairType::ReliableConnection,
-            IBV_QPT_UC => QueuePairType::UnreliableConnection,
-            IBV_QPT_UD => QueuePairType::UnreliableDatagram,
-            IBV_QPT_RAW_PACKET => QueuePairType::RawPacket,
-            IBV_QPT_XRC_SEND => QueuePairType::XrcSend,
-            IBV_QPT_XRC_RECV => QueuePairType::XrcRecv,
-            IBV_QPT_DRIVER => QueuePairType::Driver,
+            T::IBV_QPT_RC => QueuePairType::ReliableConnection,
+            T::IBV_QPT_UC => QueuePairType::UnreliableConnection,
+            T::IBV_QPT_UD => QueuePairType::UnreliableDatagram,
+            T::IBV_QPT_RAW_PACKET => QueuePairType::RawPacket,
+            T::IBV_QPT_XRC_SEND => QueuePairType::XrcSend,
+            T::IBV_QPT_XRC_RECV => QueuePairType::XrcRecv,
+            T::IBV_QPT_DRIVER => QueuePairType::Driver,
+            other => QueuePairType::Unknown(other.0),
         }
     }
 }
 
 impl From<QueuePairType> for ffi::ibv_qp_type {
     fn from(qp_type: QueuePairType) -> Self {
-        use ffi::ibv_qp_type::*;
+        use ffi::ibv_qp_type as T;
         match qp_type {
-            QueuePairType::ReliableConnection => IBV_QPT_RC,
-            QueuePairType::UnreliableConnection => IBV_QPT_UC,
-            QueuePairType::UnreliableDatagram => IBV_QPT_UD,
-            QueuePairType::RawPacket => IBV_QPT_RAW_PACKET,
-            QueuePairType::XrcSend => IBV_QPT_XRC_SEND,
-            QueuePairType::XrcRecv => IBV_QPT_XRC_RECV,
-            QueuePairType::Driver => IBV_QPT_DRIVER,
+            QueuePairType::ReliableConnection => T::IBV_QPT_RC,
+            QueuePairType::UnreliableConnection => T::IBV_QPT_UC,
+            QueuePairType::UnreliableDatagram => T::IBV_QPT_UD,
+            QueuePairType::RawPacket => T::IBV_QPT_RAW_PACKET,
+            QueuePairType::XrcSend => T::IBV_QPT_XRC_SEND,
+            QueuePairType::XrcRecv => T::IBV_QPT_XRC_RECV,
+            QueuePairType::Driver => T::IBV_QPT_DRIVER,
+            QueuePairType::Unknown(raw) => ffi::ibv_qp_type(raw),
         }
     }
 }
@@ -87,6 +91,7 @@ impl std::fmt::Display for QueuePairType {
             QueuePairType::XrcSend => "XRC send",
             QueuePairType::XrcRecv => "XRC recv",
             QueuePairType::Driver => "driver",
+            QueuePairType::Unknown(_) => "unknown",
         };
         f.write_str(name)
     }
@@ -225,32 +230,32 @@ pub enum QueuePairState {
 
 impl From<ffi::ibv_qp_state> for QueuePairState {
     fn from(state: ffi::ibv_qp_state) -> Self {
-        use ffi::ibv_qp_state::*;
+        use ffi::ibv_qp_state as S;
         match state {
-            IBV_QPS_RESET => QueuePairState::Reset,
-            IBV_QPS_INIT => QueuePairState::Init,
-            IBV_QPS_RTR => QueuePairState::ReadyToReceive,
-            IBV_QPS_RTS => QueuePairState::ReadyToSend,
-            IBV_QPS_SQD => QueuePairState::SendQueueDrain,
-            IBV_QPS_SQE => QueuePairState::SendQueueError,
-            IBV_QPS_ERR => QueuePairState::Error,
-            IBV_QPS_UNKNOWN => QueuePairState::Unknown,
+            S::IBV_QPS_RESET => QueuePairState::Reset,
+            S::IBV_QPS_INIT => QueuePairState::Init,
+            S::IBV_QPS_RTR => QueuePairState::ReadyToReceive,
+            S::IBV_QPS_RTS => QueuePairState::ReadyToSend,
+            S::IBV_QPS_SQD => QueuePairState::SendQueueDrain,
+            S::IBV_QPS_SQE => QueuePairState::SendQueueError,
+            S::IBV_QPS_ERR => QueuePairState::Error,
+            _ => QueuePairState::Unknown,
         }
     }
 }
 
 impl From<QueuePairState> for ffi::ibv_qp_state {
     fn from(state: QueuePairState) -> Self {
-        use ffi::ibv_qp_state::*;
+        use ffi::ibv_qp_state as S;
         match state {
-            QueuePairState::Reset => IBV_QPS_RESET,
-            QueuePairState::Init => IBV_QPS_INIT,
-            QueuePairState::ReadyToReceive => IBV_QPS_RTR,
-            QueuePairState::ReadyToSend => IBV_QPS_RTS,
-            QueuePairState::SendQueueDrain => IBV_QPS_SQD,
-            QueuePairState::SendQueueError => IBV_QPS_SQE,
-            QueuePairState::Error => IBV_QPS_ERR,
-            QueuePairState::Unknown => IBV_QPS_UNKNOWN,
+            QueuePairState::Reset => S::IBV_QPS_RESET,
+            QueuePairState::Init => S::IBV_QPS_INIT,
+            QueuePairState::ReadyToReceive => S::IBV_QPS_RTR,
+            QueuePairState::ReadyToSend => S::IBV_QPS_RTS,
+            QueuePairState::SendQueueDrain => S::IBV_QPS_SQD,
+            QueuePairState::SendQueueError => S::IBV_QPS_SQE,
+            QueuePairState::Error => S::IBV_QPS_ERR,
+            QueuePairState::Unknown => S::IBV_QPS_UNKNOWN,
         }
     }
 }
@@ -523,15 +528,15 @@ flags_newtype! {
 /// otherwise: SEND on every transport, RDMA WRITE on the connected transports and SRD, RDMA READ
 /// on RC and SRD, and the atomics on RC only.
 fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
-    use ffi::ibv_qp_type::{IBV_QPT_DRIVER, IBV_QPT_RC, IBV_QPT_UC};
+    use ffi::ibv_qp_type as T;
     let mut ops = SendOps::SEND | SendOps::SEND_WITH_IMM;
-    if matches!(qp_type, IBV_QPT_RC | IBV_QPT_UC | IBV_QPT_DRIVER) {
+    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_UC | T::IBV_QPT_DRIVER) {
         ops |= SendOps::RDMA_WRITE | SendOps::RDMA_WRITE_WITH_IMM;
     }
-    if matches!(qp_type, IBV_QPT_RC | IBV_QPT_DRIVER) {
+    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_DRIVER) {
         ops |= SendOps::RDMA_READ;
     }
-    if qp_type == IBV_QPT_RC {
+    if qp_type == T::IBV_QPT_RC {
         ops |= SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
     }
     ops
@@ -2217,8 +2222,8 @@ fn qp_transition_masks(
     cur: ffi::ibv_qp_state,
     next: ffi::ibv_qp_state,
 ) -> Option<(u32, u32)> {
-    use ffi::ibv_qp_state::*;
-    use ffi::ibv_qp_type::*;
+    use ffi::ibv_qp_state as S;
+    use ffi::ibv_qp_type as T;
 
     let state = ffi::ibv_qp_attr_mask::IBV_QP_STATE.0;
     let cur_state = ffi::ibv_qp_attr_mask::IBV_QP_CUR_STATE.0;
@@ -2243,28 +2248,30 @@ fn qp_transition_masks(
     let sqd_async = ffi::ibv_qp_attr_mask::IBV_QP_EN_SQD_ASYNC_NOTIFY.0;
 
     // Any state may move to RESET or ERR with only IBV_QP_STATE.
-    if let IBV_QPS_RESET | IBV_QPS_ERR = next {
+    if let S::IBV_QPS_RESET | S::IBV_QPS_ERR = next {
         return Some((state, 0));
     }
 
     match qp_type {
-        IBV_QPT_RC | IBV_QPT_XRC_SEND | IBV_QPT_XRC_RECV => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | access)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((
+        T::IBV_QPT_RC | T::IBV_QPT_XRC_SEND | T::IBV_QPT_XRC_RECV => match (cur, next) {
+            (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => Some((0, pkey | port | access)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => Some((
                 state | av | path_mtu | dest_qpn | rq_psn | max_dest_rd | min_rnr,
                 pkey | access | alt_path,
             )),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((
+            (S::IBV_QPS_RTR, S::IBV_QPS_RTS) => Some((
                 state | sq_psn | timeout | retry | rnr_retry | max_rd,
                 cur_state | access | min_rnr | alt_path | mig,
             )),
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | access | min_rnr | alt_path | mig)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => {
+            (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => {
+                Some((0, cur_state | access | min_rnr | alt_path | mig))
+            }
+            (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => Some((state, sqd_async)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => {
                 Some((state, cur_state | access | min_rnr | alt_path | mig))
             }
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((
                 0,
                 pkey | port
                     | access
@@ -2280,43 +2287,45 @@ fn qp_transition_masks(
             )),
             _ => None,
         },
-        IBV_QPT_UC => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | access)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((
+        T::IBV_QPT_UC => match (cur, next) {
+            (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => Some((state | pkey | port | access, 0)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => Some((0, pkey | port | access)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => Some((
                 state | av | path_mtu | dest_qpn | rq_psn,
                 pkey | access | alt_path,
             )),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => {
+            (S::IBV_QPS_RTR, S::IBV_QPS_RTS) => {
                 Some((state | sq_psn, cur_state | access | alt_path | mig))
             }
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | access | alt_path | mig)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, cur_state | access | alt_path | mig)),
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, pkey | port | access | av | alt_path | mig)),
+            (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => Some((0, cur_state | access | alt_path | mig)),
+            (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => Some((state, sqd_async)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => Some((state, cur_state | access | alt_path | mig)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => {
+                Some((0, pkey | port | access | av | alt_path | mig))
+            }
             _ => None,
         },
-        IBV_QPT_UD => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | pkey | port | qkey, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, pkey | port | qkey)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((state, pkey | qkey)),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((state | sq_psn, cur_state | qkey)),
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, cur_state | qkey)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, cur_state | qkey)),
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, pkey | port | qkey)),
-            (IBV_QPS_SQE, IBV_QPS_RTS) => Some((state, cur_state | qkey)),
+        T::IBV_QPT_UD => match (cur, next) {
+            (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => Some((state | pkey | port | qkey, 0)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => Some((0, pkey | port | qkey)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => Some((state, pkey | qkey)),
+            (S::IBV_QPS_RTR, S::IBV_QPS_RTS) => Some((state | sq_psn, cur_state | qkey)),
+            (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => Some((0, cur_state | qkey)),
+            (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => Some((state, sqd_async)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => Some((state, cur_state | qkey)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((0, pkey | port | qkey)),
+            (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => Some((state, cur_state | qkey)),
             _ => None,
         },
-        IBV_QPT_RAW_PACKET => match (cur, next) {
-            (IBV_QPS_RESET, IBV_QPS_INIT) => Some((state | port, 0)),
-            (IBV_QPS_INIT, IBV_QPS_INIT) => Some((0, port)),
-            (IBV_QPS_INIT, IBV_QPS_RTR) => Some((state, 0)),
-            (IBV_QPS_RTR, IBV_QPS_RTS) => Some((state, rate)),
-            (IBV_QPS_RTS, IBV_QPS_RTS) => Some((0, rate)),
-            (IBV_QPS_RTS, IBV_QPS_SQD) => Some((state, sqd_async)),
-            (IBV_QPS_SQD, IBV_QPS_RTS) => Some((state, rate)),
-            (IBV_QPS_SQD, IBV_QPS_SQD) => Some((0, port | rate)),
+        T::IBV_QPT_RAW_PACKET => match (cur, next) {
+            (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => Some((state | port, 0)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => Some((0, port)),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => Some((state, 0)),
+            (S::IBV_QPS_RTR, S::IBV_QPS_RTS) => Some((state, rate)),
+            (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => Some((0, rate)),
+            (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => Some((state, sqd_async)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => Some((state, rate)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => Some((0, port | rate)),
             _ => None,
         },
         _ => None,
@@ -2809,8 +2818,8 @@ mod test_timers {
 #[cfg(test)]
 mod test_qp_transitions {
     use super::*;
-    use ffi::ibv_qp_state::*;
-    use ffi::ibv_qp_type::IBV_QPT_RC;
+    use ffi::ibv_qp_state as S;
+    const IBV_QPT_RC: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_RC;
 
     fn bit(m: ffi::ibv_qp_attr_mask) -> u32 {
         m.0
@@ -2819,7 +2828,7 @@ mod test_qp_transitions {
     #[test]
     fn reset_to_init_requires_pkey_port_access() {
         let (required, _optional) =
-            qp_transition_masks(IBV_QPT_RC, IBV_QPS_RESET, IBV_QPS_INIT).unwrap();
+            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_RESET, S::IBV_QPS_INIT).unwrap();
         let expected = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE)
             | bit(ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX)
             | bit(ffi::ibv_qp_attr_mask::IBV_QP_PORT)
@@ -2829,18 +2838,18 @@ mod test_qp_transitions {
 
     #[test]
     fn init_to_rts_is_not_a_valid_transition() {
-        assert!(qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RTS).is_none());
+        assert!(qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_INIT, S::IBV_QPS_RTS).is_none());
     }
 
     #[test]
     fn any_state_to_reset_or_err_needs_only_state() {
         let state = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE);
         assert_eq!(
-            qp_transition_masks(IBV_QPT_RC, IBV_QPS_RTS, IBV_QPS_ERR),
+            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_RTS, S::IBV_QPS_ERR),
             Some((state, 0))
         );
         assert_eq!(
-            qp_transition_masks(IBV_QPT_RC, IBV_QPS_INIT, IBV_QPS_RESET),
+            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_INIT, S::IBV_QPS_RESET),
             Some((state, 0))
         );
     }
