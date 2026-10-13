@@ -1,7 +1,9 @@
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 
-use super::{Mlx5DmabufAccessFlags, data_direct_path, registration_error};
+use super::{
+    Mlx5DmabufAccessFlags, check_data_direct_arguments, data_direct_path, registration_error,
+};
 use crate::{AccessFlags, Error, MemoryRegion, ProtectionDomain, Result};
 
 #[test]
@@ -101,4 +103,23 @@ fn registration_returns_the_existing_memory_region_type() {
             Mlx5DmabufAccessFlags::DATA_DIRECT,
         )
     };
+}
+
+#[test]
+fn data_direct_arguments_are_checked_up_front() {
+    let rejected = |iova, flags| {
+        matches!(
+            check_data_direct_arguments(iova, flags, 4096),
+            Err(Error::RegisterMemoryRegion(e)) if e.kind() == io::ErrorKind::InvalidInput
+        )
+    };
+    assert!(check_data_direct_arguments(0x20_0000, AccessFlags::LOCAL_WRITE, 4096).is_ok());
+    assert!(
+        rejected(0x20_0010, AccessFlags::LOCAL_WRITE),
+        "unaligned iova"
+    );
+    assert!(
+        rejected(0x20_0000, AccessFlags::LOCAL_WRITE | AccessFlags::ON_DEMAND),
+        "on-demand paging"
+    );
 }
