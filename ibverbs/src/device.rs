@@ -19,27 +19,35 @@ pub fn devices() -> Result<DeviceList> {
         return Err(Error::os(io::Error::last_os_error(), Error::GetDeviceList));
     }
 
-    let devices = unsafe {
-        use std::slice;
-        slice::from_raw_parts_mut(devices, n as usize)
-    };
-    Ok(DeviceList(devices))
+    Ok(DeviceList {
+        devices,
+        len: n as usize,
+    })
 }
 
 /// List of available RDMA devices. Returned by [`devices()`].
 #[must_use]
-pub struct DeviceList(&'static mut [*mut ffi::ibv_device]);
+pub struct DeviceList {
+    /// The array `ibv_get_device_list` returned, owned until `ibv_free_device_list` in `Drop`.
+    devices: *mut *mut ffi::ibv_device,
+    len: usize,
+}
 
 unsafe impl Sync for DeviceList {}
 unsafe impl Send for DeviceList {}
 
 impl Drop for DeviceList {
     fn drop(&mut self) {
-        unsafe { ffi::ibv_free_device_list(self.0.as_mut_ptr()) };
+        unsafe { ffi::ibv_free_device_list(self.devices) };
     }
 }
 
 impl DeviceList {
+    /// The devices, borrowed for as long as the list lives.
+    fn as_slice(&self) -> &[*mut ffi::ibv_device] {
+        unsafe { std::slice::from_raw_parts(self.devices, self.len) }
+    }
+
     /// Returns an iterator over all found devices.
     pub fn iter(&self) -> DeviceListIter<'_> {
         DeviceListIter { list: self, i: 0 }
@@ -47,17 +55,17 @@ impl DeviceList {
 
     /// Returns the number of devices.
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.len
     }
 
     /// Returns `true` if there are any devices.
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.len == 0
     }
 
     /// Returns the device at the given `index`, or `None` if out of bounds.
     pub fn get(&self, index: usize) -> Option<Device<'_>> {
-        self.0.get(index).map(Device)
+        self.as_slice().get(index).map(Device)
     }
 }
 
@@ -78,7 +86,7 @@ pub struct DeviceListIter<'iter> {
 impl<'iter> Iterator for DeviceListIter<'iter> {
     type Item = Device<'iter>;
     fn next(&mut self) -> Option<Self::Item> {
-        let e = self.list.0.get(self.i);
+        let e = self.list.as_slice().get(self.i);
         if e.is_some() {
             self.i += 1;
         }
