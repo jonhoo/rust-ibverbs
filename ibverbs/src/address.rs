@@ -539,10 +539,19 @@ impl AddressHandleAttribute {
     /// completion alone). The route is global exactly when a header was present, sourced from the
     /// local GID the datagram was addressed to.
     ///
+    /// This is not cheap enough to call per datagram: with a header, libibverbs finds the local
+    /// GID by querying the port's GID table entry by entry, at two system calls per entry, and
+    /// creating the address handle from the result is usually another. A server answering many
+    /// datagrams should cache the address handle per sender (keyed by the header's
+    /// [`Grh::sgid`], or by the completion's source LID when there is no header).
+    ///
     /// # Errors
     ///
     ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): the completion reports a header
-    ///    but none was given, or the header's destination GID is not in the port's GID table.
+    ///    but none was given, or libibverbs could not derive the route: `EINVAL` when the
+    ///    header's destination GID is multicast or (on current kernels) not in the port's GID
+    ///    table, and `EPROTONOSUPPORT` when the header is neither an IPv6-style nor an IPv4 one,
+    ///    or its next header is neither UDP (RoCE v2) nor InfiniBand.
     ///
     /// [`CompletionQueue::poll_into`]: crate::CompletionQueue::poll_into
     /// [`WcFlags::GRH`]: crate::WcFlags::GRH
@@ -572,12 +581,9 @@ impl AddressHandleAttribute {
             ffi::ibv_init_ah_from_wc(context.as_raw(), port_num, &mut wc, &mut grh, &mut attr)
         };
         if ret != 0 {
-            // libibverbs reports the one failure it can hit — the header's destination GID not
-            // being in the port's table — as a bare -1, without an errno.
-            return Err(Error::CreateAddressHandle(io::Error::new(
-                io::ErrorKind::NotFound,
-                "the GRH's destination GID is not in the local port's GID table",
-            )));
+            // libibverbs leaves the reason in `errno`. Not through `Error::os`: its
+            // `EPROTONOSUPPORT` means a malformed header here, not an unsupported operation.
+            return Err(Error::CreateAddressHandle(io::Error::last_os_error()));
         }
         Ok(AddressHandleAttribute { attr })
     }

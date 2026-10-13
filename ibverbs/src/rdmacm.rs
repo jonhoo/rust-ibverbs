@@ -293,8 +293,15 @@ fn max_accept_private_data(ps: ffi::rdma_port_space) -> usize {
     }
 }
 
-/// The most private-data bytes a rejection (`rdma_reject`) can carry: the CM REJ payload.
-const MAX_REJECT_PRIVATE_DATA: usize = 148;
+/// The most private-data bytes a rejection (`rdma_reject`) can carry in a port space: the CM REJ
+/// (148 bytes) or, for the datagram port spaces, SIDR REP (136 bytes) payload.
+fn max_reject_private_data(ps: ffi::rdma_port_space) -> usize {
+    use ffi::rdma_port_space as E;
+    match ps {
+        E::RDMA_PS_TCP | E::RDMA_PS_IB => 148,
+        _ => 136,
+    }
+}
 
 /// Checks that `len` bytes of private data (`what`, for the error message) fit in `limit`.
 fn check_private_data(len: usize, limit: usize, what: &str) -> io::Result<()> {
@@ -452,6 +459,7 @@ impl CmId {
         // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so an
         // empty one reports `EAGAIN`.
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
+        nix::errno::Errno::clear();
         let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
         if ret != 0 {
             let e = io::Error::last_os_error();
@@ -460,8 +468,20 @@ impl CmId {
             }
             return Err(Error::os(e, Error::ConnectionSetup));
         }
+        // The kernel reports a failure as a negative errno, but when librdmacm itself fails to
+        // finish an address or route resolution while reading the event (querying the device,
+        // address, or path), it sets the status to -1 and leaves the reason in `errno`, which is
+        // only readable now. `errno` was cleared above, so a -1 from the kernel (`-EPERM`) stays.
+        let mut status = unsafe { (*event).status };
+        if status == -1 {
+            let errno = nix::errno::Errno::last_raw();
+            if errno != 0 {
+                status = -errno;
+            }
+        }
         Ok(Some(CmEvent {
             event,
+            status,
             _id: self.clone(),
             taken: false,
         }))
@@ -579,9 +599,13 @@ impl CmId {
         check(ret, Error::BindAddress)
     }
 
-    /// Starts listening for incoming connection requests (passive side), queueing up to `backlog`.
-    /// A [`CmEventType::ConnectRequest`] is then delivered for each incoming connection; take its
+    /// Starts listening for incoming connection requests (passive side). A
+    /// [`CmEventType::ConnectRequest`] is then delivered for each incoming connection; take its
     /// new id with [`CmEvent::connection_request`].
+    ///
+    /// `backlog` caps how many requests can wait to be read from the channel; requests beyond it
+    /// are dropped. 0 does not mean no queue: like any value above the kernel's limit
+    /// (`net.rdma_ucm.max_backlog`, 1024 by default), it means that limit.
     pub fn listen(&self, backlog: u32) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog.min(i32::MAX as u32) as i32) };
         check(ret, Error::ConnectionSetup)
@@ -674,8 +698,9 @@ impl CmId {
 
     /// Declines a connection request (passive side), on the id taken from a
     /// [`CmEventType::ConnectRequest`] with [`CmEvent::connection_request`]. The peer's connect
-    /// fails with [`CmEventType::Rejected`], carrying `private_data` (at most 148 bytes) for it to
-    /// read. Drop the id afterwards; it has no further use.
+    /// fails with [`CmEventType::Rejected`] ([`Unreachable`](CmEventType::Unreachable) in the
+    /// datagram port spaces), carrying `private_data` (at most 148 bytes, 136 in the datagram port
+    /// spaces) for it to read. Drop the id afterwards; it has no further use.
     ///
     /// # Errors
     ///
@@ -684,8 +709,8 @@ impl CmId {
     pub fn reject(&self, private_data: &[u8]) -> Result<()> {
         check_private_data(
             private_data.len(),
-            MAX_REJECT_PRIVATE_DATA,
-            "rejection private data",
+            max_reject_private_data(self.port_space()),
+            "rejection private data in this port space",
         )
         .map_err(Error::ConnectionSetup)?;
         let ret = unsafe {
@@ -712,6 +737,12 @@ impl CmId {
     /// move it to the error state the way it would a connection-manager-created one. Do that
     /// yourself with [`QueuePair::modify`] so outstanding work requests are flushed (the blocking
     /// [`Connection::disconnect`] does).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed. On InfiniBand
+    ///    and RoCE that happens only on an id that never took part in a connection: disconnecting
+    ///    one that is already down succeeds.
     pub fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.inner.id) };
         check(ret, Error::ConnectionSetup)
@@ -734,6 +765,10 @@ impl CmId {
     /// Set the type of service of this id's traffic: the IP DSCP/ToS byte (RFC 2474) its packets
     /// carry, which the network maps to a priority or a lossless class. Set it before resolving
     /// the address (active side) or binding (passive side).
+    ///
+    /// On InfiniBand and RoCE a listener's setting has no effect, though: the connections it
+    /// accepts take their traffic class and service level from the peer's request, so set it on
+    /// the connecting side.
     ///
     /// # Errors
     ///
@@ -782,6 +817,12 @@ impl CmId {
     /// asynchronous event on the queue pair ([`Context::wait_async_event`]), which the connection
     /// manager cannot see on its own; forwarding it here lets the passive side treat the
     /// connection as established when the peer's ready-to-use message was lost.
+    ///
+    /// The ids on one device share one [`context`](Self::context), so its asynchronous events are
+    /// those of every connection's queue pair, and each goes to whichever reader takes it first:
+    /// one waiting loop per connection would take the others' events. Read them in one place per
+    /// context instead, and hand each event to the connection whose queue pair it names
+    /// ([`AsyncEvent::as_raw`](crate::AsyncEvent::as_raw)).
     ///
     /// # Errors
     ///
@@ -846,8 +887,19 @@ impl CmId {
 
     /// Builds the queue pair from `prepared` and moves it from `RESET` to `INIT`. Finish the
     /// transition after the connection is set up with [`ready`](Self::ready).
+    ///
+    /// The queue pair must be on this id's device: the attributes the connection manager computes
+    /// (the port, the route) are that device's, and could misconfigure another device's queue
+    /// pair without failing.
     fn init_qp(&self, prepared: PreparedQueuePair<Rc>) -> Result<QueuePair<Rc>> {
         let mut qp = prepared.into_queue_pair();
+        let device = unsafe { (*self.verbs()?).device };
+        if unsafe { (*(*qp.as_raw()).context).device } != device {
+            return Err(Error::ModifyQueuePair(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the queue pair must come from the connection's device (the one `context` returns)",
+            )));
+        }
         self.transition(&mut qp, QueuePairState::Init)?;
         Ok(qp)
     }
@@ -912,6 +964,9 @@ impl AsFd for CmId {
 /// learns right away rather than after its retries time out.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
+    /// The event's status, with librdmacm's own failures turned into a negative errno (see
+    /// [`CmId::poll_cm_event`]).
+    status: i32,
     /// The id whose channel delivered the event (the listener, for a connection request).
     _id: CmId,
     /// Whether a connection request's new id has been taken over by
@@ -959,8 +1014,11 @@ impl CmEvent {
     /// connection errors) or a transport-specific value (the reject reason for
     /// [`Rejected`](CmEventType::Rejected)). The blocking helpers carry it in
     /// [`Error::ConnectionManager`].
+    ///
+    /// librdmacm reports its own failures to finish an address or route resolution as a raw
+    /// status of -1 with the reason in `errno`; this returns that reason, negated, instead.
     pub fn status(&self) -> i32 {
-        unsafe { (*self.event).status }
+        self.status
     }
 
     /// The private data the peer attached to its connection request or reply
@@ -1105,6 +1163,9 @@ impl ConnectionParameter {
 
     /// Sets how many times to retry a connection or transport operation before reporting an error
     /// (0-7).
+    ///
+    /// Only the connecting side's value counts: accepting ignores it (`rdma_accept(3)`), and the
+    /// accepting queue pair retries as often as the connection request asked.
     pub fn set_retry_count(mut self, retry_count: u8) -> Self {
         self.param.retry_count = retry_count;
         self
@@ -1238,7 +1299,8 @@ impl Resolved {
     ///    its reject reason and private data), or was unreachable.
     ///  - [`Connect`](Error::Connect): `rdma_connect` failed, or the private data does not fit a
     ///    request (see [`ConnectionParameter::set_private_data`]).
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
+    ///    is not on the device of [`context`](Self::context).
     ///  - [`TimedOut`](Error::TimedOut): the response did not arrive in time.
     pub fn connect(
         self,
@@ -1279,7 +1341,8 @@ pub struct Acceptor {
 impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
     /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
-    /// listening, queueing up to `backlog` pending connections.
+    /// listening, queueing up to `backlog` requests not yet taken by [`accept`](Self::accept) (0
+    /// means the kernel's limit, see [`CmId::listen`]).
     ///
     /// # Errors
     ///
@@ -1294,7 +1357,7 @@ impl Acceptor {
 
     /// As [`bind`](Self::bind), running `configure` on the listener's id before it binds: the
     /// place for the options that must precede binding ([`CmId::set_reuse_addr`],
-    /// [`CmId::set_af_only`], [`CmId::set_tos`]).
+    /// [`CmId::set_af_only`]).
     ///
     /// # Errors
     ///
@@ -1395,10 +1458,17 @@ impl Incoming {
     ///
     ///  - [`Accept`](Error::Accept): `rdma_accept` failed, or the private data does not fit a
     ///    reply (see [`ConnectionParameter::set_private_data`]).
-    ///  - [`ConnectionManager`](Error::ConnectionManager): the peer gave up before the connection
-    ///    was established.
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed.
+    ///  - [`ConnectionManager`](Error::ConnectionManager): the peer gave up after this side
+    ///    replied, before the connection was established.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
+    ///    is not on the device of [`context`](Self::context).
     ///  - [`TimedOut`](Error::TimedOut): the connection was not established in time.
+    ///
+    /// A peer that withdrew its request before this side replied (for example by dropping its id
+    /// after its connect timed out) shows up as `EINVAL` instead: in
+    /// [`ModifyQueuePair`](Error::ModifyQueuePair) when the connection manager refuses to compute
+    /// the queue pair's attributes (`rdma_init_qp_attr`), or in [`Accept`](Error::Accept) when the
+    /// request went away between those transitions and the reply.
     pub fn accept(
         self,
         qp: PreparedQueuePair<Rc>,
@@ -1480,8 +1550,8 @@ impl Connection {
     ///
     /// # Errors
     ///
-    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed (for example
-    ///    because the connection is already down).
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed. On InfiniBand
+    ///    and RoCE it does not, even when the connection is already down.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): moving the queue pair to the error state
     ///    failed.
     pub fn disconnect(&mut self) -> Result<()> {
@@ -1495,8 +1565,10 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         // Tell the peer now: destroying the id would also send the disconnect, but a clone of it
-        // (from `cm_id`) can keep it alive much longer. Fails harmlessly if already disconnected.
-        // The queue pair is destroyed right after this, which flushes it.
+        // (from `cm_id`) can keep it alive much longer. The result is ignored: a drop cannot
+        // report it, and on InfiniBand and RoCE this succeeds even if the connection is down.
+        // The queue pair is destroyed right after this, which discards its outstanding work
+        // requests without completing them (only `disconnect` flushes them as completions).
         let _ = self.id.disconnect();
     }
 }
