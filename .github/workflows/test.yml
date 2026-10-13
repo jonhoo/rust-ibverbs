@@ -147,18 +147,23 @@ jobs:
         if: hashFiles('Cargo.lock') == ''
         run: cargo generate-lockfile
       - name: cargo test -- --ignored
+        id: loopback
         env:
           IBVERBS_TEST_DEVICE: rxe0
         # Run serially: the tests share one rxe device, and Soft-RoCE drops completions when many
         # queue pairs drive it concurrently.
         run: cargo test --locked --test loopback -- --ignored --test-threads=1
       - name: cargo test --features rdmacm -- --ignored
+        # Run whenever the loopback suite ran, even if it failed, so that one failing suite does
+        # not hide the others' results.
+        if: ${{ !cancelled() && steps.loopback.outcome != 'skipped' }}
         env:
           IBVERBS_TEST_DEVICE: rxe0
         # The connection manager binds the runner's own IPv4 address, which resolves onto the same
         # rxe device. Serial for the same reason as the loopback tests.
         run: cargo test --locked --features rdmacm --test rdmacm -- --ignored --test-threads=1
       - name: cargo test --features mlx5 -- --ignored
+        if: ${{ !cancelled() && steps.loopback.outcome != 'skipped' }}
         env:
           IBVERBS_TEST_DEVICE: rxe0
         run: cargo test --locked --no-default-features --features mlx5 --test mlx5 -- --ignored --test-threads=1
