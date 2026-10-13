@@ -62,12 +62,14 @@ impl QueuePairBuilder<Srd> {
     ///
     /// # Errors
     ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `efadv_create_qp_ex` failed (`EINVAL` for
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
+    ///    device context than the protection domain, or `efadv_create_qp_ex` failed (`EINVAL` for
     ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
     ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
     ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
+        self.check_same_context()?;
         // SRD supports send and one-sided RDMA, including the immediate variants (the transport's
         // default set), or whatever the builder was told to request instead.
         let send_ops_flags = self.send_ops().0;

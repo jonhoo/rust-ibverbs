@@ -854,6 +854,93 @@ fn srq_limit_reached_async_event() {
 
 /// Unreliable datagram (UD): a connectionless queue pair sends a datagram to itself via an address
 /// handle pointing at its own GID. UD prepends a 40-byte GRH to received messages.
+/// Objects from two contexts on one device: the kernel numbers each context's objects
+/// independently, so mixing them must be refused instead of binding the queue pair to whatever the
+/// other context's number names.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn objects_from_another_context_are_refused() {
+    let a = open_test_device();
+    let b = open_test_device();
+    let pd = a.alloc_pd().expect("failed to allocate PD");
+    let cq = a.create_cq(16).build().expect("failed to create CQ");
+    let foreign_cq = b.create_cq(16).build().expect("failed to create CQ");
+    let foreign_srq = b
+        .alloc_pd()
+        .expect("failed to allocate PD")
+        .create_srq(16, 1, 0)
+        .expect("failed to create SRQ");
+    let refused = |result: ibverbs::Result<_>| {
+        matches!(
+            result.err(),
+            Some(Error::CreateQueuePair(e)) if e.kind() == std::io::ErrorKind::InvalidInput
+        )
+    };
+
+    for (send, recv) in [(&foreign_cq, &cq), (&cq, &foreign_cq)] {
+        let builder = pd
+            .create_qp::<Rc>(send, recv, 1)
+            .expect("failed to create QP builder");
+        assert!(
+            refused(builder.build()),
+            "a foreign completion queue is refused"
+        );
+    }
+    let mut builder = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP builder");
+    builder.set_srq(&foreign_srq);
+    assert!(
+        refused(builder.build()),
+        "a foreign shared receive queue is refused"
+    );
+
+    // The same objects from the protection domain's own context build.
+    let _prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP builder")
+        .build()
+        .expect("same-context objects build");
+}
+
+/// An address handle from another context is refused when a datagram is addressed with it.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "the address handle must come from the queue pair's device context")]
+fn address_handle_from_another_context_is_refused() {
+    let ctx = open_test_device();
+    let other = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build()
+        .expect("failed to build UD QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared
+        .activate(0x1234_5678)
+        .expect("failed to activate UD QP");
+
+    let mut ah_attr = AddressHandleAttribute::new(1);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
+    let foreign_ah = other
+        .alloc_pd()
+        .expect("failed to allocate PD")
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+
+    let mut batch = qp.start_send();
+    let _ = batch.to(&foreign_ah, endpoint.qp_num, 0x1234_5678);
+}
+
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn unreliable_datagram() {

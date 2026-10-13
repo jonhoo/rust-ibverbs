@@ -814,9 +814,36 @@ impl<T: Transport> QueuePairBuilder<T> {
             .unwrap_or_else(|| default_send_ops(self.qp_type))
     }
 
+    /// Refuses completion queues or a shared receive queue from another device context than the
+    /// protection domain's. libibverbs hands the kernel only their handle numbers, which each
+    /// context numbers independently and the kernel looks up in the protection domain's context:
+    /// a foreign object either fails to resolve or silently names a different object there, while
+    /// the provider keeps operating on the foreign one (misrouted completions, and type confusion
+    /// across providers).
+    pub(crate) fn check_same_context(&self) -> Result<()> {
+        let ctx = self.pd.ctx.ctx;
+        let foreign = unsafe {
+            (*self.send.cq()).context != ctx
+                || (*self.recv.cq()).context != ctx
+                || self
+                    .srq
+                    .as_ref()
+                    .is_some_and(|s| (*s.inner.srq).context != ctx)
+        };
+        if foreign {
+            return Err(Error::CreateQueuePair(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the completion queues and the shared receive queue must come from the protection \
+                 domain's device context",
+            )));
+        }
+        Ok(())
+    }
+
     /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
     /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
     fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
+        self.check_same_context()?;
         // The extended send operations driven through the doorbell post API: the transport's
         // default set, or whatever the builder was told to request instead.
         let send_ops_flags = self.send_ops().0;
@@ -912,11 +939,13 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///
     /// # Errors
     ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `ibv_create_qp_ex` failed (`EINVAL` for an
-    ///    invalid `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
-    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
-    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
-    ///    to create a QP with this Transport Service Type).
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
+    ///    queue belongs to another device context than the protection domain, or
+    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
+    ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
+    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
+    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
+    ///    with this Transport Service Type).
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
     ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
     ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
@@ -932,11 +961,13 @@ impl QueuePairBuilder<Ud> {
     ///
     /// # Errors
     ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): `ibv_create_qp_ex` failed (`EINVAL` for an
-    ///    invalid `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
-    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
-    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
-    ///    to create a QP with this Transport Service Type).
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
+    ///    queue belongs to another device context than the protection domain, or
+    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
+    ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
+    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
+    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
+    ///    with this Transport Service Type).
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
     ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
     ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
@@ -1533,6 +1564,11 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
     /// `ah` stays borrowed until the request is posted, since the provider reads the handle inside
     /// the opcode builder. Keep it alive until the request completes too: some providers (rxe,
     /// for one) only resolve the handle when the request executes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `ah` was created on another device context than the queue pair's: the provider
+    /// would read it as one of its own (mlx5 copies its address vector out of it).
     #[inline]
     pub fn to<'b>(
         &'b mut self,
@@ -1540,6 +1576,10 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
         remote_qpn: u32,
         remote_qkey: u32,
     ) -> AddressedSendOp<'b, 'qp, T> {
+        assert!(
+            unsafe { (*ah.as_ptr()).context == (*self.qpx).qp_base.context },
+            "the address handle must come from the queue pair's device context"
+        );
         AddressedSendOp {
             op: SendOp {
                 batch: self,
