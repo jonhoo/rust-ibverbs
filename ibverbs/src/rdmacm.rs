@@ -293,8 +293,15 @@ fn max_accept_private_data(ps: ffi::rdma_port_space) -> usize {
     }
 }
 
-/// The most private-data bytes a rejection (`rdma_reject`) can carry: the CM REJ payload.
-const MAX_REJECT_PRIVATE_DATA: usize = 148;
+/// The most private-data bytes a rejection (`rdma_reject`) can carry in a port space: the CM REJ
+/// (148 bytes) or, for the datagram port spaces, SIDR REP (136 bytes) payload.
+fn max_reject_private_data(ps: ffi::rdma_port_space) -> usize {
+    use ffi::rdma_port_space as E;
+    match ps {
+        E::RDMA_PS_TCP | E::RDMA_PS_IB => 148,
+        _ => 136,
+    }
+}
 
 /// Checks that `len` bytes of private data (`what`, for the error message) fit in `limit`.
 fn check_private_data(len: usize, limit: usize, what: &str) -> io::Result<()> {
@@ -687,8 +694,9 @@ impl CmId {
 
     /// Declines a connection request (passive side), on the id taken from a
     /// [`CmEventType::ConnectRequest`] with [`CmEvent::connection_request`]. The peer's connect
-    /// fails with [`CmEventType::Rejected`], carrying `private_data` (at most 148 bytes) for it to
-    /// read. Drop the id afterwards; it has no further use.
+    /// fails with [`CmEventType::Rejected`] ([`Unreachable`](CmEventType::Unreachable) in the
+    /// datagram port spaces), carrying `private_data` (at most 148 bytes, 136 in the datagram port
+    /// spaces) for it to read. Drop the id afterwards; it has no further use.
     ///
     /// # Errors
     ///
@@ -697,8 +705,8 @@ impl CmId {
     pub fn reject(&self, private_data: &[u8]) -> Result<()> {
         check_private_data(
             private_data.len(),
-            MAX_REJECT_PRIVATE_DATA,
-            "rejection private data",
+            max_reject_private_data(self.port_space()),
+            "rejection private data in this port space",
         )
         .map_err(Error::ConnectionSetup)?;
         let ret = unsafe {
