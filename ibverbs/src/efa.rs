@@ -132,7 +132,8 @@ impl PreparedQueuePair<Srd> {
     /// # Errors
     ///
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
-    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources).
+    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
+    ///    privileged `qkey`, one with its most significant bit set, without `CAP_NET_RAW`).
     pub fn activate(self, qkey: u32) -> Result<QueuePair<Srd>> {
         self.activate_impl(qkey)
     }

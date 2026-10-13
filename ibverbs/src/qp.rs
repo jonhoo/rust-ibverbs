@@ -1388,7 +1388,8 @@ impl PreparedQueuePair<Ud> {
     /// endpoint to exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with the given
     /// `qkey`. Incoming datagrams whose Q_Key does not match `qkey` are discarded (a sender whose
     /// work request sets the Q_Key's most significant bit transmits with its own QP's Q_Key
-    /// instead).
+    /// instead). A `qkey` with that bit set is a privileged one: since Linux 6.4, using it needs
+    /// `CAP_NET_RAW` (or, since 6.7, `rdma system set privileged-qkey on`).
     ///
     /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
     /// [`SendBatch::to`].
@@ -1396,7 +1397,8 @@ impl PreparedQueuePair<Ud> {
     /// # Errors
     ///
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
-    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources).
+    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
+    ///    privileged `qkey` without the privilege).
     pub fn activate(self, qkey: u32) -> Result<QueuePair<Ud>> {
         self.activate_impl(qkey)
     }
