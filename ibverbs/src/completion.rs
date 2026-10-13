@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::context::{ContextInner, HcaClock};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, destroyed};
 
 #[cfg(doc)]
 use crate::Context;
@@ -56,11 +56,9 @@ unsafe impl Sync for CompletionChannelInner {}
 
 impl Drop for CompletionChannelInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_comp_channel(self.cc) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_comp_channel failed: {e}");
-        }
+        destroyed("ibv_destroy_comp_channel", unsafe {
+            ffi::ibv_destroy_comp_channel(self.cc)
+        });
     }
 }
 
@@ -339,11 +337,7 @@ impl CompletionQueueInner {
 
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_destroy_cq(self.cq()) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_cq failed: {e}");
-        }
+        destroyed("ibv_destroy_cq", unsafe { ffi::ibv_destroy_cq(self.cq()) });
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
         // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel

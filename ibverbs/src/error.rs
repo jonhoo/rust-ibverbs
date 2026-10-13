@@ -353,6 +353,15 @@ impl Error {
     }
 }
 
+/// Panics with the error a destroy verb (`ibv_destroy_qp`, `ibv_dereg_mr`, ...) returned, if any:
+/// the `Drop` impls cannot report it, and must not carry on as if the object were gone.
+#[track_caller]
+pub(crate) fn destroyed(verb: &str, errno: i32) {
+    if errno != 0 {
+        panic!("{verb} failed: {}", io::Error::from_raw_os_error(errno));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

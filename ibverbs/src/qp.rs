@@ -8,7 +8,7 @@ use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueueInner;
 use crate::context::Mtu;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, destroyed};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomainInner;
 use crate::srq::SharedReceiveQueue;
@@ -2645,11 +2645,7 @@ impl<T: Transport> RecvQueue<'_, T> {
 impl<T: Transport> Drop for QueuePair<T> {
     fn drop(&mut self) {
         // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
-        let errno = unsafe { ffi::ibv_destroy_qp(self.qp) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_destroy_qp failed: {e}");
-        }
+        destroyed("ibv_destroy_qp", unsafe { ffi::ibv_destroy_qp(self.qp) });
     }
 }
 

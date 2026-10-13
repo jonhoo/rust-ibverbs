@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
 use crate::context::ContextInner;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, destroyed};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion, MemoryRegionInner};
 use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
 
@@ -124,11 +124,7 @@ pub(crate) struct ProtectionDomainInner {
 
 impl Drop for ProtectionDomainInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_dealloc_pd(self.pd) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_dealloc_pd failed: {e}");
-        }
+        destroyed("ibv_dealloc_pd", unsafe { ffi::ibv_dealloc_pd(self.pd) });
     }
 }
 

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
 use crate::device::Guid;
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, destroyed};
 use crate::pd::{ProtectionDomain, ProtectionDomainInner};
 
 #[cfg(doc)]
@@ -77,11 +77,9 @@ impl ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        let errno = unsafe { ffi::ibv_close_device(self.ctx) };
-        if errno != 0 {
-            let e = io::Error::from_raw_os_error(errno);
-            panic!("ibv_close_device failed: {e}");
-        }
+        destroyed("ibv_close_device", unsafe {
+            ffi::ibv_close_device(self.ctx)
+        });
     }
 }
 
