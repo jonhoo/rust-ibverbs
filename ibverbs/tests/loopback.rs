@@ -11,7 +11,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{open_test_device, test_device};
+use common::{open_test_device, poll_until, test_device};
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
     LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
@@ -160,29 +160,20 @@ impl Completed {
 /// seconds if they don't (loopback completes in microseconds).
 fn drain(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     let mut observed = Vec::with_capacity(n);
-    let deadline = Instant::now() + Duration::from_secs(5);
-
-    loop {
-        let mut completions = cq.poll().expect("failed to poll CQ");
-        while let Some(wc) = completions.next() {
-            if let Err(e) = wc.ok() {
-                panic!("work request {} failed: {e}", wc.wr_id());
-            }
-            observed.push(Completed {
-                wr_id: wc.wr_id(),
-                len: wc.len(),
-                imm_data: wc.imm_data(),
-            });
-        }
-        if observed.len() >= n {
-            return observed;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for completions: got {} of {n}",
-            observed.len()
-        );
-    }
+    let arrived = poll_until(cq, |wc| {
+        observed.push(Completed {
+            wr_id: wc.wr_id(),
+            len: wc.len(),
+            imm_data: wc.imm_data(),
+        });
+        observed.len() >= n
+    });
+    assert!(
+        arrived,
+        "timed out waiting for completions: got {} of {n}",
+        observed.len()
+    );
+    observed
 }
 
 /// Like [`drain`], but through the standard `ibv_poll_cq` batch path ([`CompletionQueue::poll_into`])
@@ -1476,18 +1467,11 @@ fn completion_timestamps() {
 
     // Each completion carries a hardware timestamp; reading it must succeed (not panic).
     let mut stamps = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while stamps.len() < 2 {
-        let mut comps = cq.poll().expect("failed to poll CQ");
-        while let Some(wc) = comps.next() {
-            wc.ok().expect("work request failed");
-            stamps.push(wc.completion_timestamp());
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for completions"
-        );
-    }
+    let arrived = poll_until(&cq, |wc| {
+        stamps.push(wc.completion_timestamp());
+        stamps.len() == 2
+    });
+    assert!(arrived, "timed out waiting for completions");
     // Timestamps are raw HCA-clock readings; their difference is a tick count.
     let earliest = *stamps.iter().min().expect("have completions");
     let latest = *stamps.iter().max().expect("have completions");
@@ -1528,31 +1512,24 @@ fn extended_wc_fields() {
     // Exercise the accessors on each completion. The addressing values are device-defined (and zero
     // on RoCE), so just ensure the reads succeed; an RC completion never carries a GRH.
     let mut seen = 0;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while seen < 2 {
-        let mut comps = cq.poll().expect("failed to poll CQ");
-        while let Some(wc) = comps.next() {
-            wc.ok().expect("work request failed");
-            let _ = wc.wc_flags();
-            let _ = wc.has_grh();
-            let _ = wc.slid();
-            let _ = wc.sl();
-            let _ = wc.dlid_path_bits();
-            assert_eq!(
-                wc.invalidated_rkey(),
-                None,
-                "a plain send invalidates nothing"
-            );
-            let raw = wc.as_raw();
-            assert!(!raw.is_null());
-            assert_eq!(unsafe { (*raw).wr_id }, wc.wr_id());
-            seen += 1;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for completions"
+    let arrived = poll_until(&cq, |wc| {
+        let _ = wc.wc_flags();
+        let _ = wc.has_grh();
+        let _ = wc.slid();
+        let _ = wc.sl();
+        let _ = wc.dlid_path_bits();
+        assert_eq!(
+            wc.invalidated_rkey(),
+            None,
+            "a plain send invalidates nothing"
         );
-    }
+        let raw = wc.as_raw();
+        assert!(!raw.is_null());
+        assert_eq!(unsafe { (*raw).wr_id }, wc.wr_id());
+        seen += 1;
+        seen == 2
+    });
+    assert!(arrived, "timed out waiting for completions");
     assert!(
         cq.capacity() >= 16,
         "the device grants at least what was asked"
@@ -1574,20 +1551,13 @@ fn extended_wc_fields() {
         batch.op().signaled().send(2, &[send.slice(..4)]);
         unsafe { batch.submit() }.expect("send failed");
         let mut seen = 0;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while seen < 2 {
-            let mut comps = cq.poll().expect("failed to poll CQ");
-            while let Some(wc) = comps.next() {
-                wc.ok().expect("work request failed");
-                let _ = wc.cvlan();
-                let _ = wc.flow_tag();
-                seen += 1;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for completions"
-            );
-        }
+        let arrived = poll_until(&cq, |wc| {
+            let _ = wc.cvlan();
+            let _ = wc.flow_tag();
+            seen += 1;
+            seen == 2
+        });
+        assert!(arrived, "timed out waiting for completions");
     }
 }
 

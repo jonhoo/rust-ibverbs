@@ -15,7 +15,7 @@ use std::os::fd::AsRawFd;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
-use common::open_test_device;
+use common::{open_test_device, poll_until};
 use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, ConnectionParameter, Connector, PortSpace,
 };
@@ -42,21 +42,10 @@ fn device_ipv4(ctx: &Context) -> Ipv4Addr {
 
 /// Poll `cq` until a completion with `wr_id` arrives (or time out), checking it succeeded.
 fn wait_for(cq: &CompletionQueue, wr_id: u64) {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let mut completions = cq.poll().expect("failed to poll CQ");
-        while let Some(wc) = completions.next() {
-            wc.ok()
-                .unwrap_or_else(|e| panic!("work request {} failed: {e}", wc.wr_id()));
-            if wc.wr_id() == wr_id {
-                return;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for completion {wr_id}"
-        );
-    }
+    assert!(
+        poll_until(cq, |wc| wc.wr_id() == wr_id),
+        "timed out waiting for completion {wr_id}"
+    );
 }
 
 const MESSAGE: &[u8] = b"hello over rdmacm";
