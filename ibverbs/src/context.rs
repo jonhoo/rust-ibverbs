@@ -19,20 +19,6 @@ use crate::{Device, QueuePairBuilder, WorkCompletion};
 
 pub(crate) struct ContextInner {
     pub(crate) ctx: *mut ffi::ibv_context,
-    ownership: ContextOwnership,
-}
-
-/// Whether a [`Context`] owns its `ibv_context` or borrows one owned elsewhere.
-enum ContextOwnership {
-    /// We opened the device and close it on drop.
-    Owned,
-    /// `ctx` is borrowed from another owner (an `rdma_cm_id`'s `verbs`). We keep that owner alive so
-    /// `ctx` stays valid for as long as this context and anything derived from it lives, and we do
-    /// not close the device ourselves. The `Arc` is held purely so its `Drop` runs last, so the
-    /// field is intentionally never read.
-    #[cfg(feature = "rdmacm")]
-    #[allow(dead_code)]
-    Borrowed(Arc<dyn Send + Sync>),
 }
 
 impl ContextInner {
@@ -91,17 +77,10 @@ impl ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        match &self.ownership {
-            ContextOwnership::Owned => {
-                let errno = unsafe { ffi::ibv_close_device(self.ctx) };
-                if errno != 0 {
-                    let e = io::Error::from_raw_os_error(errno);
-                    panic!("ibv_close_device failed: {e}");
-                }
-            }
-            // Borrowed: don't close the device; dropping the kept-alive owner is enough.
-            #[cfg(feature = "rdmacm")]
-            ContextOwnership::Borrowed(_) => {}
+        let errno = unsafe { ffi::ibv_close_device(self.ctx) };
+        if errno != 0 {
+            let e = io::Error::from_raw_os_error(errno);
+            panic!("ibv_close_device failed: {e}");
         }
     }
 }
@@ -142,35 +121,34 @@ impl Context {
             return Err(Error::OpenDevice(io::Error::last_os_error()));
         }
         let context = Context {
-            inner: Arc::new(ContextInner {
-                ctx,
-                ownership: ContextOwnership::Owned,
-            }),
+            inner: Arc::new(ContextInner { ctx }),
         };
         // If this fails, `context` drops here and closes the half-opened device again.
         context.set_async_fd_nonblocking()?;
         Ok(context)
     }
 
-    /// Wraps a raw `ibv_context` owned by `owner` (the RDMA connection manager's `rdma_cm_id`).
-    ///
-    /// The returned [`Context`] does not close the device on drop, and keeps `owner` alive for as
-    /// long as the context (or any protection domain, completion queue, queue pair, or memory
-    /// region built from it) is alive, so `ctx` cannot dangle.
+    /// A context on `dev` shared by every caller asking for the same device while any of them
+    /// still uses it, and opened afresh once none does: the connection manager's ids get their
+    /// device context here, so that the connections on one device share a single context rather
+    /// than opening one each.
     #[cfg(feature = "rdmacm")]
-    pub(crate) fn from_borrowed_context(
-        ctx: *mut ffi::ibv_context,
-        owner: Arc<dyn Send + Sync>,
-    ) -> Result<Context> {
-        let context = Context {
-            inner: Arc::new(ContextInner {
-                ctx,
-                ownership: ContextOwnership::Borrowed(owner),
-            }),
-        };
-        // The async-event descriptor is shared with every other borrow of this device context;
-        // setting it non-blocking is idempotent, so doing it once per borrow is harmless.
-        context.set_async_fd_nonblocking()?;
+    pub(crate) fn shared(dev: *mut ffi::ibv_device) -> Result<Context> {
+        use std::sync::{Mutex, PoisonError, Weak};
+        // Keyed by device address: a context holds a reference to its device, so the address
+        // cannot be reused for another device while an entry still upgrades.
+        static SHARED: Mutex<Vec<(usize, Weak<ContextInner>)>> = Mutex::new(Vec::new());
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.retain(|(_, context)| context.strong_count() > 0);
+        let existing = shared
+            .iter()
+            .find(|(device, _)| *device == dev as usize)
+            .and_then(|(_, context)| context.upgrade());
+        if let Some(inner) = existing {
+            return Ok(Context { inner });
+        }
+        let context = Context::with_device(dev)?;
+        shared.push((dev as usize, Arc::downgrade(&context.inner)));
         Ok(context)
     }
 

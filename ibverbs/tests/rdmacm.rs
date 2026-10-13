@@ -869,6 +869,67 @@ fn dropped_connect_request_is_rejected() {
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn dropped_incoming_is_rejected_while_its_resources_live() {
+    // Resources built on an incoming request's device context do not keep the request's id
+    // alive: dropping the `Incoming` still declines the request right away, and the resources
+    // stay usable.
+    let ip = device_ip(&open_test_device());
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let ctx = incoming.context().expect("server device context");
+        let pd = ctx.alloc_pd().expect("server pd");
+        let cq = ctx.create_cq(16).build().expect("server cq");
+        drop(incoming);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client saw the rejection");
+        // The request's id is gone, but the device context the resources were built on is not.
+        let _mr = pd
+            .allocate(64, AccessFlags::PERMISSIVE)
+            .expect("server mr after the request is gone");
+        let _qp = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("server qp builder after the request is gone")
+            .build()
+            .expect("server qp after the request is gone");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    let before = Instant::now();
+    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+        Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got a connection"),
+    }
+    assert!(
+        before.elapsed() < Duration::from_secs(5),
+        "the rejection arrived promptly, not after the request's retries"
+    );
+    done_tx.send(()).expect("signal done");
+    server.join().expect("server thread");
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn disconnect_flushes_outstanding_receives() {
     connect_pair(
         device_ip(&open_test_device()),
@@ -908,7 +969,7 @@ fn disconnect_flushes_outstanding_receives() {
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn dropping_connection_disconnects_peer() {
     // Dropping a `Connection` sends the disconnect right away, even though other resources built
-    // on the same device context (which keep the underlying id alive) are still around.
+    // on the same device context are still around.
     let ip = device_ip(&open_test_device());
     let (ready_tx, ready_rx) = mpsc::channel();
 
@@ -954,7 +1015,8 @@ fn dropping_connection_disconnects_peer() {
     let conn = resolved
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
-    // `ctx`, `pd`, and `cq` (all holding the connection's id) outlive the connection itself.
+    // `ctx`, `pd`, and `cq` (all on the connection's device context) outlive the connection
+    // itself.
     drop(conn);
     server.join().expect("server thread saw the disconnect");
     drop((cq, pd, ctx));
