@@ -1550,11 +1550,26 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     ///
     /// # Errors
     ///
-    ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when the send queue is full or out of
-    ///    resources).
+    ///  - [`PostSend`](Error::PostSend): the queue pair is still in RESET, INIT, or RTR
+    ///    ([`InvalidInput`](io::ErrorKind::InvalidInput); the batch is aborted, so none of it is
+    ///    posted), or completing the batch failed (`EINVAL` for an invalid value in one of the
+    ///    work requests, `ENOMEM` when the send queue is full or out of resources).
     pub unsafe fn submit(self) -> Result<()> {
+        use ffi::ibv_qp_state as S;
         let qpx = self.qpx;
+        // Refuse a queue pair below RTS up front: rxe publishes the batch before its doorbell
+        // system call, which fails there without draining the queue, so the requests would run
+        // once the queue pair reaches RTS although `submit` failed. libibverbs keeps the cached
+        // state current through `ibv_modify_qp` and `ibv_query_qp`.
+        let state = unsafe { (*qpx).qp_base.state };
+        if matches!(state, S::IBV_QPS_RESET | S::IBV_QPS_INIT | S::IBV_QPS_RTR) {
+            // Dropping the batch aborts it.
+            drop(self);
+            return Err(Error::PostSend(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the queue pair has not reached RTS",
+            )));
+        }
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
         // are about to `wr_complete`.
         std::mem::forget(self);

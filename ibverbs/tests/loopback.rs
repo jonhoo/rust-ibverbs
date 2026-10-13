@@ -2171,6 +2171,61 @@ fn manual_bringup_from_handshake_attributes() {
     assert_eq!(&recv.bytes()[..4], b"attr");
 }
 
+/// A send batch on a queue pair that has not reached RTS is refused at submit and posts nothing:
+/// Soft-RoCE would otherwise keep the requests queued behind the failed doorbell and run them once
+/// the queue pair reaches RTS.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn submit_below_rts_is_refused() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP")
+        .set_gid_index(gid_index(&ctx))
+        .build()
+        .expect("failed to build QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let bring_up = [
+        prepared.init_attributes(),
+        prepared.rtr_attributes(&endpoint).expect("rtr attributes"),
+        prepared.rts_attributes(&endpoint),
+    ];
+    let mut qp = prepared.into_queue_pair();
+
+    let recv = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut send = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register send MR");
+    send.bytes_mut()[..4].copy_from_slice(b"rts!");
+
+    // Refused in RESET, INIT, and RTR, each followed by the next transition.
+    for (wr_id, attr) in (1..).zip(&bring_up) {
+        let mut batch = qp.start_send();
+        batch.op().signaled().send(wr_id, &[send.slice(..4)]);
+        match unsafe { batch.submit() } {
+            Err(Error::PostSend(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+            other => panic!("expected PostSend with InvalidInput, got {other:?}"),
+        }
+        qp.modify(attr).expect("manual transition");
+    }
+    assert!(!poll_until(&cq, |_| true), "a refused request completed");
+
+    // At RTS, a new send is the first to consume the receive: none of the refused ones was left
+    // queued ahead of it.
+    unsafe { qp.post_recv([RecvRequest::new(10, &[recv.slice(..4)])]) }.expect("post_recv");
+    let mut batch = qp.start_send();
+    batch.op().signaled().send(11, &[send.slice(..4)]);
+    unsafe { batch.submit() }.expect("send failed");
+    let mut ids: Vec<u64> = drain(&cq, 2).iter().map(Completed::wr_id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [10, 11]);
+    assert_eq!(&recv.bytes()[..4], b"rts!");
+}
+
 /// A queue pair created with only SEND requested (no RDMA or atomics) still moves two-sided
 /// traffic, and the builder reports the effective set of operations.
 #[test]
