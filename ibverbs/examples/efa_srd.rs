@@ -69,8 +69,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // A datagram receive is prefixed by the 40-byte GRH, so the payload starts at offset 40.
+    // Unlike a UD receive, an SRD receive carries no 40-byte GRH: the payload starts at offset 0.
     let len = recv_len.unwrap();
-    println!("received {len} bytes: {:?}", &recv_buf.bytes()[40..len]);
+    println!("received {len} bytes: {:?}", &recv_buf.bytes()[..len]);
     Ok(())
 }
