@@ -599,9 +599,13 @@ impl CmId {
         check(ret, Error::BindAddress)
     }
 
-    /// Starts listening for incoming connection requests (passive side), queueing up to `backlog`.
-    /// A [`CmEventType::ConnectRequest`] is then delivered for each incoming connection; take its
+    /// Starts listening for incoming connection requests (passive side). A
+    /// [`CmEventType::ConnectRequest`] is then delivered for each incoming connection; take its
     /// new id with [`CmEvent::connection_request`].
+    ///
+    /// `backlog` caps how many requests can wait to be read from the channel; requests beyond it
+    /// are dropped. 0 does not mean no queue: like any value above the kernel's limit
+    /// (`net.rdma_ucm.max_backlog`, 1024 by default), it means that limit.
     pub fn listen(&self, backlog: u32) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog.min(i32::MAX as u32) as i32) };
         check(ret, Error::ConnectionSetup)
@@ -1313,7 +1317,8 @@ pub struct Acceptor {
 impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
     /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
-    /// listening, queueing up to `backlog` pending connections.
+    /// listening, queueing up to `backlog` requests not yet taken by [`accept`](Self::accept) (0
+    /// means the kernel's limit, see [`CmId::listen`]).
     ///
     /// # Errors
     ///
