@@ -779,10 +779,13 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// The device must support every operation requested, or [`build`](Self::build) fails with
     /// [`Unsupported`](Error::Unsupported): a device without extended atomics, for example, can
-    /// still create a send-only RC queue pair this way. Conversely, an opcode method whose
-    /// operation was not requested fails at [`submit`](SendBatch::submit). Operations beyond
-    /// the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`, `FLUSH`,
-    /// `ATOMIC_WRITE`) are reachable through [`as_raw_ex`](QueuePair::as_raw_ex).
+    /// still create a send-only RC queue pair this way. Conversely, posting an operation that was
+    /// not requested depends on the provider: rxe and EFA leave it out of the queue pair, so the
+    /// batch fails at [`submit`](SendBatch::submit) with [`Unsupported`](Error::Unsupported) and
+    /// none of it is posted; mlx5 installs every operation its transport supports and posts it
+    /// anyway. Operations beyond the ones this crate posts (`LOCAL_INV`, `BIND_MW`,
+    /// `SEND_WITH_INV`, `TSO`, `FLUSH`, `ATOMIC_WRITE`) are reachable through
+    /// [`as_raw_ex`](QueuePair::as_raw_ex).
     pub fn set_send_ops(&mut self, ops: SendOps) -> &mut Self {
         self.send_ops = Some(ops);
         self
@@ -1480,6 +1483,9 @@ impl<'a> RecvRequest<'a> {
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
+    /// An operation a request used that the provider left out of the queue pair (see
+    /// [`QueuePairBuilder::set_send_ops`]); `submit` then aborts the batch.
+    unsupported: Option<&'static &'static str>,
     _qp: std::marker::PhantomData<&'qp mut QueuePair<T>>,
 }
 
@@ -1550,10 +1556,18 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     ///
     /// # Errors
     ///
+    ///  - [`Unsupported`](Error::Unsupported): a request used an operation the queue pair was
+    ///    created without, on a provider that leaves such operations out (rxe, EFA; see
+    ///    [`QueuePairBuilder::set_send_ops`]). The batch is aborted, so none of it is posted.
     ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
     ///    value in one of the work requests, `ENOMEM` when the send queue is full or out of
     ///    resources).
     pub unsafe fn submit(self) -> Result<()> {
+        if let Some(operation) = self.unsupported {
+            // Dropping the batch aborts it.
+            drop(self);
+            return Err(Error::Unsupported { operation });
+        }
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
         // are about to `wr_complete`.
@@ -1574,6 +1588,10 @@ impl<T: Transport> Drop for SendBatch<'_, T> {
         unsafe { (*self.qpx).wr_abort.unwrap()(self.qpx) };
     }
 }
+
+/// What an opcode builder returns: `Err` with the operation's name when the provider left that
+/// operation out of the queue pair, so there was nothing to call.
+pub(crate) type OpcodeResult = std::result::Result<(), &'static &'static str>;
 
 /// One work request being configured and posted on a [`SendBatch`]. Created by
 /// [`SendBatch::op`] (connected transports; a datagram batch starts each request at
@@ -1630,7 +1648,8 @@ impl<T: Transport> SendOp<'_, '_, T> {
     }
 
     /// Post one work request: set id and flags, run the opcode builder, then the optional datagram
-    /// address, then the payload.
+    /// address, then the payload. An opcode builder whose operation the provider left out of the
+    /// queue pair returns the operation's name instead, which is recorded for `submit`.
     ///
     /// Always inlined: once an opcode has more than one call site, LLVM otherwise outlines this,
     /// and every work request then pays a call plus runtime branches on the destination and the
@@ -1640,7 +1659,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
         self,
         wr_id: u64,
         payload: Payload<'_>,
-        op: impl FnOnce(*mut ffi::ibv_qp_ex),
+        op: impl FnOnce(*mut ffi::ibv_qp_ex) -> OpcodeResult,
     ) {
         let qpx = self.batch.qpx;
         unsafe {
@@ -1656,7 +1675,12 @@ impl<T: Transport> SendOp<'_, '_, T> {
                     self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0
                 }
             };
-            op(qpx);
+            // An operation the provider left out opened no work request, so there is nothing for
+            // the setters below to fill; `submit` aborts the batch instead.
+            if let Err(operation) = op(qpx) {
+                self.batch.unsupported = Some(operation);
+                return;
+            }
             if let Some((ah, qpn, qkey)) = self.dest {
                 (*qpx).wr_set_ud_addr.unwrap()(qpx, ah, qpn, qkey);
             }
@@ -1693,29 +1717,34 @@ impl<T: Transport> SendOp<'_, '_, T> {
 
     /// The opcode builder for a SEND, with or without the immediate set by [`imm`](Self::imm).
     #[inline]
-    fn send_op(imm: Option<u32>) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
+    fn send_op(imm: Option<u32>) -> impl FnOnce(*mut ffi::ibv_qp_ex) -> OpcodeResult + use<T> {
         move |q| unsafe {
             match imm {
-                Some(imm) => (*q).wr_send_imm.unwrap()(q, imm.to_be()),
-                None => (*q).wr_send.unwrap()(q),
+                Some(imm) => (*q).wr_send_imm.ok_or(&"ibv_wr_send_imm")?(q, imm.to_be()),
+                None => (*q).wr_send.ok_or(&"ibv_wr_send")?(q),
             }
+            Ok(())
         }
     }
 
     /// The opcode builder for an RDMA WRITE into `remote`, with or without the immediate set by
     /// [`imm`](Self::imm).
     #[inline]
-    fn write_op(
+    pub(crate) fn write_op(
         imm: Option<u32>,
         remote: RemoteMemorySlice,
-    ) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
+    ) -> impl FnOnce(*mut ffi::ibv_qp_ex) -> OpcodeResult + use<T> {
         move |q| unsafe {
             match imm {
                 Some(imm) => {
-                    (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
+                    let write_imm = (*q).wr_rdma_write_imm.ok_or(&"ibv_wr_rdma_write_imm")?;
+                    write_imm(q, remote.rkey, remote.addr, imm.to_be())
                 }
-                None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
+                None => {
+                    (*q).wr_rdma_write.ok_or(&"ibv_wr_rdma_write")?(q, remote.rkey, remote.addr)
+                }
             }
+            Ok(())
         }
     }
 }
@@ -1750,7 +1779,8 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         self.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
+            (*q).wr_rdma_read.ok_or(&"ibv_wr_rdma_read")?(q, remote.rkey, remote.addr);
+            Ok(())
         })
     }
 
@@ -1765,7 +1795,9 @@ impl<T: Reliable> SendOp<'_, '_, T> {
         swap: u64,
     ) {
         self.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            (*q).wr_atomic_cmp_swp.unwrap()(q, remote.rkey, remote.addr, compare, swap)
+            let cmp_swp = (*q).wr_atomic_cmp_swp.ok_or(&"ibv_wr_atomic_cmp_swp")?;
+            cmp_swp(q, remote.rkey, remote.addr, compare, swap);
+            Ok(())
         })
     }
 
@@ -1779,7 +1811,9 @@ impl<T: Reliable> SendOp<'_, '_, T> {
         add: u64,
     ) {
         self.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            (*q).wr_atomic_fetch_add.unwrap()(q, remote.rkey, remote.addr, add)
+            let fetch_add = (*q).wr_atomic_fetch_add.ok_or(&"ibv_wr_atomic_fetch_add")?;
+            fetch_add(q, remote.rkey, remote.addr, add);
+            Ok(())
         })
     }
 }
@@ -2582,6 +2616,7 @@ impl<T: Transport> QueuePair<T> {
         unsafe { (*qpx).wr_start.unwrap()(qpx) };
         SendBatch {
             qpx,
+            unsupported: None,
             _qp: std::marker::PhantomData,
         }
     }

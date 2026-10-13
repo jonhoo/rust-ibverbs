@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::qp::{
     AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
-    QueuePairType, Transport, sealed,
+    QueuePairType, SendOp, Transport, sealed,
 };
 
 #[cfg(doc)]
@@ -149,21 +149,16 @@ impl AddressedSendOp<'_, '_, Srd> {
     #[inline]
     pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
         let imm = self.op.imm;
-        self.op.build(wr_id, payload.into(), move |q| unsafe {
-            match imm {
-                Some(imm) => {
-                    (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
-                }
-                None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
-            }
-        })
+        self.op
+            .build(wr_id, payload.into(), SendOp::<Srd>::write_op(imm, remote))
     }
 
     /// Post an RDMA READ from `remote` into `local`.
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
+            (*q).wr_rdma_read.ok_or(&"ibv_wr_rdma_read")?(q, remote.rkey, remote.addr);
+            Ok(())
         })
     }
 }

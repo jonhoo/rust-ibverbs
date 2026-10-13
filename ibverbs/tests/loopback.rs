@@ -2204,6 +2204,73 @@ fn send_ops_subset() {
     assert_eq!(&recv.bytes()[..4], b"only");
 }
 
+/// An RDMA WRITE on a queue pair created with only the SEND operations: Soft-RoCE leaves the write
+/// out of the queue pair, so the batch fails at submit with `Unsupported` and none of it is
+/// posted, not even the send before the write.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn unrequested_send_op_fails_the_batch() {
+    let ctx = open_test_device();
+    let soft_roce = ctx
+        .query_device()
+        .expect("failed to query device")
+        .vendor_id
+        == SOFT_ROCE_VENDOR_ID;
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        generous(read_write())(builder);
+        builder.set_send_ops(SendOps::SEND | SendOps::SEND_WITH_IMM);
+    });
+
+    let recv = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register recv MR");
+    let mut src = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register src MR");
+    let dst = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register dst MR");
+    src.bytes_mut()[..4].copy_from_slice(b"skip");
+    unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
+    let mut batch = qp.start_send();
+    batch.op().signaled().send(2, &[src.slice(..4)]);
+    batch
+        .op()
+        .signaled()
+        .write(3, &[src.slice(..4)], dst.remote().slice(..4));
+    match unsafe { batch.submit() } {
+        Err(Error::Unsupported { operation }) => {
+            assert_eq!(*operation, "ibv_wr_rdma_write");
+            // Neither the send, which would consume the posted receive, nor the write ran.
+            assert!(
+                !poll_until(&cq, |_| true),
+                "a request from the aborted batch completed"
+            );
+            assert_eq!(&recv.bytes()[..4], &[0; 4]);
+            assert_eq!(&dst.bytes()[..4], &[0; 4]);
+
+            // The abort left the queue pair usable, and the receive is still there for a new send.
+            let mut batch = qp.start_send();
+            batch.op().signaled().send(4, &[src.slice(..4)]);
+            unsafe { batch.submit() }.expect("send failed");
+            let mut ids: Vec<u64> = drain(&cq, 2).iter().map(Completed::wr_id).collect();
+            ids.sort_unstable();
+            assert_eq!(ids, [1, 4]);
+            assert_eq!(&recv.bytes()[..4], b"skip");
+        }
+        // mlx5 installs every operation its transport supports, whatever the queue pair was
+        // created with, so a device other than Soft-RoCE may post the write like any other.
+        Ok(()) if !soft_roce => {
+            drain(&cq, 3);
+            assert_eq!(&recv.bytes()[..4], b"skip");
+            assert_eq!(&dst.bytes()[..4], b"skip");
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
 /// A UD queue pair answers a datagram through the route derived from the receive completion and
 /// its GRH, in both completion forms: the classic `ibv_wc` from `poll_into`, and the lazily read
 /// `WorkCompletion` from `poll`.
