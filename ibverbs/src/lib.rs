@@ -85,13 +85,17 @@
 //!   exchange. Links `librdmacm`.
 //! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via the `Srd` transport
 //!   (`ProtectionDomain::create_qp::<Srd>`). Links `libefa`.
+//! - `mlx5`: mlx5 Data Direct DMA-BUF registration
+//!   (`ProtectionDomain::register_dmabuf_data_direct`) and its device query
+//!   (`Context::mlx5_data_direct_sysfs_path`). Links `libmlx5` from rdma-core 54 or newer, and
+//!   needs Linux 6.12 or newer.
 //!
 //! # Library dependency
 //!
 //! At runtime, this crate dynamically links `libibverbs`, which is part of [`rdma-core`] (the
 //! package is `libibverbs1`, with `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core`
-//! on Arch; `rdma-core-devel` on Fedora), plus `librdmacm` and `libefa` when the corresponding
-//! features are enabled.
+//! on Arch; `rdma-core-devel` on Fedora), plus `librdmacm`, `libefa`, and `libmlx5` when the
+//! corresponding features are enabled.
 //!
 //! At build time, `bindgen` generates the bindings from the [`rdma-core`] headers vendored in
 //! `ibverbs-sys`, so building needs `libclang` but no RDMA development packages. To generate
@@ -295,9 +299,6 @@ pub use efa::Srd;
 
 #[cfg(feature = "mlx5")]
 mod mlx5;
-
-#[cfg(feature = "mlx5")]
-pub use mlx5::Mlx5DmabufAccessFlags;
 
 pub use address::*;
 pub use completion::*;

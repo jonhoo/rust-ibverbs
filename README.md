@@ -120,10 +120,10 @@ None are enabled by default.
 
 ### mlx5 Data Direct
 
-Enable `mlx5` and call `ProtectionDomain::register_dmabuf_mlx5` with ordinary
-`AccessFlags` and separate `Mlx5DmabufAccessFlags::DATA_DIRECT`. The exporter must
+Enable `mlx5` and call `ProtectionDomain::register_dmabuf_data_direct`. The exporter must
 support Data Direct (for GPU memory, use its PCIe-mapped DMA-BUF export).
 Registration failure is returned directly, never retried as ordinary registration.
+Data Direct needs Linux 6.12 or newer; older kernels return `Error::Unsupported`.
 
 The result is the same `MemoryRegion<()>` returned by `register_dmabuf`: it retains
 its protection domain and deregisters on drop. Its slices and remote descriptors
@@ -131,9 +131,9 @@ use the requested IOVA, not a host virtual address. Keep the exported allocation
 alive until the MR is dropped and finish all RDMA operations before dropping it.
 
 `Context::mlx5_data_direct_sysfs_path` returns the provider's path bytes unchanged,
-without the `/sys` mount prefix. Unsupported providers return `Error::Unsupported`;
-`ENODEV` means no associated Data Direct device. Device selection and fallback policy
-remain with the caller.
+without the `/sys` mount prefix. Unsupported providers and older kernels return
+`Error::Unsupported`; `ENODEV` means no associated Data Direct device. Device selection
+and fallback policy remain with the caller.
 
 ## Building
 
