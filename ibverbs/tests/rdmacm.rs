@@ -632,12 +632,8 @@ fn accept_low_level(request: &CmId, qp: &mut ibverbs::QueuePair<Rc>) {
     }
     let param = ConnectionParameter::default().set_qp_num(qp.qp_num());
     request.accept(&param).expect("accept");
-    loop {
-        let event = request.get_cm_event().expect("server event");
-        if event.event_type() == CmEventType::Established {
-            break;
-        }
-    }
+    // Bounded, so a connection that never establishes fails the test instead of hanging it.
+    pump_until(request, CmEventType::Established);
 }
 
 #[test]
@@ -1024,12 +1020,9 @@ fn dropping_connection_disconnects_peer() {
         ready_tx
             .send(listener.local_addr().expect("listen address"))
             .expect("signal ready");
-        let request = loop {
-            let event = listener.get_cm_event().expect("listener event");
-            if event.event_type() == CmEventType::ConnectRequest {
-                break event.connection_request().expect("connection request");
-            }
-        };
+        let request = pump_until(&listener, CmEventType::ConnectRequest)
+            .connection_request()
+            .expect("connection request");
         let ctx = request.context().expect("server device context");
         let port = request.port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
