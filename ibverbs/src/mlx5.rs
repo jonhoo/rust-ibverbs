@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -32,7 +33,7 @@ impl ProtectionDomain {
     ///    `access_flags` that include `ON_DEMAND`.
     pub fn register_dmabuf_data_direct(
         &self,
-        fd: i32,
+        fd: BorrowedFd<'_>,
         offset: u64,
         len: usize,
         iova: u64,
@@ -50,7 +51,7 @@ impl ProtectionDomain {
                 offset,
                 len,
                 iova,
-                fd,
+                fd.as_raw_fd(),
                 access_flags.0 as i32,
                 data_direct.0 as i32,
             )

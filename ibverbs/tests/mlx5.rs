@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::os::fd::AsFd;
+
 use common::open_test_device;
 use ibverbs::{AccessFlags, Error};
 
@@ -31,7 +33,11 @@ fn rxe_rejects_mlx5_operations() {
     let pd = ctx
         .alloc_pd()
         .unwrap_or_else(|err| panic!("failed to allocate a protection domain on {name}: {err:?}"));
-    let Err(err) = pd.register_dmabuf_data_direct(-1, 0, 4096, 0, AccessFlags::LOCAL_WRITE) else {
+    // Not a DMA-BUF: the provider check comes first, so any descriptor will do.
+    let not_dmabuf = std::fs::File::open("/dev/null").expect("failed to open /dev/null");
+    let Err(err) =
+        pd.register_dmabuf_data_direct(not_dmabuf.as_fd(), 0, 4096, 0, AccessFlags::LOCAL_WRITE)
+    else {
         panic!("rxe must reject mlx5dv_reg_dmabuf_mr");
     };
     assert!(

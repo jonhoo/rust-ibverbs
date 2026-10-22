@@ -1,3 +1,4 @@
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -376,10 +377,11 @@ impl ProtectionDomain {
     /// exporter; the returned region only holds the registration, which is released when the
     /// region is dropped.
     ///
-    /// `fd` is the file descriptor of the DMA-BUF to register; it must refer to an already
-    /// allocated buffer. The region starts at `offset` bytes into the DMA-BUF and covers `len`
-    /// bytes. `iova` is the virtual base address of the region when accessed through an `lkey` or
-    /// `rkey`; it must have the same page offset as `offset`.
+    /// `fd` is the DMA-BUF to register; it must refer to an already allocated buffer. It is
+    /// borrowed for the call only: the region keeps the buffer itself registered, so the
+    /// descriptor may be closed afterwards. The region starts at `offset` bytes into the DMA-BUF
+    /// and covers `len` bytes. `iova` is the virtual base address of the region when accessed
+    /// through an `lkey` or `rkey`; it must have the same page offset as `offset`.
     ///
     /// # Errors
     ///
@@ -391,14 +393,21 @@ impl ProtectionDomain {
     /// [man]: https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html
     pub fn register_dmabuf(
         &self,
-        fd: i32,
+        fd: BorrowedFd<'_>,
         offset: u64,
         len: usize,
         iova: u64,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
         let mr = unsafe {
-            ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
+            ffi::ibv_reg_dmabuf_mr(
+                self.inner.pd,
+                offset,
+                len,
+                iova,
+                fd.as_raw_fd(),
+                access_flags.0 as i32,
+            )
         };
         // Promotes the EOPNOTSUPP of devices without DMA-BUF support, and the EPROTONOSUPPORT of
         // kernels that predate it, to Unsupported.
