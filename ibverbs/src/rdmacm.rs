@@ -263,8 +263,13 @@ unsafe fn socket_addr_of(sa: *const ffi::sockaddr) -> Option<SocketAddr> {
         .or_else(|| unsafe { SockaddrIn6::from_raw(sa, None) }.map(SocketAddr::from))
 }
 
+/// `timeout` in the whole milliseconds librdmacm takes, rounded up like every other wait in the
+/// crate: truncated, a sub-millisecond timeout would become 0 and expire at once.
 fn timeout_ms(timeout: Duration) -> c_int {
-    timeout.as_millis().min(c_int::MAX as u128) as c_int
+    timeout
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(c_int::MAX as u128) as c_int
 }
 
 /// The `RDMA_MAX_RESP_RES` / `RDMA_MAX_INIT_DEPTH` sentinels of `rdma_cma.h`: a connection
@@ -1656,6 +1661,15 @@ mod test_conversions {
         ] {
             assert_eq!(CmEventType::from(raw), wrapper);
         }
+    }
+
+    #[test]
+    fn timeouts_round_up_to_whole_milliseconds() {
+        assert_eq!(timeout_ms(Duration::ZERO), 0);
+        assert_eq!(timeout_ms(Duration::from_micros(900)), 1);
+        assert_eq!(timeout_ms(Duration::from_millis(5)), 5);
+        assert_eq!(timeout_ms(Duration::from_micros(5_001)), 6);
+        assert_eq!(timeout_ms(Duration::MAX), c_int::MAX);
     }
 
     #[test]
