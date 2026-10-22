@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
@@ -211,36 +211,17 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
     pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = crate::completion::deadline_after(timeout);
         loop {
-            let remaining = deadline.map(|deadline| {
-                crate::completion::ceil_to_millis(
-                    deadline.saturating_duration_since(Instant::now()),
-                )
-            });
-            let pollfd = nix::poll::PollFd::new(self.async_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::AsyncEvent(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::AsyncEvent(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // event first; if so, go back to waiting for the next one.
-                    if let Some(event) = self.poll_async_event()? {
-                        return Ok(Some(event));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !crate::completion::wait_readable(self.async_fd(), deadline)
+                .map_err(Error::AsyncEvent)?
+            {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the event
+            // first; if so, go back to waiting for the next one.
+            if let Some(event) = self.poll_async_event()? {
+                return Ok(Some(event));
             }
         }
     }

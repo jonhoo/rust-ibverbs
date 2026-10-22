@@ -9,10 +9,41 @@ use std::time::{Duration, Instant};
 use crate::context::{Context, HcaClock};
 use crate::error::{Error, Result, destroyed, keep, nonnull};
 
-/// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
-/// granularity) lasts at least the requested duration instead of returning fractionally early.
-pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
-    Duration::from_millis(remaining.as_nanos().div_ceil(1_000_000) as u64)
+/// The deadline `timeout` from now: `None` (wait indefinitely) without a timeout, and also for a
+/// timeout too far out for an [`Instant`] to hold, which no wait could outlast anyway.
+pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|timeout| Instant::now().checked_add(timeout))
+}
+
+/// Block until `fd` is readable (`true`) or `deadline` passes (`false`); with no deadline, wait
+/// indefinitely.
+///
+/// `poll(2)` waits at most `i32::MAX` milliseconds (about 24.8 days) per call, so a later deadline
+/// is waited out in slices; each is rounded up to whole milliseconds so the wait never ends
+/// fractionally early. A signal interrupting `poll(2)` (`EINTR`) resumes the wait.
+pub(crate) fn wait_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<bool> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    loop {
+        let timeout = match deadline {
+            None => PollTimeout::NONE,
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let millis = remaining.as_nanos().div_ceil(1_000_000);
+                PollTimeout::try_from(millis).unwrap_or(PollTimeout::MAX)
+            }
+        };
+        match poll(&mut [PollFd::new(fd, PollFlags::POLLIN)], timeout) {
+            // A slice ran out: the wait is over only once the deadline itself has passed.
+            Ok(0) => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Ok(false);
+                }
+            }
+            Ok(_) => return Ok(true),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
 }
 
 /// The error for a provider's poll that failed with a negative code rather than an errno.
@@ -151,33 +182,15 @@ impl CompletionChannel {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): waiting on the descriptor (`poll`)
     ///    or consuming the notification failed.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = deadline_after(timeout);
         loop {
-            let remaining = deadline
-                .map(|deadline| ceil_to_millis(deadline.saturating_duration_since(Instant::now())));
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::PollCompletionQueue(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::PollCompletionQueue(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // notification first; if so, go back to waiting for the next one.
-                    if let Some(context) = self.get_event()? {
-                        return Ok(Some(context));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !wait_readable(self.as_fd(), deadline).map_err(Error::PollCompletionQueue)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the notification
+            // first; if so, go back to waiting for the next one.
+            if let Some(context) = self.get_event()? {
+                return Ok(Some(context));
             }
         }
     }

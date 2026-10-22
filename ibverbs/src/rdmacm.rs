@@ -538,35 +538,16 @@ impl CmId {
     /// never runs past the deadline.
     fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<CmEvent> {
         loop {
-            let remaining = deadline.map(|deadline| {
-                crate::completion::ceil_to_millis(
-                    deadline.saturating_duration_since(Instant::now()),
-                )
-            });
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::ConnectionSetup(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-            match ret {
-                0 => return Err(Error::TimedOut),
-                1 => {
-                    // The descriptor was readable, but another thread may have taken the event
-                    // first, or librdmacm consumed it internally; if so, go back to waiting for the
-                    // next one with whatever time is left.
-                    if let Some(event) = self.poll_cm_event()? {
-                        return Ok(event);
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !crate::completion::wait_readable(self.as_fd(), deadline)
+                .map_err(Error::ConnectionSetup)?
+            {
+                return Err(Error::TimedOut);
+            }
+            // The descriptor was readable, but another thread may have taken the event first, or
+            // librdmacm consumed it internally; if so, go back to waiting for the next one with
+            // whatever time is left.
+            if let Some(event) = self.poll_cm_event()? {
+                return Ok(event);
             }
         }
     }
@@ -1308,7 +1289,7 @@ impl Resolved {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = crate::completion::deadline_after(timeout);
         let mut qp = self.id.init_qp(qp)?;
         let param = param.set_qp_num(qp.qp_num());
         self.id.connect(&param)?;
@@ -1402,7 +1383,7 @@ impl Acceptor {
     ///    device was removed).
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = crate::completion::deadline_after(timeout);
         let request = self
             .listener
             .wait_for(CmEventType::ConnectRequest, deadline)?;
@@ -1475,7 +1456,7 @@ impl Incoming {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = crate::completion::deadline_after(timeout);
         let mut qp = self.id.init_qp(qp)?;
         let responder_resources = (param.param.responder_resources != RDMA_MAX_RESP_RES)
             .then_some(param.param.responder_resources);
