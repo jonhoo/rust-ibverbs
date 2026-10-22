@@ -926,7 +926,7 @@ fn objects_from_another_context_are_refused() {
 /// An address handle from another context is refused when a datagram is addressed with it.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
-#[should_panic(expected = "the address handle must come from the queue pair's device context")]
+#[should_panic(expected = "the address handle must come from the queue pair's protection domain")]
 fn address_handle_from_another_context_is_refused() {
     let ctx = open_test_device();
     let other = open_test_device();
@@ -950,6 +950,35 @@ fn address_handle_from_another_context_is_refused() {
 
     let mut batch = qp.start_send();
     let _ = batch.to(&foreign_ah, endpoint.qp_num, 0x1234_5678);
+}
+
+/// So is one from another protection domain of the same context, which rxe would fail the send
+/// with (`rxe_get_av`).
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "the address handle must come from the queue pair's protection domain")]
+fn address_handle_from_another_protection_domain_is_refused() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    let (mut qp, endpoint) = activate_self(&pd, &cq, gid_index, 0x1234_5678);
+
+    let mut ah_attr = AddressHandleAttribute::new(1);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
+    let other_pd_ah = ctx
+        .alloc_pd()
+        .expect("failed to allocate PD")
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+
+    let mut batch = qp.start_send();
+    let _ = batch.to(&other_pd_ah, endpoint.qp_num, 0x1234_5678);
 }
 
 #[test]

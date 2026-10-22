@@ -1539,8 +1539,10 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `ah` was created on another device context than the queue pair's: the provider
-    /// would read it as one of its own (mlx5 copies its address vector out of it).
+    /// Panics if `ah` was created on another protection domain than the queue pair's: rxe fails
+    /// the send (an address handle must share its queue pair's protection domain), and one from
+    /// another device context would be read by the provider as one of its own (mlx5 copies its
+    /// address vector out of it).
     #[inline]
     pub fn to<'b>(
         &'b mut self,
@@ -1548,9 +1550,10 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
         remote_qpn: u32,
         remote_qkey: u32,
     ) -> AddressedSendOp<'b, 'qp, T> {
+        // One protection domain implies one device context.
         assert!(
-            unsafe { (*ah.as_raw()).context == (*self.qpx).qp_base.context },
-            "the address handle must come from the queue pair's device context"
+            unsafe { (*ah.as_raw()).pd == (*self.qpx).qp_base.pd },
+            "the address handle must come from the queue pair's protection domain"
         );
         AddressedSendOp {
             op: SendOp {
