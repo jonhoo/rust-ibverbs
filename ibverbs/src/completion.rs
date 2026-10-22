@@ -1216,6 +1216,8 @@ impl CompletionQueue {
     ///
     /// # Errors
     ///
+    ///  - [`Unsupported`](Error::Unsupported): the provider cannot arm for solicited completions
+    ///    only (EFA).
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     #[inline]
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
@@ -1226,6 +1228,13 @@ impl CompletionQueue {
         }
         let errno = unsafe { ffi::ibv_req_notify_cq(self.as_raw(), solicited_only as i32) };
         if errno != 0 {
+            if errno == nix::libc::EOPNOTSUPP {
+                // EFA cannot arm for solicited completions only; it is the arming, not the
+                // polling, that is unsupported.
+                return Err(Error::Unsupported {
+                    operation: &"ibv_req_notify_cq",
+                });
+            }
             return Err(Error::errno(errno, Error::PollCompletionQueue));
         }
         Ok(())
