@@ -1201,6 +1201,11 @@ impl CompletionQueue {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     #[inline]
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
+        // Without a channel there is nothing to notify, and providers disagree on what arming
+        // then does: EFA writes a doorbell the queue may not have, ionic fails with -ENOENT.
+        if self.inner.cc.is_none() {
+            return Ok(());
+        }
         let errno = unsafe { ffi::ibv_req_notify_cq(self.as_raw(), solicited_only as i32) };
         if errno != 0 {
             return Err(Error::errno(errno, Error::PollCompletionQueue));
