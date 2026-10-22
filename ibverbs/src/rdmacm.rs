@@ -659,12 +659,7 @@ impl CmId {
     ///    [`PortSpace::Ib`], 180 for the datagram port spaces), or the route has not resolved
     ///    yet.
     pub fn connect(&self, param: &ConnectionParameter) -> Result<()> {
-        check_private_data(
-            param.param.private_data_len.into(),
-            max_connect_private_data(self.port_space()),
-            "connection request private data in this port space",
-        )
-        .map_err(Error::Connect)?;
+        self.check_connect_private_data(param)?;
         self.device_or(Error::Connect)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
@@ -879,6 +874,16 @@ impl CmId {
     /// The port space this id was created in.
     fn port_space(&self) -> ffi::rdma_port_space {
         unsafe { (*self.inner.id).ps }
+    }
+
+    /// Checks that `param`'s private data fits a connection request in this id's port space.
+    fn check_connect_private_data(&self, param: &ConnectionParameter) -> Result<()> {
+        check_private_data(
+            param.param.private_data_len.into(),
+            max_connect_private_data(self.port_space()),
+            "connection request private data in this port space",
+        )
+        .map_err(Error::Connect)
     }
 
     /// The device context the connection manager bound this id to (its `verbs`). Only available once
@@ -1328,10 +1333,13 @@ impl Resolved {
     ///  - [`ConnectionManager`](Error::ConnectionManager): the peer rejected the request (with
     ///    its reject reason and private data), or was unreachable.
     ///  - [`Connect`](Error::Connect): `rdma_connect` failed, or the private data does not fit a
-    ///    request (see [`ConnectionParameter::set_private_data`]).
+    ///    request (see [`ConnectionParameter::set_private_data`]), which is checked before `qp`
+    ///    is touched.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
     ///    is not on the device of [`context`](Self::context).
     ///  - [`TimedOut`](Error::TimedOut): the response did not arrive in time.
+    ///
+    /// Any error, a refused `param` included, consumes `self` and `qp`: resolve again to retry.
     pub fn connect(
         self,
         qp: PreparedQueuePair<Rc>,
@@ -1339,6 +1347,7 @@ impl Resolved {
         timeout: Option<Duration>,
     ) -> Result<Connection> {
         let deadline = crate::completion::deadline_after(timeout);
+        self.id.check_connect_private_data(&param)?;
         let mut qp = self.id.init_qp(qp)?;
         let param = param.set_qp_num(qp.qp_num());
         self.id.connect(&param)?;
@@ -1533,7 +1542,8 @@ impl Incoming {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_reject` failed, or `private_data`
-    ///    is longer than a rejection can carry.
+    ///    is longer than a rejection can carry. The request is declined all the same when `self`
+    ///    drops, but without the data.
     pub fn reject(self, private_data: &[u8]) -> Result<()> {
         self.id.reject(private_data)
     }
