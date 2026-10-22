@@ -1192,7 +1192,9 @@ fn cm_id_options_and_accessors() {
     let (done_tx, done_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let acceptor = Acceptor::bind_with(SocketAddr::new(ip, 0), PortSpace::Tcp, 1, |id| {
-            id.set_tos(0x08)?;
+            // Not the client's 0x08: the accepted connection's traffic class comes from the
+            // request, which `check_options` asserts.
+            id.set_tos(0x10)?;
             id.set_reuse_addr(true)
         })
         .expect("bind_with");
