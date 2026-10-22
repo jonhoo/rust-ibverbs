@@ -23,8 +23,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Error {
     /// The device, provider, or kernel does not support the requested operation or
-    /// work-completion field (`EOPNOTSUPP`, or `EPROTONOSUPPORT` from a kernel older than the
-    /// request); `operation` names the verb that was declined.
+    /// work-completion field (`EOPNOTSUPP`, `EPROTONOSUPPORT` from a kernel older than the
+    /// request, or `ENOSYS` for a connection-manager option the kernel does not know);
+    /// `operation` names the verb that was declined.
     #[error("{operation} is not supported by the device, provider, or kernel")]
     Unsupported {
         /// The verb (or the capability it asked for) the device, provider, or kernel declined. A

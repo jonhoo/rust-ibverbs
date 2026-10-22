@@ -762,7 +762,17 @@ impl CmId {
                 std::mem::size_of::<T>(),
             )
         };
-        check(ret, Error::ConnectionSetup)
+        if ret != 0 {
+            let err = io::Error::last_os_error();
+            // The kernel answers an option it does not know with `ENOSYS`.
+            if err.raw_os_error() == Some(nix::libc::ENOSYS) {
+                return Err(Error::Unsupported {
+                    operation: &"rdma_set_option",
+                });
+            }
+            return Err(Error::os(err, Error::ConnectionSetup));
+        }
+        Ok(())
     }
 
     /// Set the type of service of this id's traffic: the IP DSCP/ToS byte (RFC 2474) its packets
@@ -776,6 +786,7 @@ impl CmId {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    ///  - [`Unsupported`](Error::Unsupported): the kernel does not know the option (`ENOSYS`).
     pub fn set_tos(&self, tos: u8) -> Result<()> {
         self.set_id_option(ffi::RDMA_OPTION_ID_TOS.0 as c_int, tos)
     }
@@ -786,6 +797,7 @@ impl CmId {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    ///  - [`Unsupported`](Error::Unsupported): the kernel does not know the option (`ENOSYS`).
     pub fn set_reuse_addr(&self, reuse: bool) -> Result<()> {
         self.set_id_option(ffi::RDMA_OPTION_ID_REUSEADDR.0 as c_int, c_int::from(reuse))
     }
@@ -800,6 +812,7 @@ impl CmId {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    ///  - [`Unsupported`](Error::Unsupported): the kernel does not know the option (`ENOSYS`).
     pub fn set_af_only(&self, only: bool) -> Result<()> {
         self.set_id_option(ffi::RDMA_OPTION_ID_AFONLY.0 as c_int, c_int::from(only))
     }
@@ -810,6 +823,7 @@ impl CmId {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
+    ///  - [`Unsupported`](Error::Unsupported): the kernel does not know the option (`ENOSYS`).
     pub fn set_ack_timeout(&self, timeout: AckTimeout) -> Result<()> {
         self.set_id_option(
             ffi::RDMA_OPTION_ID_ACK_TIMEOUT.0 as c_int,
