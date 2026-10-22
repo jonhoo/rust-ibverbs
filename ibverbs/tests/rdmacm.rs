@@ -857,6 +857,35 @@ fn rejected_request_reports_reason_and_private_data() {
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn request_without_listener_is_rejected_as_invalid_service() {
+    // Find a free port, then connect to it with nothing listening: the peer's connection manager
+    // answers the request itself, with reject reason 8 (invalid service ID), right away.
+    let ip = device_ip(&open_test_device());
+    let addr = bind_listener(ip).local_addr().expect("bound address");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, port)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+        Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {
+            assert_eq!(failure.status, 8, "reject reason");
+        }
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got a connection"),
+    }
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn dropped_connect_request_is_rejected() {
     // A listener that drops a connection-request event without taking its id declines the
     // request, so the peer fails fast instead of retrying until its timeout.
