@@ -516,7 +516,13 @@ impl CmId {
     /// `Init` a second time once the [`ConnectResponse`](CmEventType::ConnectResponse) has
     /// arrived: before the connection exists the `Init` attributes carry no remote-access flags,
     /// and only the second application grants the peer the RDMA access negotiated in the request.
+    ///
+    /// The outstanding RDMA read and atomic limits (`max_dest_rd_atomic` at `ReadyToReceive`,
+    /// `max_rd_atomic` at `ReadyToSend`) are capped to this device's, as `rdma_accept` does: on
+    /// the passive side the connection manager reports what the peer requested, which by default
+    /// is the peer device's own maximum and can exceed this device's.
     pub fn init_qp_attr(&self, target_state: QueuePairState) -> Result<QueuePairAttribute> {
+        use ffi::ibv_qp_attr_mask as M;
         // `rdma_init_qp_attr` reads the target state from the attribute and fills in the fields it
         // reports in the mask.
         let mut attr = ffi::ibv_qp_attr {
@@ -526,10 +532,14 @@ impl CmId {
         let mut mask: c_int = 0;
         let ret = unsafe { ffi::rdma_init_qp_attr(self.inner.id, &mut attr, &mut mask) };
         check(ret, Error::ModifyQueuePair)?;
-        Ok(QueuePairAttribute::from_raw(
-            attr,
-            ffi::ibv_qp_attr_mask(mask as u32),
-        ))
+        let mask = M(mask as u32);
+        if mask.0 & (M::IBV_QP_MAX_DEST_RD_ATOMIC.0 | M::IBV_QP_MAX_QP_RD_ATOMIC.0) != 0 {
+            let (max_initiator_depth, max_responder_resources) =
+                crate::context::rd_atomic_limits(self.verbs()?)?;
+            attr.max_dest_rd_atomic = attr.max_dest_rd_atomic.min(max_responder_resources);
+            attr.max_rd_atomic = attr.max_rd_atomic.min(max_initiator_depth);
+        }
+        Ok(QueuePairAttribute::from_raw(attr, mask))
     }
 
     /// Blocks until the next event arrives (up to `deadline`, indefinitely with `None`) and returns
@@ -889,24 +899,23 @@ impl CmId {
     ///
     /// Like librdmacm, `responder_resources` and `initiator_depth` override the outstanding-RDMA
     /// limits the connection manager computed (`max_dest_rd_atomic` at `RTR`, `max_rd_atomic` at
-    /// `RTS`), so the queue pair is configured with the values this side advertises in its reply.
-    /// Without an override, the computed limits are capped to this device's, as `rdma_accept`
-    /// does: on the passive side they are the peer's request, which may exceed what this device
-    /// supports.
+    /// `RTS`; already capped to this device's by [`init_qp_attr`](Self::init_qp_attr)), so the
+    /// queue pair is configured with the values this side advertises in its reply.
     fn ready(
         &self,
         qp: &mut QueuePair<Rc>,
         responder_resources: Option<u8>,
         initiator_depth: Option<u8>,
     ) -> Result<()> {
-        let (max_initiator_depth, max_responder_resources) = self.context()?.rd_atomic_limits()?;
         let mut rtr = self.init_qp_attr(QueuePairState::ReadyToReceive)?;
-        let negotiated = rtr.max_dest_rd_atomic().min(max_responder_resources);
-        rtr.set_max_dest_rd_atomic(responder_resources.unwrap_or(negotiated));
+        if let Some(responder_resources) = responder_resources {
+            rtr.set_max_dest_rd_atomic(responder_resources);
+        }
         qp.modify(&rtr)?;
         let mut rts = self.init_qp_attr(QueuePairState::ReadyToSend)?;
-        let negotiated = rts.max_rd_atomic().min(max_initiator_depth);
-        rts.set_max_rd_atomic(initiator_depth.unwrap_or(negotiated));
+        if let Some(initiator_depth) = initiator_depth {
+            rts.set_max_rd_atomic(initiator_depth);
+        }
         qp.modify(&rts)
     }
 

@@ -353,21 +353,14 @@ impl Context {
     ///  - [`QueryDevice`](Error::QueryDevice): `ibv_query_device` failed (`EINVAL` for invalid
     ///    arguments).
     pub fn query_device(&self) -> Result<DeviceAttr> {
-        let mut device_attr = ffi::ibv_device_attr::default();
-        let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
-        Ok(DeviceAttr(device_attr))
+        query_device(self.inner.ctx).map(DeviceAttr)
     }
 
     /// The most outstanding RDMA reads and atomics a queue pair on this device can issue as the
     /// initiator and service as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`),
     /// clamped to the `u8` the queue-pair attributes carry.
     pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
-        let attr = self.query_device()?;
-        let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
-        Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
+        rd_atomic_limits(self.inner.ctx)
     }
 
     /// Query the extended attributes and capabilities of this context's device
@@ -464,6 +457,24 @@ impl Context {
                 .wrapping_add(values.raw_clock.tv_nsec as u64),
         ))
     }
+}
+
+/// [`Context::query_device`] for any open context.
+fn query_device(ctx: *mut ffi::ibv_context) -> Result<ffi::ibv_device_attr> {
+    let mut device_attr = ffi::ibv_device_attr::default();
+    let errno = unsafe { ffi::ibv_query_device(ctx, &mut device_attr) };
+    if errno != 0 {
+        return Err(Error::errno(errno, Error::QueryDevice));
+    }
+    Ok(device_attr)
+}
+
+/// [`Context::rd_atomic_limits`] for any open context on a device, such as the one librdmacm
+/// keeps for a connection-manager id.
+pub(crate) fn rd_atomic_limits(ctx: *mut ffi::ibv_context) -> Result<(u8, u8)> {
+    let attr = query_device(ctx)?;
+    let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
+    Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
 }
 
 /// An asynchronous event reported by the device, consumed with [`Context::poll_async_event`] /
