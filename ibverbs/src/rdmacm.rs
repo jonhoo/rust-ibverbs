@@ -147,7 +147,10 @@ pub enum CmEventType {
     Established,
     /// The connection was disconnected.
     Disconnected,
-    /// The device backing the id was removed.
+    /// The device backing the id was removed. The id is dead from then on: the kernel destroys its
+    /// side of it and never reports on it again, so drop it and the resources built on its
+    /// device. Until it is dropped, a wait on it only ends at its timeout, and the calls that
+    /// reach the kernel fail with `ENXIO`.
     DeviceRemoval,
     /// A multicast join completed.
     MulticastJoin,
@@ -524,6 +527,12 @@ impl CmId {
     /// `max_rd_atomic` at `ReadyToSend`) are capped to this device's, as `rdma_accept` does: on
     /// the passive side the connection manager reports what the peer requested, which by default
     /// is the peer device's own maximum and can exceed this device's.
+    ///
+    /// The recipe above is for reliable connections. In the datagram port spaces this returns the
+    /// `Init` attributes for every state, which `ReadyToReceive` refuses (they carry the port), so
+    /// apply it only for `Init`, then move the queue pair to `ReadyToReceive` with its state alone
+    /// and to `ReadyToSend` with its state and a send PSN
+    /// ([`set_sq_psn`](QueuePairAttribute::set_sq_psn)), as librdmacm does.
     pub fn init_qp_attr(&self, target_state: QueuePairState) -> Result<QueuePairAttribute> {
         use ffi::ibv_qp_attr_mask as M;
         // `rdma_init_qp_attr` reads the target state from the attribute and fills in the fields it
@@ -735,8 +744,8 @@ impl CmId {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed. On InfiniBand
-    ///    and RoCE that happens only on an id that never took part in a connection: disconnecting
-    ///    one that is already down succeeds.
+    ///    and RoCE that happens only on an id that never took part in a connection, or whose
+    ///    device was removed (`ENXIO`): disconnecting one that is already down succeeds.
     pub fn disconnect(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_disconnect(self.inner.id) };
         check(ret, Error::ConnectionSetup)
@@ -781,8 +790,12 @@ impl CmId {
         self.set_id_option(ffi::RDMA_OPTION_ID_REUSEADDR.0 as c_int, c_int::from(reuse))
     }
 
-    /// Restrict an id bound to an IPv6 address to IPv6 peers, like `IPV6_V6ONLY`, instead of
-    /// also serving IPv4 ones through IPv4-mapped addresses. Set it before binding.
+    /// Restrict an id bound to a wildcard address to requests of its own address family, like
+    /// `IPV6_V6ONLY`. With it off, a wildcard listener takes IPv4 and IPv6 requests alike, and an
+    /// IPv4 peer's id carries a plain IPv4 address rather than an IPv4-mapped one. It is on by
+    /// default for IPv4 binds and follows the `net.ipv6.bindv6only` sysctl for IPv6 binds; an
+    /// IPv6 wildcard listener needs it on to share its port with an IPv4 one. An id bound to a
+    /// specific address takes only requests for that address either way. Set it before binding.
     ///
     /// # Errors
     ///
@@ -991,8 +1004,12 @@ pub struct CmFailure {
     /// The failure event.
     pub event: CmEventType,
     /// The event's status: a negative `errno` for address, route, and connection errors, or the
-    /// transport's reject reason for [`Rejected`](CmEventType::Rejected) (28, "consumer defined",
-    /// when the peer declined the request itself).
+    /// transport's reject reason for [`Rejected`](CmEventType::Rejected). On InfiniBand and RoCE
+    /// the reasons met in practice are 28 ("consumer defined") when the peer declined the request
+    /// itself, 8 ("invalid service ID") when nothing listens on the destination port, 4
+    /// ("timeout") when the peer gave up on its own request (seen while accepting), and 10
+    /// ("stale connection") when the peer still holds an earlier connection with this queue pair,
+    /// for example in timewait.
     pub status: i32,
     /// The private data the peer attached to its rejection, padded by the transport to its wire
     /// format; empty when there is none.
@@ -1016,8 +1033,10 @@ impl CmEvent {
     }
 
     /// The event's status: `0` on success, otherwise a negative errno (for address, route, and
-    /// connection errors) or a transport-specific value (the reject reason for
-    /// [`Rejected`](CmEventType::Rejected)). The blocking helpers carry it in
+    /// connection errors) or a transport-specific value: the reject reason for
+    /// [`Rejected`](CmEventType::Rejected) (see [`CmFailure::status`] for the common ones), and
+    /// for [`Unreachable`](CmEventType::Unreachable) in the datagram port spaces the status of the
+    /// peer's service-ID-resolution reply. The blocking helpers carry it in
     /// [`Error::ConnectionManager`].
     ///
     /// librdmacm reports its own failures to finish an address or route resolution as a raw
@@ -1161,6 +1180,11 @@ impl ConnectionParameter {
 
     /// Sets the number of outstanding RDMA read/atomic operations the local side can issue as an
     /// initiator. Defaults to the device's limit, negotiated down to what the peer services.
+    ///
+    /// When accepting, stay at or below what the request offered, the peer's responder resources
+    /// (`rdma_accept(3)`); the default does. Nothing checks this: a peer that cannot raise its
+    /// responder resources to match fails the connection, or answers the excess reads with an
+    /// invalid-request error.
     pub fn set_initiator_depth(mut self, initiator_depth: u8) -> Self {
         self.param.initiator_depth = initiator_depth;
         self
@@ -1404,8 +1428,12 @@ impl Acceptor {
     ///
     /// # Errors
     ///
-    ///  - [`ConnectionManager`](Error::ConnectionManager): the listener reported a failure (its
-    ///    device was removed).
+    ///  - [`ConnectionManager`](Error::ConnectionManager): the listener reported a failure: its
+    ///    device was removed, which leaves the acceptor dead (see
+    ///    [`DeviceRemoval`](CmEventType::DeviceRemoval)). Only one waiter gets the failure, and
+    ///    every other or later `accept` waits out its timeout, forever with `None`; so drop the
+    ///    acceptor, and with several waiters give each a timeout and stop them all once one sees
+    ///    the failure.
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = crate::completion::deadline_after(timeout);
@@ -1557,7 +1585,8 @@ impl Connection {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_disconnect` failed. On InfiniBand
-    ///    and RoCE it does not, even when the connection is already down.
+    ///    and RoCE it fails only once the device was removed (`ENXIO`), not when the connection
+    ///    is already down.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): moving the queue pair to the error state
     ///    failed.
     pub fn disconnect(&mut self) -> Result<()> {
