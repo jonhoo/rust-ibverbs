@@ -1071,9 +1071,18 @@ fn connect_rejects_oversized_private_data() {
     for len in [57, 196] {
         let param = ConnectionParameter::default().set_private_data(&vec![0x5a; len]);
         match id.connect(&param) {
-            Err(Error::Connect(e)) if e.kind() == io::ErrorKind::InvalidInput => {}
-            other => panic!("expected an InvalidInput error for {len} bytes, got {other:?}"),
+            // Pin the size check itself: the id has no device either, which `connect` also
+            // refuses with InvalidInput, so the kind alone would not notice the check going.
+            Err(Error::Connect(e))
+                if e.raw_os_error().is_none() && e.to_string().contains("limited to 56 bytes") => {}
+            other => panic!("expected the 56-byte request limit for {len} bytes, got {other:?}"),
         }
+    }
+    // A rejection's limit is checked before the kernel is asked.
+    match id.reject(&[0; 149]) {
+        Err(Error::ConnectionSetup(e))
+            if e.raw_os_error().is_none() && e.to_string().contains("limited to 148 bytes") => {}
+        other => panic!("expected the 148-byte rejection limit, got {other:?}"),
     }
 }
 
