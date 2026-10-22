@@ -2520,14 +2520,15 @@ impl<T: Transport> QueuePair<T> {
     /// meaningful only for the requested fields. The second return value describes the queue pair's
     /// configured capacities.
     ///
-    /// Query a given queue pair from one thread at a time: libibverbs updates the state it caches
-    /// in the queue pair without a lock (see [Thread safety](crate#thread-safety)).
+    /// Takes `&mut self`: libibverbs stores the queried state in the queue pair's cached `state`
+    /// without a lock, and rxe, EFA, and hns read that cache on every receive post, so a query must
+    /// not overlap any other use of the queue pair.
     ///
     /// # Errors
     ///
     ///  - [`QueryQueuePair`](Error::QueryQueuePair): `ibv_query_qp` failed.
     pub fn query(
-        &self,
+        &mut self,
         mask: QueuePairAttributeMask,
     ) -> Result<(QueuePairAttribute, QueuePairInitAttribute)> {
         let mask = ffi::ibv_qp_attr_mask::from(mask);

@@ -132,8 +132,6 @@
 //! A few calls keep unlocked bookkeeping in the provider, so the same object must not see two of
 //! them at once even though its type is `Sync`:
 //!
-//! - [`QueuePair::query`] updates the state libibverbs caches in the queue pair: query a given
-//!   queue pair from one thread at a time.
 //! - Arming a completion queue ([`CompletionQueue::req_notify`]) and consuming its notifications
 //!   ([`CompletionChannel::get_event`] or [`wait`](CompletionChannel::wait)) both update its arm
 //!   sequence number without a lock on mlx5: do both for a given queue from one thread at a time,

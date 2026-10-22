@@ -2194,7 +2194,7 @@ fn rd_atomic_defaults_follow_the_device() {
     let dev = ctx.query_device().expect("failed to query device");
     let responder = dev.max_qp_rd_atom.min(255);
     let initiator = dev.max_qp_init_rd_atom.min(255);
-    let lb = loopback();
+    let mut lb = loopback();
     let (attr, _) = lb
         .qp
         .query(
