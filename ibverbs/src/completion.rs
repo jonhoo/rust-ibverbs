@@ -182,6 +182,11 @@ impl CompletionChannel {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): waiting on the descriptor (`poll`)
     ///    or consuming the notification failed.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
+        // A notification that is already pending needs no wait: take it without a `poll(2)` or
+        // reading the clock.
+        if let Some(context) = self.get_event()? {
+            return Ok(Some(context));
+        }
         let deadline = deadline_after(timeout);
         loop {
             if !wait_readable(self.as_fd(), deadline).map_err(Error::PollCompletionQueue)? {
