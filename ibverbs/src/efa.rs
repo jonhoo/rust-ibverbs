@@ -103,6 +103,7 @@ impl QueuePairBuilder<Srd> {
                 qp_ex,
                 // At most what was asked for, as in qp.rs.
                 max_inline_data: self.max_inline_data.min(attr.cap.max_inline_data),
+                max_send_sge: self.max_send_sge,
                 _transport: std::marker::PhantomData,
             },
             gid_index: self.gid_index,
@@ -146,6 +147,11 @@ impl AddressedSendOp<'_, '_, Srd> {
     /// The data must come from registered memory: EFA writes inline data only on a queue pair
     /// created with its inline-write flag (`EFADV_QP_FLAGS_INLINE_WRITE`), which doubles the size
     /// of every send work request and needs rdma-core 63, so this crate does not set it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` has more entries than the queue pair was built for
+    /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         let imm = self.op.imm;
@@ -160,6 +166,11 @@ impl AddressedSendOp<'_, '_, Srd> {
     }
 
     /// Post an RDMA READ from `remote` into `local`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` has more entries than the queue pair was built for
+    /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {

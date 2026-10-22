@@ -1497,6 +1497,38 @@ fn inline_capacity_is_enforced() {
     assert_eq!(&recv.bytes()[..cap], &fits[..]);
 }
 
+/// A scatter/gather list with more entries than the queue pair was built for panics before the
+/// provider writes it, including a single entry on a queue pair built for none (which mlx5's
+/// single-entry setter would write past the work request).
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn send_sge_capacity_is_enforced() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mr = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register MR");
+    let one = [mr.slice(..8)];
+    let two = [mr.slice(..8), mr.slice(8..)];
+    for (max_send_sge, sges) in [(0, &one[..]), (1, &two[..])] {
+        let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+            builder.set_max_send_sge(max_send_sge);
+        });
+        let posted = catch_unwind(AssertUnwindSafe(|| {
+            let mut batch = qp.start_send();
+            batch.op().signaled().send(1, sges);
+        }));
+        assert!(
+            posted.is_err(),
+            "{} entries were posted to a queue pair built for {max_send_sge}",
+            sges.len()
+        );
+    }
+}
+
 /// A queue pair created on an explicitly chosen port (port 1) connects and transfers data. The test
 /// device has a single port, so this exercises the port-threading path rather than a second port.
 #[test]

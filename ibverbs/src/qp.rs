@@ -728,7 +728,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// Value can be `[0..dev_cap.max_sge]`. Some devices support fewer
     /// scatter/gather elements for specific transport types than the
-    /// maximum reported value.
+    /// maximum reported value. Posting a work request with more entries than requested here
+    /// panics, even where the device granted more; with 0, the queue pair sends only inline or
+    /// empty payloads.
     ///
     /// Defaults to 1.
     pub fn set_max_send_sge(&mut self, max_send_sge: u32) -> &mut Self {
@@ -875,6 +877,7 @@ impl<T: Transport> QueuePairBuilder<T> {
                 // At most what was asked for: mlx5 writes back a capacity that went negative when
                 // the work request has no room left for an inline segment (`max_send_sge` 0).
                 max_inline_data: self.max_inline_data.min(attr.cap.max_inline_data),
+                max_send_sge: self.max_send_sge,
                 _transport: std::marker::PhantomData,
             },
             gid_index: self.gid_index,
@@ -1499,6 +1502,7 @@ impl<'a> RecvRequest<'a> {
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
     max_inline_data: u32,
+    max_send_sge: u32,
     _qp: std::marker::PhantomData<&'qp mut QueuePair<T>>,
 }
 
@@ -1662,18 +1666,24 @@ impl<T: Transport> SendOp<'_, '_, T> {
         op: impl FnOnce(*mut ffi::ibv_qp_ex),
     ) {
         let qpx = self.batch.qpx;
-        // Not every provider checks an inline payload against the queue pair's capacity before
-        // copying it into the send queue (rxe before rdma-core 64 checks each buffer of a list
-        // alone, and hns sums the lengths in a u32), so refuse a payload that does not fit.
-        let inline_len = match payload {
-            Payload::Sges(_) => 0,
-            Payload::Inline(data) => data.len(),
-            Payload::InlineList(bufs) => {
-                bufs.iter().fold(0, |n: usize, b| n.saturating_add(b.len()))
-            }
+        // Not every provider checks a payload against the queue pair's capacities before writing
+        // it into the send queue, so refuse one that does not fit. rxe before rdma-core 64 checks
+        // each buffer of an inline list alone, hns sums inline lengths in a u32, and mlx5's
+        // single-entry setter writes its entry even into a work request with no room for one
+        // (`max_send_sge` 0).
+        let (inline_len, sges) = match payload {
+            Payload::Sges(local) => (0, local.len()),
+            Payload::Inline(data) => (data.len(), 0),
+            Payload::InlineList(bufs) => (
+                bufs.iter().fold(0, |n: usize, b| n.saturating_add(b.len())),
+                0,
+            ),
         };
         if inline_len > self.batch.max_inline_data as usize {
             inline_too_long(inline_len, self.batch.max_inline_data);
+        }
+        if sges > self.batch.max_send_sge as usize {
+            too_many_sges(sges, self.batch.max_send_sge);
         }
         unsafe {
             (*qpx).wr_id = wr_id;
@@ -1694,7 +1704,8 @@ impl<T: Transport> SendOp<'_, '_, T> {
             }
             match payload {
                 // A single entry goes through `wr_set_sge`, which providers implement without the
-                // list setter's loop, bounds checks, and copy of the entry through memory.
+                // list setter's loop, bounds checks, and copy of the entry through memory (the
+                // capacity check above stands in for the list setter's).
                 Payload::Sges([one]) => {
                     (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
                 }
@@ -1776,8 +1787,8 @@ impl<T: Connected> SendOp<'_, '_, T> {
     ///
     /// # Panics
     ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
-    /// [`Payload`]).
+    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
+    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
     #[inline]
     pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
         let imm = self.imm;
@@ -1793,8 +1804,8 @@ impl<T: Connected> SendOp<'_, '_, T> {
     ///
     /// # Panics
     ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
-    /// [`Payload`]).
+    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
+    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
     #[inline]
     pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
         let imm = self.imm;
@@ -1804,6 +1815,11 @@ impl<T: Connected> SendOp<'_, '_, T> {
 
 impl<T: Reliable> SendOp<'_, '_, T> {
     /// Post an RDMA READ from `remote` into `local`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` has more entries than the queue pair was built for
+    /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         self.build(wr_id, Payload::Sges(local), move |q| unsafe {
@@ -1812,6 +1828,11 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     }
 
     /// Post an atomic compare-and-swap on the 8-byte value at `remote`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` has more entries than the queue pair was built for
+    /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn atomic_cmp_swap(
         self,
@@ -1827,6 +1848,11 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     }
 
     /// Post an atomic fetch-and-add on the 8-byte value at `remote`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` has more entries than the queue pair was built for
+    /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn atomic_fetch_add(
         self,
@@ -1883,8 +1909,8 @@ impl<T: Datagram> AddressedSendOp<'_, '_, T> {
     ///
     /// # Panics
     ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
-    /// [`Payload`]).
+    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
+    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
     #[inline]
     pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
         let imm = self.op.imm;
@@ -1926,14 +1952,26 @@ fn inline_too_long(len: usize, max_inline_data: u32) -> ! {
     )
 }
 
+/// The panic for a scatter/gather list longer than the queue pair's send capacity, kept out of line
+/// like `inline_too_long`.
+#[cold]
+#[inline(never)]
+fn too_many_sges(len: usize, max_send_sge: u32) -> ! {
+    panic!(
+        "{len} scatter/gather entries exceed the queue pair's capacity of {max_send_sge} per send \
+         work request"
+    )
+}
+
 /// The data a SEND or RDMA WRITE carries: registered memory the device reads after the request is
 /// posted, or bytes copied into the work request as it is posted.
 ///
 /// [`Sges`](Self::Sges) references memory regions through scatter/gather entries, so the buffers
 /// must stay valid until the work completion is reaped (the [`submit`](SendBatch::submit)
-/// contract). The inline variants copy the bytes into the work request during the opcode call,
-/// which lowers latency for small messages and lets the bytes be reused or dropped right away;
-/// they need a queue pair built with enough inline capacity
+/// contract), and the opcode method panics on a list with more entries than the queue pair was
+/// built for ([`QueuePairBuilder::set_max_send_sge`]). The inline variants copy the bytes into the
+/// work request during the opcode call, which lowers latency for small messages and lets the bytes
+/// be reused or dropped right away; they need a queue pair built with enough inline capacity
 /// ([`QueuePairBuilder::set_max_inline_data`]), and the opcode method panics on a longer inline
 /// payload.
 ///
@@ -2412,6 +2450,9 @@ pub struct QueuePair<T: Transport = Rc> {
     // The inline capacity the builder asked for (capped at what the provider granted), which the
     // send path enforces (`SendOp::build`).
     pub(crate) max_inline_data: u32,
+    // The scatter/gather entries per send work request the builder asked for, which every
+    // provider sizes its work requests to hold and the send path enforces (`SendOp::build`).
+    pub(crate) max_send_sge: u32,
     pub(crate) _transport: std::marker::PhantomData<T>,
 }
 
@@ -2655,6 +2696,7 @@ impl<T: Transport> QueuePair<T> {
         SendBatch {
             qpx,
             max_inline_data: self.max_inline_data,
+            max_send_sge: self.max_send_sge,
             _qp: std::marker::PhantomData,
         }
     }
@@ -2841,6 +2883,7 @@ mod test_recv_link {
         let mut batch = SendBatch::<Rc> {
             qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
             max_inline_data: 64,
+            max_send_sge: 1,
             _qp: std::marker::PhantomData,
         };
 
@@ -2858,6 +2901,7 @@ mod test_recv_link {
         let mut batch = SendBatch::<Rc> {
             qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
             max_inline_data: 64,
+            max_send_sge: 1,
             _qp: std::marker::PhantomData,
         };
 
@@ -2874,6 +2918,7 @@ mod test_recv_link {
         let mut batch = SendBatch::<Rc> {
             qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
             max_inline_data: 64,
+            max_send_sge: 1,
             _qp: std::marker::PhantomData,
         };
 
