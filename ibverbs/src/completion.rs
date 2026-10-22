@@ -15,6 +15,15 @@ pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
     Duration::from_millis(remaining.as_nanos().div_ceil(1_000_000) as u64)
 }
 
+/// The error for a provider's poll that failed with a negative code rather than an errno.
+#[cold]
+#[inline(never)]
+fn provider_poll_failure(verb: &str, code: i32) -> Error {
+    Error::PollCompletionQueue(io::Error::other(format!(
+        "{verb} failed in the provider (returned {code})"
+    )))
+}
+
 /// A completion channel: the file descriptor that delivers completion-queue notifications.
 /// Created by [`Context::create_comp_channel`].
 ///
@@ -1137,6 +1146,9 @@ impl CompletionQueue {
                     });
                 }
                 e if e == nix::libc::EBUSY => std::hint::spin_loop(),
+                // mlx5 and hns report a malformed completion entry as a negative code, not an
+                // errno.
+                e if e < 0 => return Err(provider_poll_failure("ibv_start_poll", e)),
                 e => return Err(Error::errno(e, Error::PollCompletionQueue)),
             }
         }
@@ -1188,10 +1200,10 @@ impl CompletionQueue {
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
         let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
         if n < 0 {
-            // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
-            // surface whatever the provider left there as the cause, but do not promote it to
-            // `Unsupported` (`Error::os`), as an `EOPNOTSUPP` there would be a stale one.
-            return Err(Error::PollCompletionQueue(io::Error::last_os_error()));
+            // `ibv_poll_cq` signals failure with a negative return and leaves `errno` alone, so
+            // whatever is there is stale (in an event loop, typically the `EAGAIN` of the `get_event`
+            // just before, which would read as "try again"): report the provider's return instead.
+            return Err(provider_poll_failure("ibv_poll_cq", n));
         }
         Ok(&mut wc[..n as usize])
     }
