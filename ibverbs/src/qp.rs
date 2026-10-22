@@ -1204,7 +1204,7 @@ impl<T: Transport> PreparedQueuePair<T> {
     ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
     ///    (`ibv_query_gid`).
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
-        let qp_num = unsafe { &*self.qp.qp }.qp_num;
+        let qp_num = unsafe { (*self.qp.qp).qp_num };
         let gid = if let Some(gid_index) = self.gid_index {
             Some(self.qp.pd.context().query_gid(self.port_num, gid_index)?)
         } else {
@@ -2462,7 +2462,7 @@ unsafe impl<T: Transport> Sync for QueuePair<T> {}
 impl<T: Transport> QueuePair<T> {
     /// Returns the local QP number of this QueuePair.
     pub fn qp_num(&self) -> u32 {
-        unsafe { *self.qp }.qp_num
+        unsafe { (*self.qp).qp_num }
     }
 
     /// Returns the underlying `ibv_qp` pointer.
@@ -2622,10 +2622,11 @@ impl<T: Transport> QueuePair<T> {
         let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno =
-            unsafe { ops.post_recv.as_mut().unwrap()(self.qp, head, &mut bad_wr as *mut _) };
+        // Read only the op pointer: libibverbs and the provider write other fields of the queue
+        // pair and its context (the cached state, the async-event count, the mutexes) from other
+        // threads, so copying the whole structs here would race with them.
+        let post_recv = unsafe { (*(*self.qp).context).ops.post_recv }.unwrap();
+        let errno = unsafe { post_recv(self.qp, head, &mut bad_wr) };
         if errno != 0 {
             Err(Error::errno(errno, Error::PostReceive))
         } else {

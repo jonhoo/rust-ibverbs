@@ -186,7 +186,7 @@ impl std::os::fd::AsRawFd for CompletionChannel {
     /// when a notification arrives for any queue built on it after
     /// [`req_notify`](CompletionQueue::req_notify).
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        unsafe { *self.inner.cc }.fd
+        unsafe { (*self.inner.cc).fd }
     }
 }
 

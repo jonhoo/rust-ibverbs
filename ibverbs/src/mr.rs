@@ -104,13 +104,13 @@ impl<O> MemoryRegion<O> {
     /// Get the remote key of this memory region: the key peers use to access it directly, usually
     /// communicated as part of [`remote`](Self::remote).
     pub fn rkey(&self) -> u32 {
-        unsafe { &*self.inner.mr }.rkey
+        unsafe { (*self.inner.mr).rkey }
     }
 
     /// Get the local key of this memory region (the one [`slice`](Self::slice) stamps on every
     /// scatter/gather entry).
     pub fn lkey(&self) -> u32 {
-        unsafe { &*self.inner.mr }.lkey
+        unsafe { (*self.inner.mr).lkey }
     }
 
     /// Returns the underlying `ibv_mr` pointer.
@@ -126,8 +126,8 @@ impl<O> MemoryRegion<O> {
     pub fn remote(&self) -> RemoteMemorySlice {
         RemoteMemorySlice {
             addr: self.inner.addr,
-            len: unsafe { *self.inner.mr }.length,
-            rkey: unsafe { *self.inner.mr }.rkey,
+            len: unsafe { (*self.inner.mr).length },
+            rkey: self.rkey(),
         }
     }
 
@@ -151,11 +151,11 @@ impl<O> MemoryRegion<O> {
     /// Panics if `bounds` is empty or falls outside the region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) =
-            calc_addr_len(bounds, self.inner.addr, unsafe { *self.inner.mr }.length);
+            calc_addr_len(bounds, self.inner.addr, unsafe { (*self.inner.mr).length });
         let sge = ffi::ibv_sge {
             addr,
             length: length.try_into().unwrap(),
-            lkey: unsafe { *self.inner.mr }.lkey,
+            lkey: self.lkey(),
         };
         LocalMemorySlice { _sge: sge }
     }
