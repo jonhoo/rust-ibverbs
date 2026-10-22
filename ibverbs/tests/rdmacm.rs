@@ -111,10 +111,11 @@ where
         ready_tx.send(addr).expect("signal ready");
         let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder")
             .build()
             .expect("server qp");
@@ -133,10 +134,11 @@ where
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -275,10 +277,11 @@ fn racing_accepts_time_out_on_time() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -331,10 +334,11 @@ fn two_connections() {
         for _ in 0..2 {
             let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
             let ctx = incoming.context().expect("server device context");
+            let port = incoming.cm_id().port_num().expect("server port");
             let pd = ctx.alloc_pd().expect("server pd");
             let cq = ctx.create_cq(16).build().expect("server cq");
             let qp = pd
-                .create_qp::<Rc>(&cq, &cq, 1)
+                .create_qp::<Rc>(&cq, &cq, port)
                 .expect("server qp builder")
                 .build()
                 .expect("server qp");
@@ -370,10 +374,11 @@ fn two_connections() {
                     .resolve(addr, Duration::from_secs(5))
                     .expect("resolve");
                 let ctx = resolved.context().expect("client device context");
+                let port = resolved.cm_id().port_num().expect("client port");
                 let pd = ctx.alloc_pd().expect("client pd");
                 let cq = ctx.create_cq(16).build().expect("client cq");
                 let qp = pd
-                    .create_qp::<Rc>(&cq, &cq, 1)
+                    .create_qp::<Rc>(&cq, &cq, port)
                     .expect("client qp builder")
                     .build()
                     .expect("client qp");
@@ -482,10 +487,11 @@ fn low_level_connect_and_send() {
             }
         };
         let ctx = request.context().expect("server device context");
+        let port = request.port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let mut qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder")
             .build()
             .expect("server prepared qp")
@@ -546,10 +552,11 @@ fn low_level_connect_and_send() {
     assert_eq!(local.ip(), addr.ip());
 
     let ctx = id.context().expect("client device context");
+    let port = id.port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client prepared qp");
@@ -660,10 +667,11 @@ fn server_writes_into_client() {
         let target = RemoteMemorySlice::from_bytes(&bytes).expect("well-formed remote slice");
 
         let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder")
             .set_max_send_wr(4)
             .build()
@@ -699,10 +707,11 @@ fn server_writes_into_client() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -825,10 +834,11 @@ fn rejected_request_reports_reason_and_private_data() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -878,10 +888,11 @@ fn dropped_connect_request_is_rejected() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -916,6 +927,7 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
             .expect("signal ready");
         let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         drop(incoming);
@@ -927,7 +939,7 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
             .allocate(64, AccessFlags::PERMISSIVE)
             .expect("server mr after the request is gone");
         let _qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder after the request is gone")
             .build()
             .expect("server qp after the request is gone");
@@ -939,10 +951,11 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -1018,10 +1031,11 @@ fn dropping_connection_disconnects_peer() {
             }
         };
         let ctx = request.context().expect("server device context");
+        let port = request.port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let mut qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder")
             .build()
             .expect("server prepared qp")
@@ -1037,10 +1051,11 @@ fn dropping_connection_disconnects_peer() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");
@@ -1162,10 +1177,11 @@ fn cm_id_options_and_accessors() {
             .set_ack_timeout(AckTimeout::from_exponent(14))
             .expect("set_ack_timeout before accepting");
         let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder")
             .build()
             .expect("server qp");
@@ -1198,10 +1214,11 @@ fn cm_id_options_and_accessors() {
     let local = resolved.cm_id().local_addr();
     assert!(local.is_some());
     let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
+        .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")
         .build()
         .expect("client qp");

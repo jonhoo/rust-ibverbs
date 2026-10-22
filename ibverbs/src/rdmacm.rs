@@ -26,10 +26,11 @@
 //! let resolved = Connector::new(PortSpace::Tcp)?
 //!     .resolve("192.0.2.1:18515".parse().unwrap(), Duration::from_secs(2))?;
 //! let ctx = resolved.context()?;
+//! let port = resolved.cm_id().port_num().expect("a resolved id has a port");
 //! let pd = ctx.alloc_pd()?;
 //! let cq = ctx.create_cq(16).build()?;
 //! let qp = pd
-//!     .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
+//!     .create_qp::<ibverbs::Rc>(&cq, &cq, port)?
 //!     .build()?;
 //! let mut conn = resolved.connect(qp, ConnectionParameter::default(), None)?;
 //! // `conn.queue_pair()` is ready to post on; poll completions on `cq`.
@@ -54,8 +55,8 @@
 //! and its file descriptor ([`AsRawFd`] / [`AsFd`]) is non-blocking, so you can wait on it with
 //! `epoll`, `poll`, a `tokio` `AsyncFd`, or any other reactor and pump
 //! events with [`poll_cm_event`]. You build the queue pair on the
-//! [`context`](CmId::context) the id resolves to and transition it with
-//! [`init_qp_attr`](CmId::init_qp_attr) plus
+//! [`context`](CmId::context) and [`port_num`](CmId::port_num) the id resolves to and transition
+//! it with [`init_qp_attr`](CmId::init_qp_attr) plus
 //! [`QueuePair::modify`](crate::QueuePair::modify): on the active side `Init` before [`connect`],
 //! then — once the [`ConnectResponse`](CmEventType::ConnectResponse) has arrived — `Init` again
 //! (the attributes computed before the connection existed carry no remote-access flags),
@@ -405,7 +406,8 @@ impl Drop for CmIdInner {
 /// [`connect`](Self::connect), [`establish`](Self::establish), pumping for the matching
 /// [`CmEvent`] after each with [`get_cm_event`](Self::get_cm_event) (blocking) or
 /// [`poll_cm_event`](Self::poll_cm_event) (non-blocking); the queue pair is built on
-/// [`context`](Self::context) and transitioned with [`init_qp_attr`](Self::init_qp_attr).
+/// [`context`](Self::context) and [`port_num`](Self::port_num), and transitioned with
+/// [`init_qp_attr`](Self::init_qp_attr).
 ///
 /// Cloning is cheap (reference counted); the id (and then its channel) is destroyed once the last
 /// clone drops, which ends whatever it was doing: a listener stops listening, a request not yet
@@ -488,8 +490,9 @@ impl CmId {
     }
 
     /// A context on the device the connection manager has bound this id to. Build the queue pair
-    /// (and its protection domain and completion queue) on this context. Only available once the
-    /// address has resolved (after [`CmEventType::AddressResolved`]).
+    /// (and its protection domain and completion queue) on this context, on the port
+    /// [`port_num`](Self::port_num) reports. Only available once the address has resolved (after
+    /// [`CmEventType::AddressResolved`]).
     ///
     /// The context is this crate's own, independent of the id: one per device, shared by every id
     /// on that device while any of them uses it, so its asynchronous events
@@ -832,6 +835,18 @@ impl CmId {
         unsafe { socket_addr_of(ffi::rdma_get_peer_addr(self.inner.id)) }
     }
 
+    /// The port of [`context`](Self::context)'s device that the connection manager bound this id
+    /// to (ports are numbered from 1), or `None` while it has no device. Build the queue pair on
+    /// this port: [`ProtectionDomain::create_qp`](crate::ProtectionDomain::create_qp) refuses a
+    /// port that is not active, and on a multi-port device the connection manager may have picked
+    /// any of them.
+    pub fn port_num(&self) -> Option<u8> {
+        // librdmacm sets the port together with the device: when the address resolves, the id
+        // binds to a device's address, or a request arrives.
+        let port = unsafe { (*self.inner.id).port_num };
+        (port != 0).then_some(port)
+    }
+
     /// The local IP address and port this id is bound to, or `None` while it has not been bound
     /// or resolved yet (or its address family is neither IPv4 nor IPv6).
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -1047,8 +1062,8 @@ impl CmEvent {
     /// on return.
     ///
     /// The returned id is the passive side of the new connection: build a queue pair on its
-    /// [`context`](CmId::context), move it to `RTS`, and [`accept`](CmId::accept) — or
-    /// [`reject`](CmId::reject) it.
+    /// [`context`](CmId::context) and [`port_num`](CmId::port_num), move it to `RTS`, and
+    /// [`accept`](CmId::accept) — or [`reject`](CmId::reject) it.
     ///
     /// # Errors
     ///
@@ -1266,7 +1281,8 @@ pub struct Resolved {
 
 impl Resolved {
     /// The device the connection manager resolved to. Build the queue pair (and its protection
-    /// domain and completion queue) on this context, then pass it to [`connect`](Self::connect).
+    /// domain and completion queue) on this context, on the port [`CmId::port_num`] reports, then
+    /// pass it to [`connect`](Self::connect).
     pub fn context(&self) -> Result<Context> {
         self.id.context()
     }
@@ -1415,8 +1431,8 @@ pub struct Incoming {
 }
 
 impl Incoming {
-    /// The device the request arrived on. Build the queue pair on this context, then pass it to
-    /// [`accept`](Self::accept).
+    /// The device the request arrived on. Build the queue pair on this context, on the port
+    /// [`CmId::port_num`] reports, then pass it to [`accept`](Self::accept).
     pub fn context(&self) -> Result<Context> {
         self.id.context()
     }
