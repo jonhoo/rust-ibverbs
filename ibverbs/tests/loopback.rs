@@ -1443,9 +1443,9 @@ fn inline_send() {
     assert_eq!(&dst.bytes()[..4], b"wxyz");
 }
 
-/// An inline payload longer than the queue pair's granted inline capacity panics before the
-/// provider copies it, for one buffer and for a list whose buffers each fit but whose total does
-/// not. The panic aborts the open batch, so the queue pair still posts afterwards.
+/// An inline payload longer than the inline capacity the queue pair was built for panics before
+/// the provider copies it, for one buffer and for a list whose buffers each fit but whose total
+/// does not. The panic aborts the open batch, so the queue pair still posts afterwards.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn inline_capacity_is_enforced() {
@@ -1461,11 +1461,13 @@ fn inline_capacity_is_enforced() {
     let (_, init) = qp
         .query(QueuePairAttributeMask::STATE)
         .expect("failed to query the queue pair");
-    let cap = init.max_inline_data as usize;
     assert!(
-        cap >= 16,
-        "granted inline capacity {cap} is below the requested 16"
+        init.max_inline_data >= 16,
+        "granted inline capacity {} is below the requested 16",
+        init.max_inline_data
     );
+    // The send path holds payloads to the requested capacity, whatever the device granted.
+    let cap = 16;
 
     let too_long = vec![0u8; cap + 1];
     let half = vec![0u8; cap / 2 + 1];

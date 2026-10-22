@@ -762,10 +762,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// Inline sends (see [`Payload::Inline`]) copy their payload directly into the work request
     /// rather than referencing a registered memory region, which lowers latency for small messages.
-    /// A send queue must reserve this capacity up front; the actual value granted by the device can
-    /// be larger than requested and is reported by [`QueuePair::query`] (see
-    /// [`QueuePairInitAttribute::max_inline_data`]). Posting more inline bytes than the queue pair
-    /// supports panics.
+    /// A send queue must reserve this capacity up front. The device may grant more than requested
+    /// (reported by [`QueuePair::query`], see [`QueuePairInitAttribute::max_inline_data`]), but
+    /// posting more inline bytes than requested here panics.
     ///
     /// Defaults to 0 (inline sends disabled).
     pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
@@ -873,8 +872,9 @@ impl<T: Transport> QueuePairBuilder<T> {
                 _recv_cq: self.recv.clone(),
                 qp,
                 qp_ex,
-                // Creation writes the granted capacities back into `attr.cap`.
-                max_inline_data: attr.cap.max_inline_data,
+                // At most what was asked for: mlx5 writes back a capacity that went negative when
+                // the work request has no room left for an inline segment (`max_send_sge` 0).
+                max_inline_data: self.max_inline_data.min(attr.cap.max_inline_data),
                 _transport: std::marker::PhantomData,
             },
             gid_index: self.gid_index,
@@ -2409,7 +2409,8 @@ pub struct QueuePair<T: Transport = Rc> {
     // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
     // this aliases `qp` and lives exactly as long.
     pub(crate) qp_ex: *mut ffi::ibv_qp_ex,
-    // The inline capacity the provider granted, which the send path enforces (`SendOp::build`).
+    // The inline capacity the builder asked for (capped at what the provider granted), which the
+    // send path enforces (`SendOp::build`).
     pub(crate) max_inline_data: u32,
     pub(crate) _transport: std::marker::PhantomData<T>,
 }

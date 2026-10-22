@@ -101,8 +101,8 @@ impl QueuePairBuilder<Srd> {
                 _recv_cq: self.recv.clone(),
                 qp,
                 qp_ex,
-                // Creation writes the granted capacities back into `attr.cap`.
-                max_inline_data: attr.cap.max_inline_data,
+                // At most what was asked for, as in qp.rs.
+                max_inline_data: self.max_inline_data.min(attr.cap.max_inline_data),
                 _transport: std::marker::PhantomData,
             },
             gid_index: self.gid_index,
