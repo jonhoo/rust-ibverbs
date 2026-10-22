@@ -175,8 +175,7 @@ impl Context {
     /// [`async_fd`](Self::async_fd) from your own reactor and drain pending events here when it
     /// becomes readable.
     ///
-    /// The returned event is acknowledged when it drops; see [`AsyncEvent`] for why that should
-    /// happen promptly.
+    /// The event is acknowledged as it is read (see [`AsyncEvent`]).
     ///
     /// # Errors
     ///
@@ -193,9 +192,15 @@ impl Context {
             }
             return Err(Error::os(e, Error::AsyncEvent));
         }
+        // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
+        let mut event = unsafe { event.assume_init() };
+        // Acknowledge it right away: what is left is plain data. libibverbs blocks the destruction
+        // of the queue pair, completion queue, or shared receive queue an event names until the
+        // event is acknowledged, so acknowledging only when the caller drops it would let a held
+        // (or leaked) event hang the drop of that object forever.
+        unsafe { ffi::ibv_ack_async_event(&mut event) };
         Ok(Some(AsyncEvent {
-            // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
-            event: unsafe { event.assume_init() },
+            event,
             _ctx: PhantomData,
         }))
     }
@@ -466,15 +471,12 @@ impl Context {
 }
 
 /// An asynchronous event reported by the device, consumed with [`Context::poll_async_event`] /
-/// [`Context::wait_async_event`] and acknowledged automatically when dropped.
-///
-/// Drop events promptly: libibverbs blocks the destruction of the object an event refers to
-/// until the event is acknowledged, so holding an `AsyncEvent` while dropping the completion
-/// queue, queue pair, or shared receive queue it refers to deadlocks.
+/// [`Context::wait_async_event`], which acknowledge it as they read it: holding an `AsyncEvent`
+/// never delays the destruction of the object it names.
 pub struct AsyncEvent<'ctx> {
     event: ffi::ibv_async_event,
-    /// The event must be acknowledged before the device context closes, so it borrows the
-    /// [`Context`] it was read from.
+    /// The [`Context`] the event was read from. The event is already acknowledged, so nothing
+    /// needs the borrow any more; dropping the lifetime would make events `'static`.
     _ctx: PhantomData<&'ctx Context>,
 }
 
@@ -511,17 +513,11 @@ impl AsyncEvent<'_> {
     /// This is the escape hatch for the `element` union: for CQ-, QP-, and SRQ-scoped events it
     /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to. Those pointers
     /// cannot be mapped back to this crate's safe wrappers; compare them against the `as_raw`
-    /// handles of the wrappers you own to identify the object.
+    /// handles of the wrappers you own to identify the object. The event is already
+    /// acknowledged, so the object may have been destroyed since, and its address reused by a new
+    /// one: dereference the pointer only while you hold the wrapper it belongs to.
     pub fn as_raw(&self) -> &ffi::ibv_async_event {
         &self.event
-    }
-}
-
-impl Drop for AsyncEvent<'_> {
-    fn drop(&mut self) {
-        // Every event from `ibv_get_async_event` must be acknowledged exactly once; the object
-        // it refers to cannot be destroyed until then.
-        unsafe { ffi::ibv_ack_async_event(&mut self.event) };
     }
 }
 
