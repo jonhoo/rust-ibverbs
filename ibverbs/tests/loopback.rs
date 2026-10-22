@@ -822,6 +822,80 @@ fn srq_limit_reached_async_event() {
     }
 }
 
+/// A queue-pair-scoped asynchronous event carries the queue pair's `qp_num`: `SqDrained` on
+/// providers that support `RTS -> SQD` (such as Soft-RoCE), or `QpLastWqeReached` when moving an
+/// SRQ-attached queue pair to `ERR` on hardware providers (such as `mlx5`) that reject `SQD`.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn qp_async_event() {
+    let ctx = open_test_device();
+    let soft_roce = ctx
+        .query_device()
+        .expect("failed to query device")
+        .vendor_id
+        == SOFT_ROCE_VENDOR_ID;
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+        builder.set_srq(&srq);
+    });
+
+    let sqd_raw = ibverbs::ffi::ibv_qp_attr {
+        qp_state: ibverbs::ffi::ibv_qp_state::IBV_QPS_SQD,
+        en_sqd_async_notify: 1,
+        ..Default::default()
+    };
+    let sqd_attr = QueuePairAttribute::from_raw(
+        sqd_raw,
+        ibverbs::ffi::ibv_qp_attr_mask::IBV_QP_STATE
+            | ibverbs::ffi::ibv_qp_attr_mask::IBV_QP_EN_SQD_ASYNC_NOTIFY,
+    );
+    let expected_event = match qp.modify(&sqd_attr) {
+        Ok(()) => ibverbs::AsyncEventType::SqDrained,
+        Err(err)
+            if !soft_roce
+                && (matches!(err, Error::Unsupported { .. })
+                    || matches!(
+                        &err,
+                        Error::ModifyQueuePair(e) if e.kind() == std::io::ErrorKind::InvalidInput
+                    )) =>
+        {
+            let mut err_attr = QueuePairAttribute::new();
+            err_attr.set_state(QueuePairState::Error);
+            qp.modify(&err_attr)
+                .expect("failed to transition queue pair to ERR state");
+            ibverbs::AsyncEventType::QpLastWqeReached
+        }
+        Err(e) => panic!("RTS -> SQD failed: {e}"),
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match ctx
+            .wait_async_event(Some(remaining))
+            .expect("failed to wait for an async event")
+        {
+            Some(event) if event.event_type() == expected_event => {
+                assert_eq!(
+                    event.qp_num(),
+                    Some(qp.qp_num()),
+                    "{expected_event:?} event must identify the queue pair"
+                );
+                assert_eq!(
+                    event.port_num(),
+                    None,
+                    "a queue-pair event is not port-scoped"
+                );
+                break;
+            }
+            Some(_other) => continue,
+            None => panic!("no {expected_event:?} event within the deadline"),
+        }
+    }
+}
+
 /// Unreliable datagram (UD): a connectionless queue pair sends a datagram to itself via an address
 /// handle pointing at its own GID. UD prepends a 40-byte GRH to received messages.
 /// Objects from two contexts on one device: the kernel numbers each context's objects
