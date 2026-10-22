@@ -347,32 +347,31 @@ impl Default for ibv_wc {
 // `verbs_get_ctx_op` availability check) so the crate can create extended queue pairs and
 // completion queues.
 
-/// Recover the `verbs_context` that embeds `context` as its last field.
-///
-/// # Safety
-///
-/// `context` must be a valid `ibv_context` returned by libibverbs (every such context is embedded
-/// in a `verbs_context`).
-#[inline]
-unsafe fn verbs_get_ctx(context: *mut ibv_context) -> *mut verbs_context {
-    unsafe {
-        (context as *mut u8).sub(::std::mem::offset_of!(verbs_context, context))
-            as *mut verbs_context
-    }
-}
-
 /// The provider's implementation of the extended op `$op` on `$context`, or `None` when the
 /// provider leaves it out or its `verbs_context` predates it (rdma-core's `verbs_get_ctx_op`).
-/// New ops are added at the front of `verbs_context`, so the size check comes first: an op the
-/// provider's (older) struct does not have lies before its start and must not be read. Expands to
-/// unsafe operations; `$context` must be a valid `ibv_context`.
+///
+/// New ops are added at the front of `verbs_context` ("grows up"), so the runtime library's struct
+/// can be smaller than the vendored one, and the vendored struct's start can then lie before the
+/// provider's allocation. Everything is therefore addressed backwards from `$context`, which every
+/// libibverbs version embeds last with `sz` (the runtime struct's size) immediately before it:
+/// first `sz`, then the op only if the runtime struct is large enough to reach back to it (the C
+/// inline's size check). Expands to unsafe operations; `$context` must be a valid `ibv_context`.
 macro_rules! verbs_get_ctx_op {
     ($context:expr, $op:ident) => {{
-        let vctx = verbs_get_ctx($context);
-        let need =
-            ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, $op);
-        if (*vctx).sz >= need {
-            (*vctx).$op
+        let context = $context as *mut u8;
+        let sz = context
+            .sub(::std::mem::size_of::<usize>())
+            .cast::<usize>()
+            .read();
+        let at = ::std::mem::offset_of!(verbs_context, $op);
+        if sz >= ::std::mem::size_of::<verbs_context>() - at {
+            // The op lies `back` bytes before the context, inside the runtime struct.
+            let back = ::std::mem::offset_of!(verbs_context, context) - at;
+            /// The type of field `$op`, without projecting through a `verbs_context` pointer.
+            fn op_ptr<T>(_: fn(&verbs_context) -> &T, at: *mut u8) -> *mut T {
+                at.cast()
+            }
+            op_ptr(|v| &v.$op, context.sub(back)).read()
         } else {
             None
         }
