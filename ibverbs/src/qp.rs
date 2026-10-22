@@ -1830,43 +1830,62 @@ impl<T: Reliable> SendOp<'_, '_, T> {
         })
     }
 
-    /// Post an atomic compare-and-swap on the 8-byte value at `remote`.
+    /// Post an atomic compare-and-swap on the 8-byte value at `remote`: if it equals `compare`, it
+    /// is replaced by `swap`. The value it held before is written to `local`.
+    ///
+    /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
+    /// request, which moves the queue pairs on both sides to the error state.
     ///
     /// # Panics
     ///
-    /// Panics if `local` has more entries than the queue pair was built for
-    /// ([`QueuePairBuilder::set_max_send_sge`]).
+    /// Panics if `local` is not 8 bytes long, or the queue pair was built without room for a
+    /// scatter/gather entry ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn atomic_cmp_swap(
         self,
         wr_id: u64,
-        local: &[LocalMemorySlice],
+        local: LocalMemorySlice,
         remote: RemoteMemorySlice,
         compare: u64,
         swap: u64,
     ) {
-        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
+        self.atomic(wr_id, local, move |q| unsafe {
             (*q).wr_atomic_cmp_swp.unwrap()(q, remote.rkey, remote.addr, compare, swap)
         })
     }
 
-    /// Post an atomic fetch-and-add on the 8-byte value at `remote`.
+    /// Post an atomic fetch-and-add on the 8-byte value at `remote`: `add` is added to it. The
+    /// value it held before is written to `local`.
+    ///
+    /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
+    /// request, which moves the queue pairs on both sides to the error state.
     ///
     /// # Panics
     ///
-    /// Panics if `local` has more entries than the queue pair was built for
-    /// ([`QueuePairBuilder::set_max_send_sge`]).
+    /// Panics if `local` is not 8 bytes long, or the queue pair was built without room for a
+    /// scatter/gather entry ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn atomic_fetch_add(
         self,
         wr_id: u64,
-        local: &[LocalMemorySlice],
+        local: LocalMemorySlice,
         remote: RemoteMemorySlice,
         add: u64,
     ) {
-        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
+        self.atomic(wr_id, local, move |q| unsafe {
             (*q).wr_atomic_fetch_add.unwrap()(q, remote.rkey, remote.addr, add)
         })
+    }
+
+    /// Post the atomic `op`, whose original value lands in `local`. Not every provider checks
+    /// that buffer: rxe applies the atomic remotely and only then fails it on a shorter one,
+    /// moving the queue pair to the error state, so refuse anything but the 8 bytes written.
+    #[inline(always)]
+    fn atomic(self, wr_id: u64, local: LocalMemorySlice, op: impl FnOnce(*mut ffi::ibv_qp_ex)) {
+        if local.len() != 8 {
+            atomic_local_not_8_bytes(local.len());
+        }
+        self.build(wr_id, Payload::Sges(std::slice::from_ref(&local)), op)
     }
 }
 
@@ -1964,6 +1983,14 @@ fn too_many_sges(len: usize, max_send_sge: u32) -> ! {
         "{len} scatter/gather entries exceed the queue pair's capacity of {max_send_sge} per send \
          work request"
     )
+}
+
+/// The panic for an atomic whose local buffer is not 8 bytes long, kept out of line like
+/// `inline_too_long`.
+#[cold]
+#[inline(never)]
+fn atomic_local_not_8_bytes(len: usize) -> ! {
+    panic!("an atomic writes 8 bytes to its local buffer, which is {len} bytes long")
 }
 
 /// The data a SEND or RDMA WRITE carries: registered memory the device reads after the request is

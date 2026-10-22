@@ -1059,14 +1059,13 @@ fn atomic_operations() {
     // returned into `local`.
     let swapped = 0x0102_0304_0506_0708_u64;
     {
-        let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
             batch
                 .op()
                 .signaled()
-                .atomic_cmp_swap(1, &sg, remote, 0, swapped);
+                .atomic_cmp_swap(1, local.slice(..), remote, 0, swapped);
             batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
@@ -1081,11 +1080,13 @@ fn atomic_operations() {
 
     // A non-matching compare leaves the target untouched and returns the current value.
     {
-        let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
-            batch.op().signaled().atomic_cmp_swap(2, &sg, remote, 0, 0);
+            batch
+                .op()
+                .signaled()
+                .atomic_cmp_swap(2, local.slice(..), remote, 0, 0);
             batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
@@ -1108,11 +1109,13 @@ fn atomic_operations() {
         .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
         .expect("failed to register counter MR");
     {
-        let sg = [local.slice(..)];
         let remote = counter.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
-            batch.op().signaled().atomic_fetch_add(3, &sg, remote, 5);
+            batch
+                .op()
+                .signaled()
+                .atomic_fetch_add(3, local.slice(..), remote, 5);
             batch.submit()
         }
         .expect("post atomic_fetch_add failed");
@@ -1128,6 +1131,28 @@ fn atomic_operations() {
         sum == 5 || sum == 5u64.swap_bytes(),
         "fetch-add should add 5"
     );
+}
+
+/// An atomic whose local buffer is not the 8 bytes it writes the original value to panics before
+/// it is posted (rxe would apply it remotely and then fail it locally).
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "an atomic writes 8 bytes to its local buffer, which is 4 bytes long")]
+fn atomic_local_buffer_must_be_8_bytes() {
+    let mut lb = loopback();
+    let local = lb
+        .pd
+        .allocate(8, AccessFlags::PERMISSIVE)
+        .expect("failed to register local MR");
+    let counter = lb
+        .pd
+        .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
+        .expect("failed to register counter MR");
+    let mut batch = lb.qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .atomic_fetch_add(1, local.slice(..4), counter.remote().slice(..), 5);
 }
 
 /// `ibv_advise_mr` against a registered memory region. Prefetch advice is meant for on-demand-paging
