@@ -23,9 +23,11 @@ struct ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        destroyed("ibv_close_device", unsafe {
-            ffi::ibv_close_device(self.ctx)
-        });
+        destroyed(
+            "ibv_close_device",
+            unsafe { ffi::ibv_close_device(self.ctx) },
+            || (),
+        );
     }
 }
 

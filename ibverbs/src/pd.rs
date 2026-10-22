@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
 use crate::context::{Context, PortAttr, PortState};
-use crate::error::{Error, Result, destroyed, nonnull};
+use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion};
 use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
 use crate::srq::SharedReceiveQueue;
@@ -120,7 +120,11 @@ struct ProtectionDomainInner {
 
 impl Drop for ProtectionDomainInner {
     fn drop(&mut self) {
-        destroyed("ibv_dealloc_pd", unsafe { ffi::ibv_dealloc_pd(self.pd) });
+        destroyed(
+            "ibv_dealloc_pd",
+            unsafe { ffi::ibv_dealloc_pd(self.pd) },
+            || keep(&self.ctx),
+        );
     }
 }
 

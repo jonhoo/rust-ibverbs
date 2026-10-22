@@ -147,7 +147,7 @@
 //! reference counts keep, for example, a completion queue alive until the last queue pair built on
 //! it is gone). If the device rejects a teardown — which can only happen when raw handles obtained
 //! through the escape hatches still reference the resource — the drop panics rather than silently
-//! leak the resource.
+//! leak the resource. The resource then stays allocated, and so do the ones it was created on.
 //!
 //! # For the detail-oriented
 //!

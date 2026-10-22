@@ -1,7 +1,7 @@
 use std::ptr;
 use std::sync::Arc;
 
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 use crate::qp::RecvRequest;
 
@@ -15,7 +15,11 @@ unsafe impl Send for SharedReceiveQueueInner {}
 
 impl Drop for SharedReceiveQueueInner {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_srq", unsafe { ffi::ibv_destroy_srq(self.srq) });
+        destroyed(
+            "ibv_destroy_srq",
+            unsafe { ffi::ibv_destroy_srq(self.srq) },
+            || keep(&self._pd),
+        );
     }
 }
 

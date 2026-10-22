@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::context::{Context, HcaClock};
-use crate::error::{Error, Result, destroyed, nonnull};
+use crate::error::{Error, Result, destroyed, keep, nonnull};
 
 /// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
 /// granularity) lasts at least the requested duration instead of returning fractionally early.
@@ -53,9 +53,11 @@ unsafe impl Sync for CompletionChannelInner {}
 
 impl Drop for CompletionChannelInner {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_comp_channel", unsafe {
-            ffi::ibv_destroy_comp_channel(self.cc)
-        });
+        destroyed(
+            "ibv_destroy_comp_channel",
+            unsafe { ffi::ibv_destroy_comp_channel(self.cc) },
+            || keep(&self._ctx),
+        );
     }
 }
 
@@ -334,9 +336,14 @@ struct CompletionQueueInner {
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
         // An `ibv_cq_ex` starts with the `ibv_cq` it extends (`ibv_cq_ex_to_cq` in C).
-        destroyed("ibv_destroy_cq", unsafe {
-            ffi::ibv_destroy_cq(self.cq_ex as *mut ffi::ibv_cq)
-        });
+        destroyed(
+            "ibv_destroy_cq",
+            unsafe { ffi::ibv_destroy_cq(self.cq_ex as *mut ffi::ibv_cq) },
+            || {
+                keep(&self._ctx);
+                keep(&self.cc);
+            },
+        );
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
         // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel

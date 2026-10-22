@@ -373,11 +373,22 @@ pub(crate) fn check(ret: i32, wrap: impl FnOnce(io::Error) -> Error) -> Result<(
 
 /// Panics with the error a destroy verb (`ibv_destroy_qp`, `ibv_dereg_mr`, ...) returned, if any:
 /// the `Drop` impls cannot report it, and must not carry on as if the object were gone.
+///
+/// The object still exists then, and so must the objects it was created on: `keep_parents` leaks
+/// the references it holds to them before the panic unwinds through its fields. Released, the last
+/// of them would destroy its object under this one, fail the same way, and panic again during the
+/// unwind, which aborts the process.
 #[track_caller]
-pub(crate) fn destroyed(verb: &str, errno: i32) {
+pub(crate) fn destroyed(verb: &str, errno: i32, keep_parents: impl FnOnce()) {
     if errno != 0 {
+        keep_parents();
         panic!("{verb} failed: {}", io::Error::from_raw_os_error(errno));
     }
+}
+
+/// Leaks one reference to `parent`, for [`destroyed`]'s `keep_parents`.
+pub(crate) fn keep<T: Clone>(parent: &T) {
+    std::mem::forget(parent.clone());
 }
 
 #[cfg(test)]
@@ -429,6 +440,38 @@ mod tests {
             Some(nix::libc::ENOMEM)
         );
         assert!(Error::GidMismatch.os_error().is_none());
+    }
+
+    /// A failed destroy panics without releasing its parents: had the child held the last
+    /// reference, the parent's destroy would run during the unwind, fail too (the child still
+    /// exists), and its second panic would abort the process instead of unwinding to here.
+    #[test]
+    #[cfg_attr(miri, ignore = "leaks the parent on purpose, as a failed destroy does")]
+    fn a_failed_destroy_keeps_its_parents() {
+        use std::panic::catch_unwind;
+        use std::sync::Arc;
+
+        struct Parent;
+        impl Drop for Parent {
+            fn drop(&mut self) {
+                destroyed("ibv_dealloc_pd", nix::libc::EBUSY, || ());
+            }
+        }
+        struct Child {
+            parent: Arc<Parent>,
+        }
+        impl Drop for Child {
+            fn drop(&mut self) {
+                destroyed("ibv_dereg_mr", nix::libc::EBUSY, || keep(&self.parent));
+            }
+        }
+
+        let child = Child {
+            parent: Arc::new(Parent),
+        };
+        let parent = Arc::downgrade(&child.parent);
+        assert!(catch_unwind(move || drop(child)).is_err());
+        assert!(parent.upgrade().is_some(), "the parent was released");
     }
 
     #[test]

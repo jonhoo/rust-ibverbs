@@ -5,7 +5,7 @@ use std::io;
 
 use crate::completion::WorkCompletion;
 use crate::context::Context;
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
@@ -643,7 +643,11 @@ impl AddressHandle {
 
 impl Drop for AddressHandle {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_ah", unsafe { ffi::ibv_destroy_ah(self.ah) });
+        destroyed(
+            "ibv_destroy_ah",
+            unsafe { ffi::ibv_destroy_ah(self.ah) },
+            || keep(&self._pd),
+        );
     }
 }
 

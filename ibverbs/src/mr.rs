@@ -2,7 +2,7 @@ use std::convert::TryInto;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut, RangeBounds};
 
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
@@ -63,7 +63,11 @@ unsafe impl Send for MemoryRegionInner {}
 
 impl Drop for MemoryRegionInner {
     fn drop(&mut self) {
-        destroyed("ibv_dereg_mr", unsafe { ffi::ibv_dereg_mr(self.mr) });
+        destroyed(
+            "ibv_dereg_mr",
+            unsafe { ffi::ibv_dereg_mr(self.mr) },
+            || keep(&self._pd),
+        );
     }
 }
 
