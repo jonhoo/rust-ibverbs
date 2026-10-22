@@ -1104,23 +1104,32 @@ impl CompletionQueue {
         let cq = self.cq_ex;
         let mut attr = ffi::ibv_poll_cq_attr::default();
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
-        // paired with `end_poll`) when the queue is empty.
-        match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
-            0 => Ok(Completions {
-                cq,
-                open: true,
-                first: true,
-                done: false,
-                _cq: std::marker::PhantomData,
-            }),
-            e if e == nix::libc::ENOENT => Ok(Completions {
-                cq,
-                open: false,
-                first: false,
-                done: true,
-                _cq: std::marker::PhantomData,
-            }),
-            e => Err(Error::errno(e, Error::PollCompletionQueue)),
+        // paired with `end_poll`) when the queue is empty. On a queue with wallclock timestamps it
+        // can also fail transiently with EBUSY while the kernel updates the clock information (mlx5,
+        // ionic); the queue is left unchanged and ibv_create_cq_ex(3) says to retry.
+        loop {
+            match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
+                0 => {
+                    return Ok(Completions {
+                        cq,
+                        open: true,
+                        first: true,
+                        done: false,
+                        _cq: std::marker::PhantomData,
+                    });
+                }
+                e if e == nix::libc::ENOENT => {
+                    return Ok(Completions {
+                        cq,
+                        open: false,
+                        first: false,
+                        done: true,
+                        _cq: std::marker::PhantomData,
+                    });
+                }
+                e if e == nix::libc::EBUSY => std::hint::spin_loop(),
+                e => return Err(Error::errno(e, Error::PollCompletionQueue)),
+            }
         }
     }
 
