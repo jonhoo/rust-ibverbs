@@ -124,10 +124,13 @@
 //! The underlying ibverbs API [is thread safe][safe], and the wrapper types here are `Send` and
 //! `Sync` where that holds. Handles like [`Context`], [`ProtectionDomain`], and
 //! [`CompletionQueue`] can be shared freely across threads. Operations whose verbs contracts are
-//! per-caller are encoded in the types instead: posting work requests takes `&mut QueuePair`
-//! (wrap the queue pair in a lock to post from several threads), a [`SendBatch`] borrows its
-//! queue pair until submitted, and the views handed out during a poll ([`Completions`],
-//! [`WorkCompletion`]) borrow the queue and cannot outlive or escape it.
+//! per-caller are encoded in the types instead: a send batch ([`QueuePair::start_send`]) takes
+//! `&mut QueuePair` and borrows it until submitted, so at most one is open per send queue (wrap the
+//! queue pair in a lock to send from several threads), while receives
+//! ([`QueuePair::post_recv`]) take `&self` and may be posted from several threads at once;
+//! [`QueuePair::split`] separates the two so one thread can keep a batch open while others post
+//! receives. The views handed out during a poll ([`Completions`], [`WorkCompletion`]) borrow the
+//! queue and cannot outlive or escape it.
 //!
 //! A few calls keep unlocked bookkeeping in the provider, so the same object must not see two of
 //! them at once even though its type is `Sync`:
