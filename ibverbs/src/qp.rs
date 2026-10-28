@@ -2365,9 +2365,10 @@ fn qp_transition_masks(
     // The kernel accepts IBV_QP_STATE and IBV_QP_RATE_LIMIT on every transition.
     let accepted = state | rate;
 
-    // Any state may move to RESET, and any state but RESET to ERR, with only IBV_QP_STATE.
+    // Any state may move to RESET, and any state but RESET to ERR, with only IBV_QP_STATE (and
+    // staying in RESET or ERR needs not even that).
     if next == S::IBV_QPS_RESET || (next == S::IBV_QPS_ERR && cur != S::IBV_QPS_RESET) {
-        return Some((state, accepted));
+        return Some((if next == cur { 0 } else { state }, accepted));
     }
 
     let masks = match qp_type {
@@ -2403,6 +2404,8 @@ fn qp_transition_masks(
                     | max_dest_rd
                     | mig,
             )),
+            // The kernel's table allows this cell for every type, though RC never enters SQE.
+            (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => Some((state, 0)),
             _ => None,
         },
         T::IBV_QPT_UC => match (cur, next) {
@@ -2534,12 +2537,7 @@ impl<T: Transport> QueuePair<T> {
             return Ok(());
         }
         if errno == nix::libc::EINVAL {
-            let next = if attr.mask.0 & ffi::ibv_qp_attr_mask::IBV_QP_STATE.0 != 0 {
-                attr.attr.qp_state
-            } else {
-                unsafe { (*self.qp).state }
-            };
-            return Err(self.diagnose_modify(attr.mask, next));
+            return Err(self.diagnose_modify(attr));
         }
         Err(Error::errno(errno, Error::ModifyQueuePair))
     }
@@ -2584,9 +2582,22 @@ impl<T: Transport> QueuePair<T> {
 
     /// Turn a rejected [`modify`](Self::modify) into a precise [`Error`], consulting the queue-pair
     /// state table for the actual queue-pair type and current state.
-    fn diagnose_modify(&self, mask: ffi::ibv_qp_attr_mask, next: ffi::ibv_qp_state) -> Error {
+    fn diagnose_modify(&self, attr: &QueuePairAttribute) -> Error {
         let raw = || Error::ModifyQueuePair(io::Error::from_raw_os_error(nix::libc::EINVAL));
-        let cur = unsafe { (*self.qp).state };
+        let mask = attr.mask;
+        let has = |bit: ffi::ibv_qp_attr_mask| mask.0 & bit.0 != 0;
+        // The kernel judges the transition from the state the caller asserts, if it asserts one
+        // (mlx5, rxe, EFA, ionic), and the mask without a next state as staying put.
+        let cur = if has(ffi::ibv_qp_attr_mask::IBV_QP_CUR_STATE) {
+            attr.attr.cur_qp_state
+        } else {
+            unsafe { (*self.qp).state }
+        };
+        let next = if has(ffi::ibv_qp_attr_mask::IBV_QP_STATE) {
+            attr.attr.qp_state
+        } else {
+            cur
+        };
         let qp_type = unsafe { (*self.qp).qp_type };
         // Only the types with a transition table can be diagnosed; others (driver/SRD, and XRC,
         // which this crate does not create) fall back to the raw error.
@@ -3242,5 +3253,212 @@ mod test_qp_transitions {
             let (_, optional) = qp_transition_masks(qp_type, cur, cur).unwrap();
             assert_eq!(optional & port, 0, "{qp_type:?} in {cur:?}");
         }
+    }
+}
+
+/// The kernel's `qp_state_table` and `ib_modify_qp_is_ok` (drivers/infiniband/core/verbs.c),
+/// transcribed cell by cell, against `qp_transition_masks` for every type the crate diagnoses.
+#[cfg(test)]
+mod test_kernel_table {
+    use super::*;
+    use ffi::ibv_qp_attr_mask as M;
+    use ffi::ibv_qp_state as S;
+    use ffi::ibv_qp_type as T;
+
+    const STATE: u32 = M::IBV_QP_STATE.0;
+    const CUR: u32 = M::IBV_QP_CUR_STATE.0;
+    const NOTIFY: u32 = M::IBV_QP_EN_SQD_ASYNC_NOTIFY.0;
+    const ACCESS: u32 = M::IBV_QP_ACCESS_FLAGS.0;
+    const PKEY: u32 = M::IBV_QP_PKEY_INDEX.0;
+    const PORT: u32 = M::IBV_QP_PORT.0;
+    const QKEY: u32 = M::IBV_QP_QKEY.0;
+    const AV: u32 = M::IBV_QP_AV.0;
+    const MTU: u32 = M::IBV_QP_PATH_MTU.0;
+    const TIMEOUT: u32 = M::IBV_QP_TIMEOUT.0;
+    const RETRY: u32 = M::IBV_QP_RETRY_CNT.0;
+    const RNR_RETRY: u32 = M::IBV_QP_RNR_RETRY.0;
+    const RQ_PSN: u32 = M::IBV_QP_RQ_PSN.0;
+    const MAX_RD: u32 = M::IBV_QP_MAX_QP_RD_ATOMIC.0;
+    const ALT: u32 = M::IBV_QP_ALT_PATH.0;
+    const MIN_RNR: u32 = M::IBV_QP_MIN_RNR_TIMER.0;
+    const SQ_PSN: u32 = M::IBV_QP_SQ_PSN.0;
+    const MAX_DEST: u32 = M::IBV_QP_MAX_DEST_RD_ATOMIC.0;
+    const MIG: u32 = M::IBV_QP_PATH_MIG_STATE.0;
+    const DEST_QPN: u32 = M::IBV_QP_DEST_QPN.0;
+    const RATE: u32 = M::IBV_QP_RATE_LIMIT.0;
+
+    const STATES: [S; 7] = [
+        S::IBV_QPS_RESET,
+        S::IBV_QPS_INIT,
+        S::IBV_QPS_RTR,
+        S::IBV_QPS_RTS,
+        S::IBV_QPS_SQD,
+        S::IBV_QPS_SQE,
+        S::IBV_QPS_ERR,
+    ];
+
+    /// (valid, req, opt) of the kernel cell for `ty` (UD, UC, RC, RAW_PACKET only).
+    fn kernel_cell(cur: S, next: S, ty: T) -> (bool, u32, u32) {
+        let pick = |ud: u32, uc: u32, rc: u32, raw: u32| match ty {
+            T::IBV_QPT_UD => ud,
+            T::IBV_QPT_UC => uc,
+            T::IBV_QPT_RC => rc,
+            T::IBV_QPT_RAW_PACKET => raw,
+            _ => unreachable!(),
+        };
+        let none = (true, 0, 0);
+        match (cur, next) {
+            (S::IBV_QPS_RESET, S::IBV_QPS_RESET) => none,
+            (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => (
+                true,
+                pick(
+                    PKEY | PORT | QKEY,
+                    PKEY | PORT | ACCESS,
+                    PKEY | PORT | ACCESS,
+                    PORT,
+                ),
+                0,
+            ),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RESET) | (S::IBV_QPS_INIT, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => (
+                true,
+                0,
+                pick(
+                    PKEY | PORT | QKEY,
+                    PKEY | PORT | ACCESS,
+                    PKEY | PORT | ACCESS,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => (
+                true,
+                pick(
+                    0,
+                    AV | MTU | DEST_QPN | RQ_PSN,
+                    AV | MTU | DEST_QPN | RQ_PSN | MAX_DEST | MIN_RNR,
+                    0,
+                ),
+                pick(PKEY | QKEY, ALT | ACCESS | PKEY, ALT | ACCESS | PKEY, 0),
+            ),
+            (S::IBV_QPS_RTR, S::IBV_QPS_RESET) | (S::IBV_QPS_RTR, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_RTR, S::IBV_QPS_RTS) => (
+                true,
+                pick(
+                    SQ_PSN,
+                    SQ_PSN,
+                    TIMEOUT | RETRY | RNR_RETRY | SQ_PSN | MAX_RD,
+                    0,
+                ),
+                pick(
+                    CUR | QKEY,
+                    CUR | ALT | ACCESS | MIG,
+                    CUR | ALT | ACCESS | MIN_RNR | MIG,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_RTS, S::IBV_QPS_RESET) | (S::IBV_QPS_RTS, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => (
+                true,
+                0,
+                pick(
+                    CUR | QKEY,
+                    CUR | ACCESS | ALT | MIG,
+                    CUR | ACCESS | ALT | MIG | MIN_RNR,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => (true, 0, pick(NOTIFY, NOTIFY, NOTIFY, 0)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_RESET) | (S::IBV_QPS_SQD, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => (
+                true,
+                0,
+                pick(
+                    CUR | QKEY,
+                    CUR | ALT | ACCESS | MIG,
+                    CUR | ALT | ACCESS | MIN_RNR | MIG,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => (
+                true,
+                0,
+                pick(
+                    PKEY | QKEY,
+                    AV | ALT | ACCESS | PKEY | MIG,
+                    PORT | AV
+                        | TIMEOUT
+                        | RETRY
+                        | RNR_RETRY
+                        | MAX_RD
+                        | MAX_DEST
+                        | ALT
+                        | ACCESS
+                        | PKEY
+                        | MIN_RNR
+                        | MIG,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_SQE, S::IBV_QPS_RESET) | (S::IBV_QPS_SQE, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => (true, 0, pick(CUR | QKEY, CUR | ACCESS, 0, 0)),
+            (S::IBV_QPS_ERR, S::IBV_QPS_RESET) | (S::IBV_QPS_ERR, S::IBV_QPS_ERR) => none,
+            _ => (false, 0, 0),
+        }
+    }
+
+    /// The set of masks the kernel accepts for `cur -> next`, as (bits that must be set, bits that
+    /// may be set), folding in ib_modify_qp_is_ok's CUR_STATE rule and the fact that a mask
+    /// without STATE means "stay in `cur`" (so a real transition always carries STATE).
+    fn kernel(ty: T, cur: S, next: S) -> Option<(u32, u32)> {
+        let (valid, req, opt) = kernel_cell(cur, next, ty);
+        if !valid {
+            return None;
+        }
+        let mut must = req;
+        if next != cur {
+            must |= STATE;
+        }
+        let mut may = req | opt | STATE | RATE;
+        if !matches!(
+            cur,
+            S::IBV_QPS_RTR | S::IBV_QPS_RTS | S::IBV_QPS_SQD | S::IBV_QPS_SQE
+        ) {
+            may &= !CUR;
+        }
+        Some((must, may))
+    }
+
+    #[test]
+    fn every_cell_against_the_kernel() {
+        let mut diffs = Vec::new();
+        for ty in [
+            T::IBV_QPT_RC,
+            T::IBV_QPT_UC,
+            T::IBV_QPT_UD,
+            T::IBV_QPT_RAW_PACKET,
+        ] {
+            for cur in STATES {
+                for next in STATES {
+                    let k = kernel(ty, cur, next);
+                    let c = qp_transition_masks(ty, cur, next).map(|(r, o)| (r, r | o));
+                    if k != c {
+                        let show = |m: Option<(u32, u32)>| match m {
+                            None => "invalid".to_string(),
+                            Some((must, may)) => format!(
+                                "must {:?} may-also {:?}",
+                                QueuePairAttributeMask(must),
+                                QueuePairAttributeMask(may & !must)
+                            ),
+                        };
+                        diffs.push(format!(
+                            "{ty:?} {cur:?}->{next:?}: kernel {} / crate {}",
+                            show(k),
+                            show(c)
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
     }
 }
