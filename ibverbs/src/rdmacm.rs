@@ -99,7 +99,8 @@ pub enum PortSpace {
     Tcp,
     /// UDP port space: unreliable datagrams (UD).
     Udp,
-    /// The InfiniBand port space, for any port number.
+    /// The InfiniBand port space, open to every queue-pair type (`rdma_create_id(3)`); the
+    /// blocking helpers use it for reliable connections, like [`Tcp`](Self::Tcp).
     Ib,
 }
 
@@ -277,12 +278,13 @@ const RDMA_MAX_INIT_DEPTH: u8 = 0xFF;
 
 /// The most private-data bytes a connection request (`rdma_connect`) can carry in a port space:
 /// the InfiniBand CM REQ (92 bytes) or, for the datagram port spaces, SIDR REQ (216 bytes) payload,
-/// minus the 36-byte header the connection manager prepends in the IP-based port spaces.
+/// minus the 36-byte header that carries the IP addresses. The kernel's connection manager
+/// prepends that header to every request of an id addressed by IP, the only addressing this
+/// module offers, in the InfiniBand port space too (`cma_user_data_offset`); only native
+/// InfiniBand addresses (`AF_IB`) do without it.
 fn max_connect_private_data(ps: ffi::rdma_port_space) -> usize {
     use ffi::rdma_port_space as E;
     match ps {
-        E::RDMA_PS_TCP => 56,
-        E::RDMA_PS_IB => 92,
         E::RDMA_PS_UDP | E::RDMA_PS_IPOIB => 180,
         _ => 56,
     }
@@ -656,7 +658,7 @@ impl CmId {
     /// # Errors
     ///
     ///  - [`Connect`](Error::Connect): `rdma_connect` failed, the private data exceeds what a
-    ///    request can carry in this id's port space (56 bytes for [`PortSpace::Tcp`], 92 for
+    ///    request can carry in this id's port space (56 bytes for [`PortSpace::Tcp`] and
     ///    [`PortSpace::Ib`], 180 for the datagram port spaces), or the route has not resolved
     ///    yet.
     pub fn connect(&self, param: &ConnectionParameter) -> Result<()> {
@@ -1285,8 +1287,8 @@ impl ConnectionParameter {
     /// that save a round trip.
     ///
     /// How much fits depends on the call and port space: a request ([`Resolved::connect`] /
-    /// [`CmId::connect`]) carries at most 56 bytes in [`PortSpace::Tcp`] (92 in
-    /// [`PortSpace::Ib`], 180 in the datagram port spaces), a reply ([`Incoming::accept`] /
+    /// [`CmId::connect`]) carries at most 56 bytes in [`PortSpace::Tcp`] and [`PortSpace::Ib`]
+    /// (180 in the datagram port spaces), a reply ([`Incoming::accept`] /
     /// [`CmId::accept`]) up to 196 (136 in the datagram port spaces); those calls fail with an
     /// error when the data does not fit. The bytes are copied into the parameter.
     ///

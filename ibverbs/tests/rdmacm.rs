@@ -1023,19 +1023,28 @@ fn dropping_connection_disconnects_peer() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn connect_rejects_oversized_private_data() {
-    let id = CmId::create(PortSpace::Tcp).expect("id");
-    // 57 bytes is one more than a TCP-port-space request can carry; the parameter itself holds
-    // up to a reply's worth (196 bytes), which the request check rejects too.
-    for len in [57, 196] {
+    // 57 bytes is one more than a request addressed by IP can carry, in the InfiniBand port space
+    // as in the TCP one (the IP header takes 36 of the 92 bytes a request has); the parameter
+    // itself holds up to a reply's worth (196 bytes), which the request check rejects too.
+    for (port_space, len) in [
+        (PortSpace::Tcp, 57),
+        (PortSpace::Tcp, 196),
+        (PortSpace::Ib, 57),
+        (PortSpace::Ib, 92),
+    ] {
+        let id = CmId::create(port_space).expect("id");
         let param = ConnectionParameter::default().set_private_data(&vec![0x5a; len]);
         match id.connect(&param) {
             // Pin the size check itself: the id has no device either, which `connect` also
             // refuses with InvalidInput, so the kind alone would not notice the check going.
             Err(Error::Connect(e))
                 if e.raw_os_error().is_none() && e.to_string().contains("limited to 56 bytes") => {}
-            other => panic!("expected the 56-byte request limit for {len} bytes, got {other:?}"),
+            other => panic!(
+                "expected the 56-byte request limit for {len} bytes in {port_space}, got {other:?}"
+            ),
         }
     }
+    let id = CmId::create(PortSpace::Tcp).expect("id");
     // A rejection's limit is checked before the kernel is asked.
     match id.reject(&[0; 149]) {
         Err(Error::ConnectionSetup(e))
