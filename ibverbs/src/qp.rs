@@ -475,7 +475,7 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 #[must_use = "a queue-pair builder creates nothing until `build` is called"]
 pub struct QueuePairBuilder<T: Transport> {
-    ctx: isize,
+    ctx: u64,
     pub(crate) pd: ProtectionDomain,
     /// port local identifier
     lid: u16,
@@ -619,10 +619,12 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the opaque context value for the new `QueuePair`.
+    /// Set the opaque context value for the new `QueuePair` (its `qp_context`), an integer like
+    /// the one [`CompletionQueueBuilder::set_context`](crate::CompletionQueueBuilder::set_context)
+    /// takes.
     ///
     /// Defaults to 0.
-    pub fn set_context(&mut self, ctx: isize) -> &mut Self {
+    pub fn set_context(&mut self, ctx: u64) -> &mut Self {
         self.ctx = ctx;
         self
     }
@@ -769,6 +771,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// protection domain. The shared receive queue is left to the caller.
     pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
         ffi::ibv_qp_init_attr_ex {
+            // The cookie is a plain integer to the caller; the C ABI carries it as a pointer.
             qp_context: self.ctx as usize as *mut c_void,
             send_cq: self.send.as_raw(),
             recv_cq: self.recv.as_raw(),
