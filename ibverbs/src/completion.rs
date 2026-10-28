@@ -1022,8 +1022,10 @@ pub struct TagMatchingInfo {
     pub private: u32,
 }
 
-/// One poll of a [`CompletionQueue`]: the work completions that were ready when it started,
-/// yielded one at a time.
+/// One poll of a [`CompletionQueue`]: its work completions, yielded one at a time. Each
+/// [`next`](Completions::next) reads the live queue, so completions that arrive during the loop are
+/// yielded too, and a loop over a busy queue may not end on its own (bound it if other threads
+/// poll or post to this queue's queue pairs, see below).
 ///
 /// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
