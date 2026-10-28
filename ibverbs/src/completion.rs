@@ -549,39 +549,6 @@ impl From<ffi::ibv_wc_status> for WcStatus {
     }
 }
 
-impl From<WcStatus> for ffi::ibv_wc_status {
-    fn from(status: WcStatus) -> Self {
-        use ffi::ibv_wc_status as E;
-        match status {
-            WcStatus::Success => E::IBV_WC_SUCCESS,
-            WcStatus::LocalLengthError => E::IBV_WC_LOC_LEN_ERR,
-            WcStatus::LocalQpOperationError => E::IBV_WC_LOC_QP_OP_ERR,
-            WcStatus::LocalEecOperationError => E::IBV_WC_LOC_EEC_OP_ERR,
-            WcStatus::LocalProtectionError => E::IBV_WC_LOC_PROT_ERR,
-            WcStatus::WorkRequestFlushed => E::IBV_WC_WR_FLUSH_ERR,
-            WcStatus::MemoryWindowBindError => E::IBV_WC_MW_BIND_ERR,
-            WcStatus::BadResponse => E::IBV_WC_BAD_RESP_ERR,
-            WcStatus::LocalAccessError => E::IBV_WC_LOC_ACCESS_ERR,
-            WcStatus::RemoteInvalidRequest => E::IBV_WC_REM_INV_REQ_ERR,
-            WcStatus::RemoteAccessError => E::IBV_WC_REM_ACCESS_ERR,
-            WcStatus::RemoteOperationError => E::IBV_WC_REM_OP_ERR,
-            WcStatus::RetryExceeded => E::IBV_WC_RETRY_EXC_ERR,
-            WcStatus::RnrRetryExceeded => E::IBV_WC_RNR_RETRY_EXC_ERR,
-            WcStatus::LocalRddViolation => E::IBV_WC_LOC_RDD_VIOL_ERR,
-            WcStatus::RemoteInvalidRdRequest => E::IBV_WC_REM_INV_RD_REQ_ERR,
-            WcStatus::RemoteAborted => E::IBV_WC_REM_ABORT_ERR,
-            WcStatus::InvalidEecn => E::IBV_WC_INV_EECN_ERR,
-            WcStatus::InvalidEecState => E::IBV_WC_INV_EEC_STATE_ERR,
-            WcStatus::Fatal => E::IBV_WC_FATAL_ERR,
-            WcStatus::ResponseTimeout => E::IBV_WC_RESP_TIMEOUT_ERR,
-            WcStatus::GeneralError => E::IBV_WC_GENERAL_ERR,
-            WcStatus::TagMatchingError => E::IBV_WC_TM_ERR,
-            WcStatus::TagMatchingRendezvousIncomplete => E::IBV_WC_TM_RNDV_INCOMPLETE,
-            WcStatus::Unknown(raw) => ffi::ibv_wc_status(raw),
-        }
-    }
-}
-
 impl fmt::Display for WcStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
@@ -710,35 +677,6 @@ impl From<ffi::ibv_wc_opcode> for WcOpcode {
             E::IBV_WC_DRIVER2 => WcOpcode::Driver2,
             E::IBV_WC_DRIVER3 => WcOpcode::Driver3,
             other => WcOpcode::Unknown(other.0),
-        }
-    }
-}
-
-impl From<WcOpcode> for ffi::ibv_wc_opcode {
-    fn from(opcode: WcOpcode) -> Self {
-        use ffi::ibv_wc_opcode as E;
-        match opcode {
-            WcOpcode::Send => E::IBV_WC_SEND,
-            WcOpcode::RdmaWrite => E::IBV_WC_RDMA_WRITE,
-            WcOpcode::RdmaRead => E::IBV_WC_RDMA_READ,
-            WcOpcode::CompSwap => E::IBV_WC_COMP_SWAP,
-            WcOpcode::FetchAdd => E::IBV_WC_FETCH_ADD,
-            WcOpcode::BindMw => E::IBV_WC_BIND_MW,
-            WcOpcode::LocalInv => E::IBV_WC_LOCAL_INV,
-            WcOpcode::Tso => E::IBV_WC_TSO,
-            WcOpcode::Flush => E::IBV_WC_FLUSH,
-            WcOpcode::AtomicWrite => E::IBV_WC_ATOMIC_WRITE,
-            WcOpcode::Recv => E::IBV_WC_RECV,
-            WcOpcode::RecvRdmaWithImm => E::IBV_WC_RECV_RDMA_WITH_IMM,
-            WcOpcode::TmAdd => E::IBV_WC_TM_ADD,
-            WcOpcode::TmDel => E::IBV_WC_TM_DEL,
-            WcOpcode::TmSync => E::IBV_WC_TM_SYNC,
-            WcOpcode::TmRecv => E::IBV_WC_TM_RECV,
-            WcOpcode::TmNoTag => E::IBV_WC_TM_NO_TAG,
-            WcOpcode::Driver1 => E::IBV_WC_DRIVER1,
-            WcOpcode::Driver2 => E::IBV_WC_DRIVER2,
-            WcOpcode::Driver3 => E::IBV_WC_DRIVER3,
-            WcOpcode::Unknown(raw) => ffi::ibv_wc_opcode(raw),
         }
     }
 }
@@ -1339,7 +1277,7 @@ mod test_conversions {
     use super::*;
 
     #[test]
-    fn wc_status_roundtrip() {
+    fn wc_status_from_raw() {
         for (wrapper, raw) in [
             (WcStatus::Success, ffi::ibv_wc_status::IBV_WC_SUCCESS),
             (
@@ -1356,7 +1294,6 @@ mod test_conversions {
             ),
         ] {
             assert_eq!(WcStatus::from(raw), wrapper);
-            assert_eq!(ffi::ibv_wc_status::from(wrapper), raw);
         }
     }
 
@@ -1374,7 +1311,7 @@ mod test_conversions {
     }
 
     #[test]
-    fn wc_opcode_roundtrip() {
+    fn wc_opcode_from_raw() {
         for (wrapper, raw) in [
             (WcOpcode::Send, ffi::ibv_wc_opcode::IBV_WC_SEND),
             (WcOpcode::RdmaRead, ffi::ibv_wc_opcode::IBV_WC_RDMA_READ),
@@ -1385,7 +1322,6 @@ mod test_conversions {
             ),
         ] {
             assert_eq!(WcOpcode::from(raw), wrapper);
-            assert_eq!(ffi::ibv_wc_opcode::from(wrapper), raw);
         }
     }
 }

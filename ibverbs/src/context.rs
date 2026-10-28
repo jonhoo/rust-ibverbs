@@ -630,36 +630,6 @@ impl From<ffi::ibv_event_type> for AsyncEventType {
     }
 }
 
-impl From<AsyncEventType> for ffi::ibv_event_type {
-    fn from(event: AsyncEventType) -> Self {
-        use ffi::ibv_event_type as E;
-        match event {
-            AsyncEventType::CqError => E::IBV_EVENT_CQ_ERR,
-            AsyncEventType::QpFatal => E::IBV_EVENT_QP_FATAL,
-            AsyncEventType::QpRequestError => E::IBV_EVENT_QP_REQ_ERR,
-            AsyncEventType::QpAccessError => E::IBV_EVENT_QP_ACCESS_ERR,
-            AsyncEventType::CommEstablished => E::IBV_EVENT_COMM_EST,
-            AsyncEventType::SqDrained => E::IBV_EVENT_SQ_DRAINED,
-            AsyncEventType::PathMigrated => E::IBV_EVENT_PATH_MIG,
-            AsyncEventType::PathMigrationError => E::IBV_EVENT_PATH_MIG_ERR,
-            AsyncEventType::DeviceFatal => E::IBV_EVENT_DEVICE_FATAL,
-            AsyncEventType::PortActive => E::IBV_EVENT_PORT_ACTIVE,
-            AsyncEventType::PortError => E::IBV_EVENT_PORT_ERR,
-            AsyncEventType::LidChange => E::IBV_EVENT_LID_CHANGE,
-            AsyncEventType::PkeyChange => E::IBV_EVENT_PKEY_CHANGE,
-            AsyncEventType::SmChange => E::IBV_EVENT_SM_CHANGE,
-            AsyncEventType::SrqError => E::IBV_EVENT_SRQ_ERR,
-            AsyncEventType::SrqLimitReached => E::IBV_EVENT_SRQ_LIMIT_REACHED,
-            AsyncEventType::QpLastWqeReached => E::IBV_EVENT_QP_LAST_WQE_REACHED,
-            AsyncEventType::ClientReregister => E::IBV_EVENT_CLIENT_REREGISTER,
-            AsyncEventType::GidChange => E::IBV_EVENT_GID_CHANGE,
-            AsyncEventType::WqFatal => E::IBV_EVENT_WQ_FATAL,
-            AsyncEventType::DeviceSpeedChange => E::IBV_EVENT_DEVICE_SPEED_CHANGE,
-            AsyncEventType::Unknown(raw) => ffi::ibv_event_type(raw),
-        }
-    }
-}
-
 impl std::fmt::Display for AsyncEventType {
     /// Formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
     /// [`SrqLimitReached`](Self::SrqLimitReached).
@@ -817,20 +787,6 @@ impl From<ffi::ibv_port_state> for PortState {
             ffi::ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
             ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
             other => PortState::Unknown(other.0),
-        }
-    }
-}
-
-impl From<PortState> for ffi::ibv_port_state {
-    fn from(state: PortState) -> Self {
-        match state {
-            PortState::Nop => ffi::ibv_port_state::IBV_PORT_NOP,
-            PortState::Down => ffi::ibv_port_state::IBV_PORT_DOWN,
-            PortState::Init => ffi::ibv_port_state::IBV_PORT_INIT,
-            PortState::Armed => ffi::ibv_port_state::IBV_PORT_ARMED,
-            PortState::Active => ffi::ibv_port_state::IBV_PORT_ACTIVE,
-            PortState::ActiveDefer => ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER,
-            PortState::Unknown(raw) => ffi::ibv_port_state(raw),
         }
     }
 }
@@ -1329,7 +1285,7 @@ mod test_display {
     }
 
     #[test]
-    fn port_state_roundtrip() {
+    fn port_state_from_raw() {
         for (wrapper, raw) in [
             (PortState::Down, ffi::ibv_port_state::IBV_PORT_DOWN),
             (PortState::Active, ffi::ibv_port_state::IBV_PORT_ACTIVE),
@@ -1339,13 +1295,12 @@ mod test_display {
             ),
         ] {
             assert_eq!(PortState::from(raw), wrapper);
-            assert_eq!(ffi::ibv_port_state::from(wrapper), raw);
         }
         assert_eq!(PortState::Active.to_string(), "Active");
     }
 
     #[test]
-    fn async_event_type_roundtrip() {
+    fn async_event_type_from_raw() {
         for (wrapper, raw) in [
             (
                 AsyncEventType::CqError,
@@ -1369,7 +1324,6 @@ mod test_display {
             ),
         ] {
             assert_eq!(AsyncEventType::from(raw), wrapper);
-            assert_eq!(ffi::ibv_event_type::from(wrapper), raw);
         }
     }
 

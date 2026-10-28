@@ -316,19 +316,6 @@ impl From<ffi::ibv_transport_type> for TransportType {
     }
 }
 
-impl From<TransportType> for ffi::ibv_transport_type {
-    fn from(transport: TransportType) -> Self {
-        match transport {
-            TransportType::Unknown => ffi::ibv_transport_type::IBV_TRANSPORT_UNKNOWN,
-            TransportType::Ib => ffi::ibv_transport_type::IBV_TRANSPORT_IB,
-            TransportType::Iwarp => ffi::ibv_transport_type::IBV_TRANSPORT_IWARP,
-            TransportType::Usnic => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC,
-            TransportType::UsnicUdp => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC_UDP,
-            TransportType::Unspecified => ffi::ibv_transport_type::IBV_TRANSPORT_UNSPECIFIED,
-        }
-    }
-}
-
 impl fmt::Display for TransportType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -382,7 +369,7 @@ mod test_display {
     }
 
     #[test]
-    fn transport_type_roundtrip() {
+    fn transport_type_from_raw() {
         for (wrapper, raw) in [
             (TransportType::Ib, ffi::ibv_transport_type::IBV_TRANSPORT_IB),
             (
@@ -395,7 +382,6 @@ mod test_display {
             ),
         ] {
             assert_eq!(TransportType::from(raw), wrapper);
-            assert_eq!(ffi::ibv_transport_type::from(wrapper), raw);
         }
         assert_eq!(TransportType::Ib.to_string(), "InfiniBand");
         assert_eq!(TransportType::Iwarp.to_string(), "iWARP");
