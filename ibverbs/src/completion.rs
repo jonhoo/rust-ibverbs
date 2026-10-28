@@ -1294,8 +1294,9 @@ impl CompletionQueue {
         self.inner.cc.as_ref()
     }
 
-    /// The number of completions the queue can hold: the capacity the device granted, which is at
-    /// least the `min_cq_entries` asked of [`Context::create_cq`]. Keep fewer signaled work
+    /// The number of completions the queue can hold: the capacity the device granted, normally at
+    /// least the `min_cq_entries` asked of [`Context::create_cq`] (hns reports one less than its
+    /// power-of-two ring, so asking it for 64 reports 63). Keep fewer signaled work
     /// requests in flight across the queue pairs sharing this queue, or it overruns
     /// (`IBV_EVENT_CQ_ERR`) and stops working.
     pub fn capacity(&self) -> u32 {
