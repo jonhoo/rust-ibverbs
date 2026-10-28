@@ -196,3 +196,14 @@ The examples (except the EFA one, which needs EFA hardware) and the integration 
 against it unchanged. CI runs the whole data-path test suite (two-sided, one-sided, atomics,
 inline, UC/UD, and the connection manager) against a SoftRoCE device on every pull request and
 asserts on the transferred bytes; it builds the examples but does not run them.
+
+The tests that need a device are `#[ignore]`d. Run them the way CI does, one at a time (they
+share the device, and SoftRoCE drops completions when many queue pairs drive it at once), with
+the connection-manager and mlx5 suites under their features (the mlx5 one checks that SoftRoCE
+refuses the mlx5 calls):
+
+```console
+$ IBVERBS_TEST_DEVICE=rxe0 cargo test -- --ignored --test-threads=1
+$ IBVERBS_TEST_DEVICE=rxe0 cargo test --features rdmacm --test rdmacm -- --ignored --test-threads=1
+$ IBVERBS_TEST_DEVICE=rxe0 cargo test --no-default-features --features mlx5 --test mlx5 -- --ignored --test-threads=1
+```
