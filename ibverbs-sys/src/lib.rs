@@ -2,9 +2,6 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
-// Suppress expected warnings from bindgen-generated code.
-// See https://github.com/rust-lang/rust-bindgen/issues/1651.
-#![allow(deref_nullptr)]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 /// An ibverb work completion.
@@ -187,139 +184,27 @@ impl ibv_wc {
     }
 }
 
-#[test]
-fn bindgen_test_layout_ibv_wc() {
-    assert_eq!(
-        ::std::mem::size_of::<ibv_wc>(),
-        48usize,
-        concat!("Size of: ", stringify!(ibv_wc))
-    );
-    assert_eq!(
-        ::std::mem::align_of::<ibv_wc>(),
-        8usize,
-        concat!("Alignment of ", stringify!(ibv_wc))
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, wr_id),
-        0usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(wr_id)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, status),
-        8usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(status)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, opcode),
-        12usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(opcode)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, vendor_err),
-        16usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(vendor_err)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, byte_len),
-        20usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(byte_len)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, qp_num),
-        28usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(qp_num)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, src_qp),
-        32usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(src_qp)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, wc_flags),
-        36usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(wc_flags)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, pkey_index),
-        40usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(pkey_index)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, slid),
-        42usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(slid)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, sl),
-        44usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(sl)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, dlid_path_bits),
-        45usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(dlid_path_bits)
-        )
-    );
-}
+// The layout `ibv_poll_cq` fills in (`struct ibv_wc` in verbs.h), checked at compile time on every
+// target, like bindgen's checks of the structs it generates. The alignment is `u64`'s (8 bytes on
+// 64-bit targets, 4 on i386, as in C).
+const _: () = {
+    use ::std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<ibv_wc>() == 48);
+    assert!(align_of::<ibv_wc>() == align_of::<u64>());
+    assert!(offset_of!(ibv_wc, wr_id) == 0);
+    assert!(offset_of!(ibv_wc, status) == 8);
+    assert!(offset_of!(ibv_wc, opcode) == 12);
+    assert!(offset_of!(ibv_wc, vendor_err) == 16);
+    assert!(offset_of!(ibv_wc, byte_len) == 20);
+    assert!(offset_of!(ibv_wc, imm_data) == 24);
+    assert!(offset_of!(ibv_wc, qp_num) == 28);
+    assert!(offset_of!(ibv_wc, src_qp) == 32);
+    assert!(offset_of!(ibv_wc, wc_flags) == 36);
+    assert!(offset_of!(ibv_wc, pkey_index) == 40);
+    assert!(offset_of!(ibv_wc, slid) == 42);
+    assert!(offset_of!(ibv_wc, sl) == 44);
+    assert!(offset_of!(ibv_wc, dlid_path_bits) == 45);
+};
 
 impl Default for ibv_wc {
     fn default() -> Self {
