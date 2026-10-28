@@ -1013,6 +1013,9 @@ unsafe impl Send for CmEvent {}
 
 /// A failure event the connection manager reported while a blocking helper waited for the next
 /// setup step, carried by [`Error::ConnectionManager`].
+///
+/// A negative [`status`](Self::status) is an errno, and comes back as the failure's
+/// [`source`](std::error::Error::source), which is how [`Error::os_error`] finds it.
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct CmFailure {
@@ -1029,16 +1032,48 @@ pub struct CmFailure {
     /// The private data the peer attached to its rejection, padded by the transport to its wire
     /// format; empty when there is none.
     pub private_data: Vec<u8>,
+    /// The OS error a negative `status` stands for, which `source` hands out by reference.
+    os_error: Option<io::Error>,
+}
+
+impl CmFailure {
+    fn new(event: CmEventType, status: i32, private_data: Vec<u8>) -> CmFailure {
+        CmFailure {
+            event,
+            status,
+            private_data,
+            os_error: status
+                .checked_neg()
+                .filter(|&errno| errno > 0)
+                .map(io::Error::from_raw_os_error),
+        }
+    }
+}
+
+impl std::fmt::Display for CmFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the connection manager reported {} (status {})",
+            self.event, self.status
+        )
+    }
+}
+
+impl std::error::Error for CmFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.os_error.as_ref().map(|e| e as _)
+    }
 }
 
 impl CmEvent {
     /// The failure this event reports, for the blocking helpers to return.
     fn into_error(self) -> Error {
-        Error::ConnectionManager(Box::new(CmFailure {
-            event: self.event_type(),
-            status: self.status(),
-            private_data: self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
-        }))
+        Error::ConnectionManager(Box::new(CmFailure::new(
+            self.event_type(),
+            self.status(),
+            self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
+        )))
     }
 
     /// The kind of event. Match on the [`CmEventType`] to decide what to do next; see [`CmId`] for
@@ -1683,6 +1718,38 @@ mod test_conversions {
         assert_eq!(timeout_ms(Duration::from_millis(5)), 5);
         assert_eq!(timeout_ms(Duration::from_micros(5_001)), 6);
         assert_eq!(timeout_ms(Duration::MAX), c_int::MAX);
+    }
+
+    #[test]
+    fn negative_statuses_are_the_failures_os_error() {
+        let address_error = Error::ConnectionManager(Box::new(CmFailure::new(
+            CmEventType::AddressError,
+            -nix::libc::ETIMEDOUT,
+            Vec::new(),
+        )));
+        let os_error = address_error
+            .os_error()
+            .expect("an address error has an errno");
+        assert_eq!(os_error.raw_os_error(), Some(nix::libc::ETIMEDOUT));
+        assert_eq!(
+            address_error.to_string(),
+            format!(
+                "the connection manager reported ADDR_ERROR (status -{})",
+                nix::libc::ETIMEDOUT
+            )
+        );
+        // A reject reason is the transport's, not an errno.
+        let rejected = Error::ConnectionManager(Box::new(CmFailure::new(
+            CmEventType::Rejected,
+            28,
+            Vec::new(),
+        )));
+        assert!(rejected.os_error().is_none());
+        assert!(
+            CmFailure::new(CmEventType::ConnectError, i32::MIN, Vec::new())
+                .os_error
+                .is_none()
+        );
     }
 
     #[test]

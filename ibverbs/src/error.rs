@@ -221,7 +221,7 @@ pub enum Error {
     /// The connection manager reported a failure event while a blocking helper was waiting for
     /// the next setup step. Boxed, so that `Error` stays two words.
     #[cfg(feature = "rdmacm")]
-    #[error("the connection manager reported {} (status {})", .0.event, .0.status)]
+    #[error(transparent)]
     ConnectionManager(Box<CmFailure>),
 
     /// Binding a connection-manager identifier to a local address failed (`rdma_bind_addr`).
@@ -264,7 +264,9 @@ impl Error {
     /// `EOPNOTSUPP` or `EPROTONOSUPPORT`. The crate's checks of its own inputs (a queue from
     /// another context, oversized private data, and the like) are reported in the operation's
     /// variant as an [`io::ErrorKind::InvalidInput`] error with no errno, so for them this is
-    /// `Some` but [`raw_os_error`](io::Error::raw_os_error) is `None`.
+    /// `Some` but [`raw_os_error`](io::Error::raw_os_error) is `None`. For the connection
+    /// manager's `ConnectionManager`, it is the errno a negative status stands for (an address,
+    /// route, or connection error), and `None` for a reject reason.
     pub fn os_error(&self) -> Option<&io::Error> {
         std::error::Error::source(self)?.downcast_ref::<io::Error>()
     }
