@@ -104,10 +104,10 @@
 //!
 //! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
 //! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
-//! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`, and
-//! `rxe` (SoftRoCE) implement both. A provider that lacks them fails cleanly at completion-queue
-//! or queue-pair creation (with [`Error::Unsupported`]) rather than degrading to the
-//! legacy verbs.
+//! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`,
+//! `rxe` (SoftRoCE), and, for reliable connections only, `ionic` implement both. A provider that
+//! lacks them fails cleanly at completion-queue or queue-pair creation (with
+//! [`Error::Unsupported`]) rather than degrading to the legacy verbs.
 //!
 //! # Typed transports
 //!
