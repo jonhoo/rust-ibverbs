@@ -565,7 +565,10 @@ pub enum AsyncEventType {
     PathMigrated,
     /// The connection failed to migrate to its alternate path.
     PathMigrationError,
-    /// The device is in a fatal state; all of its resources are unusable.
+    /// The device is in a fatal state; all of its resources are unusable. This is the device's
+    /// last event: no other events follow it (a [`Context::wait_async_event`] without a timeout
+    /// then waits forever), and posting may keep succeeding without effect. Drop everything built
+    /// on the device and open it again.
     DeviceFatal,
     /// The port's logical state became active.
     PortActive,
