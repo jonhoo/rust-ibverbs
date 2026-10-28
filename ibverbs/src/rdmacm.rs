@@ -364,13 +364,8 @@ impl EventChannel {
         let channel = EventChannel { chan };
         // SAFETY: the channel owns this fd, and the borrow ends within this call.
         let fd = unsafe { BorrowedFd::borrow_raw((*chan).fd) };
-        // If either call fails, `channel` drops here and destroys the channel again.
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::ConnectionSetup(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::ConnectionSetup(e.into()))?;
+        // If this fails, `channel` drops here and destroys the channel again.
+        crate::completion::set_nonblocking(fd).map_err(Error::ConnectionSetup)?;
         Ok(channel)
     }
 }

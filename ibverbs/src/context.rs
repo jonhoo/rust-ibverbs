@@ -66,8 +66,9 @@ impl Context {
         let context = Context {
             inner: Arc::new(ContextInner { ctx }),
         };
-        // If this fails, `context` drops here and closes the half-opened device again.
-        context.set_async_fd_nonblocking()?;
+        // Non-blocking, so `poll_async_event` reports an empty event queue instead of blocking. If
+        // this fails, `context` drops here and closes the half-opened device again.
+        crate::completion::set_nonblocking(context.async_fd()).map_err(Error::OpenDevice)?;
         Ok(context)
     }
 
@@ -93,21 +94,6 @@ impl Context {
         let context = Context::with_device(dev)?;
         shared.push((dev as usize, Arc::downgrade(&context.inner)));
         Ok(context)
-    }
-
-    /// Set this context's asynchronous-event file descriptor to non-blocking, so
-    /// [`poll_async_event`](Self::poll_async_event) reports an empty event queue instead of
-    /// blocking.
-    fn set_async_fd_nonblocking(&self) -> Result<()> {
-        // SAFETY: the context owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.ctx).async_fd) };
-        let flags =
-            nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(|e| Error::OpenDevice(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::OpenDevice(e.into()))?;
-        Ok(())
     }
 
     /// Begin building a completion queue (CQ) with room for at least `min_cq_entries` entries.

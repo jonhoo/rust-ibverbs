@@ -46,6 +46,17 @@ pub(crate) fn wait_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io
     }
 }
 
+/// Set `fd` non-blocking, so reading it from an empty queue reports `EAGAIN` instead of blocking.
+pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    use nix::fcntl::{F_GETFL, FcntlArg, OFlag, fcntl};
+    let flags = fcntl(fd, F_GETFL)?;
+    fcntl(
+        fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+    )?;
+    Ok(())
+}
+
 /// The error for a provider's poll that failed with a negative code rather than an errno.
 #[cold]
 #[inline(never)]
@@ -117,21 +128,8 @@ impl CompletionChannel {
             }),
         };
         // If this fails, `channel` drops here and tears the half-created channel back down.
-        channel.set_nonblocking()?;
+        set_nonblocking(channel.as_fd()).map_err(Error::CreateCompletionChannel)?;
         Ok(channel)
-    }
-
-    /// Set this channel's file descriptor to non-blocking.
-    fn set_nonblocking(&self) -> Result<()> {
-        // SAFETY: the channel owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.cc).fd) };
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        Ok(())
     }
 
     /// Consume one pending notification from the channel, returning the context value of the
