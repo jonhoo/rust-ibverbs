@@ -224,8 +224,8 @@ pub enum QueuePairState {
     ReadyToSend,
     /// The send queue is draining ("SQD"): posted sends finish, new ones wait.
     SendQueueDrain,
-    /// The send queue errored ("SQE"): receives still work, sends are flushed (UD and similar
-    /// transports only; RC moves straight to [`Error`](Self::Error)).
+    /// The send queue errored ("SQE"): receives still work, sends are flushed (UD and UC only;
+    /// RC moves straight to [`Error`](Self::Error)).
     SendQueueError,
     /// The error state: outstanding and new work requests are flushed with
     /// [`WcStatus::WorkRequestFlushed`](crate::WcStatus::WorkRequestFlushed).
