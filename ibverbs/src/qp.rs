@@ -795,10 +795,11 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// The device must support every operation requested, or [`build`](Self::build) fails with
     /// [`Unsupported`](Error::Unsupported): a device without extended atomics, for example, can
-    /// still create a send-only RC queue pair this way. Conversely, an opcode method whose
-    /// operation was not requested fails at [`submit`](SendBatch::submit). Operations beyond
-    /// the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`, `FLUSH`,
-    /// `ATOMIC_WRITE`) are reachable through [`as_raw_ex`](QueuePair::as_raw_ex).
+    /// still create a send-only RC queue pair this way. Conversely, do not call an opcode method
+    /// whose operation was not requested: what happens depends on the provider (rxe and EFA
+    /// install only the requested operations, so the method panics; mlx5 posts it anyway).
+    /// Operations beyond the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`,
+    /// `FLUSH`, `ATOMIC_WRITE`) are reachable through [`as_raw_ex`](QueuePair::as_raw_ex).
     pub fn set_send_ops(&mut self, ops: SendOps) -> &mut Self {
         self.send_ops = Some(ops);
         self
