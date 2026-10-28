@@ -41,8 +41,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ah_attr.set_grh(receiver_gid, gid_index as u8, 64, 0);
     let ah = pd.create_address_handle(&ah_attr)?;
 
-    let mut send_buf = pd.allocate(64, ibverbs::AccessFlags::PERMISSIVE)?;
-    let recv_buf = pd.allocate(64, ibverbs::AccessFlags::PERMISSIVE)?;
+    // A send only reads its buffer and a receive writes its own: neither needs remote access,
+    // which EFA devices without RDMA read or write refuse to register.
+    let mut send_buf = pd.allocate(64, ibverbs::AccessFlags::empty())?;
+    let recv_buf = pd.allocate(64, ibverbs::AccessFlags::LOCAL_WRITE)?;
     send_buf.bytes_mut()[..5].copy_from_slice(b"hello");
 
     // Post the receive, then the send. Both go through the normal, non-EFA-specific API. Every SRD

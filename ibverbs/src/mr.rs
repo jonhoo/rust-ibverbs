@@ -44,9 +44,13 @@ impl AccessFlags {
     /// fully trust. Narrow it when the region does not need to be remotely writable.
     ///
     /// Add the rest with `|` where they apply. Not every device supports
-    /// [`REMOTE_ATOMIC`](Self::REMOTE_ATOMIC) (EFA refuses to register a region that asks for
-    /// it), and [`RELAXED_ORDERING`](Self::RELAXED_ORDERING) lets the bytes of an RDMA write land
-    /// out of order, which breaks a receiver that polls the last byte to see the write arrive.
+    /// [`REMOTE_ATOMIC`](Self::REMOTE_ATOMIC), and EFA refuses every remote flag its device lacks
+    /// the capability for: atomics always, and remote read or write on EFA generations without
+    /// RDMA read or write (registration then fails with
+    /// [`Unsupported`](crate::Error::Unsupported)). For send and receive buffers,
+    /// [`LOCAL_WRITE`](Self::LOCAL_WRITE) alone is enough.
+    /// [`RELAXED_ORDERING`](Self::RELAXED_ORDERING) lets the bytes of an RDMA write land out of
+    /// order, which breaks a receiver that polls the last byte to see the write arrive.
     pub const PERMISSIVE: AccessFlags = AccessFlags(
         AccessFlags::LOCAL_WRITE.0 | AccessFlags::REMOTE_WRITE.0 | AccessFlags::REMOTE_READ.0,
     );
