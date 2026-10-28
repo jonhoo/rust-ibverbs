@@ -447,7 +447,7 @@ impl ProtectionDomain {
     ///
     /// See also [RDMAmojo's `ibv_create_srq` documentation][1] and the [man page][2].
     ///
-    /// [1]: https://www.rdmamojo.com/2013/01/30/ibv_create_srq/
+    /// [1]: https://www.rdmamojo.com/2012/11/24/ibv_create_srq/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_create_srq.3.html
     pub fn create_srq(
         &self,
