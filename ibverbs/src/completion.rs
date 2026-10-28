@@ -312,12 +312,13 @@ impl CompletionQueueBuilder {
     /// # Errors
     ///
     ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
-    ///    work-completion field (`EOPNOTSUPP`).
+    ///    work-completion field, or a completion channel (EFA devices without completion
+    ///    notifications) (`EOPNOTSUPP`).
     ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `min_cq_entries` is 0 or above
     ///    `i32::MAX`, or the completion channel comes from another device context (both
-    ///    [`io::ErrorKind::InvalidInput`]), or `ibv_create_cq_ex` failed (`EINVAL` for
-    ///    an invalid `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`, or an invalid
-    ///    completion vector, `ENOMEM` when out of resources).
+    ///    [`io::ErrorKind::InvalidInput`]), or `ibv_create_cq_ex` failed (`EINVAL` for an invalid
+    ///    `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`, or an invalid completion
+    ///    vector, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<CompletionQueue> {
         // The legacy verbs take the size as an `int`, and providers do unsigned arithmetic on it
         // that wraps near `u32::MAX` (mlx5 then accepts `u32::MAX` as a one-entry queue).
