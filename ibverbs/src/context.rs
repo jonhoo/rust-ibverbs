@@ -181,10 +181,8 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
     pub fn poll_async_event(&self) -> Result<Option<AsyncEvent<'_>>> {
-        // `ibv_async_event` embeds an enum with no zero variant inside a union, so let
-        // `ibv_get_async_event` initialize the storage before a Rust value is formed.
-        let mut event = std::mem::MaybeUninit::<ffi::ibv_async_event>::uninit();
-        let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, event.as_mut_ptr()) };
+        let mut event = ffi::ibv_async_event::default();
+        let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, &mut event) };
         if rc != 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::WouldBlock {
@@ -192,8 +190,6 @@ impl Context {
             }
             return Err(Error::os(e, Error::AsyncEvent));
         }
-        // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
-        let mut event = unsafe { event.assume_init() };
         // Acknowledge it right away: what is left is plain data. libibverbs blocks the destruction
         // of the queue pair, completion queue, or shared receive queue an event names until the
         // event is acknowledged, so acknowledging only when the caller drops it would let a held
