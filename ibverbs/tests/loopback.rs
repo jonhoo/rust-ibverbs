@@ -1320,12 +1320,18 @@ fn raw_handles() {
     assert!(!srq.as_raw().is_null());
 
     // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
-    let (qp, endpoint) = activate_self(&pd, &cq, gid_index(&ctx), 0x1234_5678);
+    let gid_index = gid_index(&ctx);
+    let (qp, endpoint) = activate_self(&pd, &cq, gid_index, 0x1234_5678);
     assert!(!qp.as_raw().is_null());
     assert!(!qp.as_raw_ex().is_null());
 
     let mut ah_attr = AddressHandleAttribute::new(1);
-    ah_attr.set_grh(endpoint.gid.expect("RoCE requires a GID"), 1, 64, 0);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
     let ah = pd
         .create_address_handle(&ah_attr)
         .expect("failed to create address handle");
