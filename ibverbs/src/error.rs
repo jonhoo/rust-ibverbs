@@ -15,10 +15,12 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Most variants wrap the underlying operating-system error (an `errno` from a libibverbs or
 /// librdmacm call); the specific variant identifies which operation failed and carries any relevant
-/// context. A few variants — [`Unsupported`](Error::Unsupported),
+/// context. The others — [`Unsupported`](Error::Unsupported),
 /// [`PortNotActive`](Error::PortNotActive), [`GidMismatch`](Error::GidMismatch),
-/// [`MalformedWireFormat`](Error::MalformedWireFormat), and the two `InvalidQueuePair*` diagnoses
-/// — capture conditions that callers commonly branch on.
+/// [`GidRequired`](Error::GidRequired), [`DeviceIndexUnavailable`](Error::DeviceIndexUnavailable),
+/// [`MalformedWireFormat`](Error::MalformedWireFormat), the two `InvalidQueuePair*` diagnoses,
+/// and the connection manager's `TimedOut` and `ConnectionManager` — capture conditions that
+/// callers commonly branch on.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
