@@ -1,3 +1,4 @@
+use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::raw::c_void;
 use std::ptr;
@@ -322,12 +323,14 @@ impl ProtectionDomain {
     ///
     ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags
     ///    (`EOPNOTSUPP`).
-    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): `ibv_reg_mr` failed (`EINVAL`
-    ///    for an invalid access value, `ENOMEM` when out of resources — either in the operating
-    ///    system or in the RDMA device).
+    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): allocating the buffer failed
+    ///    (`ENOMEM`), or `ibv_reg_mr` failed (`EINVAL` for an invalid access value, `ENOMEM` when
+    ///    out of resources — either in the operating system or in the RDMA device).
     pub fn allocate(&self, n: usize, access_flags: AccessFlags) -> Result<MemoryRegion<Box<[u8]>>> {
         assert!(n > 0);
-        let mut data = vec![0u8; n].into_boxed_slice();
+        let mut data = zeroed_buffer(n).ok_or_else(|| {
+            Error::RegisterMemoryRegion(io::Error::from_raw_os_error(nix::libc::ENOMEM))
+        })?;
         unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags, data) }
     }
 
@@ -466,6 +469,21 @@ impl ProtectionDomain {
         )?;
         Ok(SharedReceiveQueue::new(self.clone(), srq))
     }
+}
+
+/// `n` (nonzero) zeroed bytes on the heap, or `None` when the allocator cannot provide them —
+/// where `vec![0; n]` aborts the process, or panics for `n` above `isize::MAX`. Zeroed through
+/// `alloc_zeroed` like `vec!`, so a large buffer is not touched (and committed) up front.
+fn zeroed_buffer(n: usize) -> Option<Box<[u8]>> {
+    let layout = std::alloc::Layout::array::<u8>(n).ok()?;
+    // SAFETY: the layout's size is `n`, which is nonzero.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is a fresh, zeroed allocation with the layout of `[u8; n]`, the one `Box`
+    // frees it with.
+    Some(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n)) })
 }
 
 /// Refuses a port that is neither `ACTIVE` nor `ARMED`, for [`ProtectionDomain::create_qp`].
