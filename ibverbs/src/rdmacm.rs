@@ -610,6 +610,13 @@ impl CmId {
     ///
     /// This is the entry point for driving connection setup yourself; see the [type-level
     /// docs](Self) for the sequence of calls.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): opening the event channel
+    ///    (`rdma_create_event_channel`) or creating the id (`rdma_create_id`) failed: `ENODEV`
+    ///    when there is no RDMA device, `EPERM` when the kernel's connection manager (the
+    ///    `rdma_ucm` module) is not loaded.
     pub fn create(port_space: PortSpace) -> Result<CmId> {
         CmId::create_in(EventChannel::open(false)?, port_space)
     }
@@ -617,6 +624,10 @@ impl CmId {
     /// Creates a new identifier on `channel`, for the given port space, to share it with the
     /// other ids there: read their events from the channel ([`EventChannel::poll_cm_event`]) and
     /// route each by [`CmEvent::id`].
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_create_id` failed.
     pub fn create_on(channel: &EventChannel, port_space: PortSpace) -> Result<CmId> {
         CmId::create_in(channel.clone(), port_space)
     }
@@ -653,6 +664,11 @@ impl CmId {
     ///
     /// The event is acknowledged automatically when the returned [`CmEvent`] drops. To wait from
     /// an event loop instead, use [`poll_cm_event`](Self::poll_cm_event).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the channel's file descriptor
+    ///    (`poll`) or reading the event (`rdma_get_cm_event`) failed.
     pub fn get_cm_event(&self) -> Result<CmEvent> {
         self.get_cm_event_deadline(None)
     }
@@ -664,6 +680,11 @@ impl CmId {
     /// Intended for event-loop use: wait for the (non-blocking) file descriptor from
     /// [`AsRawFd`]/[`AsFd`] to become readable with your
     /// reactor of choice, then drain pending events with this method (acknowledged on drop).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): reading the event (`rdma_get_cm_event`)
+    ///    failed.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
         self.inner.channel.poll_cm_event()
     }
@@ -709,6 +730,14 @@ impl CmId {
     /// apply it only for `Init`, then move the queue pair to `ReadyToReceive` with its state alone
     /// and to `ReadyToSend` with its state and a send PSN
     /// ([`set_sq_psn`](QueuePairAttribute::set_sq_psn)), as librdmacm does.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): `rdma_init_qp_attr` failed (`EINVAL` when
+    ///    the id has no attributes for `target_state`, as once the peer has withdrawn its
+    ///    request).
+    ///  - [`QueryDevice`](Error::QueryDevice): reading the device's read and atomic limits, to cap
+    ///    the attributes to, failed (`ibv_query_device`).
     pub fn init_qp_attr(&self, target_state: QueuePairState) -> Result<QueuePairAttribute> {
         use ffi::ibv_qp_attr_mask as M;
         // `rdma_init_qp_attr` reads the target state from the attribute and fills in the fields it
@@ -757,6 +786,11 @@ impl CmId {
 
     /// Binds to a local `addr` (passive side). Bind to an unspecified address such as
     /// `0.0.0.0:port` to accept connections on any device. Follow with [`listen`](Self::listen).
+    ///
+    /// # Errors
+    ///
+    ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed (`ENODEV` when no RDMA
+    ///    device answers to `addr`, `EADDRINUSE` when its port is taken).
     pub fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
         let addr = SockaddrStorage::from(addr);
         let ret =
@@ -771,6 +805,11 @@ impl CmId {
     /// `backlog` caps how many requests can wait to be read from the channel; requests beyond it
     /// are dropped. 0 does not mean no queue: like any value above the kernel's limit
     /// (`net.rdma_ucm.max_backlog`, 1024 by default), it means that limit.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_listen` failed (`EINVAL` on an id
+    ///    that is resolving, connecting, or connected).
     pub fn listen(&self, backlog: u32) -> Result<()> {
         let ret = unsafe { ffi::rdma_listen(self.inner.id, backlog.min(i32::MAX as u32) as i32) };
         check(ret, Error::ConnectionSetup)
@@ -780,6 +819,12 @@ impl CmId {
     /// a [`CmEventType::AddressResolved`] event is delivered, after which
     /// [`context`](Self::context) is available and [`resolve_route`](Self::resolve_route) is the
     /// next step.
+    ///
+    /// # Errors
+    ///
+    ///  - [`ResolveAddress`](Error::ResolveAddress): `rdma_resolve_addr` could not start the
+    ///    resolution (`EINVAL` on an id past that step). A resolution that fails or times out
+    ///    later is reported by an [`AddressError`](CmEventType::AddressError) event instead.
     pub fn resolve_addr(&self, dst: SocketAddr, timeout: Duration) -> Result<()> {
         let dst = SockaddrStorage::from(dst);
         let ret = unsafe {
@@ -897,6 +942,11 @@ impl CmId {
 
     /// Completes connection establishment on the active side after the queue pair has reached
     /// `RTS`, in response to a [`CmEventType::ConnectResponse`].
+    ///
+    /// # Errors
+    ///
+    ///  - [`Connect`](Error::Connect): `rdma_establish` failed (`EINVAL` before the
+    ///    [`ConnectResponse`](CmEventType::ConnectResponse) has arrived).
     pub fn establish(&self) -> Result<()> {
         let ret = unsafe { ffi::rdma_establish(self.inner.id) };
         check(ret, Error::Connect)
@@ -1579,6 +1629,16 @@ impl Connector {
     /// Resolves the destination address and route (blocking until both complete), then returns a
     /// handle to build the queue pair on the resolved device. `timeout` bounds each of the two
     /// resolution steps (it is enforced by the kernel, which reports expiry as a failure event).
+    ///
+    /// # Errors
+    ///
+    ///  - [`ResolveAddress`](Error::ResolveAddress) / [`ResolveRoute`](Error::ResolveRoute):
+    ///    starting a resolution failed (`rdma_resolve_addr` / `rdma_resolve_route`).
+    ///  - [`ConnectionManager`](Error::ConnectionManager): a resolution failed or timed out
+    ///    ([`AddressError`](CmEventType::AddressError) /
+    ///    [`RouteError`](CmEventType::RouteError), with the errno, such as `ETIMEDOUT`, as the
+    ///    failure's OS error), or the device was removed.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading an event failed.
     pub fn resolve(self, dst: SocketAddr, timeout: Duration) -> Result<Resolved> {
         self.id.resolve_addr(dst, timeout)?;
         // The kernel delivers AddressError/RouteError once `timeout` expires, so these waits
@@ -1601,6 +1661,10 @@ impl Resolved {
     /// The device the connection manager resolved to. Build the queue pair (and its protection
     /// domain and completion queue) on this context, on the port [`CmId::port_num`] reports, then
     /// pass it to [`connect`](Self::connect).
+    ///
+    /// # Errors
+    ///
+    ///  - [`OpenDevice`](Error::OpenDevice): opening the device failed (`ibv_open_device`).
     pub fn context(&self) -> Result<Context> {
         self.id.context()
     }
@@ -1784,6 +1848,10 @@ pub struct Incoming {
 impl Incoming {
     /// The device the request arrived on. Build the queue pair on this context, on the port
     /// [`CmId::port_num`] reports, then pass it to [`accept`](Self::accept).
+    ///
+    /// # Errors
+    ///
+    ///  - [`OpenDevice`](Error::OpenDevice): opening the device failed (`ibv_open_device`).
     pub fn context(&self) -> Result<Context> {
         self.id.context()
     }
