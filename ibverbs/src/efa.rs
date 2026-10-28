@@ -88,38 +88,7 @@ impl QueuePairBuilder<Srd> {
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
             )
         };
-        let qp = nonnull(qp, Error::CreateQueuePair)?;
-        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-        let prepared = PreparedQueuePair {
-            lid: self.lid,
-            roce: self.roce,
-            port_num: self.port_num,
-            qp: QueuePair {
-                pd: self.pd.clone(),
-                _srq: None,
-                _send_cq: self.send.clone(),
-                _recv_cq: self.recv.clone(),
-                qp,
-                qp_ex,
-                // At most what was asked for, as in qp.rs.
-                max_inline_data: self.max_inline_data.min(attr.cap.max_inline_data),
-                max_send_sge: self.max_send_sge,
-                _transport: std::marker::PhantomData,
-            },
-            gid_index: self.gid_index,
-            traffic_class: self.traffic_class,
-            service_level: self.service_level,
-            bring_up: self.bring_up.clone(),
-        };
-        // As in qp.rs: a provider that accepted the send-operations mask without installing the
-        // work-request table leaves `ibv_qp_to_qp_ex` returning NULL. Dropping `prepared` destroys
-        // the queue pair.
-        if qp_ex.is_null() {
-            return Err(Error::Unsupported {
-                operation: &"ibv_qp_to_qp_ex",
-            });
-        }
-        Ok(prepared)
+        self.prepared(nonnull(qp, Error::CreateQueuePair)?, &attr)
     }
 }
 

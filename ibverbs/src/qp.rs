@@ -558,34 +558,34 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 #[must_use = "a queue-pair builder creates nothing until `build` is called"]
 pub struct QueuePairBuilder<T: Transport> {
-    pub(crate) ctx: isize,
+    ctx: isize,
     pub(crate) pd: ProtectionDomain,
     /// port local identifier
-    pub(crate) lid: u16,
+    lid: u16,
     /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
-    pub(crate) roce: bool,
+    roce: bool,
     /// the device port this queue pair is associated with (numbered from 1)
-    pub(crate) port_num: u8,
+    port_num: u8,
 
-    pub(crate) send: CompletionQueue,
-    pub(crate) max_send_wr: u32,
-    pub(crate) recv: CompletionQueue,
-    pub(crate) max_recv_wr: u32,
+    send: CompletionQueue,
+    max_send_wr: u32,
+    recv: CompletionQueue,
+    max_recv_wr: u32,
 
-    pub(crate) gid_index: Option<u32>,
-    pub(crate) max_send_sge: u32,
-    pub(crate) max_recv_sge: u32,
-    pub(crate) max_inline_data: u32,
+    gid_index: Option<u32>,
+    max_send_sge: u32,
+    max_recv_sge: u32,
+    max_inline_data: u32,
     /// the send operations to request at creation, or the transport's default set
-    pub(crate) send_ops: Option<SendOps>,
+    send_ops: Option<SendOps>,
 
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
-    pub(crate) traffic_class: u8,
+    traffic_class: u8,
     /// service level (0-15). Higher value means higher priority.
-    pub(crate) service_level: u8,
+    service_level: u8,
     /// the transport's bring-up attributes, with the setters' values written into them
-    pub(crate) bring_up: BringUp,
+    bring_up: BringUp,
     /// shared receive queue
     srq: Option<SharedReceiveQueue>,
     _transport: std::marker::PhantomData<T>,
@@ -880,6 +880,17 @@ impl<T: Transport> QueuePairBuilder<T> {
             unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
             Error::CreateQueuePair,
         )?;
+        self.prepared(qp, &attr)
+    }
+
+    /// Wraps `qp`, just created from `attr`, as the prepared queue pair this builder describes:
+    /// the end of every transport's `build`. Creation wrote the granted capacities back into
+    /// `attr`, and the queue pair holds the shared receive queue `attr` attached it to, if any.
+    pub(crate) fn prepared(
+        &self,
+        qp: *mut ffi::ibv_qp,
+        attr: &ffi::ibv_qp_init_attr_ex,
+    ) -> Result<PreparedQueuePair<T>> {
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         let prepared = PreparedQueuePair {
             lid: self.lid,
@@ -887,7 +898,11 @@ impl<T: Transport> QueuePairBuilder<T> {
             port_num: self.port_num,
             qp: QueuePair {
                 pd: self.pd.clone(),
-                _srq: self.srq.clone(),
+                _srq: if attr.srq.is_null() {
+                    None
+                } else {
+                    self.srq.clone()
+                },
                 _send_cq: self.send.clone(),
                 _recv_cq: self.recv.clone(),
                 qp,
@@ -1090,20 +1105,20 @@ impl<T: Reliable> QueuePairBuilder<T> {
 /// brought up with `activate` instead of `handshake`.
 #[must_use = "a prepared queue pair is destroyed when dropped; connect it with `handshake` or `activate`"]
 pub struct PreparedQueuePair<T: Transport> {
-    pub(crate) qp: QueuePair<T>,
+    qp: QueuePair<T>,
     /// port local identifier
-    pub(crate) lid: u16,
+    lid: u16,
     /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
-    pub(crate) roce: bool,
+    roce: bool,
     /// the device port this queue pair is associated with (numbered from 1)
-    pub(crate) port_num: u8,
+    port_num: u8,
     // carried from builder
-    pub(crate) gid_index: Option<u32>,
+    gid_index: Option<u32>,
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
-    pub(crate) traffic_class: u8,
+    traffic_class: u8,
     /// service level (0-15). Higher value means higher priority.
-    pub(crate) service_level: u8,
-    pub(crate) bring_up: BringUp,
+    service_level: u8,
+    bring_up: BringUp,
 }
 
 /// The `INIT`, `RTR`, and `RTS` attributes of a queue pair's bring-up as the builder configured
@@ -1112,10 +1127,10 @@ pub struct PreparedQueuePair<T: Transport> {
 /// connected transport's route, remote queue pair number, and receive-queue PSN at `RTR` (and the
 /// cap of its RDMA read and atomic depth at `RTS`), or a datagram transport's Q_Key at `INIT`.
 #[derive(Clone)]
-pub(crate) struct BringUp {
-    pub(crate) init: QueuePairAttribute,
-    pub(crate) rtr: QueuePairAttribute,
-    pub(crate) rts: QueuePairAttribute,
+struct BringUp {
+    init: QueuePairAttribute,
+    rtr: QueuePairAttribute,
+    rts: QueuePairAttribute,
 }
 
 /// An identifier for the network endpoint of a `QueuePair`. Returned by
@@ -2537,23 +2552,23 @@ fn qp_transition_masks(
 /// as one socket binds a TCP or UDP port).
 #[must_use = "QueuePair is immediately destroyed via drop() unless assigned to a variable"]
 pub struct QueuePair<T: Transport = Rc> {
-    pub(crate) pd: ProtectionDomain,
-    pub(crate) _srq: Option<SharedReceiveQueue>,
+    pd: ProtectionDomain,
+    _srq: Option<SharedReceiveQueue>,
     // Keep the completion queues alive while the queue pair references them; `ibv_destroy_cq` fails
     // with EBUSY if a queue pair is still attached.
-    pub(crate) _send_cq: CompletionQueue,
-    pub(crate) _recv_cq: CompletionQueue,
-    pub(crate) qp: *mut ffi::ibv_qp,
+    _send_cq: CompletionQueue,
+    _recv_cq: CompletionQueue,
+    qp: *mut ffi::ibv_qp,
     // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
     // this aliases `qp` and lives exactly as long.
-    pub(crate) qp_ex: *mut ffi::ibv_qp_ex,
+    qp_ex: *mut ffi::ibv_qp_ex,
     // The inline capacity the builder asked for (capped at what the provider granted), which the
     // send path enforces (`SendOp::build`).
-    pub(crate) max_inline_data: u32,
+    max_inline_data: u32,
     // The scatter/gather entries per send work request the builder asked for, which every
     // provider sizes its work requests to hold and the send path enforces (`SendOp::build`).
-    pub(crate) max_send_sge: u32,
-    pub(crate) _transport: std::marker::PhantomData<T>,
+    max_send_sge: u32,
+    _transport: std::marker::PhantomData<T>,
 }
 
 unsafe impl<T: Transport> Send for QueuePair<T> {}
