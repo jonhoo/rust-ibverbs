@@ -258,7 +258,12 @@ pub enum Error {
 impl Error {
     /// The operating-system error (`errno`) underlying this error, for the variants that wrap one:
     /// the uniform way to branch on `ENOMEM`, `EINVAL`, and friends without matching every
-    /// variant. `None` for the errors this crate diagnoses itself.
+    /// variant. `None` for the variants this crate diagnoses itself, and for
+    /// [`Unsupported`](Error::Unsupported), which does not keep whether the errno was
+    /// `EOPNOTSUPP` or `EPROTONOSUPPORT`. The crate's checks of its own inputs (a queue from
+    /// another context, oversized private data, and the like) are reported in the operation's
+    /// variant as an [`io::ErrorKind::InvalidInput`] error with no errno, so for them this is
+    /// `Some` but [`raw_os_error`](io::Error::raw_os_error) is `None`.
     pub fn os_error(&self) -> Option<&io::Error> {
         std::error::Error::source(self)?.downcast_ref::<io::Error>()
     }
