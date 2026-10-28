@@ -135,10 +135,12 @@
 //! A few calls keep unlocked bookkeeping in the provider, so the same object must not see two of
 //! them at once even though its type is `Sync`:
 //!
-//! - Arming a completion queue ([`CompletionQueue::req_notify`]) and consuming its notifications
+//! - Arming a completion queue ([`CompletionQueue::req_notify`]) reads its consumer index, which
+//!   polling advances, without a lock, and arming and consuming its notifications
 //!   ([`CompletionChannel::get_event`] or [`wait`](CompletionChannel::wait)) both update its arm
-//!   sequence number without a lock on mlx5: do both for a given queue from one thread at a time,
-//!   or an arm can be lost and its notification never arrive.
+//!   sequence number without one (on mlx5, EFA, and hns): arm, poll, and consume the
+//!   notifications of a given queue from one thread at a time, or an arm can be lost and its
+//!   notification never arrive.
 //! - Setting `MLX5_SINGLE_THREADED=1` in the environment tells mlx5 the process is single threaded
 //!   and turns its locks into best-effort checks, which voids the `Sync` of completion queues,
 //!   queue pairs, and shared receive queues: do not set it in a program that uses them from
