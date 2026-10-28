@@ -2670,7 +2670,9 @@ impl<T: Transport> QueuePair<T> {
         let post_recv = unsafe { (*(*self.qp).context).ops.post_recv }.unwrap();
         let errno = unsafe { post_recv(self.qp, head, &mut bad_wr) };
         if errno != 0 {
-            Err(Error::errno(errno, Error::PostReceive))
+            // ionic returns its errnos negated (`-EAGAIN` when the device still owns the slot, so
+            // posting again soon succeeds); the others return them as they are.
+            Err(Error::errno(errno.abs(), Error::PostReceive))
         } else {
             Ok(())
         }
