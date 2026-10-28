@@ -1615,14 +1615,24 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     ///
     /// # Safety
     ///
-    /// Every memory region referenced by the batch must stay valid until a work completion has been
-    /// polled for the corresponding `wr_id`.
+    /// Every memory region the batch references must stay valid until the device is done with it:
+    /// until a work completion has been polled for its request, or for a later signaled request on
+    /// the same send queue (an unsignaled request produces no completion of its own), or until the
+    /// queue pair has been reset or destroyed.
+    ///
+    /// That holds even when this returns `Err`, and for requests of a batch that was dropped:
+    ///
+    /// - rxe hands the requests to the device before it reports a failure (below `RTS`, for one);
+    /// - on mlx5, a request added while the send queue is full rewrites the last request posted
+    ///   before it, so never have more requests outstanding than the queue's capacity;
+    /// - hns devices in owner-doorbell mode may execute each request as soon as its opcode method
+    ///   returns, before `submit` and even if the batch is dropped.
     ///
     /// # Errors
     ///
     ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when the send queue is full or out of
-    ///    resources).
+    ///    value in one of the work requests, `ENOMEM` when out of resources or when the send queue
+    ///    was full, which on mlx5 also corrupted a posted request; see Safety).
     pub unsafe fn submit(self) -> Result<()> {
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
@@ -2702,7 +2712,9 @@ impl<T: Transport> QueuePair<T> {
     /// # Safety
     ///
     /// Each referenced memory region must stay valid until a work completion has been polled for the
-    /// corresponding `wr_id`.
+    /// corresponding `wr_id`, or until the queue pair has been reset or destroyed (which discards
+    /// its outstanding receives). After an `Err`, the requests ahead of the one that failed were
+    /// posted, so the same holds for theirs.
     ///
     /// # Errors
     ///
@@ -2736,11 +2748,12 @@ impl<T: Transport> QueuePair<T> {
     /// batch starts each request at [`to`](SendBatch::to) instead, which also addresses it):
     /// chain [`signaled`](SendOp::signaled) to request a completion, then post with the opcode
     /// method (`send`, `write`, `read`, the atomics, ...; which of them exist depends on the
-    /// transport — see [`Transport`]). Nothing reaches the device until
-    /// [`submit`](SendBatch::submit), which rings the doorbell once for the whole batch.
+    /// transport — see [`Transport`]). [`submit`](SendBatch::submit) then rings the doorbell once
+    /// for the whole batch; before that, the requests normally do not reach the device (its
+    /// safety section lists the exceptions).
     ///
-    /// As with any send, the memory backing each scatter/gather slice must stay valid until a work
-    /// completion has been polled for the request.
+    /// As with any send, the memory backing each scatter/gather slice must stay valid until the
+    /// device is done with the request (see [`submit`](SendBatch::submit)).
     ///
     /// # Examples
     ///
@@ -2840,7 +2853,9 @@ impl<T: Transport> RecvQueue<'_, T> {
     /// # Safety
     ///
     /// Each referenced memory region must stay valid until a work completion has been polled for
-    /// the corresponding `wr_id`.
+    /// the corresponding `wr_id`, or until the queue pair has been reset or destroyed (which
+    /// discards its outstanding receives). After an `Err`, the requests ahead of the one that
+    /// failed were posted, so the same holds for theirs.
     ///
     /// # Errors
     ///

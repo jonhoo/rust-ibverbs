@@ -153,7 +153,8 @@ impl SharedReceiveQueue {
     ///
     /// Each referenced memory region must stay valid until a work completion has been polled for
     /// the corresponding `wr_id` (i.e., until `CompletionQueue::poll` returns a completion for
-    /// that receive).
+    /// that receive), or until the shared receive queue is destroyed. After an `Err`, the requests
+    /// ahead of the one that failed were posted, so the same holds for theirs.
     ///
     /// # Errors
     ///
