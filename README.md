@@ -186,6 +186,6 @@ $ sudo rdma link add rxe0 type rxe netdev <netdev>
 ```
 
 The examples (except the EFA one, which needs EFA hardware) and the integration test suite run
-against it unchanged, and CI does exactly this on every pull request: the whole data-path suite
-(two-sided, one-sided, atomics, inline, UC/UD, and the connection manager) runs against a
-SoftRoCE device and asserts on the transferred bytes.
+against it unchanged. CI runs the whole data-path test suite (two-sided, one-sided, atomics,
+inline, UC/UD, and the connection manager) against a SoftRoCE device on every pull request and
+asserts on the transferred bytes; it builds the examples but does not run them.
