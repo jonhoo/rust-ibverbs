@@ -99,11 +99,10 @@ jobs:
       - name: cargo semver-checks
         env:
           # The baseline is built from a scratch checkout without the vendored submodule, so point
-          # every header lookup at this workspace's copy (mirroring configure-ci.sh's values as
+          # the header lookup at the headers configure-ci.sh published (mirroring its values as
           # real environment variables, which apply to the baseline build too).
           RDMA_CORE_INCLUDE_DIR: ${{ github.workspace }}/rdma-core-build/include
           RDMA_CORE_LIB_DIR: ${{ github.workspace }}/rdma-core-build/lib
-          IBVERBS_HEADER_DIR: ${{ github.workspace }}/ibverbs-sys/vendor/rdma-core/libibverbs
         run: cargo semver-checks --package ibverbs --baseline-rev ${{ github.event.pull_request.base.sha }}
   package:
     # Packaging fails in ways the normal build does not: a path dependency whose registry version
