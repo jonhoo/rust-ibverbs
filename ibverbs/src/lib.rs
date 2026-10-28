@@ -82,7 +82,7 @@
 //!
 //! - `rdmacm`: the `rdmacm` module, wrapping the `librdmacm` connection manager: connection setup
 //!   over IP addresses, blocking or event-loop driven, instead of an out-of-band endpoint
-//!   exchange. Links `librdmacm`.
+//!   exchange. Links `librdmacm`, and needs the kernel's `rdma_ucm` module loaded.
 //! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via the `Srd` transport
 //!   (`ProtectionDomain::create_qp::<Srd>`). Links `libefa`.
 //! - `mlx5`: mlx5 Data Direct DMA-BUF registration
@@ -95,7 +95,9 @@
 //! At runtime, this crate dynamically links `libibverbs`, which is part of [`rdma-core`] (the
 //! package is `libibverbs1`, with `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core`
 //! on Arch; `rdma-core-devel` on Fedora), plus `librdmacm`, `libefa`, and `libmlx5` when the
-//! corresponding features are enabled.
+//! corresponding features are enabled. `libibverbs` in turn reaches a device through its provider
+//! library, which Debian and Ubuntu package separately as `ibverbs-providers`; without it, no
+//! device is listed.
 //!
 //! At build time, `bindgen` generates the bindings from the [`rdma-core`] headers vendored in
 //! `ibverbs-sys`, so building needs `libclang` but not the installed headers; the development

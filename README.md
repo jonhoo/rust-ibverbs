@@ -142,6 +142,11 @@ This crate dynamically links `libibverbs`, which is part of
 `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core` on Arch; `rdma-core-devel` on
 Fedora), plus `librdmacm`, `libefa`, and `libmlx5` when the corresponding features are enabled.
 
+Running needs two more pieces. `libibverbs` reaches a device through its provider library, which
+Debian and Ubuntu package separately as `ibverbs-providers`; without it, no device is listed. And
+the `rdmacm` feature reaches the kernel's connection manager through the `rdma_ucm` module, which
+may have to be loaded first (`sudo modprobe rdma_ucm`).
+
 At build time, `bindgen` generates the bindings from the `rdma-core` headers vendored in the
 `ibverbs-sys` crate, so building needs `libclang` but not the installed headers; the development
 packages are still needed for the unversioned library links (`libibverbs.so` and the like) that
