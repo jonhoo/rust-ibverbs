@@ -186,10 +186,10 @@
 //! [`libibverbs/verbs.h`]: https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h
 //! [C examples]: https://github.com/linux-rdma/rdma-core/tree/master/libibverbs/examples
 //! [examples]: https://github.com/jonhoo/rust-ibverbs/tree/main/ibverbs/examples
-//! [infini]: http://www.infinibandta.org/content/pages.php?pg=technology_public_specification
+//! [infini]: https://infinibandta.org/ibta-specification/
 //! [RFC5040]: https://tools.ietf.org/html/rfc5040
 //! [safe]: http://www.rdmamojo.com/2013/07/26/libibverbs-thread-safe-level/
-//! [soft]: https://docs.kernel.org/infiniband/rxe.html
+//! [soft]: https://github.com/linux-rdma/rdma-core/blob/master/Documentation/rxe.md
 //! [RDMAmojo]: http://www.rdmamojo.com/
 //! [overview]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 

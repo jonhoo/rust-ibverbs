@@ -176,7 +176,7 @@ are you will want to head over there. In particular, [this overview
 post](http://www.rdmamojo.com/2012/05/18/libibverbs/) may be a good place to start.
 
 For more information on RDMA verbs in general, see the [InfiniBand Architecture
-Specification](http://www.infinibandta.org/content/pages.php?pg=technology_public_specification)
+Specification](https://infinibandta.org/ibta-specification/)
 vol. 1, especially chapter 11, the RDMA Consortium's [RDMA Protocol Verbs
 Specification](https://tools.ietf.org/html/rfc5040), the upstream
 [`libibverbs/verbs.h`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h)
@@ -186,7 +186,7 @@ examples](https://github.com/linux-rdma/rdma-core/tree/master/libibverbs/example
 ## Testing without RDMA hardware
 
 Any modern Linux kernel can attach a software RDMA device
-([SoftRoCE](https://docs.kernel.org/infiniband/rxe.html)) to an ordinary network interface:
+([SoftRoCE](https://github.com/linux-rdma/rdma-core/blob/master/Documentation/rxe.md)) to an ordinary network interface:
 
 ```console
 $ sudo rdma link add rxe0 type rxe netdev <netdev>
