@@ -1123,7 +1123,7 @@ pub(crate) struct BringUp {
 /// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
 /// rdmacm connection request's `private_data`.
 ///
-/// Internally, this contains the `QueuePair`'s `qp_num`, the context's `lid` and `gid`, the
+/// Internally, this contains the `QueuePair`'s `qp_num`, its port's `lid` and `gid`, the
 /// packet sequence number the queue pair's send queue starts at, and how many RDMA reads and
 /// atomics it services at once.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
