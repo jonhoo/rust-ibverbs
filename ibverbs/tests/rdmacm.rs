@@ -288,6 +288,62 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn request_tells_the_peer_about_srq_and_flow_control() {
+    // The blocking helper sets the request's SRQ flag from a queue pair on a shared receive queue;
+    // the flow-control flag comes from the parameter. The listener reads both off the request.
+    let ip = device_ip(&open_test_device());
+    let listener = bind_listener(ip);
+    listener.listen(1).expect("listen");
+    let addr = listener.local_addr().expect("listen address");
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match listener.poll_cm_event().expect("listener event") {
+                Some(event) if event.event_type() == CmEventType::ConnectRequest => {
+                    let conn = unsafe { (*event.as_raw()).param.conn };
+                    let id = event.connection_request().expect("connection request");
+                    id.reject(&[]).expect("reject");
+                    return (conn.srq, conn.flow_control);
+                }
+                Some(_) => {}
+                None => {
+                    assert!(Instant::now() < deadline, "no connection request arrived");
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    });
+
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let srq = pd.create_srq(16, 1, 0).expect("client srq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, port)
+        .expect("client qp builder")
+        .set_srq(&srq)
+        .build()
+        .expect("client qp");
+    let param = ConnectionParameter::default().set_flow_control(true);
+    match resolved.connect(qp, param, SETUP_TIMEOUT) {
+        Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got a connection"),
+    }
+    assert_eq!(
+        join(server),
+        (1, 1),
+        "the request's SRQ and flow-control flags"
+    );
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn accept_times_out() {
     // An acceptor with a timeout and no client reports TimedOut instead of blocking forever.
     let acceptor = bind_acceptor(device_ip(&open_test_device()), 1);
@@ -567,6 +623,11 @@ fn low_level_connect_and_send() {
         unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) }
             .expect("post_recv");
 
+        // A reply that names no queue pair would point the client at queue pair 0.
+        match request.accept(&ConnectionParameter::default()) {
+            Err(Error::Accept(e)) if e.kind() == io::ErrorKind::InvalidInput => {}
+            other => panic!("expected the missing queue pair number refused, got {other:?}"),
+        }
         let param = ConnectionParameter::default()
             .set_qp_num(qp.qp_num())
             .set_private_data(SERVER_PDATA);
@@ -618,6 +679,11 @@ fn low_level_connect_and_send() {
         .expect("client init attr");
     qp.modify(&init).expect("client init");
 
+    // A request that names no queue pair would point the server at queue pair 0.
+    match id.connect(&ConnectionParameter::default()) {
+        Err(Error::Connect(e)) if e.kind() == io::ErrorKind::InvalidInput => {}
+        other => panic!("expected the missing queue pair number refused, got {other:?}"),
+    }
     let param = ConnectionParameter::default()
         .set_qp_num(qp.qp_num())
         .set_private_data(&client_endpoint.to_bytes());

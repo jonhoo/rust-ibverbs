@@ -2540,6 +2540,12 @@ impl<T: Transport> QueuePair<T> {
         unsafe { (*self.qp).qp_num }
     }
 
+    /// Whether this queue pair receives through a shared receive queue.
+    #[cfg(feature = "rdmacm")]
+    pub(crate) fn uses_srq(&self) -> bool {
+        self._srq.is_some()
+    }
+
     /// Returns the underlying `ibv_qp` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The send path uses the

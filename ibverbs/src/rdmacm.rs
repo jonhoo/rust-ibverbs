@@ -651,7 +651,8 @@ impl CmId {
     /// Initiates a connection to the remote (active side). On success a
     /// [`CmEventType::ConnectResponse`] (external queue pair) or [`CmEventType::Established`]
     /// event is delivered. `param` carries the local queue pair number; set it with
-    /// [`ConnectionParameter::set_qp_num`] to the number of the queue pair you built. After the
+    /// [`ConnectionParameter::set_qp_num`] to the number of the queue pair you built (and
+    /// [`set_srq`](ConnectionParameter::set_srq) if it uses a shared receive queue). After the
     /// response, apply the `Init` attributes again (see [`init_qp_attr`](Self::init_qp_attr)),
     /// move the queue pair to `RTR`/`RTS`, and call [`establish`](Self::establish).
     ///
@@ -659,11 +660,19 @@ impl CmId {
     ///
     ///  - [`Connect`](Error::Connect): `rdma_connect` failed, the private data exceeds what a
     ///    request can carry in this id's port space (56 bytes for [`PortSpace::Tcp`] and
-    ///    [`PortSpace::Ib`], 180 for the datagram port spaces), or the route has not resolved
-    ///    yet.
+    ///    [`PortSpace::Ib`], 180 for the datagram port spaces), the route has not resolved yet,
+    ///    or, in the connected port spaces, `param` carries no queue pair number (0) while the
+    ///    id has no queue pair of its own to take it from.
     pub fn connect(&self, param: &ConnectionParameter) -> Result<()> {
         self.check_connect_private_data(param)?;
         self.device_or(Error::Connect)?;
+        // A datagram request carries no queue pair number; the peer learns it from the reply.
+        if matches!(
+            self.port_space(),
+            ffi::rdma_port_space::RDMA_PS_TCP | ffi::rdma_port_space::RDMA_PS_IB
+        ) {
+            self.check_qp_num(param).map_err(Error::Connect)?;
+        }
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
@@ -673,15 +682,17 @@ impl CmId {
 
     /// Accepts a connection request (passive side), in response to a
     /// [`CmEventType::ConnectRequest`]. Build and move the queue pair to `RTS` first; `param`
-    /// carries its number, set with [`ConnectionParameter::set_qp_num`]. On success a
-    /// [`CmEventType::Established`] event is delivered.
+    /// carries its number, set with [`ConnectionParameter::set_qp_num`] (and
+    /// [`set_srq`](ConnectionParameter::set_srq) if it uses a shared receive queue). On success
+    /// a [`CmEventType::Established`] event is delivered.
     ///
     /// # Errors
     ///
     ///  - [`Accept`](Error::Accept): `rdma_accept` failed, the private data exceeds what a reply
     ///    can carry in this id's port space (196 bytes for [`PortSpace::Tcp`] and
-    ///    [`PortSpace::Ib`], 136 for the datagram port spaces), or the id has no device (a
-    ///    connection request's id always has one).
+    ///    [`PortSpace::Ib`], 136 for the datagram port spaces), the id has no device (a
+    ///    connection request's id always has one), or `param` carries no queue pair number (0)
+    ///    while the id has no queue pair of its own to take it from.
     pub fn accept(&self, param: &ConnectionParameter) -> Result<()> {
         check_private_data(
             param.param.private_data_len.into(),
@@ -690,6 +701,7 @@ impl CmId {
         )
         .map_err(Error::Accept)?;
         self.device_or(Error::Accept)?;
+        self.check_qp_num(param).map_err(Error::Accept)?;
         // The raw struct's private-data pointer aims into `param`'s inline storage, which the
         // borrow keeps alive across the FFI call.
         let mut raw = param.as_raw();
@@ -892,6 +904,21 @@ impl CmId {
     /// The port space this id was created in.
     fn port_space(&self) -> ffi::rdma_port_space {
         unsafe { (*self.inner.id).ps }
+    }
+
+    /// Checks that `param` names the queue pair the peer is to address: librdmacm takes the number
+    /// from a queue pair it created on the id (`rdma_create_qp`) and otherwise sends `param`'s
+    /// as it is, so a forgotten [`set_qp_num`](ConnectionParameter::set_qp_num) would point the
+    /// peer at queue pair 0.
+    fn check_qp_num(&self, param: &ConnectionParameter) -> io::Result<()> {
+        if param.param.qp_num == 0 && unsafe { (*self.inner.id).qp }.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the connection parameter carries no queue pair number; set it with \
+                 ConnectionParameter::set_qp_num",
+            ));
+        }
+        Ok(())
     }
 
     /// Checks that `param`'s private data fits a connection request in this id's port space.
@@ -1200,7 +1227,8 @@ const MAX_PRIVATE_DATA: usize = 196;
 /// [`Default`] gives sane reliable-connection defaults, and the setters consume and return the
 /// value, so a parameter is built up in one expression:
 /// `ConnectionParameter::default().set_qp_num(qpn).set_private_data(b"hello")`. The local queue
-/// pair number is set automatically by [`Resolved::connect`] / [`Incoming::accept`].
+/// pair's number, and whether it uses a shared receive queue, are set automatically by
+/// [`Resolved::connect`] / [`Incoming::accept`].
 #[derive(Clone, Copy)]
 pub struct ConnectionParameter {
     param: ffi::rdma_conn_param,
@@ -1278,6 +1306,28 @@ impl ConnectionParameter {
             "a queue pair number is 24 bits, got {qp_num:#x}"
         );
         self.param.qp_num = qp_num;
+        self
+    }
+
+    /// Sets whether the local queue pair receives through a shared receive queue, which the request
+    /// or reply tells the peer. The blocking [`Resolved::connect`] / [`Incoming::accept`] helpers
+    /// set this from the queue pair, as librdmacm does for a queue pair it created; set it
+    /// yourself when driving [`CmId::connect`] or [`CmId::accept`] directly.
+    ///
+    /// Defaults to `false`.
+    pub fn set_srq(mut self, srq: bool) -> Self {
+        self.param.srq = srq.into();
+        self
+    }
+
+    /// Sets whether the local side implements end-to-end flow control, which the request or reply
+    /// tells the peer: whether its acknowledgments carry the receive credits that tell the peer
+    /// how many receives are posted (a shared receive queue cannot count them per connection).
+    /// The connection manager only passes it on.
+    ///
+    /// Defaults to `false`.
+    pub fn set_flow_control(mut self, flow_control: bool) -> Self {
+        self.param.flow_control = flow_control.into();
         self
     }
 
@@ -1384,7 +1434,8 @@ impl Resolved {
     }
 
     /// Connects to the remote (blocking) using `qp`, returning the established [`Connection`]. The
-    /// queue pair number in `param` is set automatically.
+    /// queue pair's number and whether it uses a shared receive queue are set in `param`
+    /// automatically.
     ///
     /// `timeout` bounds how long to wait for the remote's response: on expiry
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
@@ -1433,7 +1484,7 @@ impl Resolved {
         let deadline = crate::completion::deadline_after(timeout);
         self.id.check_connect_private_data(&param)?;
         let mut qp = self.id.init_qp(qp)?;
-        let param = param.set_qp_num(qp.qp_num());
+        let param = param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
         self.id.connect(&param)?;
         let response = self.id.wait_for(CmEventType::ConnectResponse, deadline)?;
         let private_data = response
@@ -1574,7 +1625,8 @@ impl Incoming {
     }
 
     /// Accepts the connection (blocking) using `qp`, returning the established [`Connection`]. The
-    /// queue pair number in `param` is set automatically, and the queue pair is configured with
+    /// queue pair's number and whether it uses a shared receive queue are set in `param`
+    /// automatically, and the queue pair is configured with
     /// the outstanding-RDMA limits `param` advertises to the peer
     /// ([`set_responder_resources`](ConnectionParameter::set_responder_resources) /
     /// [`set_initiator_depth`](ConnectionParameter::set_initiator_depth)).
@@ -1636,7 +1688,7 @@ impl Incoming {
         self.id
             .ready(&mut qp, responder_resources, initiator_depth)?;
         prepare(&qp)?;
-        let param = param.set_qp_num(qp.qp_num());
+        let param = param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
         self.id.accept(&param)?;
         self.id.wait_for(CmEventType::Established, deadline)?;
         Ok(Connection {
@@ -1775,6 +1827,18 @@ mod test_conversions {
         assert_eq!(timeout_ms(Duration::from_millis(5)), 5);
         assert_eq!(timeout_ms(Duration::from_micros(5_001)), 6);
         assert_eq!(timeout_ms(Duration::MAX), c_int::MAX);
+    }
+
+    #[test]
+    fn connection_parameters_reach_the_raw_struct() {
+        let raw = ConnectionParameter::default().as_raw();
+        assert_eq!((raw.srq, raw.flow_control, raw.qp_num), (0, 0, 0));
+        let raw = ConnectionParameter::default()
+            .set_srq(true)
+            .set_flow_control(true)
+            .set_qp_num(0x12_3456)
+            .as_raw();
+        assert_eq!((raw.srq, raw.flow_control, raw.qp_num), (1, 1, 0x12_3456));
     }
 
     #[test]
