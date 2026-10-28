@@ -593,7 +593,8 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The entry corresponds to the index in [`Context::gid_table`](crate::Context::gid_table).
     /// [`PreparedQueuePair::endpoint`] embeds the GID at this index in the local endpoint, and
     /// [`handshake`](PreparedQueuePair::handshake) routes with it when the remote endpoint
-    /// carries a `gid`.
+    /// carries a `gid`. Only indexes up to 255 can route (an address vector holds the source GID
+    /// index in 8 bits), so the handshake refuses a larger one.
     ///
     /// Defaults to unset.
     pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
@@ -1235,16 +1236,28 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`GidMismatch`](Error::GidMismatch): `remote` carries a GID, but no `gid_index` was
     ///    set on the builder to route from.
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but `remote` carries no GID.
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): the path MTU is not a valid MTU encoding
-    ///    ([`io::ErrorKind::InvalidInput`]), as when the port reported no active MTU to default
-    ///    to and none was set with [`QueuePairBuilder::set_path_mtu`].
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
+    ///    path MTU is not a valid MTU encoding, as when the port reported no active MTU to default
+    ///    to and none was set with [`QueuePairBuilder::set_path_mtu`]; or `remote` carries a GID
+    ///    and the builder's GID index is above 255, more than an address vector can hold.
     pub fn rtr_attributes(&self, remote: &QueuePairEndpoint) -> Result<QueuePairAttribute> {
         let mut path = AddressHandleAttribute::new(self.port_num);
         path.set_dest_lid(remote.lid)
             .set_service_level(self.service_level);
         if let Some(gid) = remote.gid {
             let sgid_index = self.gid_index.ok_or(Error::GidMismatch)?;
-            path.set_grh(gid, sgid_index as u8, 0xff, self.traffic_class);
+            // The address vector carries the index in 8 bits (`ibv_global_route.sgid_index`, and
+            // the kernel ABI's), so a larger one would route from whatever entry it truncates to.
+            let sgid_index = u8::try_from(sgid_index).map_err(|_| {
+                Error::ModifyQueuePair(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "GID index {sgid_index} is above 255, the highest an address vector can \
+                         route from"
+                    ),
+                ))
+            })?;
+            path.set_grh(gid, sgid_index, 0xff, self.traffic_class);
         } else if self.roce {
             // RoCE routes every packet by GID; the kernel refuses an address vector without one
             // with nothing but `EINVAL`.
@@ -1309,7 +1322,8 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but the remote endpoint carries
     ///    no GID.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
-    ///    path MTU is not a valid MTU encoding (see [`rtr_attributes`](Self::rtr_attributes)).
+    ///    path MTU is not a valid MTU encoding, or the GID index to route from is above 255 (see
+    ///    [`rtr_attributes`](Self::rtr_attributes)).
     ///  - The errors of [`QueuePair::modify`]: [`ModifyQueuePair`](Error::ModifyQueuePair) when
     ///    a transition fails (for example because the remote endpoint is unreachable — on RoCE,
     ///    the error spells out the route that failed), or its typed diagnoses of a rejected

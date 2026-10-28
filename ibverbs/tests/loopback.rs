@@ -2179,6 +2179,39 @@ fn roce_handshake_needs_a_gid() {
     }
 }
 
+/// An address vector holds the source GID index in 8 bits, so routing from a higher index
+/// (Soft-RoCE's GID table has 1024 entries) is refused rather than truncated to another entry.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn gid_index_above_255_is_refused() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let remote = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP")
+        .set_gid_index(gid_index(&ctx))
+        .build()
+        .expect("failed to build QP")
+        .endpoint()
+        .expect("failed to read endpoint");
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP")
+        .set_gid_index(256 + gid_index(&ctx))
+        .build()
+        .expect("failed to build QP");
+    match prepared.rtr_attributes(&remote) {
+        Err(Error::ModifyQueuePair(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            assert!(e.to_string().contains("above 255"), "{e}");
+        }
+        other => panic!(
+            "expected an InvalidInput ModifyQueuePair, got {:?}",
+            other.err()
+        ),
+    }
+}
+
 /// The attributes `handshake` applies are exposed, so a manual bring-up can start from them,
 /// adjust one, and still reach a working queue pair.
 #[test]
