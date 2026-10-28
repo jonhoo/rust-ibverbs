@@ -1253,8 +1253,11 @@ impl CompletionQueue {
     /// without a channel ([`CompletionQueueBuilder::set_comp_channel`]), arming has nothing to
     /// notify.
     ///
-    /// If `solicited_only` is set, only completions of work requests that asked for a solicited
-    /// event generate a notification.
+    /// If `solicited_only` is set, only solicited completions generate a notification: receive
+    /// completions of messages whose sender asked for a solicited event
+    /// ([`SendOp::solicited`](crate::SendOp::solicited)), and every completion with an error
+    /// status. Not every provider can arm for solicited completions only (EFA returns
+    /// [`Unsupported`](Error::Unsupported)).
     ///
     /// Arm a given queue and consume its notifications from one thread at a time (see
     /// [Thread safety](crate#thread-safety)).
