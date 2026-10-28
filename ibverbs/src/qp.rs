@@ -156,8 +156,9 @@ pub trait Transport: sealed::Sealed {}
 /// remote endpoint with [`PreparedQueuePair::handshake`].
 pub trait Connected: Transport {}
 
-/// Implemented by the reliable connected transport RC, the only transport with acknowledgements
-/// and retries, RDMA reads, and atomics.
+/// Implemented by the reliable connected transport RC, the only connected transport with
+/// acknowledgements and retries and RDMA reads, and the only transport with atomics (EFA's SRD,
+/// behind the `efa` feature, is reliable and has RDMA reads too, but is a datagram transport).
 pub trait Reliable: Connected {}
 
 /// Implemented by the datagram transports UD and SRD, which address each send individually with
