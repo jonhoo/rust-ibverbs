@@ -505,8 +505,15 @@ fn batched_post() {
     }
     .expect("batched post failed");
 
-    // The receive completion for the send plus the single signaled send completion.
+    // The receive completion for the send plus the single signaled send completion, and nothing
+    // for the unsignaled write.
     let comps = drain(&lb.cq, 2);
+    let mut rest = lb.cq.poll().expect("failed to poll the completion queue");
+    assert!(
+        rest.next().is_none(),
+        "the unsignaled write produced a completion"
+    );
+    drop(rest);
     assert!(
         comps.iter().any(|wc| wc.wr_id() == 100),
         "missing recv completion"
