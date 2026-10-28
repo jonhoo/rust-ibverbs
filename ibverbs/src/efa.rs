@@ -87,7 +87,9 @@ impl QueuePairBuilder<Srd> {
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
             )
         };
-        self.prepared(nonnull(qp, Error::CreateQueuePair)?, &attr)
+        let qp = nonnull(qp, Error::CreateQueuePair)
+            .map_err(|e| e.for_operation(&"efadv_create_qp_ex"))?;
+        self.prepared(qp, &attr)
     }
 }
 

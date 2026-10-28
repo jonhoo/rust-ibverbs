@@ -357,6 +357,16 @@ impl Error {
         }
     }
 
+    /// This error, naming `operation` as the declined verb if it is
+    /// [`Unsupported`](Error::Unsupported): for the verbs that report their failures through a
+    /// variant whose own [`operation`](Error::operation) names another verb.
+    pub(crate) fn for_operation(self, operation: &'static &'static str) -> Error {
+        match self {
+            Error::Unsupported { errno, .. } => Error::Unsupported { operation, errno },
+            other => other,
+        }
+    }
+
     /// As [`os`](Error::os), but from a raw `errno`.
     ///
     /// Cold and out of line: the data-path calls (`submit`, `post_recv`, `poll`) report failures
@@ -446,6 +456,25 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_shared_variant_names_the_verb_that_was_declined() {
+        let err = Error::errno(nix::libc::EOPNOTSUPP, Error::RegisterMemoryRegion)
+            .for_operation(&"ibv_reg_dmabuf_mr");
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported {
+                    operation: &"ibv_reg_dmabuf_mr",
+                    errno: nix::libc::EOPNOTSUPP,
+                }
+            ),
+            "{err:?}"
+        );
+        let err = Error::errno(nix::libc::ENOMEM, Error::RegisterMemoryRegion)
+            .for_operation(&"ibv_reg_dmabuf_mr");
+        assert!(matches!(err, Error::RegisterMemoryRegion(_)), "{err:?}");
     }
 
     #[test]

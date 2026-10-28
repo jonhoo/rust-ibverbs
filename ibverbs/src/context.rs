@@ -372,7 +372,9 @@ impl Context {
             ffi::ibv_query_device_ex(self.inner.ctx, std::ptr::null(), &mut device_attr as *mut _)
         };
         if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
+            return Err(
+                Error::errno(errno, Error::QueryDevice).for_operation(&"ibv_query_device_ex")
+            );
         }
         Ok(DeviceAttrEx(device_attr))
     }

@@ -1089,6 +1089,37 @@ fn advise_mr() {
     }
 }
 
+/// A device that cannot register DMA-BUFs (Soft-RoCE among them) refuses it naming the verb that
+/// was called, `ibv_reg_dmabuf_mr`, not `ibv_reg_mr`.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn dmabuf_registration_names_its_verb() {
+    use std::os::fd::AsFd;
+
+    let ctx = open_test_device();
+    let soft_roce = ctx
+        .query_device()
+        .expect("failed to query device")
+        .vendor_id
+        == SOFT_ROCE_VENDOR_ID;
+    let pd = ctx
+        .alloc_pd()
+        .expect("failed to allocate protection domain");
+    let not_dmabuf = std::fs::File::open("/dev/null").expect("failed to open /dev/null");
+    match pd.register_dmabuf(not_dmabuf.as_fd(), 0, 4096, 0, AccessFlags::LOCAL_WRITE) {
+        Err(Error::Unsupported { operation, errno }) => {
+            assert_eq!(*operation, "ibv_reg_dmabuf_mr");
+            assert_eq!(errno, nix::libc::EOPNOTSUPP);
+        }
+        // A device that registers DMA-BUFs refuses a descriptor that is not one.
+        Err(Error::RegisterMemoryRegion(_)) if !soft_roce => {}
+        other => panic!(
+            "expected ibv_reg_dmabuf_mr to be refused, got {:?}",
+            other.err()
+        ),
+    }
+}
+
 /// Registering externally managed memory through the unsafe raw entry point, then using it for a
 /// loopback transfer. The caller owns the buffers and keeps them alive past the regions.
 #[test]

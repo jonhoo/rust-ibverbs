@@ -156,7 +156,7 @@ impl CompletionChannel {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::os(e, Error::PollCompletionQueue));
+            return Err(Error::os(e, Error::PollCompletionQueue).for_operation(&"ibv_get_cq_event"));
         }
         // Every event from ibv_get_cq_event() must eventually be acknowledged.
         unsafe { ffi::ibv_ack_cq_events(out_cq, 1) };

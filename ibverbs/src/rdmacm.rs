@@ -762,7 +762,7 @@ impl CmId {
                     errno: nix::libc::ENOSYS,
                 });
             }
-            return Err(Error::os(err, Error::ConnectionSetup));
+            return Err(Error::os(err, Error::ConnectionSetup).for_operation(&"rdma_set_option"));
         }
         Ok(())
     }
