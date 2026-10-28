@@ -182,8 +182,8 @@ pub struct Uc;
 /// send is addressed individually with an [`AddressHandle`]
 /// ([`QueuePairType::UnreliableDatagram`]).
 ///
-/// On EFA, mark every UD send [`signaled`](AddressedSendOp::signaled) and none
-/// [`solicited`](AddressedSendOp::solicited): EFA refuses unsignaled and solicited work requests,
+/// On EFA, mark every UD send [`signaled`](SendOp::signaled) and none
+/// [`solicited`](SendOp::solicited): EFA refuses unsignaled and solicited work requests,
 /// and the batch then fails at [`submit`](SendBatch::submit).
 #[derive(Debug, Clone, Copy)]
 pub struct Ud;
@@ -1584,8 +1584,8 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
     ///
     /// Every datagram send needs a destination, so this is the datagram batch's entry point; the
     /// destination is per work request, so one batch may address each request to a different
-    /// peer. The returned [`AddressedSendOp`] carries the request until an opcode method posts
-    /// it: chain the modifiers first (`batch.to(&ah, qpn, qkey).signaled().send(id, sges)`),
+    /// peer. The returned [`SendOp`] carries the request until an opcode method posts it:
+    /// chain the modifiers first (`batch.to(&ah, qpn, qkey).signaled().send(id, sges)`),
     /// because the provider reads the work-request flags and addressing inside the opcode
     /// builder.
     ///
@@ -1605,19 +1605,17 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
         ah: &'b AddressHandle,
         remote_qpn: u32,
         remote_qkey: u32,
-    ) -> AddressedSendOp<'b, 'qp, T> {
+    ) -> SendOp<'b, 'qp, T> {
         // One protection domain implies one device context.
         assert!(
             unsafe { (*ah.as_raw()).pd == (*self.qpx).qp_base.pd },
             "the address handle must come from the queue pair's protection domain"
         );
-        AddressedSendOp {
-            op: SendOp {
-                batch: self,
-                flags: 0,
-                imm: None,
-                dest: Some((ah.as_raw(), remote_qpn, remote_qkey)),
-            },
+        SendOp {
+            batch: self,
+            flags: 0,
+            imm: None,
+            dest: Some((ah.as_raw(), remote_qpn, remote_qkey)),
         }
     }
 }
@@ -1668,13 +1666,15 @@ impl<T: Transport> Drop for SendBatch<'_, T> {
 }
 
 /// One work request being configured and posted on a [`SendBatch`]. Created by
-/// [`SendBatch::op`] (connected transports; a datagram batch starts each request at
-/// [`SendBatch::to`], which yields an [`AddressedSendOp`] instead).
+/// [`SendBatch::op`] on the connected transports, and by [`SendBatch::to`], which also addresses
+/// it, on the datagram ones.
 ///
-/// Chain the modifiers ([`signaled`](Self::signaled), [`solicited`](Self::solicited),
-/// [`imm`](Self::imm), and on RC [`fenced`](Self::fenced)) and finish with an opcode method (`send`,
-/// `write`, ...), which posts the request immediately. The opcodes exist only on the transports
-/// that support them (see [`Transport`]); `send` and `write` take any [`Payload`].
+/// Chain the modifiers ([`signaled`](Self::signaled), [`imm`](Self::imm), except on SRD
+/// [`solicited`](Self::solicited), and on RC [`fenced`](Self::fenced)) and finish with an opcode
+/// method (`send`, `write`, ...), which posts the request immediately. The opcodes exist only on
+/// the transports that support them (see [`Transport`]): UD supports SEND, and SRD (behind the
+/// `efa` feature) RDMA WRITE (from registered memory) and READ as well. `send` and the connected
+/// transports' `write` take any [`Payload`].
 #[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
 pub struct SendOp<'b, 'qp, T: Transport> {
     batch: &'b mut SendBatch<'qp, T>,
@@ -1685,18 +1685,34 @@ pub struct SendOp<'b, 'qp, T: Transport> {
 
 impl<T: Transport> SendOp<'_, '_, T> {
     /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
+    ///
+    /// On SRD every work request generates a completion, so this is implied there. EFA refuses
+    /// unsignaled work requests on UD too, so on EFA mark every UD send signaled.
     #[inline]
     pub fn signaled(mut self) -> Self {
         self.flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
         self
     }
 
-    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or an RDMA WRITE with an
-    /// immediate raises a solicited event on the remote side, waking a peer blocked on its
-    /// completion channel after arming with [`CompletionQueue::req_notify`] for solicited events
-    /// only. The flag is valid only on those operations: ionic refuses it on any other.
+    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
+    ///
+    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
+    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
+    /// requirements of each.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
+    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
     #[inline]
-    pub fn solicited(mut self) -> Self {
+    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
+        let imm = self.imm;
+        self.build(wr_id, payload.into(), Self::send_op(imm))
+    }
+
+    /// Set the solicited flag; the transports that allow it expose this as `solicited`.
+    #[inline]
+    fn solicit(mut self) -> Self {
         self.flags |= ffi::ibv_send_flags::IBV_SEND_SOLICITED.0;
         self
     }
@@ -1845,20 +1861,13 @@ impl<T: Transport> SendOp<'_, '_, T> {
 }
 
 impl<T: Connected> SendOp<'_, '_, T> {
-    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
-    ///
-    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
-    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
-    /// requirements of each.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
-    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or an RDMA WRITE with an
+    /// immediate raises a solicited event on the remote side, waking a peer blocked on its
+    /// completion channel after arming with [`CompletionQueue::req_notify`] for solicited events
+    /// only. The flag is valid only on those operations: ionic refuses it on any other.
     #[inline]
-    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
-        let imm = self.imm;
-        self.build(wr_id, payload.into(), Self::send_op(imm))
+    pub fn solicited(self) -> Self {
+        self.solicit()
     }
 
     /// Post an RDMA WRITE of `payload` into `remote`, with the immediate set by [`imm`](Self::imm)
@@ -1960,67 +1969,14 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     }
 }
 
-/// One datagram work request being configured and posted on a [`SendBatch`], addressed at
-/// creation by [`SendBatch::to`].
-///
-/// Chain the modifiers ([`signaled`](Self::signaled), [`imm`](Self::imm), and on UD
-/// [`solicited`](Self::solicited)) and finish with an opcode method, which posts the request
-/// immediately. UD supports SEND (with any [`Payload`]); SRD (behind the `efa` feature)
-/// additionally supports RDMA write (from registered memory) and read, but not the solicited flag,
-/// which EFA refuses (on UD as well).
-#[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
-pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
-    pub(crate) op: SendOp<'b, 'qp, T>,
-}
-
-impl<T: Datagram> AddressedSendOp<'_, '_, T> {
-    /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
-    ///
-    /// On SRD every work request generates a completion, so this is implied there. EFA refuses
-    /// unsignaled work requests on UD too, so on EFA mark every UD send signaled.
-    #[inline]
-    pub fn signaled(self) -> Self {
-        AddressedSendOp {
-            op: self.op.signaled(),
-        }
-    }
-
-    /// Attach a 32-bit immediate (host byte order) to the SEND this request posts, delivered to
-    /// the receiver in its work completion ([`WorkCompletion::imm_data`](crate::WorkCompletion::imm_data)).
-    #[inline]
-    pub fn imm(self, imm: u32) -> Self {
-        AddressedSendOp {
-            op: self.op.imm(imm),
-        }
-    }
-
-    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
-    ///
-    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
-    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
-    /// requirements of each.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
-    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
-    #[inline]
-    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
-        let imm = self.op.imm;
-        self.op
-            .build(wr_id, payload.into(), SendOp::<T>::send_op(imm))
-    }
-}
-
-impl AddressedSendOp<'_, '_, Ud> {
-    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
-    /// raises a solicited event on the remote side, waking a peer blocked on its completion
-    /// channel after arming with [`CompletionQueue::req_notify`] for solicited events only.
+// UD has the solicited flag but SRD does not: EFA refuses it (on UD as well).
+impl SendOp<'_, '_, Ud> {
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND raises a solicited event on
+    /// the remote side, waking a peer blocked on its completion channel after arming with
+    /// [`CompletionQueue::req_notify`] for solicited events only.
     #[inline]
     pub fn solicited(self) -> Self {
-        AddressedSendOp {
-            op: self.op.solicited(),
-        }
+        self.solicit()
     }
 }
 

@@ -11,8 +11,8 @@
 use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::qp::{
-    AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePairBuilder, QueuePairType, SendOp,
-    Transport, sealed,
+    Datagram, Payload, PreparedQueuePair, QueuePairBuilder, QueuePairType, SendOp, Transport,
+    sealed,
 };
 
 #[cfg(doc)]
@@ -28,12 +28,12 @@ use crate::{AddressHandle, ProtectionDomain, QueuePair};
 /// [`to(..)`](crate::SendBatch::to), receive with [`post_recv`](QueuePair::post_recv).
 ///
 /// Every SRD work request generates a completion: EFA refuses unsignaled ones, so the queue pair
-/// is created to signal every send and [`signaled`](AddressedSendOp::signaled) is implied. Size
+/// is created to signal every send and [`signaled`](SendOp::signaled) is implied. Size
 /// the send completion queue for a completion per work request (see
 /// [`CompletionQueue::capacity`](crate::CompletionQueue::capacity)).
 ///
 /// EFA also refuses the solicited flag, so an SRD work request has no
-/// [`solicited`](AddressedSendOp::solicited) modifier:
+/// [`solicited`](SendOp::solicited) modifier:
 ///
 /// ```compile_fail,E0599
 /// // EFA refuses the solicited flag: `solicited` exists only on UD.
@@ -92,7 +92,7 @@ impl QueuePairBuilder<Srd> {
     }
 }
 
-impl AddressedSendOp<'_, '_, Srd> {
+impl SendOp<'_, '_, Srd> {
     /// Post an RDMA WRITE of `local` into `remote`, with the immediate set by [`imm`](Self::imm)
     /// if any.
     ///
@@ -106,9 +106,9 @@ impl AddressedSendOp<'_, '_, Srd> {
     /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        let imm = self.op.imm;
+        let imm = self.imm;
         let op = SendOp::<Srd>::write_op(imm, remote);
-        self.op.build(wr_id, Payload::Sges(local), op)
+        self.build(wr_id, Payload::Sges(local), op)
     }
 
     /// Post an RDMA READ from `remote` into `local`.
@@ -120,6 +120,6 @@ impl AddressedSendOp<'_, '_, Srd> {
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         let op = SendOp::<Srd>::read_op(remote);
-        self.op.build(wr_id, Payload::Sges(local), op)
+        self.build(wr_id, Payload::Sges(local), op)
     }
 }
