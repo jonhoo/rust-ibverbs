@@ -1740,11 +1740,10 @@ impl<T: Transport> SendOp<'_, '_, T> {
             (*qpx).wr_id = wr_id;
             (*qpx).wr_flags = match payload {
                 Payload::Sges(_) => self.flags,
-                // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline; it
-                // is what the legacy `ibv_post_send` ABI carries, and rdma-core's generic doorbell
-                // emulation (used by providers such as Soft-RoCE) sets it when translating
-                // `wr_set_inline_data`. Native doorbell providers key off the `wr_set_inline_data`
-                // call itself, so the flag is redundant but harmless there.
+                // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline, as
+                // the legacy `ibv_post_send` ABI carries it. Soft-RoCE copies the work-request
+                // flags into the request verbatim and needs it; the other providers key off the
+                // `wr_set_inline_data` call itself, so the flag is redundant but harmless there.
                 Payload::Inline(_) | Payload::InlineList(_) => {
                     self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0
                 }
