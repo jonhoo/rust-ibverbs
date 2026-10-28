@@ -11,15 +11,14 @@
 use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::qp::{
-    Datagram, Payload, PreparedQueuePair, QueuePairBuilder, QueuePairType, SendOp, Transport,
-    sealed,
+    Datagram, Payload, PreparedQueuePair, QueuePairBuilder, SendOp, Transport, sealed,
 };
 
 #[cfg(doc)]
 use crate::{AddressHandle, ProtectionDomain, QueuePair};
 
 /// The EFA SRD (Scalable Reliable Datagram) transport: reliable like RC but connectionless and
-/// addressed like UD ([`QueuePairType::Driver`]).
+/// addressed like UD (a provider-specific `IBV_QPT_DRIVER` queue pair).
 ///
 /// Begin building an SRD queue pair with [`ProtectionDomain::create_qp`]`::<Srd>`, configure it
 /// like any other queue pair (GID index, queue/SGE limits), create it with
@@ -46,7 +45,7 @@ use crate::{AddressHandle, ProtectionDomain, QueuePair};
 pub struct Srd;
 
 impl sealed::Sealed for Srd {
-    const TYPE: QueuePairType = QueuePairType::Driver;
+    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_DRIVER;
 }
 impl Transport for Srd {}
 impl Datagram for Srd {}

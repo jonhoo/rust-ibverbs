@@ -9,7 +9,7 @@ use crate::completion::CompletionQueue;
 use crate::context::{Context, PortAttr, PortState};
 use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion};
-use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
+use crate::qp::{QueuePairBuilder, Transport};
 use crate::srq::SharedReceiveQueue;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
@@ -182,7 +182,7 @@ impl ProtectionDomain {
         let port_attr = self.context().query_port(port_num)?;
         require_active(port_num, &port_attr)?;
         // Only reliable connections carry RDMA read and atomic limits.
-        let rd_atomic_limits = if T::TYPE == QueuePairType::ReliableConnection {
+        let rd_atomic_limits = if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
             Some(self.context().rd_atomic_limits()?)
         } else {
             None

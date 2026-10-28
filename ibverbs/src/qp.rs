@@ -12,93 +12,12 @@ use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
 use crate::srq::SharedReceiveQueue;
 
-/// The transport service type of a queue pair.
-///
-/// At creation the type is derived from the transport marker (see [`Transport`] and
-/// [`ProtectionDomain::create_qp`]); this enum names the types on the wire and in queries. The
-/// types without a marker ([`RawPacket`](Self::RawPacket), the XRC pair, and
-/// [`Driver`](Self::Driver) other than EFA's SRD) are not usable through the portable wrapper;
-/// when they become so, they will get their own markers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum QueuePairType {
-    /// Reliable connection ("RC"): connected to exactly one peer, with in-order, reliable
-    /// delivery. Supports sends, RDMA read/write, and atomics.
-    ReliableConnection,
-    /// Unreliable connection ("UC"): connected to exactly one peer, in order but without
-    /// delivery guarantees. Supports sends and RDMA writes.
-    UnreliableConnection,
-    /// Unreliable datagram ("UD"): connectionless; each send is addressed individually with an
-    /// [`AddressHandle`], and each message fits in one MTU.
-    UnreliableDatagram,
-    /// Raw packet ("raw Ethernet"): sends and receives whole L2 frames, bypassing the transport.
-    RawPacket,
-    /// The sending side of an extended reliable connection ("XRC send").
-    XrcSend,
-    /// The receiving side of an extended reliable connection ("XRC recv").
-    XrcRecv,
-    /// A provider-specific ("driver") queue pair, such as EFA's SRD.
-    Driver,
-    /// A value this version of the crate does not know.
-    Unknown(u32),
-}
-
-impl From<ffi::ibv_qp_type> for QueuePairType {
-    fn from(qp_type: ffi::ibv_qp_type) -> Self {
-        use ffi::ibv_qp_type as T;
-        match qp_type {
-            T::IBV_QPT_RC => QueuePairType::ReliableConnection,
-            T::IBV_QPT_UC => QueuePairType::UnreliableConnection,
-            T::IBV_QPT_UD => QueuePairType::UnreliableDatagram,
-            T::IBV_QPT_RAW_PACKET => QueuePairType::RawPacket,
-            T::IBV_QPT_XRC_SEND => QueuePairType::XrcSend,
-            T::IBV_QPT_XRC_RECV => QueuePairType::XrcRecv,
-            T::IBV_QPT_DRIVER => QueuePairType::Driver,
-            other => QueuePairType::Unknown(other.0),
-        }
-    }
-}
-
-impl From<QueuePairType> for ffi::ibv_qp_type {
-    fn from(qp_type: QueuePairType) -> Self {
-        use ffi::ibv_qp_type as T;
-        match qp_type {
-            QueuePairType::ReliableConnection => T::IBV_QPT_RC,
-            QueuePairType::UnreliableConnection => T::IBV_QPT_UC,
-            QueuePairType::UnreliableDatagram => T::IBV_QPT_UD,
-            QueuePairType::RawPacket => T::IBV_QPT_RAW_PACKET,
-            QueuePairType::XrcSend => T::IBV_QPT_XRC_SEND,
-            QueuePairType::XrcRecv => T::IBV_QPT_XRC_RECV,
-            QueuePairType::Driver => T::IBV_QPT_DRIVER,
-            QueuePairType::Unknown(raw) => ffi::ibv_qp_type(raw),
-        }
-    }
-}
-
-impl std::fmt::Display for QueuePairType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            QueuePairType::ReliableConnection => "RC",
-            QueuePairType::UnreliableConnection => "UC",
-            QueuePairType::UnreliableDatagram => "UD",
-            QueuePairType::RawPacket => "raw packet",
-            QueuePairType::XrcSend => "XRC send",
-            QueuePairType::XrcRecv => "XRC recv",
-            QueuePairType::Driver => "driver",
-            QueuePairType::Unknown(_) => "unknown",
-        };
-        f.write_str(name)
-    }
-}
-
 /// Seals the transport traits: only the markers defined by this crate implement them.
 pub(crate) mod sealed {
-    use super::QueuePairType;
-
     /// Implemented by every transport marker.
     pub trait Sealed {
-        /// The [`QueuePairType`] the marker stands for.
-        const TYPE: QueuePairType;
+        /// The queue-pair type (`IBV_QPT_*`) the marker stands for.
+        const TYPE: ffi::ibv_qp_type;
     }
 }
 
@@ -166,21 +85,19 @@ pub trait Reliable: Connected {}
 pub trait Datagram: Transport {}
 
 /// The reliable-connection (RC) transport: connected to exactly one peer, in-order and reliable;
-/// supports sends, RDMA read/write, and atomics ([`QueuePairType::ReliableConnection`]).
+/// supports sends, RDMA read/write, and atomics.
 ///
 /// Note that this marker shadows [`std::rc::Rc`] when glob-imported (`use ibverbs::*`).
 #[derive(Debug, Clone, Copy)]
 pub struct Rc;
 
 /// The unreliable-connection (UC) transport: connected to exactly one peer, in order but without
-/// delivery guarantees; supports sends and RDMA writes
-/// ([`QueuePairType::UnreliableConnection`]).
+/// delivery guarantees; supports sends and RDMA writes.
 #[derive(Debug, Clone, Copy)]
 pub struct Uc;
 
 /// The unreliable-datagram (UD) transport: connectionless, each message fits in one MTU, and each
-/// send is addressed individually with an [`AddressHandle`]
-/// ([`QueuePairType::UnreliableDatagram`]).
+/// send is addressed individually with an [`AddressHandle`].
 ///
 /// On EFA, mark every UD send [`signaled`](SendOp::signaled) and none
 /// [`solicited`](SendOp::solicited): EFA refuses unsignaled and solicited work requests,
@@ -189,20 +106,20 @@ pub struct Uc;
 pub struct Ud;
 
 impl sealed::Sealed for Rc {
-    const TYPE: QueuePairType = QueuePairType::ReliableConnection;
+    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_RC;
 }
 impl Transport for Rc {}
 impl Connected for Rc {}
 impl Reliable for Rc {}
 
 impl sealed::Sealed for Uc {
-    const TYPE: QueuePairType = QueuePairType::UnreliableConnection;
+    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UC;
 }
 impl Transport for Uc {}
 impl Connected for Uc {}
 
 impl sealed::Sealed for Ud {
-    const TYPE: QueuePairType = QueuePairType::UnreliableDatagram;
+    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UD;
 }
 impl Transport for Ud {}
 impl Datagram for Ud {}
@@ -605,8 +522,8 @@ impl<T: Transport> QueuePairBuilder<T> {
         recv: CompletionQueue,
         rd_atomic_limits: Option<(u8, u8)>,
     ) -> QueuePairBuilder<T> {
-        let reliable = T::TYPE == QueuePairType::ReliableConnection;
-        let connected = reliable || T::TYPE == QueuePairType::UnreliableConnection;
+        let reliable = T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC;
+        let connected = reliable || T::TYPE == ffi::ibv_qp_type::IBV_QPT_UC;
         let mut init = QueuePairAttribute::new();
         init.set_state(QueuePairState::Init)
             .set_pkey_index(0)
@@ -812,8 +729,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// SRD, and the atomics on RC. Start from it to add an operation:
     /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
     pub fn send_ops(&self) -> SendOps {
-        self.send_ops
-            .unwrap_or_else(|| default_send_ops(T::TYPE.into()))
+        self.send_ops.unwrap_or_else(|| default_send_ops(T::TYPE))
     }
 
     /// Refuses completion queues or a shared receive queue from another device context than the
@@ -857,7 +773,7 @@ impl<T: Transport> QueuePairBuilder<T> {
                 max_recv_sge: self.max_recv_sge,
                 max_inline_data: self.max_inline_data,
             },
-            qp_type: T::TYPE.into(),
+            qp_type: T::TYPE,
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
             pd: self.pd.as_raw(),
@@ -3010,25 +2926,6 @@ mod test_conversions {
         send::<SendQueue<'static, Rc>>();
         send::<&'static QueuePair<Rc>>();
         sync::<QueuePair<Rc>>();
-    }
-
-    #[test]
-    fn queue_pair_type_roundtrip() {
-        for (wrapper, raw) in [
-            (
-                QueuePairType::ReliableConnection,
-                ffi::ibv_qp_type::IBV_QPT_RC,
-            ),
-            (
-                QueuePairType::UnreliableDatagram,
-                ffi::ibv_qp_type::IBV_QPT_UD,
-            ),
-            (QueuePairType::Driver, ffi::ibv_qp_type::IBV_QPT_DRIVER),
-        ] {
-            assert_eq!(QueuePairType::from(raw), wrapper);
-            assert_eq!(ffi::ibv_qp_type::from(wrapper), raw);
-        }
-        assert_eq!(QueuePairType::ReliableConnection.to_string(), "RC");
     }
 
     #[test]
