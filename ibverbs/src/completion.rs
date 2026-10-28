@@ -314,7 +314,8 @@ impl CompletionQueueBuilder {
     ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
     ///    work-completion field (`EOPNOTSUPP`).
     ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `min_cq_entries` is 0 or above
-    ///    `i32::MAX` ([`io::ErrorKind::InvalidInput`]), or `ibv_create_cq_ex` failed (`EINVAL` for
+    ///    `i32::MAX`, or the completion channel comes from another device context (both
+    ///    [`io::ErrorKind::InvalidInput`]), or `ibv_create_cq_ex` failed (`EINVAL` for
     ///    an invalid `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`, or an invalid
     ///    completion vector, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<CompletionQueue> {
@@ -325,6 +326,16 @@ impl CompletionQueueBuilder {
                 io::ErrorKind::InvalidInput,
                 "min_cq_entries must be between 1 and i32::MAX",
             )));
+        }
+        // The kernel looks a completion channel up in the creating context's own file table, so a
+        // channel from another context fails with nothing but `EBADF`.
+        if let Some(channel) = &self.comp_channel {
+            if unsafe { (*channel.as_raw()).context } != self.ctx.as_raw() {
+                return Err(Error::CreateCompletionQueue(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the completion channel must come from the completion queue's device context",
+                )));
+            }
         }
         // The queue holds a reference to its channel (if any), so the channel cannot be destroyed
         // out from under it.
