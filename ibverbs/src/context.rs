@@ -273,9 +273,11 @@ impl Context {
     ///
     /// Not every entry routes. On RoCE over plain Ethernet, peers answer on the RoCE v2 entry that
     /// holds the interface's IP address, and for an IPv4 network that is the IPv4-mapped one
-    /// (`::ffff:a.b.c.d`); this prefers such an entry and otherwise falls back to the port's first
-    /// entry (on InfiniBand, the port GID at index 0, where any entry routes). Pass the entry's
-    /// [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
+    /// (`::ffff:a.b.c.d`). This prefers such an entry, then any other RoCE v2 entry (an IPv6
+    /// address, or the link-local one), and otherwise falls back to the port's first entry: on
+    /// InfiniBand the port GID at index 0, where any entry routes, and on RoCE a RoCE v1 entry,
+    /// which reaches only peers on the same Ethernet segment that still speak RoCE v1. Pass the
+    /// entry's [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
     /// [`gid`](GidEntry::gid) to the peer or to [`AddressHandleAttribute::set_grh`]. Choose
     /// differently from [`gid_table`](Self::gid_table) when the network needs another entry.
     ///
@@ -285,14 +287,7 @@ impl Context {
     ///
     /// [`AddressHandleAttribute::set_grh`]: crate::AddressHandleAttribute::set_grh
     pub fn routable_gid(&self, port_num: u8) -> Result<Option<GidEntry>> {
-        let table = self.gid_table()?;
-        let on_port = |entry: &&GidEntry| entry.port_num == port_num;
-        let entry = table
-            .iter()
-            .filter(on_port)
-            .find(|entry| entry.gid_type == GidType::RoceV2 && entry.gid.is_ipv4_mapped())
-            .or_else(|| table.iter().find(on_port));
-        Ok(entry.cloned())
+        Ok(routable_entry(&self.gid_table()?, port_num).cloned())
     }
 
     /// Query a single entry of a port's GID table (`ibv_query_gid`).
@@ -451,6 +446,17 @@ impl Context {
                 .wrapping_add(values.raw_clock.tv_nsec as u64),
         ))
     }
+}
+
+/// The entry of `table` that [`Context::routable_gid`] picks for `port_num`.
+fn routable_entry(table: &[GidEntry], port_num: u8) -> Option<&GidEntry> {
+    let on_port = || table.iter().filter(move |entry| entry.port_num == port_num);
+    let roce_v2 = |entry: &&GidEntry| entry.gid_type == GidType::RoceV2;
+    on_port()
+        .filter(roce_v2)
+        .find(|entry| entry.gid.is_ipv4_mapped())
+        .or_else(|| on_port().find(roce_v2))
+        .or_else(|| on_port().next())
 }
 
 /// [`Context::query_device`] for any open context.
@@ -1327,6 +1333,38 @@ mod test_display {
         ] {
             assert_eq!(AsyncEventType::from(raw), wrapper);
         }
+    }
+
+    #[test]
+    fn routable_entry_prefers_roce_v2() {
+        let entry = |gid_index, port_num, gid: &str, gid_type| GidEntry {
+            gid: Gid::from(gid.parse::<std::net::Ipv6Addr>().unwrap()),
+            gid_index,
+            port_num,
+            gid_type,
+            ndev_ifindex: 0,
+        };
+        let routable = |table: &[GidEntry]| routable_entry(table, 1).map(|e| e.gid_index);
+        // What a RoCE port with an IPv4 and an IPv6 address lists, plus another port's entry.
+        let mut table = vec![
+            entry(0, 2, "::ffff:192.0.2.2", GidType::RoceV2),
+            entry(0, 1, "fe80::1", GidType::RoceV1),
+            entry(1, 1, "fe80::1", GidType::RoceV2),
+            entry(2, 1, "2001:db8::1", GidType::RoceV1),
+            entry(3, 1, "2001:db8::1", GidType::RoceV2),
+            entry(4, 1, "::ffff:192.0.2.1", GidType::RoceV1),
+            entry(5, 1, "::ffff:192.0.2.1", GidType::RoceV2),
+        ];
+        assert_eq!(routable(&table), Some(5));
+        // Without an IPv4 address, any RoCE v2 entry rather than the RoCE v1 one at index 0.
+        table.truncate(5);
+        assert_eq!(routable(&table), Some(1));
+        let ib = [
+            entry(0, 1, "fe80::2", GidType::Ib),
+            entry(1, 1, "fe80::3", GidType::Ib),
+        ];
+        assert_eq!(routable(&ib), Some(0));
+        assert_eq!(routable(&table[..1]), None);
     }
 
     #[test]
