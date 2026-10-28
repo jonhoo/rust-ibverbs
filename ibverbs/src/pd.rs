@@ -36,81 +36,12 @@ impl From<MrAdvice> for ffi::ib_uverbs_advise_mr_advice {
     }
 }
 
-/// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
-#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct MrAdviseFlags(pub(crate) u32);
-
-impl MrAdviseFlags {
-    /// Perform the advise synchronously: the call returns only once the operation has completed.
-    pub const FLUSHABLE: MrAdviseFlags =
-        MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH.0);
-
-    /// No flags set.
-    #[must_use]
-    pub const fn empty() -> Self {
-        MrAdviseFlags(0)
-    }
-
-    /// Whether every flag set in `other` is also set in `self`.
-    #[must_use]
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-}
-
-impl std::ops::BitOr for MrAdviseFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        MrAdviseFlags(self.0 | rhs.0)
-    }
-}
-
-impl std::ops::BitOrAssign for MrAdviseFlags {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl std::ops::BitAnd for MrAdviseFlags {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self {
-        MrAdviseFlags(self.0 & rhs.0)
-    }
-}
-
-impl std::fmt::Debug for MrAdviseFlags {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MrAdviseFlags(")?;
-        let mut rest = self.0;
-        let mut first = true;
-        if rest & MrAdviseFlags::FLUSHABLE.0 == MrAdviseFlags::FLUSHABLE.0 {
-            f.write_str("FLUSHABLE")?;
-            first = false;
-            rest &= !MrAdviseFlags::FLUSHABLE.0;
-        }
-        if rest != 0 {
-            if !first {
-                f.write_str(" | ")?;
-            }
-            write!(f, "{rest:#x}")?;
-            first = false;
-        }
-        if first {
-            f.write_str("0")?;
-        }
-        f.write_str(")")
-    }
-}
-
-impl From<ffi::ib_uverbs_advise_mr_flag> for MrAdviseFlags {
-    fn from(flag: ffi::ib_uverbs_advise_mr_flag) -> Self {
-        MrAdviseFlags(flag.0)
-    }
-}
-
-impl From<MrAdviseFlags> for u32 {
-    fn from(flags: MrAdviseFlags) -> Self {
-        flags.0
+flags_newtype! {
+    /// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
+    pub struct MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag) {
+        /// Perform the advise synchronously: the call returns only once the operation has
+        /// completed.
+        FLUSHABLE = IB_UVERBS_ADVISE_MR_FLAG_FLUSH;
     }
 }
 
@@ -205,7 +136,7 @@ impl ProtectionDomain {
             ffi::ibv_advise_mr(
                 self.inner.pd,
                 advice.into(),
-                flags.into(),
+                flags.0,
                 sg_list.as_ptr() as *mut ffi::ibv_sge,
                 sg_list.len() as u32,
             )
@@ -517,20 +448,5 @@ mod test_conversions {
         ] {
             assert_eq!(ffi::ib_uverbs_advise_mr_advice::from(wrapper), raw);
         }
-    }
-
-    #[test]
-    fn mr_advise_flags_bits_and_debug() {
-        assert!(!MrAdviseFlags::empty().contains(MrAdviseFlags::FLUSHABLE));
-        let mut flags = MrAdviseFlags::empty();
-        flags |= MrAdviseFlags::FLUSHABLE;
-        assert!(flags.contains(MrAdviseFlags::FLUSHABLE));
-        assert_eq!(u32::from(flags), 1);
-        assert_eq!(
-            MrAdviseFlags::from(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH),
-            MrAdviseFlags::FLUSHABLE
-        );
-        assert_eq!(format!("{flags:?}"), "MrAdviseFlags(FLUSHABLE)");
-        assert_eq!(format!("{:?}", MrAdviseFlags::empty()), "MrAdviseFlags(0)");
     }
 }
