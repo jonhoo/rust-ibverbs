@@ -137,6 +137,14 @@ pub(crate) mod sealed {
 /// ```
 ///
 /// ```compile_fail,E0599
+/// // Only RC has reads and atomics for a fence to wait for: `fenced` requires `T: Reliable`.
+/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Uc>) {
+///     let mut batch = qp.start_send();
+///     let _ = batch.op().fenced();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
 /// // A datagram queue pair has no remote endpoint to handshake with: use `activate`.
 /// fn f(pqp: ibverbs::PreparedQueuePair<ibverbs::Ud>, remote: ibverbs::QueuePairEndpoint) {
 ///     let _ = pqp.handshake(remote);
@@ -173,8 +181,9 @@ pub struct Uc;
 /// send is addressed individually with an [`AddressHandle`]
 /// ([`QueuePairType::UnreliableDatagram`]).
 ///
-/// On EFA, mark every UD send [`signaled`](AddressedSendOp::signaled): EFA refuses unsignaled work
-/// requests, and the batch then fails at [`submit`](SendBatch::submit).
+/// On EFA, mark every UD send [`signaled`](AddressedSendOp::signaled) and none
+/// [`solicited`](AddressedSendOp::solicited): EFA refuses unsignaled and solicited work requests,
+/// and the batch then fails at [`submit`](SendBatch::submit).
 #[derive(Debug, Clone, Copy)]
 pub struct Ud;
 
@@ -1448,8 +1457,8 @@ impl<'a> RecvRequest<'a> {
 ///
 /// Created by [`QueuePair::start_send`]. Each work request starts at [`op`](Self::op) (on a
 /// datagram queue pair, at [`to`](Self::to), which also addresses it), is optionally modified
-/// ([`signaled`](SendOp::signaled), [`fenced`](SendOp::fenced),
-/// [`solicited`](SendOp::solicited)), and ends with the opcode method (`send`, `write`, `read`,
+/// ([`signaled`](SendOp::signaled), [`solicited`](SendOp::solicited), and on RC
+/// [`fenced`](SendOp::fenced)), and ends with the opcode method (`send`, `write`, `read`,
 /// ...) that appends it to the open block immediately, through the extended ("doorbell")
 /// interface. The opcodes available depend on the queue pair's transport (see [`Transport`]).
 /// [`submit`](Self::submit) then rings the doorbell once for the whole batch. Dropping the batch
@@ -1605,8 +1614,8 @@ impl<T: Transport> Drop for SendBatch<'_, T> {
 /// [`SendBatch::op`] (connected transports; a datagram batch starts each request at
 /// [`SendBatch::to`], which yields an [`AddressedSendOp`] instead).
 ///
-/// Chain the modifiers ([`signaled`](Self::signaled), [`fenced`](Self::fenced),
-/// [`solicited`](Self::solicited), [`imm`](Self::imm)) and finish with an opcode method (`send`,
+/// Chain the modifiers ([`signaled`](Self::signaled), [`solicited`](Self::solicited),
+/// [`imm`](Self::imm), and on RC [`fenced`](Self::fenced)) and finish with an opcode method (`send`,
 /// `write`, ...), which posts the request immediately. The opcodes exist only on the transports
 /// that support them (see [`Transport`]); `send` and `write` take any [`Payload`].
 #[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
@@ -1625,18 +1634,10 @@ impl<T: Transport> SendOp<'_, '_, T> {
         self
     }
 
-    /// Mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
-    /// reads and atomic operations on this queue pair have completed. Used to order a send or
-    /// write after a read whose data it depends on.
-    #[inline]
-    pub fn fenced(mut self) -> Self {
-        self.flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
-        self
-    }
-
-    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
-    /// raises a solicited event on the remote side, waking a peer blocked on its completion
-    /// channel after arming with [`CompletionQueue::req_notify`] for solicited events only.
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or an RDMA WRITE with an
+    /// immediate raises a solicited event on the remote side, waking a peer blocked on its
+    /// completion channel after arming with [`CompletionQueue::req_notify`] for solicited events
+    /// only. The flag is valid only on those operations: ionic refuses it on any other.
     #[inline]
     pub fn solicited(mut self) -> Self {
         self.flags |= ffi::ibv_send_flags::IBV_SEND_SOLICITED.0;
@@ -1817,6 +1818,16 @@ impl<T: Connected> SendOp<'_, '_, T> {
 }
 
 impl<T: Reliable> SendOp<'_, '_, T> {
+    /// Mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
+    /// reads and atomic operations on this queue pair have completed. Used to order a send or
+    /// write after a read whose data it depends on. Only RC has reads and atomics to wait for
+    /// (`ibv_post_send(3)`: the flag is valid only on RC queue pairs).
+    #[inline]
+    pub fn fenced(mut self) -> Self {
+        self.flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
+        self
+    }
+
     /// Post an RDMA READ from `remote` into `local`.
     ///
     /// # Panics
@@ -1893,10 +1904,10 @@ impl<T: Reliable> SendOp<'_, '_, T> {
 /// creation by [`SendBatch::to`].
 ///
 /// Chain the modifiers ([`signaled`](Self::signaled), [`imm`](Self::imm), and on UD
-/// [`fenced`](Self::fenced) and [`solicited`](Self::solicited)) and finish with an opcode method,
-/// which posts the request immediately. UD supports SEND (with any [`Payload`]); SRD (behind the
-/// `efa` feature) additionally supports RDMA write (from registered memory) and read, but not the
-/// fence and solicited flags, which EFA refuses.
+/// [`solicited`](Self::solicited)) and finish with an opcode method, which posts the request
+/// immediately. UD supports SEND (with any [`Payload`]); SRD (behind the `efa` feature)
+/// additionally supports RDMA write (from registered memory) and read, but not the solicited flag,
+/// which EFA refuses (on UD as well).
 #[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
 pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
     pub(crate) op: SendOp<'b, 'qp, T>,
@@ -1942,16 +1953,6 @@ impl<T: Datagram> AddressedSendOp<'_, '_, T> {
 }
 
 impl AddressedSendOp<'_, '_, Ud> {
-    /// Mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
-    /// reads and atomic operations on this queue pair have completed. Used to order a send or
-    /// write after a read whose data it depends on.
-    #[inline]
-    pub fn fenced(self) -> Self {
-        AddressedSendOp {
-            op: self.op.fenced(),
-        }
-    }
-
     /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
     /// raises a solicited event on the remote side, waking a peer blocked on its completion
     /// channel after arming with [`CompletionQueue::req_notify`] for solicited events only.
