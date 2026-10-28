@@ -12,6 +12,7 @@ mod common;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
+use std::os::unix::thread::JoinHandleExt;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
@@ -208,6 +209,37 @@ fn accept_times_out() {
         Ok(_) => panic!("expected TimedOut, got a connection"),
     }
     assert!(before.elapsed() >= Duration::from_millis(50));
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn waits_survive_restartable_signals() {
+    // A signal whose handler was installed with SA_RESTART (as `ctrlc`, `signal-hook`, and
+    // `tokio::signal` install theirs) must not end a wait: `poll(2)` reports EINTR even then.
+    extern "C" fn handler(_: nix::libc::c_int) {}
+    let installed = unsafe {
+        let mut action: nix::libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as *const () as usize;
+        action.sa_flags = nix::libc::SA_RESTART;
+        nix::libc::sigaction(nix::libc::SIGUSR1, &action, std::ptr::null_mut())
+    };
+    assert_eq!(installed, 0, "install the SIGUSR1 handler");
+    let acceptor = bind_acceptor(device_ip(&open_test_device()), 1);
+    let waiter = std::thread::spawn(move || {
+        let before = Instant::now();
+        let result = acceptor.accept(Some(Duration::from_millis(500))).map(drop);
+        (result, before.elapsed())
+    });
+    // Let the waiter block, then interrupt it.
+    std::thread::sleep(Duration::from_millis(100));
+    let sent = unsafe { nix::libc::pthread_kill(waiter.as_pthread_t(), nix::libc::SIGUSR1) };
+    assert_eq!(sent, 0, "signal the waiter");
+    let (result, elapsed) = waiter.join().expect("waiter thread");
+    assert!(matches!(result, Err(Error::TimedOut)), "{result:?}");
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "returned after {elapsed:?}"
+    );
 }
 
 #[test]
