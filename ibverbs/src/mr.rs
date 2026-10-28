@@ -285,11 +285,16 @@ impl RemoteMemorySlice {
     /// # Errors
     ///
     ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the encoded length does not fit
-    ///    this platform's `usize`.
+    ///    this platform's `usize`, or the range runs past the end of the 64-bit address space.
     pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
+        let addr = u64::from_be_bytes(bytes[0..8].try_into().expect("slice length is fixed"));
         let len = u64::from_be_bytes(bytes[8..16].try_into().expect("slice length is fixed"));
+        // The peer chose these: a range that wraps would make `slice` overflow its address.
+        if len != 0 && addr.checked_add(len - 1).is_none() {
+            return Err(Error::MalformedWireFormat);
+        }
         Ok(RemoteMemorySlice {
-            addr: u64::from_be_bytes(bytes[0..8].try_into().expect("slice length is fixed")),
+            addr,
             len: usize::try_from(len).map_err(|_| Error::MalformedWireFormat)?,
             rkey: u32::from_be_bytes(bytes[16..20].try_into().expect("slice length is fixed")),
         })
@@ -311,20 +316,21 @@ impl RemoteMemorySlice {
 }
 
 fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, usize) {
+    let outside = "the slice bounds fall outside the region";
     let start = match bounds.start_bound() {
         std::ops::Bound::Included(i) => *i,
-        std::ops::Bound::Excluded(i) => *i + 1,
+        std::ops::Bound::Excluded(i) => i.checked_add(1).expect(outside),
         std::ops::Bound::Unbounded => 0,
     };
     let end = match bounds.end_bound() {
-        std::ops::Bound::Included(i) => *i + 1,
+        std::ops::Bound::Included(i) => i.checked_add(1).expect(outside),
         std::ops::Bound::Excluded(i) => *i,
         std::ops::Bound::Unbounded => bytes_len,
     };
     assert!(start < end);
     assert!(start <= bytes_len);
     assert!(end <= bytes_len);
-    let addr = addr + start as u64;
+    let addr = addr.checked_add(start as u64).expect(outside);
     let len = end - start;
     (addr, len)
 }
@@ -342,6 +348,23 @@ mod test {
         };
         let encoded = remote.to_bytes();
         assert_eq!(RemoteMemorySlice::from_bytes(&encoded).unwrap(), remote);
+    }
+
+    #[test]
+    fn remote_memory_slice_rejects_a_wrapping_range() {
+        let mut bytes = RemoteMemorySlice {
+            addr: u64::MAX - 15,
+            len: 16,
+            rkey: 1,
+        }
+        .to_bytes();
+        // Ending at the last address is fine; one byte more wraps.
+        assert!(RemoteMemorySlice::from_bytes(&bytes).is_ok());
+        bytes[8..16].copy_from_slice(&17u64.to_be_bytes());
+        assert!(matches!(
+            RemoteMemorySlice::from_bytes(&bytes),
+            Err(Error::MalformedWireFormat)
+        ));
     }
 
     #[test]
