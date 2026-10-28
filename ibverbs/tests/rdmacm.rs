@@ -70,6 +70,15 @@ fn resources(
     (pd, cq, qp)
 }
 
+/// Waits for a test's server thread, re-raising its panic, with the server's own message, if it
+/// panicked. (Signals to a server that is gone are ignored for the same reason: this then reports
+/// why it is gone, where a failed send or join would only say that it is.)
+fn join<T>(server: std::thread::JoinHandle<T>) -> T {
+    server
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+}
+
 const MESSAGE: &[u8] = b"hello over rdmacm";
 
 /// A generous bound for the blocking helpers: far above what loopback setup needs, so it only
@@ -156,8 +165,8 @@ where
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     client(&mut conn, &cq, &pd, addr);
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -388,7 +397,7 @@ fn two_connections() {
     for client in clients {
         client.join().expect("client thread");
     }
-    let mut received = server.join().expect("server thread");
+    let mut received = join(server);
     received.sort();
     assert_eq!(
         received,
@@ -584,7 +593,7 @@ fn low_level_connect_and_send() {
         .recv_timeout(Duration::from_secs(10))
         .expect("server received the message");
     id.disconnect().ok();
-    server.join().expect("server thread");
+    join(server);
 }
 
 /// Bring the passive side of a low-level connection to `RTS` and accept it, returning once the
@@ -681,8 +690,8 @@ fn server_writes_into_client() {
     .expect("post_recv");
     wait_for(&cq, 1);
     assert_eq!(&target.bytes()[..MESSAGE.len()], MESSAGE);
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -799,8 +808,8 @@ fn rejected_request_reports_reason_and_private_data() {
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
     }
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -873,8 +882,8 @@ fn dropped_connect_request_is_rejected() {
         before.elapsed() < Duration::from_secs(5),
         "the rejection arrived promptly, not after the request's retries"
     );
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -928,8 +937,8 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
         before.elapsed() < Duration::from_secs(5),
         "the rejection arrived promptly, not after the request's retries"
     );
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -1007,7 +1016,7 @@ fn dropping_connection_disconnects_peer() {
     // `ctx`, `pd`, and `cq` (all on the connection's device context) outlive the connection
     // itself.
     drop(conn);
-    server.join().expect("server thread saw the disconnect");
+    join(server);
     drop((cq, pd, ctx));
 }
 
@@ -1170,8 +1179,8 @@ fn cm_id_options_and_accessors() {
     // The connection keeps the id that resolved the route, bound to the same local address.
     assert_eq!(conn.cm_id().local_addr(), local);
     check_options(&mut conn, "client");
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 /// Checks that `side`'s connected queue pair has the ACK timeout and the type of service (as its
