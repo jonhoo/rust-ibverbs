@@ -1964,6 +1964,24 @@ impl AddressedSendOp<'_, '_, Ud> {
     }
 }
 
+/// The error for a failed `ibv_post_recv` on a queue pair, kept out of line. A queue pair that
+/// receives through a shared receive queue has no receive queue of its own, and the providers
+/// refuse posts to it with errnos that point elsewhere (mlx5 reports a full queue, hns
+/// `EOPNOTSUPP`, rxe `EINVAL`), so name the mistake instead. ionic returns its errnos negated
+/// (`-EAGAIN` when the device still owns the slot, so posting again soon succeeds); the others
+/// return them as they are.
+#[cold]
+#[inline(never)]
+fn post_recv_error(errno: i32, srq_attached: bool) -> Error {
+    if srq_attached {
+        return Error::PostReceive(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "this queue pair receives through its shared receive queue; post receives there",
+        ));
+    }
+    Error::errno(errno.abs(), Error::PostReceive)
+}
+
 /// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
 /// so the posting path carries only the comparison.
 #[cold]
@@ -2653,9 +2671,10 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// # Errors
     ///
-    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
-    ///    resources).
+    ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
+    ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
+    ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
+    ///    of resources).
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
@@ -2670,9 +2689,7 @@ impl<T: Transport> QueuePair<T> {
         let post_recv = unsafe { (*(*self.qp).context).ops.post_recv }.unwrap();
         let errno = unsafe { post_recv(self.qp, head, &mut bad_wr) };
         if errno != 0 {
-            // ionic returns its errnos negated (`-EAGAIN` when the device still owns the slot, so
-            // posting again soon succeeds); the others return them as they are.
-            Err(Error::errno(errno.abs(), Error::PostReceive))
+            Err(post_recv_error(errno, self._srq.is_some()))
         } else {
             Ok(())
         }
@@ -2789,9 +2806,10 @@ impl<T: Transport> RecvQueue<'_, T> {
     ///
     /// # Errors
     ///
-    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
-    ///    resources).
+    ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
+    ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
+    ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
+    ///    of resources).
     #[inline]
     pub unsafe fn post_recv<'a>(&self, recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         unsafe { self.qp.post_recv(recvs) }
