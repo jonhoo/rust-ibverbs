@@ -2,9 +2,6 @@
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(missing_docs)]
-// Suppress expected warnings from bindgen-generated code.
-// See https://github.com/rust-lang/rust-bindgen/issues/1651.
-#![allow(deref_nullptr)]
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
 /// An ibverb work completion.
@@ -187,139 +184,27 @@ impl ibv_wc {
     }
 }
 
-#[test]
-fn bindgen_test_layout_ibv_wc() {
-    assert_eq!(
-        ::std::mem::size_of::<ibv_wc>(),
-        48usize,
-        concat!("Size of: ", stringify!(ibv_wc))
-    );
-    assert_eq!(
-        ::std::mem::align_of::<ibv_wc>(),
-        8usize,
-        concat!("Alignment of ", stringify!(ibv_wc))
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, wr_id),
-        0usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(wr_id)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, status),
-        8usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(status)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, opcode),
-        12usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(opcode)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, vendor_err),
-        16usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(vendor_err)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, byte_len),
-        20usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(byte_len)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, qp_num),
-        28usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(qp_num)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, src_qp),
-        32usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(src_qp)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, wc_flags),
-        36usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(wc_flags)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, pkey_index),
-        40usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(pkey_index)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, slid),
-        42usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(slid)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, sl),
-        44usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(sl)
-        )
-    );
-    assert_eq!(
-        std::mem::offset_of!(ibv_wc, dlid_path_bits),
-        45usize,
-        concat!(
-            "Alignment of field: ",
-            stringify!(ibv_wc),
-            "::",
-            stringify!(dlid_path_bits)
-        )
-    );
-}
+// The layout `ibv_poll_cq` fills in (`struct ibv_wc` in verbs.h), checked at compile time on every
+// target, like bindgen's checks of the structs it generates. The alignment is `u64`'s (8 bytes on
+// 64-bit targets, 4 on i386, as in C).
+const _: () = {
+    use ::std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<ibv_wc>() == 48);
+    assert!(align_of::<ibv_wc>() == align_of::<u64>());
+    assert!(offset_of!(ibv_wc, wr_id) == 0);
+    assert!(offset_of!(ibv_wc, status) == 8);
+    assert!(offset_of!(ibv_wc, opcode) == 12);
+    assert!(offset_of!(ibv_wc, vendor_err) == 16);
+    assert!(offset_of!(ibv_wc, byte_len) == 20);
+    assert!(offset_of!(ibv_wc, imm_data) == 24);
+    assert!(offset_of!(ibv_wc, qp_num) == 28);
+    assert!(offset_of!(ibv_wc, src_qp) == 32);
+    assert!(offset_of!(ibv_wc, wc_flags) == 36);
+    assert!(offset_of!(ibv_wc, pkey_index) == 40);
+    assert!(offset_of!(ibv_wc, slid) == 42);
+    assert!(offset_of!(ibv_wc, sl) == 44);
+    assert!(offset_of!(ibv_wc, dlid_path_bits) == 45);
+};
 
 impl Default for ibv_wc {
     fn default() -> Self {
@@ -341,48 +226,67 @@ impl Default for ibv_wc {
     }
 }
 
-// `ibv_create_cq_ex` and `ibv_create_qp_ex` are `static inline` in verbs.h: they reach the provider
-// through the op table embedded in `verbs_context`, so there is no exported symbol for bindgen to
-// bind. The functions below reimplement that dispatch (the `verbs_get_ctx` container_of and the
-// `verbs_get_ctx_op` availability check) so the crate can create extended queue pairs and
-// completion queues.
-
-/// Recover the `verbs_context` that embeds `context` as its last field.
-///
-/// # Safety
-///
-/// `context` must be a valid `ibv_context` returned by libibverbs (every such context is embedded
-/// in a `verbs_context`).
-#[inline]
-unsafe fn verbs_get_ctx(context: *mut ibv_context) -> *mut verbs_context {
-    unsafe {
-        (context as *mut u8).sub(::std::mem::offset_of!(verbs_context, context))
-            as *mut verbs_context
-    }
-}
+// `___ibv_query_port`, `ibv_create_cq_ex`, `ibv_create_qp_ex`, `ibv_advise_mr`,
+// `ibv_query_rt_values_ex`, and `ibv_query_device_ex` are `static inline` in verbs.h: they reach
+// the provider through the op table embedded in `verbs_context`, so there is no exported symbol
+// for bindgen to bind. The functions below reimplement that dispatch (`verbs_get_ctx_op`'s
+// availability check and op lookup).
 
 /// The provider's implementation of the extended op `$op` on `$context`, or `None` when the
 /// provider leaves it out or its `verbs_context` predates it (rdma-core's `verbs_get_ctx_op`).
-/// New ops are added at the front of `verbs_context`, so the size check comes first: an op the
-/// provider's (older) struct does not have lies before its start and must not be read. Expands to
-/// unsafe operations; `$context` must be a valid `ibv_context`.
+///
+/// New ops are added at the front of `verbs_context` ("grows up"), so the runtime library's struct
+/// can be smaller than the vendored one, and the vendored struct's start can then lie before the
+/// provider's allocation. Everything is therefore addressed backwards from `$context`, which every
+/// libibverbs version embeds last with `sz` (the runtime struct's size) immediately before it:
+/// first `sz`, then the op only if the runtime struct is large enough to reach back to it (the C
+/// inline's size check). Expands to unsafe operations; `$context` must be a valid `ibv_context`.
 macro_rules! verbs_get_ctx_op {
     ($context:expr, $op:ident) => {{
-        let vctx = verbs_get_ctx($context);
-        let need =
-            ::std::mem::size_of::<verbs_context>() - ::std::mem::offset_of!(verbs_context, $op);
-        if (*vctx).sz >= need {
-            (*vctx).$op
+        let context = $context as *mut u8;
+        let sz = context
+            .sub(::std::mem::size_of::<usize>())
+            .cast::<usize>()
+            .read();
+        let at = ::std::mem::offset_of!(verbs_context, $op);
+        if sz >= ::std::mem::size_of::<verbs_context>() - at {
+            // The op lies `back` bytes before the context, inside the runtime struct.
+            let back = ::std::mem::offset_of!(verbs_context, context) - at;
+            /// The type of field `$op`, without projecting through a `verbs_context` pointer.
+            fn op_ptr<T>(_: fn(&verbs_context) -> &T, at: *mut u8) -> *mut T {
+                at.cast()
+            }
+            op_ptr(|v| &v.$op, context.sub(back)).read()
         } else {
             None
         }
     }};
 }
 
-// The errno values the shims report or recognize, as on Linux, the only platform rdma-core targets.
+// The errno values the shims report or recognize: Linux's, the only platform rdma-core targets,
+// which numbers `ENOSYS` and `EOPNOTSUPP` differently on mips and sparc.
+const MIPS: bool = cfg!(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6"
+));
+const SPARC: bool = cfg!(any(target_arch = "sparc", target_arch = "sparc64"));
 const EINVAL: ::std::os::raw::c_int = 22;
-const ENOSYS: ::std::os::raw::c_int = 38;
-const EOPNOTSUPP: ::std::os::raw::c_int = 95;
+const ENOSYS: ::std::os::raw::c_int = if MIPS {
+    89
+} else if SPARC {
+    90
+} else {
+    38
+};
+const EOPNOTSUPP: ::std::os::raw::c_int = if MIPS {
+    122
+} else if SPARC {
+    45
+} else {
+    95
+};
 
 /// Query a port's attributes, including the extended fields (rdma-core's `___ibv_query_port`,
 /// which the `ibv_query_port` macro resolves to in C).
@@ -569,9 +473,12 @@ pub unsafe fn ibv_query_device_ex(
     }
 }
 
-// `ibv_poll_cq` and `ibv_req_notify_cq` are `static inline` as well, but dispatch through the
-// legacy op table in `ibv_context` itself, which libibverbs fills completely (with a stub that
-// fails for any op the provider leaves out), so they need no availability check.
+// `ibv_poll_cq`, `ibv_req_notify_cq`, `ibv_post_recv`, and `ibv_post_srq_recv` are `static inline`
+// as well, but dispatch through the legacy op table in `ibv_context` itself, which libibverbs fills
+// completely (a stub returning `EOPNOTSUPP` stands in for any op the provider leaves out; every
+// provider that creates completion queues implements `poll_cq`, for which that would read as a
+// count), so they need no availability check. They read only the op pointer: other threads write
+// other fields of the queue pair, the queue, and the context.
 
 /// Poll a completion queue for up to `num_entries` work completions, copying them into `wc`
 /// (`ibv_poll_cq`).
@@ -606,6 +513,42 @@ pub unsafe fn ibv_req_notify_cq(
     solicited_only: ::std::os::raw::c_int,
 ) -> ::std::os::raw::c_int {
     unsafe { (*(*cq).context).ops.req_notify_cq.unwrap()(cq, solicited_only) }
+}
+
+/// Post a linked list of receive work requests to a queue pair's receive queue (`ibv_post_recv`).
+///
+/// Returns 0 on success, or the `errno` value on failure, with `bad_wr` set to the first request
+/// that was not posted.
+///
+/// # Safety
+///
+/// `qp` must be a valid queue pair, `wr` a valid list of receive work requests whose buffers stay
+/// valid until they complete, and `bad_wr` valid for writes.
+#[inline]
+pub unsafe fn ibv_post_recv(
+    qp: *mut ibv_qp,
+    wr: *mut ibv_recv_wr,
+    bad_wr: *mut *mut ibv_recv_wr,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*qp).context).ops.post_recv.unwrap()(qp, wr, bad_wr) }
+}
+
+/// Post a linked list of receive work requests to a shared receive queue (`ibv_post_srq_recv`).
+///
+/// Returns 0 on success, or the `errno` value on failure, with `bad_recv_wr` set to the first
+/// request that was not posted.
+///
+/// # Safety
+///
+/// `srq` must be a valid shared receive queue, `recv_wr` a valid list of receive work requests
+/// whose buffers stay valid until they complete, and `bad_recv_wr` valid for writes.
+#[inline]
+pub unsafe fn ibv_post_srq_recv(
+    srq: *mut ibv_srq,
+    recv_wr: *mut ibv_recv_wr,
+    bad_recv_wr: *mut *mut ibv_recv_wr,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*srq).context).ops.post_srq_recv.unwrap()(srq, recv_wr, bad_recv_wr) }
 }
 
 // `rdma_get_local_addr` and `rdma_get_peer_addr` are `static inline` in rdma_cma.h: they return

@@ -12,17 +12,18 @@ mod common;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::AsRawFd;
+use std::os::unix::thread::JoinHandleExt;
 use std::sync::{Arc, Barrier, mpsc};
 use std::time::{Duration, Instant};
 
-use common::{open_test_device, poll_until};
+use common::{mr, open_test_device, poll_until};
 use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, PortSpace,
 };
 use ibverbs::{
-    AccessFlags, AckTimeout, CompletionQueue, Context, Error, ProtectionDomain, QueuePairAttribute,
-    QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest, RemoteMemorySlice,
-    WcStatus,
+    AccessFlags, AckTimeout, CompletionQueue, Context, Error, PreparedQueuePair, ProtectionDomain,
+    QueuePairAttribute, QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest,
+    RemoteMemorySlice, WcStatus,
 };
 
 /// The device's IPv4 address, from its routable GID on port 1 (the IPv4-mapped RoCEv2 entry of the
@@ -45,6 +46,37 @@ fn wait_for(cq: &CompletionQueue, wr_id: u64) {
         poll_until(cq, |wc| wc.wr_id() == wr_id),
         "timed out waiting for completion {wr_id}"
     );
+}
+
+/// A protection domain and a completion queue on `ctx`, and a default reliable-connection queue
+/// pair built on them for `port` (the one the connection manager chose): what each side of most
+/// tests connects with.
+fn resources(
+    ctx: &Context,
+    port: u8,
+) -> (ProtectionDomain, CompletionQueue, PreparedQueuePair<Rc>) {
+    let pd = ctx
+        .alloc_pd()
+        .expect("failed to allocate a protection domain");
+    let cq = ctx
+        .create_cq(16)
+        .build()
+        .expect("failed to create a completion queue");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, port)
+        .expect("failed to create a queue pair builder")
+        .build()
+        .expect("failed to build a queue pair");
+    (pd, cq, qp)
+}
+
+/// Waits for a test's server thread, re-raising its panic, with the server's own message, if it
+/// panicked. (Signals to a server that is gone are ignored for the same reason: this then reports
+/// why it is gone, where a failed send or join would only say that it is.)
+fn join<T>(server: std::thread::JoinHandle<T>) -> T {
+    server
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 const MESSAGE: &[u8] = b"hello over rdmacm";
@@ -110,13 +142,8 @@ where
         ready_tx.send(addr).expect("signal ready");
         let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
-        let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16).build().expect("server cq");
-        let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("server qp builder")
-            .build()
-            .expect("server qp");
+        let port = incoming.cm_id().port_num().expect("server port");
+        let (pd, cq, qp) = resources(&ctx, port);
         let mut conn = incoming
             .accept(qp, server_param(), SETUP_TIMEOUT)
             .expect("accept");
@@ -132,19 +159,14 @@ where
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (pd, cq, qp) = resources(&ctx, port);
     let mut conn = resolved
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     client(&mut conn, &cq, &pd, addr);
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -155,9 +177,7 @@ fn connect_and_send() {
         ConnectionParameter::default,
         // Passive side: receive the message.
         |conn, cq, pd, addr| {
-            let mut recv = pd
-                .allocate(64, AccessFlags::PERMISSIVE)
-                .expect("server recv mr");
+            let mut recv = mr(pd, 64);
             // The accepted connection keeps the listener's address, and its peer is the client on
             // the same device (the port is the client's ephemeral one).
             assert_eq!(conn.cm_id().local_addr(), Some(addr));
@@ -176,9 +196,7 @@ fn connect_and_send() {
         },
         // Active side: send the message.
         |conn, cq, pd, addr| {
-            let mut send = pd
-                .allocate(64, AccessFlags::PERMISSIVE)
-                .expect("client send mr");
+            let mut send = mr(pd, 64);
             send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
             // The client's peer is the server's listen address; its own address is on the same
             // device.
@@ -208,6 +226,37 @@ fn accept_times_out() {
         Ok(_) => panic!("expected TimedOut, got a connection"),
     }
     assert!(before.elapsed() >= Duration::from_millis(50));
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn waits_survive_restartable_signals() {
+    // A signal whose handler was installed with SA_RESTART (as `ctrlc`, `signal-hook`, and
+    // `tokio::signal` install theirs) must not end a wait: `poll(2)` reports EINTR even then.
+    extern "C" fn handler(_: nix::libc::c_int) {}
+    let installed = unsafe {
+        let mut action: nix::libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = handler as *const () as usize;
+        action.sa_flags = nix::libc::SA_RESTART;
+        nix::libc::sigaction(nix::libc::SIGUSR1, &action, std::ptr::null_mut())
+    };
+    assert_eq!(installed, 0, "install the SIGUSR1 handler");
+    let acceptor = bind_acceptor(device_ip(&open_test_device()), 1);
+    let waiter = std::thread::spawn(move || {
+        let before = Instant::now();
+        let result = acceptor.accept(Some(Duration::from_millis(500))).map(drop);
+        (result, before.elapsed())
+    });
+    // Let the waiter block, then interrupt it.
+    std::thread::sleep(Duration::from_millis(100));
+    let sent = unsafe { nix::libc::pthread_kill(waiter.as_pthread_t(), nix::libc::SIGUSR1) };
+    assert_eq!(sent, 0, "signal the waiter");
+    let (result, elapsed) = waiter.join().expect("waiter thread");
+    assert!(matches!(result, Err(Error::TimedOut)), "{result:?}");
+    assert!(
+        elapsed >= Duration::from_millis(500),
+        "returned after {elapsed:?}"
+    );
 }
 
 #[test]
@@ -243,13 +292,8 @@ fn racing_accepts_time_out_on_time() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (_pd, _cq, qp) = resources(&ctx, port);
     match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
         Err(other) => panic!("expected a rejection, got {other:?}"),
@@ -299,16 +343,9 @@ fn two_connections() {
         for _ in 0..2 {
             let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
             let ctx = incoming.context().expect("server device context");
-            let pd = ctx.alloc_pd().expect("server pd");
-            let cq = ctx.create_cq(16).build().expect("server cq");
-            let qp = pd
-                .create_qp::<Rc>(&cq, &cq, 1)
-                .expect("server qp builder")
-                .build()
-                .expect("server qp");
-            let mut recv = pd
-                .allocate(64, AccessFlags::PERMISSIVE)
-                .expect("server recv mr");
+            let port = incoming.cm_id().port_num().expect("server port");
+            let (pd, cq, qp) = resources(&ctx, port);
+            let mut recv = mr(&pd, 64);
             let mut conn = incoming
                 .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
                 .expect("accept");
@@ -338,16 +375,9 @@ fn two_connections() {
                     .resolve(addr, Duration::from_secs(5))
                     .expect("resolve");
                 let ctx = resolved.context().expect("client device context");
-                let pd = ctx.alloc_pd().expect("client pd");
-                let cq = ctx.create_cq(16).build().expect("client cq");
-                let qp = pd
-                    .create_qp::<Rc>(&cq, &cq, 1)
-                    .expect("client qp builder")
-                    .build()
-                    .expect("client qp");
-                let mut send = pd
-                    .allocate(64, AccessFlags::PERMISSIVE)
-                    .expect("client send mr");
+                let port = resolved.cm_id().port_num().expect("client port");
+                let (pd, cq, qp) = resources(&ctx, port);
+                let mut send = mr(&pd, 64);
                 send.bytes_mut()[..MESSAGE.len()].fill(tag);
                 let mut conn = resolved
                     .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
@@ -367,7 +397,7 @@ fn two_connections() {
     for client in clients {
         client.join().expect("client thread");
     }
-    let mut received = server.join().expect("server thread");
+    let mut received = join(server);
     received.sort();
     assert_eq!(
         received,
@@ -450,14 +480,9 @@ fn low_level_connect_and_send() {
             }
         };
         let ctx = request.context().expect("server device context");
-        let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16).build().expect("server cq");
-        let mut qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("server qp builder")
-            .build()
-            .expect("server prepared qp")
-            .into_queue_pair();
+        let port = request.port_num().expect("server port");
+        let (pd, cq, qp) = resources(&ctx, port);
+        let mut qp = qp.into_queue_pair();
         for state in [
             QueuePairState::Init,
             QueuePairState::ReadyToReceive,
@@ -466,9 +491,7 @@ fn low_level_connect_and_send() {
             let attr = request.init_qp_attr(state).expect("server init_qp_attr");
             qp.modify(&attr).expect("server modify");
         }
-        let mut recv = pd
-            .allocate(64, AccessFlags::PERMISSIVE)
-            .expect("server recv mr");
+        let mut recv = mr(&pd, 64);
         unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) }
             .expect("post_recv");
 
@@ -514,13 +537,8 @@ fn low_level_connect_and_send() {
     assert_eq!(local.ip(), addr.ip());
 
     let ctx = id.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client prepared qp");
+    let port = id.port_num().expect("client port");
+    let (pd, cq, qp) = resources(&ctx, port);
     let client_endpoint = qp.endpoint().expect("client endpoint");
     let mut qp = qp.into_queue_pair();
     let init = id
@@ -561,9 +579,7 @@ fn low_level_connect_and_send() {
     }
     id.establish().expect("establish");
 
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("client send mr");
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
     let mut batch = qp.start_send();
     batch
@@ -577,7 +593,7 @@ fn low_level_connect_and_send() {
         .recv_timeout(Duration::from_secs(10))
         .expect("server received the message");
     id.disconnect().ok();
-    server.join().expect("server thread");
+    join(server);
 }
 
 /// Bring the passive side of a low-level connection to `RTS` and accept it, returning once the
@@ -593,12 +609,8 @@ fn accept_low_level(request: &CmId, qp: &mut ibverbs::QueuePair<Rc>) {
     }
     let param = ConnectionParameter::default().set_qp_num(qp.qp_num());
     request.accept(&param).expect("accept");
-    loop {
-        let event = request.get_cm_event().expect("server event");
-        if event.event_type() == CmEventType::Established {
-            break;
-        }
-    }
+    // Bounded, so a connection that never establishes fails the test instead of hanging it.
+    pump_until(request, CmEventType::Established);
 }
 
 #[test]
@@ -628,21 +640,18 @@ fn server_writes_into_client() {
         let target = RemoteMemorySlice::from_bytes(&bytes).expect("well-formed remote slice");
 
         let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder")
             .set_max_send_wr(4)
             .build()
             .expect("server qp");
-        let mut src = pd
-            .allocate(64, AccessFlags::PERMISSIVE)
-            .expect("server source mr");
+        let mut src = mr(&pd, 64);
         src.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
-        let notify = pd
-            .allocate(1, AccessFlags::PERMISSIVE)
-            .expect("server notify mr");
+        let notify = mr(&pd, 1);
         let mut conn = incoming
             .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
@@ -667,19 +676,10 @@ fn server_writes_into_client() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
-    let target = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("client target mr");
-    let notify = pd
-        .allocate(1, AccessFlags::PERMISSIVE)
-        .expect("client notify mr");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (pd, cq, qp) = resources(&ctx, port);
+    let target = mr(&pd, 64);
+    let notify = mr(&pd, 1);
     let param = ConnectionParameter::default()
         .set_private_data(&target.remote().slice(..MESSAGE.len()).to_bytes());
     let mut conn = resolved.connect(qp, param, SETUP_TIMEOUT).expect("connect");
@@ -690,8 +690,8 @@ fn server_writes_into_client() {
     .expect("post_recv");
     wait_for(&cq, 1);
     assert_eq!(&target.bytes()[..MESSAGE.len()], MESSAGE);
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -793,13 +793,8 @@ fn rejected_request_reports_reason_and_private_data() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (_pd, _cq, qp) = resources(&ctx, port);
     match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {
             // 28 is the InfiniBand CM's "consumer defined" reject reason: the peer itself said no.
@@ -813,8 +808,37 @@ fn rejected_request_reports_reason_and_private_data() {
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
     }
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn request_without_listener_is_rejected_as_invalid_service() {
+    // Find a free port, then connect to it with nothing listening: the peer's connection manager
+    // answers the request itself, with reject reason 8 (invalid service ID), right away.
+    let ip = device_ip(&open_test_device());
+    let addr = bind_listener(ip).local_addr().expect("bound address");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let pd = ctx.alloc_pd().expect("client pd");
+    let cq = ctx.create_cq(16).build().expect("client cq");
+    let qp = pd
+        .create_qp::<Rc>(&cq, &cq, port)
+        .expect("client qp builder")
+        .build()
+        .expect("client qp");
+    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+        Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {
+            assert_eq!(failure.status, 8, "reject reason");
+        }
+        Err(other) => panic!("expected a rejection, got {other:?}"),
+        Ok(_) => panic!("expected a rejection, got a connection"),
+    }
 }
 
 #[test]
@@ -846,13 +870,8 @@ fn dropped_connect_request_is_rejected() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (_pd, _cq, qp) = resources(&ctx, port);
     let before = Instant::now();
     match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
@@ -863,8 +882,8 @@ fn dropped_connect_request_is_rejected() {
         before.elapsed() < Duration::from_secs(5),
         "the rejection arrived promptly, not after the request's retries"
     );
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -884,6 +903,7 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
             .expect("signal ready");
         let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
         let cq = ctx.create_cq(16).build().expect("server cq");
         drop(incoming);
@@ -891,11 +911,9 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
             .recv_timeout(Duration::from_secs(10))
             .expect("client saw the rejection");
         // The request's id is gone, but the device context the resources were built on is not.
-        let _mr = pd
-            .allocate(64, AccessFlags::PERMISSIVE)
-            .expect("server mr after the request is gone");
+        let _mr = mr(&pd, 64);
         let _qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
+            .create_qp::<Rc>(&cq, &cq, port)
             .expect("server qp builder after the request is gone")
             .build()
             .expect("server qp after the request is gone");
@@ -907,13 +925,8 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (_pd, _cq, qp) = resources(&ctx, port);
     let before = Instant::now();
     match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
@@ -924,8 +937,8 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
         before.elapsed() < Duration::from_secs(5),
         "the rejection arrived promptly, not after the request's retries"
     );
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 #[test]
@@ -936,9 +949,7 @@ fn disconnect_flushes_outstanding_receives() {
         ConnectionParameter::default,
         |_, _, _, _| {},
         |conn, cq, pd, _| {
-            let recv = pd
-                .allocate(64, AccessFlags::PERMISSIVE)
-                .expect("client recv mr");
+            let recv = mr(pd, 64);
             unsafe {
                 conn.queue_pair()
                     .post_recv([RecvRequest::new(7, &[recv.slice(..)])])
@@ -979,21 +990,13 @@ fn dropping_connection_disconnects_peer() {
         ready_tx
             .send(listener.local_addr().expect("listen address"))
             .expect("signal ready");
-        let request = loop {
-            let event = listener.get_cm_event().expect("listener event");
-            if event.event_type() == CmEventType::ConnectRequest {
-                break event.connection_request().expect("connection request");
-            }
-        };
+        let request = pump_until(&listener, CmEventType::ConnectRequest)
+            .connection_request()
+            .expect("connection request");
         let ctx = request.context().expect("server device context");
-        let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16).build().expect("server cq");
-        let mut qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("server qp builder")
-            .build()
-            .expect("server prepared qp")
-            .into_queue_pair();
+        let port = request.port_num().expect("server port");
+        let (_pd, _cq, qp) = resources(&ctx, port);
+        let mut qp = qp.into_queue_pair();
         accept_low_level(&request, &mut qp);
         // Then watch for the peer going away.
         pump_until(&request, CmEventType::Disconnected);
@@ -1005,20 +1008,15 @@ fn dropping_connection_disconnects_peer() {
         .resolve(addr, Duration::from_secs(5))
         .expect("resolve");
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (pd, cq, qp) = resources(&ctx, port);
     let conn = resolved
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     // `ctx`, `pd`, and `cq` (all on the connection's device context) outlive the connection
     // itself.
     drop(conn);
-    server.join().expect("server thread saw the disconnect");
+    join(server);
     drop((cq, pd, ctx));
 }
 
@@ -1031,9 +1029,18 @@ fn connect_rejects_oversized_private_data() {
     for len in [57, 196] {
         let param = ConnectionParameter::default().set_private_data(&vec![0x5a; len]);
         match id.connect(&param) {
-            Err(Error::Connect(e)) if e.kind() == io::ErrorKind::InvalidInput => {}
-            other => panic!("expected an InvalidInput error for {len} bytes, got {other:?}"),
+            // Pin the size check itself: the id has no device either, which `connect` also
+            // refuses with InvalidInput, so the kind alone would not notice the check going.
+            Err(Error::Connect(e))
+                if e.raw_os_error().is_none() && e.to_string().contains("limited to 56 bytes") => {}
+            other => panic!("expected the 56-byte request limit for {len} bytes, got {other:?}"),
         }
+    }
+    // A rejection's limit is checked before the kernel is asked.
+    match id.reject(&[0; 149]) {
+        Err(Error::ConnectionSetup(e))
+            if e.raw_os_error().is_none() && e.to_string().contains("limited to 148 bytes") => {}
+        other => panic!("expected the 148-byte rejection limit, got {other:?}"),
     }
 }
 
@@ -1114,7 +1121,9 @@ fn cm_id_options_and_accessors() {
     let (done_tx, done_rx) = mpsc::channel();
     let server = std::thread::spawn(move || {
         let acceptor = Acceptor::bind_with(SocketAddr::new(ip, 0), PortSpace::Tcp, 1, |id| {
-            id.set_tos(0x08)?;
+            // Not the client's 0x08: the accepted connection's traffic class comes from the
+            // request, which `check_options` asserts.
+            id.set_tos(0x10)?;
             id.set_reuse_addr(true)
         })
         .expect("bind_with");
@@ -1130,13 +1139,8 @@ fn cm_id_options_and_accessors() {
             .set_ack_timeout(AckTimeout::from_exponent(14))
             .expect("set_ack_timeout before accepting");
         let ctx = incoming.context().expect("server device context");
-        let pd = ctx.alloc_pd().expect("server pd");
-        let cq = ctx.create_cq(16).build().expect("server cq");
-        let qp = pd
-            .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("server qp builder")
-            .build()
-            .expect("server qp");
+        let port = incoming.cm_id().port_num().expect("server port");
+        let (_pd, _cq, qp) = resources(&ctx, port);
         let mut conn = incoming
             .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
@@ -1166,13 +1170,8 @@ fn cm_id_options_and_accessors() {
     let local = resolved.cm_id().local_addr();
     assert!(local.is_some());
     let ctx = resolved.context().expect("client device context");
-    let pd = ctx.alloc_pd().expect("client pd");
-    let cq = ctx.create_cq(16).build().expect("client cq");
-    let qp = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("client qp builder")
-        .build()
-        .expect("client qp");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (_pd, _cq, qp) = resources(&ctx, port);
     let mut conn = resolved
         .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
@@ -1180,8 +1179,8 @@ fn cm_id_options_and_accessors() {
     // The connection keeps the id that resolved the route, bound to the same local address.
     assert_eq!(conn.cm_id().local_addr(), local);
     check_options(&mut conn, "client");
-    done_tx.send(()).expect("signal done");
-    server.join().expect("server thread");
+    let _ = done_tx.send(());
+    join(server);
 }
 
 /// Checks that `side`'s connected queue pair has the ACK timeout and the type of service (as its

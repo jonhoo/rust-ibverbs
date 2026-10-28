@@ -104,10 +104,10 @@
 //!
 //! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
 //! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
-//! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`, and
-//! `rxe` (SoftRoCE) implement both. A provider that lacks them fails cleanly at completion-queue
-//! or queue-pair creation (with [`Error::Unsupported`]) rather than degrading to the
-//! legacy verbs.
+//! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`,
+//! `rxe` (SoftRoCE), and, for reliable connections only, `ionic` implement both. A provider that
+//! lacks them fails cleanly at completion-queue or queue-pair creation (with
+//! [`Error::Unsupported`]) rather than degrading to the legacy verbs.
 //!
 //! # Typed transports
 //!
@@ -124,20 +124,23 @@
 //! The underlying ibverbs API [is thread safe][safe], and the wrapper types here are `Send` and
 //! `Sync` where that holds. Handles like [`Context`], [`ProtectionDomain`], and
 //! [`CompletionQueue`] can be shared freely across threads. Operations whose verbs contracts are
-//! per-caller are encoded in the types instead: posting work requests takes `&mut QueuePair`
-//! (wrap the queue pair in a lock to post from several threads), a [`SendBatch`] borrows its
-//! queue pair until submitted, and the views handed out during a poll ([`Completions`],
-//! [`WorkCompletion`]) borrow the queue and cannot outlive or escape it.
+//! per-caller are encoded in the types instead: a send batch ([`QueuePair::start_send`]) takes
+//! `&mut QueuePair` and borrows it until submitted, so at most one is open per send queue (wrap the
+//! queue pair in a lock to send from several threads), while receives
+//! ([`QueuePair::post_recv`]) take `&self` and may be posted from several threads at once;
+//! [`QueuePair::split`] separates the two so one thread can keep a batch open while others post
+//! receives. The views handed out during a poll ([`Completions`], [`WorkCompletion`]) borrow the
+//! queue and cannot outlive or escape it.
 //!
 //! A few calls keep unlocked bookkeeping in the provider, so the same object must not see two of
 //! them at once even though its type is `Sync`:
 //!
-//! - [`QueuePair::query`] updates the state libibverbs caches in the queue pair: query a given
-//!   queue pair from one thread at a time.
-//! - Arming a completion queue ([`CompletionQueue::req_notify`]) and consuming its notifications
+//! - Arming a completion queue ([`CompletionQueue::req_notify`]) reads its consumer index, which
+//!   polling advances, without a lock, and arming and consuming its notifications
 //!   ([`CompletionChannel::get_event`] or [`wait`](CompletionChannel::wait)) both update its arm
-//!   sequence number without a lock on mlx5: do both for a given queue from one thread at a time,
-//!   or an arm can be lost and its notification never arrive.
+//!   sequence number without one (on mlx5, EFA, and hns): arm, poll, and consume the
+//!   notifications of a given queue from one thread at a time, or an arm can be lost and its
+//!   notification never arrive.
 //! - Setting `MLX5_SINGLE_THREADED=1` in the environment tells mlx5 the process is single threaded
 //!   and turns its locks into best-effort checks, which voids the `Sync` of completion queues,
 //!   queue pairs, and shared receive queues: do not set it in a program that uses them from
@@ -149,7 +152,14 @@
 //! reference counts keep, for example, a completion queue alive until the last queue pair built on
 //! it is gone). If the device rejects a teardown — which can only happen when raw handles obtained
 //! through the escape hatches still reference the resource — the drop panics rather than silently
-//! leak the resource.
+//! leak the resource. The resource then stays allocated, and so do the ones it was created on.
+//!
+//! # Forking
+//!
+//! Since Linux 5.13, registered memory stays intact across `fork()` without `ibv_fork_init`. A
+//! forked child shares the parent's device handles, though, and its drops destroy the parent's
+//! resources (the parent's own drops then fail): a child must `exec` or exit without dropping the
+//! ibverbs objects it inherited.
 //!
 //! # For the detail-oriented
 //!

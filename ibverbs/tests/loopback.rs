@@ -11,7 +11,7 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{open_test_device, poll_until, test_device};
+use common::{mr, open_test_device, poll_until, test_device};
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
     LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
@@ -56,12 +56,6 @@ fn gid_index(ctx: &Context) -> u32 {
         .expect("failed to read the GID table")
         .expect("no GID on port 1")
         .gid_index
-}
-
-/// Local write plus remote read and write access, for one-sided operations (which loop back to
-/// the same QP).
-fn read_write() -> AccessFlags {
-    AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ
 }
 
 /// Configures generous queue/SGE limits, so the tests can post batches and multi-SGE lists, and
@@ -133,7 +127,7 @@ fn loopback_of<T: Connected>(access: AccessFlags) -> Loopback<T> {
 /// A reliable-connected self-loopback queue pair (the common case). Besides remote read/write, it
 /// grants remote-atomic access, which the atomic loopback additionally requires (RC only).
 fn loopback() -> Loopback<Rc> {
-    loopback_of::<Rc>(read_write() | AccessFlags::REMOTE_ATOMIC)
+    loopback_of::<Rc>(AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
 }
 
 /// An owned snapshot of the completion fields the tests inspect (the borrowed `WorkCompletion`
@@ -228,14 +222,8 @@ fn gid_table() {
 fn send_recv() {
     let mut lb = loopback();
 
-    let mut recv = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let mut recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
     send.bytes_mut()[..5].copy_from_slice(b"hello");
 
     unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }
@@ -313,14 +301,8 @@ fn zero_length_ops_with_empty_slices() {
 fn send_recv_poll_into() {
     let mut lb = loopback();
 
-    let mut recv = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let mut recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
     send.bytes_mut()[..5].copy_from_slice(b"hello");
 
     unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }
@@ -363,14 +345,8 @@ fn send_recv_large() {
     let mut lb = loopback();
 
     const LEN: usize = 4096;
-    let recv = lb
-        .pd
-        .allocate(LEN, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = lb
-        .pd
-        .allocate(LEN, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&lb.pd, LEN);
+    let mut send = mr(&lb.pd, LEN);
     for (i, b) in send.bytes_mut().iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
@@ -398,14 +374,8 @@ fn send_recv_large() {
 fn scatter_gather() {
     let mut lb = loopback();
 
-    let mut send = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
-    let mut recv = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
+    let mut send = mr(&lb.pd, 64);
+    let mut recv = mr(&lb.pd, 64);
     send.bytes_mut()[0..3].copy_from_slice(b"AAA");
     send.bytes_mut()[16..21].copy_from_slice(b"BBBBB");
 
@@ -438,14 +408,8 @@ fn scatter_gather() {
 fn rdma_write() {
     let mut lb = loopback();
 
-    let mut src = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register src MR");
-    let mut dst = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register dst MR");
+    let mut src = mr(&lb.pd, 64);
+    let mut dst = mr(&lb.pd, 64);
     src.bytes_mut()[..6].copy_from_slice(b"verbs!");
 
     let remote = dst.remote().slice(..6);
@@ -465,18 +429,9 @@ fn rdma_write() {
 fn rdma_write_with_imm() {
     let mut lb = loopback();
 
-    let mut src = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register src MR");
-    let mut dst = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register dst MR");
-    let dummy = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register dummy MR");
+    let mut src = mr(&lb.pd, 64);
+    let mut dst = mr(&lb.pd, 64);
+    let dummy = mr(&lb.pd, 64);
     src.bytes_mut()[..4].copy_from_slice(&[1, 2, 3, 4]);
 
     // A write-with-immediate consumes a receive work request on the target queue pair.
@@ -508,14 +463,8 @@ fn rdma_write_with_imm() {
 fn rdma_read() {
     let mut lb = loopback();
 
-    let mut remote_mr = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register remote MR");
-    let mut local = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register local MR");
+    let mut remote_mr = mr(&lb.pd, 64);
+    let mut local = mr(&lb.pd, 64);
     remote_mr.bytes_mut()[..8].copy_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
 
     let remote = remote_mr.remote().slice(..8);
@@ -535,22 +484,10 @@ fn rdma_read() {
 fn batched_post() {
     let mut lb = loopback();
 
-    let mut payload = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register payload MR");
-    let mut dst = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register dst MR");
-    let mut note = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register note MR");
-    let mut recv = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
+    let mut payload = mr(&lb.pd, 64);
+    let mut dst = mr(&lb.pd, 64);
+    let mut note = mr(&lb.pd, 64);
+    let mut recv = mr(&lb.pd, 64);
     payload.bytes_mut()[..3].copy_from_slice(&[42, 43, 44]);
     note.bytes_mut()[..2].copy_from_slice(&[1, 2]);
 
@@ -568,8 +505,15 @@ fn batched_post() {
     }
     .expect("batched post failed");
 
-    // The receive completion for the send plus the single signaled send completion.
+    // The receive completion for the send plus the single signaled send completion, and nothing
+    // for the unsignaled write.
     let comps = drain(&lb.cq, 2);
+    let mut rest = lb.cq.poll().expect("failed to poll the completion queue");
+    assert!(
+        rest.next().is_none(),
+        "the unsignaled write produced a completion"
+    );
+    drop(rest);
     assert!(
         comps.iter().any(|wc| wc.wr_id() == 100),
         "missing recv completion"
@@ -593,10 +537,7 @@ fn multiple_outstanding() {
     // Keep the memory regions alive until their work requests complete.
     let mut recv_mrs = Vec::new();
     for i in 0..N {
-        let mr = lb
-            .pd
-            .allocate(8, AccessFlags::PERMISSIVE)
-            .expect("failed to register recv MR");
+        let mr = mr(&lb.pd, 8);
         unsafe {
             lb.qp
                 .post_recv([RecvRequest::new(1000 + i, &[mr.slice(..8)])])
@@ -606,10 +547,7 @@ fn multiple_outstanding() {
     }
     let mut send_mrs = Vec::new();
     for i in 0..N {
-        let mut mr = lb
-            .pd
-            .allocate(8, AccessFlags::PERMISSIVE)
-            .expect("failed to register send MR");
+        let mut mr = mr(&lb.pd, 8);
         mr.bytes_mut()[0] = i as u8;
         let mut batch = lb.qp.start_send();
         batch.op().signaled().send(i, &[mr.slice(..8)]);
@@ -650,14 +588,10 @@ fn wait_for_completion() {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(read_write()));
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(AccessFlags::PERMISSIVE));
 
-    let mut recv = pd
-        .allocate(16, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(16, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let mut recv = mr(&pd, 16);
+    let mut send = mr(&pd, 16);
     send.bytes_mut()[..4].copy_from_slice(b"wait");
 
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
@@ -700,16 +634,10 @@ fn wait_for_completion() {
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn unreliable_connection() {
-    let mut lb = loopback_of::<Uc>(read_write());
+    let mut lb = loopback_of::<Uc>(AccessFlags::PERMISSIVE);
 
-    let mut recv = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let mut recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
     send.bytes_mut()[..3].copy_from_slice(b"ucq");
 
     unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..3)])]) }
@@ -745,12 +673,8 @@ fn shared_receive_queue() {
         builder.set_srq(&srq);
     });
 
-    let mut recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let mut recv = mr(&pd, 64);
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"srq!");
 
     // Receives go to the SRQ, not the queue pair's own receive queue.
@@ -829,12 +753,8 @@ fn srq_limit_reached_async_event() {
         builder.set_srq(&srq).set_max_send_wr(8);
     });
 
-    let recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&pd, 64);
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"srq!");
 
     // Post three receives, then consume all of them: the count crosses below the limit of 2.
@@ -872,8 +792,6 @@ fn srq_limit_reached_async_event() {
     }
 }
 
-/// Unreliable datagram (UD): a connectionless queue pair sends a datagram to itself via an address
-/// handle pointing at its own GID. UD prepends a 40-byte GRH to received messages.
 /// Objects from two contexts on one device: the kernel numbers each context's objects
 /// independently, so mixing them must be refused instead of binding the queue pair to whatever the
 /// other context's number names.
@@ -926,7 +844,7 @@ fn objects_from_another_context_are_refused() {
 /// An address handle from another context is refused when a datagram is addressed with it.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
-#[should_panic(expected = "the address handle must come from the queue pair's device context")]
+#[should_panic(expected = "the address handle must come from the queue pair's protection domain")]
 fn address_handle_from_another_context_is_refused() {
     let ctx = open_test_device();
     let other = open_test_device();
@@ -952,6 +870,37 @@ fn address_handle_from_another_context_is_refused() {
     let _ = batch.to(&foreign_ah, endpoint.qp_num, 0x1234_5678);
 }
 
+/// So is one from another protection domain of the same context, which rxe would fail the send
+/// with (`rxe_get_av`).
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "the address handle must come from the queue pair's protection domain")]
+fn address_handle_from_another_protection_domain_is_refused() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    let (mut qp, endpoint) = activate_self(&pd, &cq, gid_index, 0x1234_5678);
+
+    let mut ah_attr = AddressHandleAttribute::new(1);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
+    let other_pd_ah = ctx
+        .alloc_pd()
+        .expect("failed to allocate PD")
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+
+    let mut batch = qp.start_send();
+    let _ = batch.to(&other_pd_ah, endpoint.qp_num, 0x1234_5678);
+}
+
+/// Unreliable datagram (UD): a connectionless queue pair sends a datagram to itself via an address
+/// handle pointing at its own GID. UD prepends a 40-byte GRH to received messages.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn unreliable_datagram() {
@@ -973,12 +922,8 @@ fn unreliable_datagram() {
 
     let payload = b"datagram";
     // UD receives prepend a 40-byte GRH, so the receive buffer must allow for it.
-    let mut recv = pd
-        .allocate(40 + 64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let mut recv = mr(&pd, 40 + 64);
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..payload.len()].copy_from_slice(payload);
 
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..40 + payload.len())])]) }
@@ -1021,23 +966,19 @@ fn atomic_operations() {
         .pd
         .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
         .expect("failed to register target MR");
-    let mut local = lb
-        .pd
-        .allocate(8, AccessFlags::PERMISSIVE)
-        .expect("failed to register local MR");
+    let mut local = mr(&lb.pd, 8);
 
     // The compare matches the zeroed target, so the swap takes effect and the original value (0) is
     // returned into `local`.
     let swapped = 0x0102_0304_0506_0708_u64;
     {
-        let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
             batch
                 .op()
                 .signaled()
-                .atomic_cmp_swap(1, &sg, remote, 0, swapped);
+                .atomic_cmp_swap(1, local.slice(..), remote, 0, swapped);
             batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
@@ -1052,11 +993,13 @@ fn atomic_operations() {
 
     // A non-matching compare leaves the target untouched and returns the current value.
     {
-        let sg = [local.slice(..)];
         let remote = target.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
-            batch.op().signaled().atomic_cmp_swap(2, &sg, remote, 0, 0);
+            batch
+                .op()
+                .signaled()
+                .atomic_cmp_swap(2, local.slice(..), remote, 0, 0);
             batch.submit()
         }
         .expect("post atomic_cmp_swap failed");
@@ -1079,11 +1022,13 @@ fn atomic_operations() {
         .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
         .expect("failed to register counter MR");
     {
-        let sg = [local.slice(..)];
         let remote = counter.remote().slice(..);
         unsafe {
             let mut batch = lb.qp.start_send();
-            batch.op().signaled().atomic_fetch_add(3, &sg, remote, 5);
+            batch
+                .op()
+                .signaled()
+                .atomic_fetch_add(3, local.slice(..), remote, 5);
             batch.submit()
         }
         .expect("post atomic_fetch_add failed");
@@ -1101,6 +1046,28 @@ fn atomic_operations() {
     );
 }
 
+/// An atomic whose local buffer is not the 8 bytes it writes the original value to panics before
+/// it is posted (rxe would apply it remotely and then fail it locally).
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "an atomic writes 8 bytes to its local buffer, which is 4 bytes long")]
+fn atomic_local_buffer_must_be_8_bytes() {
+    let mut lb = loopback();
+    let local = lb
+        .pd
+        .allocate(8, AccessFlags::PERMISSIVE)
+        .expect("failed to register local MR");
+    let counter = lb
+        .pd
+        .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
+        .expect("failed to register counter MR");
+    let mut batch = lb.qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .atomic_fetch_add(1, local.slice(..4), counter.remote().slice(..), 5);
+}
+
 /// `ibv_advise_mr` against a registered memory region. Prefetch advice is meant for on-demand-paging
 /// MRs, which Soft-RoCE does not support, so the device may report the verb as unsupported; the
 /// point of the test is that the dispatch path works and returns a result rather than crashing.
@@ -1108,10 +1075,7 @@ fn atomic_operations() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn advise_mr() {
     let lb = loopback();
-    let mr = lb
-        .pd
-        .allocate(4096, AccessFlags::PERMISSIVE)
-        .expect("failed to register MR");
+    let mr = mr(&lb.pd, 4096);
     let sg = [mr.slice(..)];
 
     match lb
@@ -1165,22 +1129,14 @@ fn register_from_raw() {
     assert_eq!(&recv_buf[..6], b"extern");
 }
 
-/// Batched receive: two receives posted in one `post_recv` (caller-owned array) catch two sends, in
-/// order, on the same RC queue pair.
 /// A split queue pair: one thread posts the receives and another sends into them.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn split_queue_pair_across_threads() {
     const N: u64 = 8;
     let mut lb = loopback();
-    let recv = lb
-        .pd
-        .allocate(N as usize * 8, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = lb
-        .pd
-        .allocate(N as usize * 8, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&lb.pd, N as usize * 8);
+    let mut send = mr(&lb.pd, N as usize * 8);
     for (i, chunk) in send.bytes_mut().chunks_mut(8).enumerate() {
         chunk.copy_from_slice(&(i as u64).to_le_bytes());
     }
@@ -1219,27 +1175,17 @@ fn split_queue_pair_across_threads() {
     assert_eq!(recv.bytes(), send.bytes());
 }
 
+/// Batched receive: two receives posted in one `post_recv` (caller-owned array) catch two sends, in
+/// order, on the same RC queue pair.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn batched_recv() {
     let mut lb = loopback();
 
-    let recv_a = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR a");
-    let recv_b = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR b");
-    let mut send_a = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR a");
-    let mut send_b = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR b");
+    let recv_a = mr(&lb.pd, 64);
+    let recv_b = mr(&lb.pd, 64);
+    let mut send_a = mr(&lb.pd, 64);
+    let mut send_b = mr(&lb.pd, 64);
     send_a.bytes_mut()[..3].copy_from_slice(b"one");
     send_b.bytes_mut()[..3].copy_from_slice(b"two");
 
@@ -1277,14 +1223,8 @@ fn batched_recv() {
 fn send_flags() {
     let mut lb = loopback();
 
-    let recv = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = lb
-        .pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"flag");
 
     let sg = [recv.slice(..4)];
@@ -1343,7 +1283,7 @@ fn query_device_and_port() {
         port.gid_tbl_len > 0,
         "a RoCE port should expose a GID table"
     );
-    // `open_test_device` only succeeds on an active port, so the typed state reflects that, and the
+    // The data-path tests need an active port 1, so the typed state reflects that, and the
     // remaining typed accessors decode without panicking.
     assert!(matches!(port.state(), PortState::Active | PortState::Armed));
     let _ = port.active_mtu();
@@ -1358,8 +1298,7 @@ fn query_device_and_port() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn raw_handles() {
     let devices = ibverbs::devices().expect("failed to list RDMA devices");
-    let device = devices.iter().next().expect("no RDMA device available");
-    assert!(!device.as_raw().is_null());
+    assert!(!test_device(&devices).as_raw().is_null());
 
     let ctx = open_test_device();
     assert!(!ctx.as_raw().is_null());
@@ -1380,9 +1319,7 @@ fn raw_handles() {
     // The plain and extended views are the same underlying completion queue.
     assert_eq!(cq.as_raw() as *const (), cq.as_raw_ex() as *const ());
 
-    let mr = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register MR");
+    let mr = mr(&pd, 64);
     assert!(!mr.as_raw().is_null());
     assert_eq!(mr.lkey(), mr.slice(..).lkey());
 
@@ -1390,12 +1327,18 @@ fn raw_handles() {
     assert!(!srq.as_raw().is_null());
 
     // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
-    let (qp, endpoint) = activate_self(&pd, &cq, gid_index(&ctx), 0x1234_5678);
+    let gid_index = gid_index(&ctx);
+    let (qp, endpoint) = activate_self(&pd, &cq, gid_index, 0x1234_5678);
     assert!(!qp.as_raw().is_null());
     assert!(!qp.as_raw_ex().is_null());
 
     let mut ah_attr = AddressHandleAttribute::new(1);
-    ah_attr.set_grh(endpoint.gid.expect("RoCE requires a GID"), 1, 64, 0);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
     let ah = pd
         .create_address_handle(&ah_attr)
         .expect("failed to create address handle");
@@ -1411,13 +1354,13 @@ fn inline_send() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_max_inline_data(64).set_access(read_write());
+        builder
+            .set_max_inline_data(64)
+            .set_access(AccessFlags::PERMISSIVE);
     });
 
     // Inline SEND: the payload lives only in this stack array, never in a registered MR.
-    let recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
+    let recv = mr(&pd, 64);
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }.expect("post_recv failed");
     let mut batch = qp.start_send();
     batch.op().signaled().send(2, Payload::Inline(b"inrun"));
@@ -1428,9 +1371,7 @@ fn inline_send() {
     assert_eq!(&recv.bytes()[..5], b"inrun");
 
     // Inline RDMA WRITE into a remote region.
-    let dst = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register dst MR");
+    let dst = mr(&pd, 64);
     let remote = dst.remote().slice(..4);
     let mut batch = qp.start_send();
     batch
@@ -1443,9 +1384,9 @@ fn inline_send() {
     assert_eq!(&dst.bytes()[..4], b"wxyz");
 }
 
-/// An inline payload longer than the queue pair's granted inline capacity panics before the
-/// provider copies it, for one buffer and for a list whose buffers each fit but whose total does
-/// not. The panic aborts the open batch, so the queue pair still posts afterwards.
+/// An inline payload longer than the inline capacity the queue pair was built for panics before
+/// the provider copies it, for one buffer and for a list whose buffers each fit but whose total
+/// does not. The panic aborts the open batch, so the queue pair still posts afterwards.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn inline_capacity_is_enforced() {
@@ -1456,16 +1397,20 @@ fn inline_capacity_is_enforced() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_max_inline_data(16).set_access(read_write());
+        builder
+            .set_max_inline_data(16)
+            .set_access(AccessFlags::PERMISSIVE);
     });
     let (_, init) = qp
         .query(QueuePairAttributeMask::STATE)
         .expect("failed to query the queue pair");
-    let cap = init.max_inline_data as usize;
     assert!(
-        cap >= 16,
-        "granted inline capacity {cap} is below the requested 16"
+        init.max_inline_data >= 16,
+        "granted inline capacity {} is below the requested 16",
+        init.max_inline_data
     );
+    // The send path holds payloads to the requested capacity, whatever the device granted.
+    let cap = 16;
 
     let too_long = vec![0u8; cap + 1];
     let half = vec![0u8; cap / 2 + 1];
@@ -1481,9 +1426,7 @@ fn inline_capacity_is_enforced() {
         );
     }
 
-    let recv = pd
-        .allocate(cap, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
+    let recv = mr(&pd, cap);
     unsafe { qp.post_recv([RecvRequest::new(2, &[recv.slice(..)])]) }.expect("post_recv failed");
     let fits = vec![7u8; cap];
     let mut batch = qp.start_send();
@@ -1493,6 +1436,38 @@ fn inline_capacity_is_enforced() {
     ids.sort_unstable();
     assert_eq!(ids, [2, 3], "only the send that fits completed");
     assert_eq!(&recv.bytes()[..cap], &fits[..]);
+}
+
+/// A scatter/gather list with more entries than the queue pair was built for panics before the
+/// provider writes it, including a single entry on a queue pair built for none (which mlx5's
+/// single-entry setter would write past the work request).
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn send_sge_capacity_is_enforced() {
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mr = pd
+        .allocate(16, AccessFlags::PERMISSIVE)
+        .expect("failed to register MR");
+    let one = [mr.slice(..8)];
+    let two = [mr.slice(..8), mr.slice(8..)];
+    for (max_send_sge, sges) in [(0, &one[..]), (1, &two[..])] {
+        let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
+            builder.set_max_send_sge(max_send_sge);
+        });
+        let posted = catch_unwind(AssertUnwindSafe(|| {
+            let mut batch = qp.start_send();
+            batch.op().signaled().send(1, sges);
+        }));
+        assert!(
+            posted.is_err(),
+            "{} entries were posted to a queue pair built for {max_send_sge}",
+            sges.len()
+        );
+    }
 }
 
 /// A queue pair created on an explicitly chosen port (port 1) connects and transfers data. The test
@@ -1505,15 +1480,11 @@ fn queue_pair_on_explicit_port() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(read_write());
+        builder.set_access(AccessFlags::PERMISSIVE);
     });
 
-    let recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&pd, 64);
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"port");
 
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
@@ -1551,15 +1522,11 @@ fn completion_timestamps() {
     };
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(read_write());
+        builder.set_access(AccessFlags::PERMISSIVE);
     });
 
-    let recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&pd, 64);
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"time");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
     let mut batch = qp.start_send();
@@ -1595,15 +1562,11 @@ fn extended_wc_fields() {
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(read_write());
+        builder.set_access(AccessFlags::PERMISSIVE);
     });
 
-    let recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&pd, 64);
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"wcfl");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
     let mut batch = qp.start_send();
@@ -1645,7 +1608,8 @@ fn extended_wc_fields() {
             .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
             .build(),
     ) {
-        let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(read_write()));
+        let mut qp =
+            connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(AccessFlags::PERMISSIVE));
         unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
             .expect("post_recv failed");
         let mut batch = qp.start_send();
@@ -1690,14 +1654,10 @@ fn event_driven_completion() {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(read_write()));
+    let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(AccessFlags::PERMISSIVE));
 
-    let mut recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let mut recv = mr(&pd, 64);
+    let mut send = mr(&pd, 64);
     send.bytes_mut()[..5].copy_from_slice(b"hello");
 
     // Arm the queue before posting so the completions raise a notification on the descriptor.
@@ -1869,13 +1829,13 @@ fn inline_send_list() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_max_inline_data(64).set_access(read_write());
+        builder
+            .set_max_inline_data(64)
+            .set_access(AccessFlags::PERMISSIVE);
     });
 
     // Gathered inline SEND: the payload is assembled from three separate stack buffers.
-    let recv = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
+    let recv = mr(&pd, 64);
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..9)])]) }.expect("post_recv failed");
     let bufs = [
         IoSlice::new(b"ab"),
@@ -1901,9 +1861,7 @@ fn inline_send_list() {
     assert_eq!(&recv.bytes()[..9], b"abcdefghi");
 
     // Gathered inline RDMA WRITE into a remote region.
-    let dst = pd
-        .allocate(64, AccessFlags::PERMISSIVE)
-        .expect("failed to register dst MR");
+    let dst = mr(&pd, 64);
     let remote = dst.remote().slice(..6);
     let parts = [IoSlice::new(b"uvw"), IoSlice::new(b"xyz")];
     let mut batch = qp.start_send();
@@ -2012,13 +1970,23 @@ fn shared_completion_channel() {
     );
 
     let pd = ctx.alloc_pd().expect("failed to allocate pd");
-    let mut qp_a = connect_self::<Rc>(&pd, &cq_a, gid_index(&ctx), generous(read_write()));
-    let mut qp_b = connect_self::<Rc>(&pd, &cq_b, gid_index(&ctx), generous(read_write()));
+    let mut qp_a = connect_self::<Rc>(
+        &pd,
+        &cq_a,
+        gid_index(&ctx),
+        generous(AccessFlags::PERMISSIVE),
+    );
+    let mut qp_b = connect_self::<Rc>(
+        &pd,
+        &cq_b,
+        gid_index(&ctx),
+        generous(AccessFlags::PERMISSIVE),
+    );
 
-    let mut recv_a = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv a");
-    let mut recv_b = pd.allocate(16, AccessFlags::PERMISSIVE).expect("recv b");
-    let mut send_a = pd.allocate(16, AccessFlags::PERMISSIVE).expect("send a");
-    let mut send_b = pd.allocate(16, AccessFlags::PERMISSIVE).expect("send b");
+    let mut recv_a = mr(&pd, 16);
+    let mut recv_b = mr(&pd, 16);
+    let mut send_a = mr(&pd, 16);
+    let mut send_b = mr(&pd, 16);
     send_a.bytes_mut()[..4].copy_from_slice(b"aaaa");
     send_b.bytes_mut()[..4].copy_from_slice(b"bbbb");
 
@@ -2149,18 +2117,16 @@ fn routable_gid() {
     );
 }
 
-/// The attributes `handshake` applies are exposed, so a manual bring-up can start from them,
-/// adjust one, and still reach a working queue pair.
+/// A reliable connection defaults to as many outstanding RDMA reads and atomics as the device
+/// supports, and the peer's handshake caps its initiator side to the advertised responder resources.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn rd_atomic_defaults_follow_the_device() {
-    // A reliable connection defaults to as many outstanding RDMA reads and atomics as the device
-    // supports, instead of one at a time.
     let ctx = open_test_device();
     let dev = ctx.query_device().expect("failed to query device");
     let responder = dev.max_qp_rd_atom.min(255);
     let initiator = dev.max_qp_init_rd_atom.min(255);
-    let lb = loopback();
+    let mut lb = loopback();
     let (attr, _) = lb
         .qp
         .query(
@@ -2213,6 +2179,8 @@ fn roce_handshake_needs_a_gid() {
     }
 }
 
+/// The attributes `handshake` applies are exposed, so a manual bring-up can start from them,
+/// adjust one, and still reach a working queue pair.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn manual_bringup_from_handshake_attributes() {
@@ -2256,12 +2224,8 @@ fn manual_bringup_from_handshake_attributes() {
     assert_eq!(attr.min_rnr_timer().duration(), Duration::from_micros(10));
 
     // And the result moves data.
-    let recv = pd
-        .allocate(16, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(16, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&pd, 16);
+    let mut send = mr(&pd, 16);
     send.bytes_mut()[..4].copy_from_slice(b"attr");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv");
     let mut batch = qp.start_send();
@@ -2289,12 +2253,8 @@ fn send_ops_subset() {
         assert_eq!(builder.send_ops(), SendOps::SEND);
     });
 
-    let recv = pd
-        .allocate(16, AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(16, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&pd, 16);
+    let mut send = mr(&pd, 16);
     send.bytes_mut()[..4].copy_from_slice(b"only");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
     let mut batch = qp.start_send();
@@ -2325,12 +2285,8 @@ fn reply_through_address_handle_from_wc() {
         .create_address_handle(&request_attr)
         .expect("failed to create the request's address handle");
 
-    let recv = pd
-        .allocate(2 * (Grh::LEN + 16), AccessFlags::PERMISSIVE)
-        .expect("failed to register recv MR");
-    let mut send = pd
-        .allocate(32, AccessFlags::PERMISSIVE)
-        .expect("failed to register send MR");
+    let recv = mr(&pd, 2 * (Grh::LEN + 16));
+    let mut send = mr(&pd, 32);
     send.bytes_mut()[..4].copy_from_slice(b"ask?");
     send.bytes_mut()[16..20].copy_from_slice(b"yes!");
     let (first, second) = (Grh::LEN + 16, 2 * (Grh::LEN + 16));

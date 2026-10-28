@@ -15,16 +15,19 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Most variants wrap the underlying operating-system error (an `errno` from a libibverbs or
 /// librdmacm call); the specific variant identifies which operation failed and carries any relevant
-/// context. A few variants — [`Unsupported`](Error::Unsupported),
+/// context. The others — [`Unsupported`](Error::Unsupported),
 /// [`PortNotActive`](Error::PortNotActive), [`GidMismatch`](Error::GidMismatch),
-/// [`MalformedWireFormat`](Error::MalformedWireFormat), and the two `InvalidQueuePair*` diagnoses
-/// — capture conditions that callers commonly branch on.
+/// [`GidRequired`](Error::GidRequired), [`DeviceIndexUnavailable`](Error::DeviceIndexUnavailable),
+/// [`MalformedWireFormat`](Error::MalformedWireFormat), the two `InvalidQueuePair*` diagnoses,
+/// and the connection manager's `TimedOut` and `ConnectionManager` — capture conditions that
+/// callers commonly branch on.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The device, provider, or kernel does not support the requested operation or
-    /// work-completion field (`EOPNOTSUPP`, or `EPROTONOSUPPORT` from a kernel older than the
-    /// request); `operation` names the verb that was declined.
+    /// work-completion field (`EOPNOTSUPP`, `EPROTONOSUPPORT` from a kernel older than the
+    /// request, or `ENOSYS` for a connection-manager option the kernel does not know);
+    /// `operation` names the verb that was declined.
     #[error("{operation} is not supported by the device, provider, or kernel")]
     Unsupported {
         /// The verb (or the capability it asked for) the device, provider, or kernel declined. A
@@ -255,7 +258,12 @@ pub enum Error {
 impl Error {
     /// The operating-system error (`errno`) underlying this error, for the variants that wrap one:
     /// the uniform way to branch on `ENOMEM`, `EINVAL`, and friends without matching every
-    /// variant. `None` for the errors this crate diagnoses itself.
+    /// variant. `None` for the variants this crate diagnoses itself, and for
+    /// [`Unsupported`](Error::Unsupported), which does not keep whether the errno was
+    /// `EOPNOTSUPP` or `EPROTONOSUPPORT`. The crate's checks of its own inputs (a queue from
+    /// another context, oversized private data, and the like) are reported in the operation's
+    /// variant as an [`io::ErrorKind::InvalidInput`] error with no errno, so for them this is
+    /// `Some` but [`raw_os_error`](io::Error::raw_os_error) is `None`.
     pub fn os_error(&self) -> Option<&io::Error> {
         std::error::Error::source(self)?.downcast_ref::<io::Error>()
     }
@@ -373,11 +381,22 @@ pub(crate) fn check(ret: i32, wrap: impl FnOnce(io::Error) -> Error) -> Result<(
 
 /// Panics with the error a destroy verb (`ibv_destroy_qp`, `ibv_dereg_mr`, ...) returned, if any:
 /// the `Drop` impls cannot report it, and must not carry on as if the object were gone.
+///
+/// The object still exists then, and so must the objects it was created on: `keep_parents` leaks
+/// the references it holds to them before the panic unwinds through its fields. Released, the last
+/// of them would destroy its object under this one, fail the same way, and panic again during the
+/// unwind, which aborts the process.
 #[track_caller]
-pub(crate) fn destroyed(verb: &str, errno: i32) {
+pub(crate) fn destroyed(verb: &str, errno: i32, keep_parents: impl FnOnce()) {
     if errno != 0 {
+        keep_parents();
         panic!("{verb} failed: {}", io::Error::from_raw_os_error(errno));
     }
+}
+
+/// Leaks one reference to `parent`, for [`destroyed`]'s `keep_parents`.
+pub(crate) fn keep<T: Clone>(parent: &T) {
+    std::mem::forget(parent.clone());
 }
 
 #[cfg(test)]
@@ -429,6 +448,38 @@ mod tests {
             Some(nix::libc::ENOMEM)
         );
         assert!(Error::GidMismatch.os_error().is_none());
+    }
+
+    /// A failed destroy panics without releasing its parents: had the child held the last
+    /// reference, the parent's destroy would run during the unwind, fail too (the child still
+    /// exists), and its second panic would abort the process instead of unwinding to here.
+    #[test]
+    #[cfg_attr(miri, ignore = "leaks the parent on purpose, as a failed destroy does")]
+    fn a_failed_destroy_keeps_its_parents() {
+        use std::panic::catch_unwind;
+        use std::sync::Arc;
+
+        struct Parent;
+        impl Drop for Parent {
+            fn drop(&mut self) {
+                destroyed("ibv_dealloc_pd", nix::libc::EBUSY, || ());
+            }
+        }
+        struct Child {
+            parent: Arc<Parent>,
+        }
+        impl Drop for Child {
+            fn drop(&mut self) {
+                destroyed("ibv_dereg_mr", nix::libc::EBUSY, || keep(&self.parent));
+            }
+        }
+
+        let child = Child {
+            parent: Arc::new(Parent),
+        };
+        let parent = Arc::downgrade(&child.parent);
+        assert!(catch_unwind(move || drop(child)).is_err());
+        assert!(parent.upgrade().is_some(), "the parent was released");
     }
 
     #[test]

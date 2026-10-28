@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
@@ -32,7 +33,7 @@ impl ProtectionDomain {
     ///    `access_flags` that include `ON_DEMAND`.
     pub fn register_dmabuf_data_direct(
         &self,
-        fd: i32,
+        fd: BorrowedFd<'_>,
         offset: u64,
         len: usize,
         iova: u64,
@@ -50,7 +51,7 @@ impl ProtectionDomain {
                 offset,
                 len,
                 iova,
-                fd,
+                fd.as_raw_fd(),
                 access_flags.0 as i32,
                 data_direct.0 as i32,
             )
@@ -60,7 +61,7 @@ impl ProtectionDomain {
             // The kernel reports a device without a Data Direct device as `EINVAL`, like a bad
             // argument; its Data Direct query tells the two apart by reporting `ENODEV`.
             if err.raw_os_error() == Some(nix::libc::EINVAL)
-                && !has_data_direct_device(self.context().as_raw())
+                && !has_data_direct_device(self.context())
             {
                 return Err(Error::Unsupported {
                     operation: &"mlx5dv_reg_dmabuf_mr",
@@ -125,12 +126,11 @@ fn check_data_direct_arguments(iova: u64, access_flags: AccessFlags, page_size: 
 
 /// Whether the device behind `ctx` has a Data Direct device: false only when the provider's query
 /// says it has none (`ENODEV`).
-fn has_data_direct_device(ctx: *mut ffi::ibv_context) -> bool {
-    let mut buf = [0u8; nix::libc::PATH_MAX as usize];
-    // SAFETY: the context is live and `buf` is writable for the supplied length.
-    let rc =
-        unsafe { ffi::mlx5dv_get_data_direct_sysfs_path(ctx, buf.as_mut_ptr().cast(), buf.len()) };
-    rc != nix::libc::ENODEV
+fn has_data_direct_device(ctx: &Context) -> bool {
+    !matches!(
+        ctx.mlx5_data_direct_sysfs_path(),
+        Err(Error::QueryMlx5DataDirectSysfsPath(e)) if e.raw_os_error() == Some(nix::libc::ENODEV)
+    )
 }
 
 fn registration_error(err: io::Error) -> Error {

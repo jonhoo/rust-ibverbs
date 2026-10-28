@@ -7,98 +7,17 @@ use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
 use crate::context::Mtu;
-use crate::error::{Error, Result, destroyed, nonnull};
+use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
 use crate::srq::SharedReceiveQueue;
 
-/// The transport service type of a queue pair.
-///
-/// At creation the type is derived from the transport marker (see [`Transport`] and
-/// [`ProtectionDomain::create_qp`]); this enum names the types on the wire and in queries. The
-/// types without a marker ([`RawPacket`](Self::RawPacket), the XRC pair, and
-/// [`Driver`](Self::Driver) other than EFA's SRD) are not usable through the portable wrapper;
-/// when they become so, they will get their own markers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum QueuePairType {
-    /// Reliable connection ("RC"): connected to exactly one peer, with in-order, reliable
-    /// delivery. Supports sends, RDMA read/write, and atomics.
-    ReliableConnection,
-    /// Unreliable connection ("UC"): connected to exactly one peer, in order but without
-    /// delivery guarantees. Supports sends and RDMA writes.
-    UnreliableConnection,
-    /// Unreliable datagram ("UD"): connectionless; each send is addressed individually with an
-    /// [`AddressHandle`], and each message fits in one MTU.
-    UnreliableDatagram,
-    /// Raw packet ("raw Ethernet"): sends and receives whole L2 frames, bypassing the transport.
-    RawPacket,
-    /// The sending side of an extended reliable connection ("XRC send").
-    XrcSend,
-    /// The receiving side of an extended reliable connection ("XRC recv").
-    XrcRecv,
-    /// A provider-specific ("driver") queue pair, such as EFA's SRD.
-    Driver,
-    /// A value this version of the crate does not know.
-    Unknown(u32),
-}
-
-impl From<ffi::ibv_qp_type> for QueuePairType {
-    fn from(qp_type: ffi::ibv_qp_type) -> Self {
-        use ffi::ibv_qp_type as T;
-        match qp_type {
-            T::IBV_QPT_RC => QueuePairType::ReliableConnection,
-            T::IBV_QPT_UC => QueuePairType::UnreliableConnection,
-            T::IBV_QPT_UD => QueuePairType::UnreliableDatagram,
-            T::IBV_QPT_RAW_PACKET => QueuePairType::RawPacket,
-            T::IBV_QPT_XRC_SEND => QueuePairType::XrcSend,
-            T::IBV_QPT_XRC_RECV => QueuePairType::XrcRecv,
-            T::IBV_QPT_DRIVER => QueuePairType::Driver,
-            other => QueuePairType::Unknown(other.0),
-        }
-    }
-}
-
-impl From<QueuePairType> for ffi::ibv_qp_type {
-    fn from(qp_type: QueuePairType) -> Self {
-        use ffi::ibv_qp_type as T;
-        match qp_type {
-            QueuePairType::ReliableConnection => T::IBV_QPT_RC,
-            QueuePairType::UnreliableConnection => T::IBV_QPT_UC,
-            QueuePairType::UnreliableDatagram => T::IBV_QPT_UD,
-            QueuePairType::RawPacket => T::IBV_QPT_RAW_PACKET,
-            QueuePairType::XrcSend => T::IBV_QPT_XRC_SEND,
-            QueuePairType::XrcRecv => T::IBV_QPT_XRC_RECV,
-            QueuePairType::Driver => T::IBV_QPT_DRIVER,
-            QueuePairType::Unknown(raw) => ffi::ibv_qp_type(raw),
-        }
-    }
-}
-
-impl std::fmt::Display for QueuePairType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            QueuePairType::ReliableConnection => "RC",
-            QueuePairType::UnreliableConnection => "UC",
-            QueuePairType::UnreliableDatagram => "UD",
-            QueuePairType::RawPacket => "raw packet",
-            QueuePairType::XrcSend => "XRC send",
-            QueuePairType::XrcRecv => "XRC recv",
-            QueuePairType::Driver => "driver",
-            QueuePairType::Unknown(_) => "unknown",
-        };
-        f.write_str(name)
-    }
-}
-
 /// Seals the transport traits: only the markers defined by this crate implement them.
 pub(crate) mod sealed {
-    use super::QueuePairType;
-
     /// Implemented by every transport marker.
     pub trait Sealed {
-        /// The [`QueuePairType`] the marker stands for.
-        const TYPE: QueuePairType;
+        /// The queue-pair type (`IBV_QPT_*`) the marker stands for.
+        const TYPE: ffi::ibv_qp_type;
     }
 }
 
@@ -137,6 +56,14 @@ pub(crate) mod sealed {
 /// ```
 ///
 /// ```compile_fail,E0599
+/// // Only RC has reads and atomics for a fence to wait for: `fenced` requires `T: Reliable`.
+/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Uc>) {
+///     let mut batch = qp.start_send();
+///     let _ = batch.op().fenced();
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
 /// // A datagram queue pair has no remote endpoint to handshake with: use `activate`.
 /// fn f(pqp: ibverbs::PreparedQueuePair<ibverbs::Ud>, remote: ibverbs::QueuePairEndpoint) {
 ///     let _ = pqp.handshake(remote);
@@ -148,8 +75,9 @@ pub trait Transport: sealed::Sealed {}
 /// remote endpoint with [`PreparedQueuePair::handshake`].
 pub trait Connected: Transport {}
 
-/// Implemented by the reliable connected transport RC, the only transport with acknowledgements
-/// and retries, RDMA reads, and atomics.
+/// Implemented by the reliable connected transport RC, the only connected transport with
+/// acknowledgements and retries and RDMA reads, and the only transport with atomics (EFA's SRD,
+/// behind the `efa` feature, is reliable and has RDMA reads too, but is a datagram transport).
 pub trait Reliable: Connected {}
 
 /// Implemented by the datagram transports UD and SRD, which address each send individually with
@@ -157,42 +85,41 @@ pub trait Reliable: Connected {}
 pub trait Datagram: Transport {}
 
 /// The reliable-connection (RC) transport: connected to exactly one peer, in-order and reliable;
-/// supports sends, RDMA read/write, and atomics ([`QueuePairType::ReliableConnection`]).
+/// supports sends, RDMA read/write, and atomics.
 ///
 /// Note that this marker shadows [`std::rc::Rc`] when glob-imported (`use ibverbs::*`).
 #[derive(Debug, Clone, Copy)]
 pub struct Rc;
 
 /// The unreliable-connection (UC) transport: connected to exactly one peer, in order but without
-/// delivery guarantees; supports sends and RDMA writes
-/// ([`QueuePairType::UnreliableConnection`]).
+/// delivery guarantees; supports sends and RDMA writes.
 #[derive(Debug, Clone, Copy)]
 pub struct Uc;
 
 /// The unreliable-datagram (UD) transport: connectionless, each message fits in one MTU, and each
-/// send is addressed individually with an [`AddressHandle`]
-/// ([`QueuePairType::UnreliableDatagram`]).
+/// send is addressed individually with an [`AddressHandle`].
 ///
-/// On EFA, mark every UD send [`signaled`](AddressedSendOp::signaled): EFA refuses unsignaled work
-/// requests, and the batch then fails at [`submit`](SendBatch::submit).
+/// On EFA, mark every UD send [`signaled`](SendOp::signaled) and none
+/// [`solicited`](SendOp::solicited): EFA refuses unsignaled and solicited work requests,
+/// and the batch then fails at [`submit`](SendBatch::submit).
 #[derive(Debug, Clone, Copy)]
 pub struct Ud;
 
 impl sealed::Sealed for Rc {
-    const TYPE: QueuePairType = QueuePairType::ReliableConnection;
+    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_RC;
 }
 impl Transport for Rc {}
 impl Connected for Rc {}
 impl Reliable for Rc {}
 
 impl sealed::Sealed for Uc {
-    const TYPE: QueuePairType = QueuePairType::UnreliableConnection;
+    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UC;
 }
 impl Transport for Uc {}
 impl Connected for Uc {}
 
 impl sealed::Sealed for Ud {
-    const TYPE: QueuePairType = QueuePairType::UnreliableDatagram;
+    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UD;
 }
 impl Transport for Ud {}
 impl Datagram for Ud {}
@@ -215,8 +142,8 @@ pub enum QueuePairState {
     ReadyToSend,
     /// The send queue is draining ("SQD"): posted sends finish, new ones wait.
     SendQueueDrain,
-    /// The send queue errored ("SQE"): receives still work, sends are flushed (UD and similar
-    /// transports only; RC moves straight to [`Error`](Self::Error)).
+    /// The send queue errored ("SQE"): receives still work, sends are flushed (UD and UC only;
+    /// RC moves straight to [`Error`](Self::Error)).
     SendQueueError,
     /// The error state: outstanding and new work requests are flushed with
     /// [`WcStatus::WorkRequestFlushed`](crate::WcStatus::WorkRequestFlushed).
@@ -548,34 +475,34 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 #[must_use = "a queue-pair builder creates nothing until `build` is called"]
 pub struct QueuePairBuilder<T: Transport> {
-    pub(crate) ctx: isize,
+    ctx: isize,
     pub(crate) pd: ProtectionDomain,
     /// port local identifier
-    pub(crate) lid: u16,
+    lid: u16,
     /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
-    pub(crate) roce: bool,
+    roce: bool,
     /// the device port this queue pair is associated with (numbered from 1)
-    pub(crate) port_num: u8,
+    port_num: u8,
 
-    pub(crate) send: CompletionQueue,
-    pub(crate) max_send_wr: u32,
-    pub(crate) recv: CompletionQueue,
-    pub(crate) max_recv_wr: u32,
+    send: CompletionQueue,
+    max_send_wr: u32,
+    recv: CompletionQueue,
+    max_recv_wr: u32,
 
-    pub(crate) gid_index: Option<u32>,
-    pub(crate) max_send_sge: u32,
-    pub(crate) max_recv_sge: u32,
-    pub(crate) max_inline_data: u32,
+    gid_index: Option<u32>,
+    max_send_sge: u32,
+    max_recv_sge: u32,
+    max_inline_data: u32,
     /// the send operations to request at creation, or the transport's default set
-    pub(crate) send_ops: Option<SendOps>,
+    send_ops: Option<SendOps>,
 
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
-    pub(crate) traffic_class: u8,
+    traffic_class: u8,
     /// service level (0-15). Higher value means higher priority.
-    pub(crate) service_level: u8,
+    service_level: u8,
     /// the transport's bring-up attributes, with the setters' values written into them
-    pub(crate) bring_up: BringUp,
+    bring_up: BringUp,
     /// shared receive queue
     srq: Option<SharedReceiveQueue>,
     _transport: std::marker::PhantomData<T>,
@@ -595,8 +522,8 @@ impl<T: Transport> QueuePairBuilder<T> {
         recv: CompletionQueue,
         rd_atomic_limits: Option<(u8, u8)>,
     ) -> QueuePairBuilder<T> {
-        let reliable = T::TYPE == QueuePairType::ReliableConnection;
-        let connected = reliable || T::TYPE == QueuePairType::UnreliableConnection;
+        let reliable = T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC;
+        let connected = reliable || T::TYPE == ffi::ibv_qp_type::IBV_QPT_UC;
         let mut init = QueuePairAttribute::new();
         init.set_state(QueuePairState::Init)
             .set_pkey_index(0)
@@ -647,10 +574,17 @@ impl<T: Transport> QueuePairBuilder<T> {
 
     /// Set the service level of the new `QueuePair`.
     ///
-    /// The service level (0–15); higher values mean higher priority.
+    /// The service level (0–15) selects the virtual lane on InfiniBand, through the subnet
+    /// manager's SL-to-VL mapping; on RoCE, its low 3 bits become the packets' 802.1p priority.
     ///
     /// Defaults to 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `service_level` is above 15: the field is 4 bits wide, and providers would
+    /// silently drop the extra bits.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
+        assert!(service_level <= 15, "the service level is a 4-bit value");
         self.service_level = service_level;
         self
     }
@@ -728,7 +662,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// Value can be `[0..dev_cap.max_sge]`. Some devices support fewer
     /// scatter/gather elements for specific transport types than the
-    /// maximum reported value.
+    /// maximum reported value. Posting a work request with more entries than requested here
+    /// panics, even where the device granted more; with 0, the queue pair sends only inline or
+    /// empty payloads.
     ///
     /// Defaults to 1.
     pub fn set_max_send_sge(&mut self, max_send_sge: u32) -> &mut Self {
@@ -762,10 +698,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// Inline sends (see [`Payload::Inline`]) copy their payload directly into the work request
     /// rather than referencing a registered memory region, which lowers latency for small messages.
-    /// A send queue must reserve this capacity up front; the actual value granted by the device can
-    /// be larger than requested and is reported by [`QueuePair::query`] (see
-    /// [`QueuePairInitAttribute::max_inline_data`]). Posting more inline bytes than the queue pair
-    /// supports panics.
+    /// A send queue must reserve this capacity up front. The device may grant more than requested
+    /// (reported by [`QueuePair::query`], see [`QueuePairInitAttribute::max_inline_data`]), but
+    /// posting more inline bytes than requested here panics.
     ///
     /// Defaults to 0 (inline sends disabled).
     pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
@@ -778,10 +713,11 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// The device must support every operation requested, or [`build`](Self::build) fails with
     /// [`Unsupported`](Error::Unsupported): a device without extended atomics, for example, can
-    /// still create a send-only RC queue pair this way. Conversely, an opcode method whose
-    /// operation was not requested fails at [`submit`](SendBatch::submit). Operations beyond
-    /// the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`, `FLUSH`,
-    /// `ATOMIC_WRITE`) are reachable through [`as_raw_ex`](QueuePair::as_raw_ex).
+    /// still create a send-only RC queue pair this way. Conversely, do not call an opcode method
+    /// whose operation was not requested: what happens depends on the provider (rxe and EFA
+    /// install only the requested operations, so the method panics; mlx5 posts it anyway).
+    /// Operations beyond the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`,
+    /// `FLUSH`, `ATOMIC_WRITE`) are reachable through [`as_raw_ex`](QueuePair::as_raw_ex).
     pub fn set_send_ops(&mut self, ops: SendOps) -> &mut Self {
         self.send_ops = Some(ops);
         self
@@ -793,8 +729,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// SRD, and the atomics on RC. Start from it to add an operation:
     /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
     pub fn send_ops(&self) -> SendOps {
-        self.send_ops
-            .unwrap_or_else(|| default_send_ops(T::TYPE.into()))
+        self.send_ops.unwrap_or_else(|| default_send_ops(T::TYPE))
     }
 
     /// Refuses completion queues or a shared receive queue from another device context than the
@@ -838,7 +773,7 @@ impl<T: Transport> QueuePairBuilder<T> {
                 max_recv_sge: self.max_recv_sge,
                 max_inline_data: self.max_inline_data,
             },
-            qp_type: T::TYPE.into(),
+            qp_type: T::TYPE,
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
                 | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
             pd: self.pd.as_raw(),
@@ -861,6 +796,17 @@ impl<T: Transport> QueuePairBuilder<T> {
             unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
             Error::CreateQueuePair,
         )?;
+        self.prepared(qp, &attr)
+    }
+
+    /// Wraps `qp`, just created from `attr`, as the prepared queue pair this builder describes:
+    /// the end of every transport's `build`. Creation wrote the granted capacities back into
+    /// `attr`, and the queue pair holds the shared receive queue `attr` attached it to, if any.
+    pub(crate) fn prepared(
+        &self,
+        qp: *mut ffi::ibv_qp,
+        attr: &ffi::ibv_qp_init_attr_ex,
+    ) -> Result<PreparedQueuePair<T>> {
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
         let prepared = PreparedQueuePair {
             lid: self.lid,
@@ -868,13 +814,19 @@ impl<T: Transport> QueuePairBuilder<T> {
             port_num: self.port_num,
             qp: QueuePair {
                 pd: self.pd.clone(),
-                _srq: self.srq.clone(),
+                _srq: if attr.srq.is_null() {
+                    None
+                } else {
+                    self.srq.clone()
+                },
                 _send_cq: self.send.clone(),
                 _recv_cq: self.recv.clone(),
                 qp,
                 qp_ex,
-                // Creation writes the granted capacities back into `attr.cap`.
-                max_inline_data: attr.cap.max_inline_data,
+                // At most what was asked for: mlx5 writes back a capacity that went negative when
+                // the work request has no room left for an inline segment (`max_send_sge` 0).
+                max_inline_data: self.max_inline_data.min(attr.cap.max_inline_data),
+                max_send_sge: self.max_send_sge,
                 _transport: std::marker::PhantomData,
             },
             gid_index: self.gid_index,
@@ -1040,8 +992,8 @@ impl<T: Reliable> QueuePairBuilder<T> {
 
 /// An allocated but uninitialized `QueuePair`. Created by [`QueuePairBuilder::build`].
 ///
-/// Specifically, this `QueuePair` has been allocated with `ibv_create_qp_ex`, but has not yet been
-/// initialized with calls to `ibv_modify_qp`.
+/// Specifically, this `QueuePair` has been allocated (with `ibv_create_qp_ex`, or
+/// `efadv_create_qp_ex` for SRD), but has not yet been initialized with calls to `ibv_modify_qp`.
 ///
 /// To complete the construction of the `QueuePair`, you will need to obtain the
 /// [`QueuePairEndpoint`] of the remote end (by using [`endpoint`](Self::endpoint)), and then call
@@ -1069,20 +1021,20 @@ impl<T: Reliable> QueuePairBuilder<T> {
 /// brought up with `activate` instead of `handshake`.
 #[must_use = "a prepared queue pair is destroyed when dropped; connect it with `handshake` or `activate`"]
 pub struct PreparedQueuePair<T: Transport> {
-    pub(crate) qp: QueuePair<T>,
+    qp: QueuePair<T>,
     /// port local identifier
-    pub(crate) lid: u16,
+    lid: u16,
     /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
-    pub(crate) roce: bool,
+    roce: bool,
     /// the device port this queue pair is associated with (numbered from 1)
-    pub(crate) port_num: u8,
+    port_num: u8,
     // carried from builder
-    pub(crate) gid_index: Option<u32>,
+    gid_index: Option<u32>,
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
-    pub(crate) traffic_class: u8,
+    traffic_class: u8,
     /// service level (0-15). Higher value means higher priority.
-    pub(crate) service_level: u8,
-    pub(crate) bring_up: BringUp,
+    service_level: u8,
+    bring_up: BringUp,
 }
 
 /// The `INIT`, `RTR`, and `RTS` attributes of a queue pair's bring-up as the builder configured
@@ -1091,10 +1043,10 @@ pub struct PreparedQueuePair<T: Transport> {
 /// connected transport's route, remote queue pair number, and receive-queue PSN at `RTR` (and the
 /// cap of its RDMA read and atomic depth at `RTS`), or a datagram transport's Q_Key at `INIT`.
 #[derive(Clone)]
-pub(crate) struct BringUp {
-    pub(crate) init: QueuePairAttribute,
-    pub(crate) rtr: QueuePairAttribute,
-    pub(crate) rts: QueuePairAttribute,
+struct BringUp {
+    init: QueuePairAttribute,
+    rtr: QueuePairAttribute,
+    rts: QueuePairAttribute,
 }
 
 /// An identifier for the network endpoint of a `QueuePair`. Returned by
@@ -1102,7 +1054,7 @@ pub(crate) struct BringUp {
 /// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
 /// rdmacm connection request's `private_data`.
 ///
-/// Internally, this contains the `QueuePair`'s `qp_num`, the context's `lid` and `gid`, the
+/// Internally, this contains the `QueuePair`'s `qp_num`, its port's `lid` and `gid`, the
 /// packet sequence number the queue pair's send queue starts at, and how many RDMA reads and
 /// atomics it services at once.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -1201,7 +1153,7 @@ impl<T: Transport> PreparedQueuePair<T> {
     ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
     ///    (`ibv_query_gid`).
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
-        let qp_num = unsafe { &*self.qp.qp }.qp_num;
+        let qp_num = unsafe { (*self.qp.qp).qp_num };
         let gid = if let Some(gid_index) = self.gid_index {
             Some(self.qp.pd.context().query_gid(self.port_num, gid_index)?)
         } else {
@@ -1232,9 +1184,25 @@ impl<T: Datagram> PreparedQueuePair<T> {
         [init, rtr, rts]
     }
 
-    /// The connectionless bring-up shared by the datagram transports' `activate` (UD here, SRD in
-    /// `efa.rs`): applies [`activate_attributes`](Self::activate_attributes) in order.
-    pub(crate) fn activate_impl(self, qkey: u32) -> Result<QueuePair<T>> {
+    /// Activate this datagram queue pair (UD, or SRD behind the `efa` feature).
+    ///
+    /// Unlike a connected transport's handshake, a datagram transport is connectionless: there is
+    /// no remote endpoint to exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with
+    /// the given `qkey` ([`activate_attributes`](Self::activate_attributes)). Incoming datagrams
+    /// whose Q_Key does not match `qkey` are discarded (a sender whose work request sets the
+    /// Q_Key's most significant bit transmits with its own QP's Q_Key instead). A `qkey` with that
+    /// bit set is a privileged one: since Linux 6.4, using it needs `CAP_NET_RAW` (or, since 6.7,
+    /// `rdma system set privileged-qkey on`).
+    ///
+    /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
+    /// [`SendBatch::to`].
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
+    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
+    ///    privileged `qkey` without the privilege).
+    pub fn activate(self, qkey: u32) -> Result<QueuePair<T>> {
         let attributes = self.activate_attributes(qkey);
         let mut qp = self.qp;
         for attr in &attributes {
@@ -1267,6 +1235,9 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`GidMismatch`](Error::GidMismatch): `remote` carries a GID, but no `gid_index` was
     ///    set on the builder to route from.
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but `remote` carries no GID.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): the path MTU is not a valid MTU encoding
+    ///    ([`io::ErrorKind::InvalidInput`]), as when the port reported no active MTU to default
+    ///    to and none was set with [`QueuePairBuilder::set_path_mtu`].
     pub fn rtr_attributes(&self, remote: &QueuePairEndpoint) -> Result<QueuePairAttribute> {
         let mut path = AddressHandleAttribute::new(self.port_num);
         path.set_dest_lid(remote.lid)
@@ -1280,6 +1251,18 @@ impl<T: Connected> PreparedQueuePair<T> {
             return Err(Error::GidRequired);
         }
         let mut attr = self.bring_up.rtr.clone();
+        // A port that reports no active MTU (rxe on a netdev whose MTU is too small for 256-byte
+        // packets, or mlx5 RoCE without a netdev) leaves the default path MTU unknown, which mlx5
+        // refuses with nothing but `EINVAL` and rxe accepts as an MTU of -1.
+        if let Mtu::Unknown(raw) = attr.path_mtu() {
+            return Err(Error::ModifyQueuePair(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the path MTU {raw} is not a valid MTU encoding (the port reports no active \
+                     MTU); set one with QueuePairBuilder::set_path_mtu"
+                ),
+            )));
+        }
         attr.set_address_vector(&path)
             .set_dest_qp_num(remote.qp_num)
             // The receive queue starts at the PSN the peer's send queue starts at.
@@ -1325,6 +1308,8 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///    `gid_index` was set on the builder to route from.
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but the remote endpoint carries
     ///    no GID.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
+    ///    path MTU is not a valid MTU encoding (see [`rtr_attributes`](Self::rtr_attributes)).
     ///  - The errors of [`QueuePair::modify`]: [`ModifyQueuePair`](Error::ModifyQueuePair) when
     ///    a transition fails (for example because the remote endpoint is unreachable — on RoCE,
     ///    the error spells out the route that failed), or its typed diagnoses of a rejected
@@ -1365,29 +1350,6 @@ impl<T: Connected> PreparedQueuePair<T> {
         }
         qp.modify(&rts)?;
         Ok(qp)
-    }
-}
-
-impl PreparedQueuePair<Ud> {
-    /// Activate this unreliable datagram (UD) queue pair.
-    ///
-    /// Unlike a connected transport's handshake, UD is connectionless: there is no remote
-    /// endpoint to exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with the given
-    /// `qkey`. Incoming datagrams whose Q_Key does not match `qkey` are discarded (a sender whose
-    /// work request sets the Q_Key's most significant bit transmits with its own QP's Q_Key
-    /// instead). A `qkey` with that bit set is a privileged one: since Linux 6.4, using it needs
-    /// `CAP_NET_RAW` (or, since 6.7, `rdma system set privileged-qkey on`).
-    ///
-    /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
-    /// [`SendBatch::to`].
-    ///
-    /// # Errors
-    ///
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
-    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
-    ///    privileged `qkey` without the privilege).
-    pub fn activate(self, qkey: u32) -> Result<QueuePair<Ud>> {
-        self.activate_impl(qkey)
     }
 }
 
@@ -1445,8 +1407,8 @@ impl<'a> RecvRequest<'a> {
 ///
 /// Created by [`QueuePair::start_send`]. Each work request starts at [`op`](Self::op) (on a
 /// datagram queue pair, at [`to`](Self::to), which also addresses it), is optionally modified
-/// ([`signaled`](SendOp::signaled), [`fenced`](SendOp::fenced),
-/// [`solicited`](SendOp::solicited)), and ends with the opcode method (`send`, `write`, `read`,
+/// ([`signaled`](SendOp::signaled), [`solicited`](SendOp::solicited), and on RC
+/// [`fenced`](SendOp::fenced)), and ends with the opcode method (`send`, `write`, `read`,
 /// ...) that appends it to the open block immediately, through the extended ("doorbell")
 /// interface. The opcodes available depend on the queue pair's transport (see [`Transport`]).
 /// [`submit`](Self::submit) then rings the doorbell once for the whole batch. Dropping the batch
@@ -1495,11 +1457,25 @@ impl<'a> RecvRequest<'a> {
 /// op.send(1, sges);
 /// # }
 /// ```
+///
+/// # Deadlocks
+///
+/// The provider holds the send queue's lock from [`start_send`](QueuePair::start_send) until the
+/// batch is submitted or dropped. On ionic, an open batch holds the lock of the queue pair's send
+/// completion queue too, which polling and arming that completion queue take, and so does posting
+/// a receive to a queue pair whose receive completion queue is the same one. So on ionic, while a
+/// batch is open, the thread holding it must not poll or arm its send completion queue or post
+/// receives through it, and other threads doing so wait until the batch ends. On hns, polling a
+/// failed completion takes the send queue's lock, so do not poll this queue pair's completion
+/// queues while holding an open batch either (see [`Completions`](crate::Completions)).
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
     max_inline_data: u32,
-    _qp: std::marker::PhantomData<&'qp mut QueuePair<T>>,
+    max_send_sge: u32,
+    // Opened through a shared borrow (`QueuePair::open_batch`); what keeps a second batch out is
+    // that every caller holds the send queue exclusively.
+    _qp: std::marker::PhantomData<&'qp QueuePair<T>>,
 }
 
 impl<'qp, T: Connected> SendBatch<'qp, T> {
@@ -1524,8 +1500,8 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
     ///
     /// Every datagram send needs a destination, so this is the datagram batch's entry point; the
     /// destination is per work request, so one batch may address each request to a different
-    /// peer. The returned [`AddressedSendOp`] carries the request until an opcode method posts
-    /// it: chain the modifiers first (`batch.to(&ah, qpn, qkey).signaled().send(id, sges)`),
+    /// peer. The returned [`SendOp`] carries the request until an opcode method posts it:
+    /// chain the modifiers first (`batch.to(&ah, qpn, qkey).signaled().send(id, sges)`),
     /// because the provider reads the work-request flags and addressing inside the opcode
     /// builder.
     ///
@@ -1535,26 +1511,27 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
     ///
     /// # Panics
     ///
-    /// Panics if `ah` was created on another device context than the queue pair's: the provider
-    /// would read it as one of its own (mlx5 copies its address vector out of it).
+    /// Panics if `ah` was created on another protection domain than the queue pair's: rxe fails
+    /// the send (an address handle must share its queue pair's protection domain), and one from
+    /// another device context would be read by the provider as one of its own (mlx5 copies its
+    /// address vector out of it).
     #[inline]
     pub fn to<'b>(
         &'b mut self,
         ah: &'b AddressHandle,
         remote_qpn: u32,
         remote_qkey: u32,
-    ) -> AddressedSendOp<'b, 'qp, T> {
+    ) -> SendOp<'b, 'qp, T> {
+        // One protection domain implies one device context.
         assert!(
-            unsafe { (*ah.as_raw()).context == (*self.qpx).qp_base.context },
-            "the address handle must come from the queue pair's device context"
+            unsafe { (*ah.as_raw()).pd == (*self.qpx).qp_base.pd },
+            "the address handle must come from the queue pair's protection domain"
         );
-        AddressedSendOp {
-            op: SendOp {
-                batch: self,
-                flags: 0,
-                imm: None,
-                dest: Some((ah.as_raw(), remote_qpn, remote_qkey)),
-            },
+        SendOp {
+            batch: self,
+            flags: 0,
+            imm: None,
+            dest: Some((ah.as_raw(), remote_qpn, remote_qkey)),
         }
     }
 }
@@ -1564,14 +1541,24 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     ///
     /// # Safety
     ///
-    /// Every memory region referenced by the batch must stay valid until a work completion has been
-    /// polled for the corresponding `wr_id`.
+    /// Every memory region the batch references must stay valid until the device is done with it:
+    /// until a work completion has been polled for its request, or for a later signaled request on
+    /// the same send queue (an unsignaled request produces no completion of its own), or until the
+    /// queue pair has been reset or destroyed.
+    ///
+    /// That holds even when this returns `Err`, and for requests of a batch that was dropped:
+    ///
+    /// - rxe hands the requests to the device before it reports a failure (below `RTS`, for one);
+    /// - on mlx5, a request added while the send queue is full rewrites the last request posted
+    ///   before it, so never have more requests outstanding than the queue's capacity;
+    /// - hns devices in owner-doorbell mode may execute each request as soon as its opcode method
+    ///   returns, before `submit` and even if the batch is dropped.
     ///
     /// # Errors
     ///
     ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when the send queue is full or out of
-    ///    resources).
+    ///    value in one of the work requests, `ENOMEM` when out of resources or when the send queue
+    ///    was full, which on mlx5 also corrupted a posted request; see Safety).
     pub unsafe fn submit(self) -> Result<()> {
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
@@ -1595,13 +1582,15 @@ impl<T: Transport> Drop for SendBatch<'_, T> {
 }
 
 /// One work request being configured and posted on a [`SendBatch`]. Created by
-/// [`SendBatch::op`] (connected transports; a datagram batch starts each request at
-/// [`SendBatch::to`], which yields an [`AddressedSendOp`] instead).
+/// [`SendBatch::op`] on the connected transports, and by [`SendBatch::to`], which also addresses
+/// it, on the datagram ones.
 ///
-/// Chain the modifiers ([`signaled`](Self::signaled), [`fenced`](Self::fenced),
-/// [`solicited`](Self::solicited), [`imm`](Self::imm)) and finish with an opcode method (`send`,
-/// `write`, ...), which posts the request immediately. The opcodes exist only on the transports
-/// that support them (see [`Transport`]); `send` and `write` take any [`Payload`].
+/// Chain the modifiers ([`signaled`](Self::signaled), [`imm`](Self::imm), except on SRD
+/// [`solicited`](Self::solicited), and on RC [`fenced`](Self::fenced)) and finish with an opcode
+/// method (`send`, `write`, ...), which posts the request immediately. The opcodes exist only on
+/// the transports that support them (see [`Transport`]): UD supports SEND, and SRD (behind the
+/// `efa` feature) RDMA WRITE (from registered memory) and READ as well. `send` and the connected
+/// transports' `write` take any [`Payload`].
 #[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
 pub struct SendOp<'b, 'qp, T: Transport> {
     batch: &'b mut SendBatch<'qp, T>,
@@ -1612,26 +1601,34 @@ pub struct SendOp<'b, 'qp, T: Transport> {
 
 impl<T: Transport> SendOp<'_, '_, T> {
     /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
+    ///
+    /// On SRD every work request generates a completion, so this is implied there. EFA refuses
+    /// unsignaled work requests on UD too, so on EFA mark every UD send signaled.
     #[inline]
     pub fn signaled(mut self) -> Self {
         self.flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
         self
     }
 
-    /// Mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
-    /// reads and atomic operations on this queue pair have completed. Used to order a send or
-    /// write after a read whose data it depends on.
+    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
+    ///
+    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
+    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
+    /// requirements of each.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
+    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
     #[inline]
-    pub fn fenced(mut self) -> Self {
-        self.flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
-        self
+    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
+        let imm = self.imm;
+        self.build(wr_id, payload.into(), Self::send_op(imm))
     }
 
-    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
-    /// raises a solicited event on the remote side, waking a peer blocked on its completion
-    /// channel after arming with [`CompletionQueue::req_notify`] for solicited events only.
+    /// Set the solicited flag; the transports that allow it expose this as `solicited`.
     #[inline]
-    pub fn solicited(mut self) -> Self {
+    fn solicit(mut self) -> Self {
         self.flags |= ffi::ibv_send_flags::IBV_SEND_SOLICITED.0;
         self
     }
@@ -1662,28 +1659,33 @@ impl<T: Transport> SendOp<'_, '_, T> {
         op: impl FnOnce(*mut ffi::ibv_qp_ex),
     ) {
         let qpx = self.batch.qpx;
-        // Not every provider checks an inline payload against the queue pair's capacity before
-        // copying it into the send queue (rxe before rdma-core 64 checks each buffer of a list
-        // alone, and hns sums the lengths in a u32), so refuse a payload that does not fit.
-        let inline_len = match payload {
-            Payload::Sges(_) => 0,
-            Payload::Inline(data) => data.len(),
-            Payload::InlineList(bufs) => {
-                bufs.iter().fold(0, |n: usize, b| n.saturating_add(b.len()))
-            }
+        // Not every provider checks a payload against the queue pair's capacities before writing
+        // it into the send queue, so refuse one that does not fit. rxe before rdma-core 64 checks
+        // each buffer of an inline list alone, hns sums inline lengths in a u32, and mlx5's
+        // single-entry setter writes its entry even into a work request with no room for one
+        // (`max_send_sge` 0).
+        let (inline_len, sges) = match payload {
+            Payload::Sges(local) => (0, local.len()),
+            Payload::Inline(data) => (data.len(), 0),
+            Payload::InlineList(bufs) => (
+                bufs.iter().fold(0, |n: usize, b| n.saturating_add(b.len())),
+                0,
+            ),
         };
         if inline_len > self.batch.max_inline_data as usize {
             inline_too_long(inline_len, self.batch.max_inline_data);
+        }
+        if sges > self.batch.max_send_sge as usize {
+            too_many_sges(sges, self.batch.max_send_sge);
         }
         unsafe {
             (*qpx).wr_id = wr_id;
             (*qpx).wr_flags = match payload {
                 Payload::Sges(_) => self.flags,
-                // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline; it
-                // is what the legacy `ibv_post_send` ABI carries, and rdma-core's generic doorbell
-                // emulation (used by providers such as Soft-RoCE) sets it when translating
-                // `wr_set_inline_data`. Native doorbell providers key off the `wr_set_inline_data`
-                // call itself, so the flag is redundant but harmless there.
+                // `IBV_SEND_INLINE` is the work-request flag that marks the payload as inline, as
+                // the legacy `ibv_post_send` ABI carries it. Soft-RoCE copies the work-request
+                // flags into the request verbatim and needs it; the other providers key off the
+                // `wr_set_inline_data` call itself, so the flag is redundant but harmless there.
                 Payload::Inline(_) | Payload::InlineList(_) => {
                     self.flags | ffi::ibv_send_flags::IBV_SEND_INLINE.0
                 }
@@ -1694,7 +1696,8 @@ impl<T: Transport> SendOp<'_, '_, T> {
             }
             match payload {
                 // A single entry goes through `wr_set_sge`, which providers implement without the
-                // list setter's loop, bounds checks, and copy of the entry through memory.
+                // list setter's loop, bounds checks, and copy of the entry through memory (the
+                // capacity check above stands in for the list setter's).
                 Payload::Sges([one]) => {
                     (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
                 }
@@ -1752,7 +1755,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
     /// The opcode builder for an RDMA WRITE into `remote`, with or without the immediate set by
     /// [`imm`](Self::imm).
     #[inline]
-    fn write_op(
+    pub(crate) fn write_op(
         imm: Option<u32>,
         remote: RemoteMemorySlice,
     ) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
@@ -1765,23 +1768,22 @@ impl<T: Transport> SendOp<'_, '_, T> {
             }
         }
     }
+
+    /// The opcode builder for an RDMA READ from `remote`.
+    #[inline]
+    pub(crate) fn read_op(remote: RemoteMemorySlice) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
+        move |q| unsafe { (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr) }
+    }
 }
 
 impl<T: Connected> SendOp<'_, '_, T> {
-    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
-    ///
-    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
-    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
-    /// requirements of each.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
-    /// [`Payload`]).
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or an RDMA WRITE with an
+    /// immediate raises a solicited event on the remote side, waking a peer blocked on its
+    /// completion channel after arming with [`CompletionQueue::req_notify`] for solicited events
+    /// only. The flag is valid only on those operations: ionic refuses it on any other.
     #[inline]
-    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
-        let imm = self.imm;
-        self.build(wr_id, payload.into(), Self::send_op(imm))
+    pub fn solicited(self) -> Self {
+        self.solicit()
     }
 
     /// Post an RDMA WRITE of `payload` into `remote`, with the immediate set by [`imm`](Self::imm)
@@ -1793,8 +1795,8 @@ impl<T: Connected> SendOp<'_, '_, T> {
     ///
     /// # Panics
     ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
-    /// [`Payload`]).
+    /// Panics if an inline payload is longer than the queue pair's inline capacity, or a
+    /// scatter/gather list has more entries than the queue pair was built for (see [`Payload`]).
     #[inline]
     pub fn write<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>, remote: RemoteMemorySlice) {
         let imm = self.imm;
@@ -1803,116 +1805,113 @@ impl<T: Connected> SendOp<'_, '_, T> {
 }
 
 impl<T: Reliable> SendOp<'_, '_, T> {
-    /// Post an RDMA READ from `remote` into `local`.
+    /// Mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
+    /// reads and atomic operations on this queue pair have completed. Used to order a send or
+    /// write after a read whose data it depends on. Only RC has reads and atomics to wait for
+    /// (`ibv_post_send(3)`: the flag is valid only on RC queue pairs).
     #[inline]
-    pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
-        })
+    pub fn fenced(mut self) -> Self {
+        self.flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
+        self
     }
 
-    /// Post an atomic compare-and-swap on the 8-byte value at `remote`.
+    /// Post an RDMA READ from `remote` into `local`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` has more entries than the queue pair was built for
+    /// ([`QueuePairBuilder::set_max_send_sge`]).
+    #[inline]
+    pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+        self.build(wr_id, Payload::Sges(local), Self::read_op(remote))
+    }
+
+    /// Post an atomic compare-and-swap on the 8-byte value at `remote`: if it equals `compare`, it
+    /// is replaced by `swap`. The value it held before is written to `local`.
+    ///
+    /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
+    /// request, which moves the queue pairs on both sides to the error state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` is not 8 bytes long, or the queue pair was built without room for a
+    /// scatter/gather entry ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn atomic_cmp_swap(
         self,
         wr_id: u64,
-        local: &[LocalMemorySlice],
+        local: LocalMemorySlice,
         remote: RemoteMemorySlice,
         compare: u64,
         swap: u64,
     ) {
-        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
+        self.atomic(wr_id, local, move |q| unsafe {
             (*q).wr_atomic_cmp_swp.unwrap()(q, remote.rkey, remote.addr, compare, swap)
         })
     }
 
-    /// Post an atomic fetch-and-add on the 8-byte value at `remote`.
+    /// Post an atomic fetch-and-add on the 8-byte value at `remote`: `add` is added to it. The
+    /// value it held before is written to `local`.
+    ///
+    /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
+    /// request, which moves the queue pairs on both sides to the error state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` is not 8 bytes long, or the queue pair was built without room for a
+    /// scatter/gather entry ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn atomic_fetch_add(
         self,
         wr_id: u64,
-        local: &[LocalMemorySlice],
+        local: LocalMemorySlice,
         remote: RemoteMemorySlice,
         add: u64,
     ) {
-        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
+        self.atomic(wr_id, local, move |q| unsafe {
             (*q).wr_atomic_fetch_add.unwrap()(q, remote.rkey, remote.addr, add)
         })
     }
-}
 
-/// One datagram work request being configured and posted on a [`SendBatch`], addressed at
-/// creation by [`SendBatch::to`].
-///
-/// Chain the modifiers ([`signaled`](Self::signaled), [`imm`](Self::imm), and on UD
-/// [`fenced`](Self::fenced) and [`solicited`](Self::solicited)) and finish with an opcode method,
-/// which posts the request immediately. UD supports SEND (with any [`Payload`]); SRD (behind the
-/// `efa` feature) additionally supports RDMA write (from registered memory) and read, but not the
-/// fence and solicited flags, which EFA refuses.
-#[must_use = "a send operation posts nothing until an opcode method (`send`, `write`, ...) is called"]
-pub struct AddressedSendOp<'b, 'qp, T: Datagram> {
-    pub(crate) op: SendOp<'b, 'qp, T>,
-}
-
-impl<T: Datagram> AddressedSendOp<'_, '_, T> {
-    /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
-    ///
-    /// On SRD every work request generates a completion, so this is implied there. EFA refuses
-    /// unsignaled work requests on UD too, so on EFA mark every UD send signaled.
-    #[inline]
-    pub fn signaled(self) -> Self {
-        AddressedSendOp {
-            op: self.op.signaled(),
+    /// Post the atomic `op`, whose original value lands in `local`. Not every provider checks
+    /// that buffer: rxe applies the atomic remotely and only then fails it on a shorter one,
+    /// moving the queue pair to the error state, so refuse anything but the 8 bytes written.
+    #[inline(always)]
+    fn atomic(self, wr_id: u64, local: LocalMemorySlice, op: impl FnOnce(*mut ffi::ibv_qp_ex)) {
+        if local.len() != 8 {
+            atomic_local_not_8_bytes(local.len());
         }
-    }
-
-    /// Attach a 32-bit immediate (host byte order) to the SEND this request posts, delivered to
-    /// the receiver in its work completion ([`WorkCompletion::imm_data`](crate::WorkCompletion::imm_data)).
-    #[inline]
-    pub fn imm(self, imm: u32) -> Self {
-        AddressedSendOp {
-            op: self.op.imm(imm),
-        }
-    }
-
-    /// Post a SEND of `payload`, with the immediate set by [`imm`](Self::imm) if any.
-    ///
-    /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
-    /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
-    /// requirements of each.
-    ///
-    /// # Panics
-    ///
-    /// Panics if an inline payload is longer than the queue pair's inline capacity (see
-    /// [`Payload`]).
-    #[inline]
-    pub fn send<'a>(self, wr_id: u64, payload: impl Into<Payload<'a>>) {
-        let imm = self.op.imm;
-        self.op
-            .build(wr_id, payload.into(), SendOp::<T>::send_op(imm))
+        self.build(wr_id, Payload::Sges(std::slice::from_ref(&local)), op)
     }
 }
 
-impl AddressedSendOp<'_, '_, Ud> {
-    /// Mark this work request fenced (`IBV_SEND_FENCE`): the device blocks it until prior RDMA
-    /// reads and atomic operations on this queue pair have completed. Used to order a send or
-    /// write after a read whose data it depends on.
-    #[inline]
-    pub fn fenced(self) -> Self {
-        AddressedSendOp {
-            op: self.op.fenced(),
-        }
-    }
-
-    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND or SEND-with-immediate
-    /// raises a solicited event on the remote side, waking a peer blocked on its completion
-    /// channel after arming with [`CompletionQueue::req_notify`] for solicited events only.
+// UD has the solicited flag but SRD does not: EFA refuses it (on UD as well).
+impl SendOp<'_, '_, Ud> {
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`): a SEND raises a solicited event on
+    /// the remote side, waking a peer blocked on its completion channel after arming with
+    /// [`CompletionQueue::req_notify`] for solicited events only.
     #[inline]
     pub fn solicited(self) -> Self {
-        AddressedSendOp {
-            op: self.op.solicited(),
-        }
+        self.solicit()
     }
+}
+
+/// The error for a failed `ibv_post_recv` on a queue pair, kept out of line. A queue pair that
+/// receives through a shared receive queue has no receive queue of its own, and the providers
+/// refuse posts to it with errnos that point elsewhere (mlx5 reports a full queue, hns
+/// `EOPNOTSUPP`, rxe `EINVAL`), so name the mistake instead. ionic returns its errnos negated
+/// (`-EAGAIN` when the device still owns the slot, so posting again soon succeeds); the others
+/// return them as they are.
+#[cold]
+#[inline(never)]
+fn post_recv_error(errno: i32, srq_attached: bool) -> Error {
+    if srq_attached {
+        return Error::PostReceive(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "this queue pair receives through its shared receive queue; post receives there",
+        ));
+    }
+    Error::errno(errno.abs(), Error::PostReceive)
 }
 
 /// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
@@ -1926,14 +1925,34 @@ fn inline_too_long(len: usize, max_inline_data: u32) -> ! {
     )
 }
 
+/// The panic for a scatter/gather list longer than the queue pair's send capacity, kept out of line
+/// like `inline_too_long`.
+#[cold]
+#[inline(never)]
+fn too_many_sges(len: usize, max_send_sge: u32) -> ! {
+    panic!(
+        "{len} scatter/gather entries exceed the queue pair's capacity of {max_send_sge} per send \
+         work request"
+    )
+}
+
+/// The panic for an atomic whose local buffer is not 8 bytes long, kept out of line like
+/// `inline_too_long`.
+#[cold]
+#[inline(never)]
+fn atomic_local_not_8_bytes(len: usize) -> ! {
+    panic!("an atomic writes 8 bytes to its local buffer, which is {len} bytes long")
+}
+
 /// The data a SEND or RDMA WRITE carries: registered memory the device reads after the request is
 /// posted, or bytes copied into the work request as it is posted.
 ///
 /// [`Sges`](Self::Sges) references memory regions through scatter/gather entries, so the buffers
 /// must stay valid until the work completion is reaped (the [`submit`](SendBatch::submit)
-/// contract). The inline variants copy the bytes into the work request during the opcode call,
-/// which lowers latency for small messages and lets the bytes be reused or dropped right away;
-/// they need a queue pair built with enough inline capacity
+/// contract), and the opcode method panics on a list with more entries than the queue pair was
+/// built for ([`QueuePairBuilder::set_max_send_sge`]). The inline variants copy the bytes into the
+/// work request during the opcode call, which lowers latency for small messages and lets the bytes
+/// be reused or dropped right away; they need a queue pair built with enough inline capacity
 /// ([`QueuePairBuilder::set_max_inline_data`]), and the opcode method panics on a longer inline
 /// payload.
 ///
@@ -2297,9 +2316,10 @@ fn qp_transition_masks(
     // The kernel accepts IBV_QP_STATE and IBV_QP_RATE_LIMIT on every transition.
     let accepted = state | rate;
 
-    // Any state may move to RESET, and any state but RESET to ERR, with only IBV_QP_STATE.
+    // Any state may move to RESET, and any state but RESET to ERR, with only IBV_QP_STATE (and
+    // staying in RESET or ERR needs not even that).
     if next == S::IBV_QPS_RESET || (next == S::IBV_QPS_ERR && cur != S::IBV_QPS_RESET) {
-        return Some((state, accepted));
+        return Some((if next == cur { 0 } else { state }, accepted));
     }
 
     let masks = match qp_type {
@@ -2335,6 +2355,8 @@ fn qp_transition_masks(
                     | max_dest_rd
                     | mig,
             )),
+            // The kernel's table allows this cell for every type, though RC never enters SQE.
+            (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => Some((state, 0)),
             _ => None,
         },
         T::IBV_QPT_UC => match (cur, next) {
@@ -2399,19 +2421,23 @@ fn qp_transition_masks(
 /// as one socket binds a TCP or UDP port).
 #[must_use = "QueuePair is immediately destroyed via drop() unless assigned to a variable"]
 pub struct QueuePair<T: Transport = Rc> {
-    pub(crate) pd: ProtectionDomain,
-    pub(crate) _srq: Option<SharedReceiveQueue>,
+    pd: ProtectionDomain,
+    _srq: Option<SharedReceiveQueue>,
     // Keep the completion queues alive while the queue pair references them; `ibv_destroy_cq` fails
     // with EBUSY if a queue pair is still attached.
-    pub(crate) _send_cq: CompletionQueue,
-    pub(crate) _recv_cq: CompletionQueue,
-    pub(crate) qp: *mut ffi::ibv_qp,
+    _send_cq: CompletionQueue,
+    _recv_cq: CompletionQueue,
+    qp: *mut ffi::ibv_qp,
     // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
     // this aliases `qp` and lives exactly as long.
-    pub(crate) qp_ex: *mut ffi::ibv_qp_ex,
-    // The inline capacity the provider granted, which the send path enforces (`SendOp::build`).
-    pub(crate) max_inline_data: u32,
-    pub(crate) _transport: std::marker::PhantomData<T>,
+    qp_ex: *mut ffi::ibv_qp_ex,
+    // The inline capacity the builder asked for (capped at what the provider granted), which the
+    // send path enforces (`SendOp::build`).
+    max_inline_data: u32,
+    // The scatter/gather entries per send work request the builder asked for, which every
+    // provider sizes its work requests to hold and the send path enforces (`SendOp::build`).
+    max_send_sge: u32,
+    _transport: std::marker::PhantomData<T>,
 }
 
 unsafe impl<T: Transport> Send for QueuePair<T> {}
@@ -2420,7 +2446,7 @@ unsafe impl<T: Transport> Sync for QueuePair<T> {}
 impl<T: Transport> QueuePair<T> {
     /// Returns the local QP number of this QueuePair.
     pub fn qp_num(&self) -> u32 {
-        unsafe { *self.qp }.qp_num
+        unsafe { (*self.qp).qp_num }
     }
 
     /// Returns the underlying `ibv_qp` pointer.
@@ -2462,12 +2488,7 @@ impl<T: Transport> QueuePair<T> {
             return Ok(());
         }
         if errno == nix::libc::EINVAL {
-            let next = if attr.mask.0 & ffi::ibv_qp_attr_mask::IBV_QP_STATE.0 != 0 {
-                attr.attr.qp_state
-            } else {
-                unsafe { (*self.qp).state }
-            };
-            return Err(self.diagnose_modify(attr.mask, next));
+            return Err(self.diagnose_modify(attr));
         }
         Err(Error::errno(errno, Error::ModifyQueuePair))
     }
@@ -2478,14 +2499,15 @@ impl<T: Transport> QueuePair<T> {
     /// meaningful only for the requested fields. The second return value describes the queue pair's
     /// configured capacities.
     ///
-    /// Query a given queue pair from one thread at a time: libibverbs updates the state it caches
-    /// in the queue pair without a lock (see [Thread safety](crate#thread-safety)).
+    /// Takes `&mut self`: libibverbs stores the queried state in the queue pair's cached `state`
+    /// without a lock, and rxe, EFA, and hns read that cache on every receive post, so a query must
+    /// not overlap any other use of the queue pair.
     ///
     /// # Errors
     ///
     ///  - [`QueryQueuePair`](Error::QueryQueuePair): `ibv_query_qp` failed.
     pub fn query(
-        &self,
+        &mut self,
         mask: QueuePairAttributeMask,
     ) -> Result<(QueuePairAttribute, QueuePairInitAttribute)> {
         let mask = ffi::ibv_qp_attr_mask::from(mask);
@@ -2511,9 +2533,22 @@ impl<T: Transport> QueuePair<T> {
 
     /// Turn a rejected [`modify`](Self::modify) into a precise [`Error`], consulting the queue-pair
     /// state table for the actual queue-pair type and current state.
-    fn diagnose_modify(&self, mask: ffi::ibv_qp_attr_mask, next: ffi::ibv_qp_state) -> Error {
+    fn diagnose_modify(&self, attr: &QueuePairAttribute) -> Error {
         let raw = || Error::ModifyQueuePair(io::Error::from_raw_os_error(nix::libc::EINVAL));
-        let cur = unsafe { (*self.qp).state };
+        let mask = attr.mask;
+        let has = |bit: ffi::ibv_qp_attr_mask| mask.0 & bit.0 != 0;
+        // The kernel judges the transition from the state the caller asserts, if it asserts one
+        // (mlx5, rxe, EFA, ionic), and the mask without a next state as staying put.
+        let cur = if has(ffi::ibv_qp_attr_mask::IBV_QP_CUR_STATE) {
+            attr.attr.cur_qp_state
+        } else {
+            unsafe { (*self.qp).state }
+        };
+        let next = if has(ffi::ibv_qp_attr_mask::IBV_QP_STATE) {
+            attr.attr.qp_state
+        } else {
+            cur
+        };
         let qp_type = unsafe { (*self.qp).qp_type };
         // Only the types with a transition table can be diagnosed; others (driver/SRD, and XRC,
         // which this crate does not create) fall back to the raw error.
@@ -2564,13 +2599,16 @@ impl<T: Transport> QueuePair<T> {
     /// # Safety
     ///
     /// Each referenced memory region must stay valid until a work completion has been polled for the
-    /// corresponding `wr_id`.
+    /// corresponding `wr_id`, or until the queue pair has been reset or destroyed (which discards
+    /// its outstanding receives). After an `Err`, the requests ahead of the one that failed were
+    /// posted, so the same holds for theirs.
     ///
     /// # Errors
     ///
-    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
-    ///    resources).
+    ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
+    ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
+    ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
+    ///    of resources).
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
@@ -2579,12 +2617,9 @@ impl<T: Transport> QueuePair<T> {
         let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let ctx = unsafe { *self.qp }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno =
-            unsafe { ops.post_recv.as_mut().unwrap()(self.qp, head, &mut bad_wr as *mut _) };
+        let errno = unsafe { ffi::ibv_post_recv(self.qp, head, &mut bad_wr) };
         if errno != 0 {
-            Err(Error::errno(errno, Error::PostReceive))
+            Err(post_recv_error(errno, self._srq.is_some()))
         } else {
             Ok(())
         }
@@ -2596,11 +2631,12 @@ impl<T: Transport> QueuePair<T> {
     /// batch starts each request at [`to`](SendBatch::to) instead, which also addresses it):
     /// chain [`signaled`](SendOp::signaled) to request a completion, then post with the opcode
     /// method (`send`, `write`, `read`, the atomics, ...; which of them exist depends on the
-    /// transport — see [`Transport`]). Nothing reaches the device until
-    /// [`submit`](SendBatch::submit), which rings the doorbell once for the whole batch.
+    /// transport — see [`Transport`]). [`submit`](SendBatch::submit) then rings the doorbell once
+    /// for the whole batch; before that, the requests normally do not reach the device (its
+    /// safety section lists the exceptions).
     ///
-    /// As with any send, the memory backing each scatter/gather slice must stay valid until a work
-    /// completion has been polled for the request.
+    /// As with any send, the memory backing each scatter/gather slice must stay valid until the
+    /// device is done with the request (see [`submit`](SendBatch::submit)).
     ///
     /// # Examples
     ///
@@ -2618,11 +2654,15 @@ impl<T: Transport> QueuePair<T> {
         self.open_batch()
     }
 
-    /// Splits the queue pair into its send and receive halves, so that one thread can build and
-    /// submit send batches while others post receives. The providers lock the two queues
-    /// separately, so neither half waits for the other.
+    /// Splits the queue pair into its send half and a shared reference for the receive side, so
+    /// that one thread can build and submit send batches while others post receives
+    /// ([`post_recv`](Self::post_recv) takes `&self`). mlx5, rxe, EFA, and hns lock the two
+    /// queues separately, so neither side waits for the other. ionic is the exception: an open
+    /// send batch also holds its send completion queue's lock, so when one completion queue serves
+    /// both queues, receives posted meanwhile wait for the batch to end, and the thread holding the
+    /// batch must not post receives itself (see [`SendBatch`]).
     ///
-    /// Both halves borrow the queue pair, which is usable again once they are dropped.
+    /// Both borrow the queue pair, which is usable again once they are dropped.
     ///
     /// # Examples
     ///
@@ -2640,8 +2680,8 @@ impl<T: Transport> QueuePair<T> {
     /// });
     /// # }
     /// ```
-    pub fn split(&mut self) -> (SendQueue<'_, T>, RecvQueue<'_, T>) {
-        (SendQueue { qp: self }, RecvQueue { qp: self })
+    pub fn split(&mut self) -> (SendQueue<'_, T>, &Self) {
+        (SendQueue { qp: self }, self)
     }
 
     /// Opens a work-request block on the send queue (`wr_start`). Every caller holds the send
@@ -2654,6 +2694,7 @@ impl<T: Transport> QueuePair<T> {
         SendBatch {
             qpx,
             max_inline_data: self.max_inline_data,
+            max_send_sge: self.max_send_sge,
             _qp: std::marker::PhantomData,
         }
     }
@@ -2684,35 +2725,19 @@ impl<T: Transport> SendQueue<'_, T> {
     }
 }
 
-/// The receive half of a [`QueuePair`], from [`QueuePair::split`]. It can be shared between
-/// threads: each may post receives.
-pub struct RecvQueue<'qp, T: Transport> {
-    qp: &'qp QueuePair<T>,
-}
-
-impl<T: Transport> RecvQueue<'_, T> {
-    /// Posts a batch of receive work requests, as [`QueuePair::post_recv`] does.
-    ///
-    /// # Safety
-    ///
-    /// Each referenced memory region must stay valid until a work completion has been polled for
-    /// the corresponding `wr_id`.
-    ///
-    /// # Errors
-    ///
-    ///  - [`PostReceive`](Error::PostReceive): `ibv_post_recv` failed (`EINVAL` for an invalid
-    ///    value in one of the work requests, `ENOMEM` when the receive queue is full or out of
-    ///    resources).
-    #[inline]
-    pub unsafe fn post_recv<'a>(&self, recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
-        unsafe { self.qp.post_recv(recvs) }
-    }
-}
-
 impl<T: Transport> Drop for QueuePair<T> {
     fn drop(&mut self) {
-        // TODO: ibv_destroy_qp() fails if the QP is attached to a multicast group.
-        destroyed("ibv_destroy_qp", unsafe { ffi::ibv_destroy_qp(self.qp) });
+        // ibv_destroy_qp() fails if the QP is attached to a multicast group (through `as_raw`).
+        destroyed(
+            "ibv_destroy_qp",
+            unsafe { ffi::ibv_destroy_qp(self.qp) },
+            || {
+                keep(&self.pd);
+                keep(&self._srq);
+                keep(&self._send_cq);
+                keep(&self._recv_cq);
+            },
+        );
     }
 }
 
@@ -2840,6 +2865,7 @@ mod test_recv_link {
         let mut batch = SendBatch::<Rc> {
             qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
             max_inline_data: 64,
+            max_send_sge: 1,
             _qp: std::marker::PhantomData,
         };
 
@@ -2857,6 +2883,7 @@ mod test_recv_link {
         let mut batch = SendBatch::<Rc> {
             qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
             max_inline_data: 64,
+            max_send_sge: 1,
             _qp: std::marker::PhantomData,
         };
 
@@ -2873,6 +2900,7 @@ mod test_recv_link {
         let mut batch = SendBatch::<Rc> {
             qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
             max_inline_data: 64,
+            max_send_sge: 1,
             _qp: std::marker::PhantomData,
         };
 
@@ -2892,27 +2920,8 @@ mod test_conversions {
         fn send<T: Send>() {}
         fn sync<T: Sync>() {}
         send::<SendQueue<'static, Rc>>();
-        send::<RecvQueue<'static, Rc>>();
-        sync::<RecvQueue<'static, Rc>>();
-    }
-
-    #[test]
-    fn queue_pair_type_roundtrip() {
-        for (wrapper, raw) in [
-            (
-                QueuePairType::ReliableConnection,
-                ffi::ibv_qp_type::IBV_QPT_RC,
-            ),
-            (
-                QueuePairType::UnreliableDatagram,
-                ffi::ibv_qp_type::IBV_QPT_UD,
-            ),
-            (QueuePairType::Driver, ffi::ibv_qp_type::IBV_QPT_DRIVER),
-        ] {
-            assert_eq!(QueuePairType::from(raw), wrapper);
-            assert_eq!(ffi::ibv_qp_type::from(wrapper), raw);
-        }
-        assert_eq!(QueuePairType::ReliableConnection.to_string(), "RC");
+        send::<&'static QueuePair<Rc>>();
+        sync::<QueuePair<Rc>>();
     }
 
     #[test]
@@ -3155,5 +3164,212 @@ mod test_qp_transitions {
             let (_, optional) = qp_transition_masks(qp_type, cur, cur).unwrap();
             assert_eq!(optional & port, 0, "{qp_type:?} in {cur:?}");
         }
+    }
+}
+
+/// The kernel's `qp_state_table` and `ib_modify_qp_is_ok` (drivers/infiniband/core/verbs.c),
+/// transcribed cell by cell, against `qp_transition_masks` for every type the crate diagnoses.
+#[cfg(test)]
+mod test_kernel_table {
+    use super::*;
+    use ffi::ibv_qp_attr_mask as M;
+    use ffi::ibv_qp_state as S;
+    use ffi::ibv_qp_type as T;
+
+    const STATE: u32 = M::IBV_QP_STATE.0;
+    const CUR: u32 = M::IBV_QP_CUR_STATE.0;
+    const NOTIFY: u32 = M::IBV_QP_EN_SQD_ASYNC_NOTIFY.0;
+    const ACCESS: u32 = M::IBV_QP_ACCESS_FLAGS.0;
+    const PKEY: u32 = M::IBV_QP_PKEY_INDEX.0;
+    const PORT: u32 = M::IBV_QP_PORT.0;
+    const QKEY: u32 = M::IBV_QP_QKEY.0;
+    const AV: u32 = M::IBV_QP_AV.0;
+    const MTU: u32 = M::IBV_QP_PATH_MTU.0;
+    const TIMEOUT: u32 = M::IBV_QP_TIMEOUT.0;
+    const RETRY: u32 = M::IBV_QP_RETRY_CNT.0;
+    const RNR_RETRY: u32 = M::IBV_QP_RNR_RETRY.0;
+    const RQ_PSN: u32 = M::IBV_QP_RQ_PSN.0;
+    const MAX_RD: u32 = M::IBV_QP_MAX_QP_RD_ATOMIC.0;
+    const ALT: u32 = M::IBV_QP_ALT_PATH.0;
+    const MIN_RNR: u32 = M::IBV_QP_MIN_RNR_TIMER.0;
+    const SQ_PSN: u32 = M::IBV_QP_SQ_PSN.0;
+    const MAX_DEST: u32 = M::IBV_QP_MAX_DEST_RD_ATOMIC.0;
+    const MIG: u32 = M::IBV_QP_PATH_MIG_STATE.0;
+    const DEST_QPN: u32 = M::IBV_QP_DEST_QPN.0;
+    const RATE: u32 = M::IBV_QP_RATE_LIMIT.0;
+
+    const STATES: [S; 7] = [
+        S::IBV_QPS_RESET,
+        S::IBV_QPS_INIT,
+        S::IBV_QPS_RTR,
+        S::IBV_QPS_RTS,
+        S::IBV_QPS_SQD,
+        S::IBV_QPS_SQE,
+        S::IBV_QPS_ERR,
+    ];
+
+    /// (valid, req, opt) of the kernel cell for `ty` (UD, UC, RC, RAW_PACKET only).
+    fn kernel_cell(cur: S, next: S, ty: T) -> (bool, u32, u32) {
+        let pick = |ud: u32, uc: u32, rc: u32, raw: u32| match ty {
+            T::IBV_QPT_UD => ud,
+            T::IBV_QPT_UC => uc,
+            T::IBV_QPT_RC => rc,
+            T::IBV_QPT_RAW_PACKET => raw,
+            _ => unreachable!(),
+        };
+        let none = (true, 0, 0);
+        match (cur, next) {
+            (S::IBV_QPS_RESET, S::IBV_QPS_RESET) => none,
+            (S::IBV_QPS_RESET, S::IBV_QPS_INIT) => (
+                true,
+                pick(
+                    PKEY | PORT | QKEY,
+                    PKEY | PORT | ACCESS,
+                    PKEY | PORT | ACCESS,
+                    PORT,
+                ),
+                0,
+            ),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RESET) | (S::IBV_QPS_INIT, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_INIT, S::IBV_QPS_INIT) => (
+                true,
+                0,
+                pick(
+                    PKEY | PORT | QKEY,
+                    PKEY | PORT | ACCESS,
+                    PKEY | PORT | ACCESS,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_INIT, S::IBV_QPS_RTR) => (
+                true,
+                pick(
+                    0,
+                    AV | MTU | DEST_QPN | RQ_PSN,
+                    AV | MTU | DEST_QPN | RQ_PSN | MAX_DEST | MIN_RNR,
+                    0,
+                ),
+                pick(PKEY | QKEY, ALT | ACCESS | PKEY, ALT | ACCESS | PKEY, 0),
+            ),
+            (S::IBV_QPS_RTR, S::IBV_QPS_RESET) | (S::IBV_QPS_RTR, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_RTR, S::IBV_QPS_RTS) => (
+                true,
+                pick(
+                    SQ_PSN,
+                    SQ_PSN,
+                    TIMEOUT | RETRY | RNR_RETRY | SQ_PSN | MAX_RD,
+                    0,
+                ),
+                pick(
+                    CUR | QKEY,
+                    CUR | ALT | ACCESS | MIG,
+                    CUR | ALT | ACCESS | MIN_RNR | MIG,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_RTS, S::IBV_QPS_RESET) | (S::IBV_QPS_RTS, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_RTS, S::IBV_QPS_RTS) => (
+                true,
+                0,
+                pick(
+                    CUR | QKEY,
+                    CUR | ACCESS | ALT | MIG,
+                    CUR | ACCESS | ALT | MIG | MIN_RNR,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_RTS, S::IBV_QPS_SQD) => (true, 0, pick(NOTIFY, NOTIFY, NOTIFY, 0)),
+            (S::IBV_QPS_SQD, S::IBV_QPS_RESET) | (S::IBV_QPS_SQD, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_SQD, S::IBV_QPS_RTS) => (
+                true,
+                0,
+                pick(
+                    CUR | QKEY,
+                    CUR | ALT | ACCESS | MIG,
+                    CUR | ALT | ACCESS | MIN_RNR | MIG,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_SQD, S::IBV_QPS_SQD) => (
+                true,
+                0,
+                pick(
+                    PKEY | QKEY,
+                    AV | ALT | ACCESS | PKEY | MIG,
+                    PORT | AV
+                        | TIMEOUT
+                        | RETRY
+                        | RNR_RETRY
+                        | MAX_RD
+                        | MAX_DEST
+                        | ALT
+                        | ACCESS
+                        | PKEY
+                        | MIN_RNR
+                        | MIG,
+                    0,
+                ),
+            ),
+            (S::IBV_QPS_SQE, S::IBV_QPS_RESET) | (S::IBV_QPS_SQE, S::IBV_QPS_ERR) => none,
+            (S::IBV_QPS_SQE, S::IBV_QPS_RTS) => (true, 0, pick(CUR | QKEY, CUR | ACCESS, 0, 0)),
+            (S::IBV_QPS_ERR, S::IBV_QPS_RESET) | (S::IBV_QPS_ERR, S::IBV_QPS_ERR) => none,
+            _ => (false, 0, 0),
+        }
+    }
+
+    /// The set of masks the kernel accepts for `cur -> next`, as (bits that must be set, bits that
+    /// may be set), folding in ib_modify_qp_is_ok's CUR_STATE rule and the fact that a mask
+    /// without STATE means "stay in `cur`" (so a real transition always carries STATE).
+    fn kernel(ty: T, cur: S, next: S) -> Option<(u32, u32)> {
+        let (valid, req, opt) = kernel_cell(cur, next, ty);
+        if !valid {
+            return None;
+        }
+        let mut must = req;
+        if next != cur {
+            must |= STATE;
+        }
+        let mut may = req | opt | STATE | RATE;
+        if !matches!(
+            cur,
+            S::IBV_QPS_RTR | S::IBV_QPS_RTS | S::IBV_QPS_SQD | S::IBV_QPS_SQE
+        ) {
+            may &= !CUR;
+        }
+        Some((must, may))
+    }
+
+    #[test]
+    fn every_cell_against_the_kernel() {
+        let mut diffs = Vec::new();
+        for ty in [
+            T::IBV_QPT_RC,
+            T::IBV_QPT_UC,
+            T::IBV_QPT_UD,
+            T::IBV_QPT_RAW_PACKET,
+        ] {
+            for cur in STATES {
+                for next in STATES {
+                    let k = kernel(ty, cur, next);
+                    let c = qp_transition_masks(ty, cur, next).map(|(r, o)| (r, r | o));
+                    if k != c {
+                        let show = |m: Option<(u32, u32)>| match m {
+                            None => "invalid".to_string(),
+                            Some((must, may)) => format!(
+                                "must {:?} may-also {:?}",
+                                QueuePairAttributeMask(must),
+                                QueuePairAttributeMask(may & !must)
+                            ),
+                        };
+                        diffs.push(format!(
+                            "{ty:?} {cur:?}->{next:?}: kernel {} / crate {}",
+                            show(k),
+                            show(c)
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(diffs.is_empty(), "{}", diffs.join("\n"));
     }
 }

@@ -2,7 +2,7 @@ use std::convert::TryInto;
 use std::mem::ManuallyDrop;
 use std::ops::{Deref, DerefMut, RangeBounds};
 
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
@@ -44,9 +44,13 @@ impl AccessFlags {
     /// fully trust. Narrow it when the region does not need to be remotely writable.
     ///
     /// Add the rest with `|` where they apply. Not every device supports
-    /// [`REMOTE_ATOMIC`](Self::REMOTE_ATOMIC) (EFA refuses to register a region that asks for
-    /// it), and [`RELAXED_ORDERING`](Self::RELAXED_ORDERING) lets the bytes of an RDMA write land
-    /// out of order, which breaks a receiver that polls the last byte to see the write arrive.
+    /// [`REMOTE_ATOMIC`](Self::REMOTE_ATOMIC), and EFA refuses every remote flag its device lacks
+    /// the capability for: atomics always, and remote read or write on EFA generations without
+    /// RDMA read or write (registration then fails with
+    /// [`Unsupported`](crate::Error::Unsupported)). For send and receive buffers,
+    /// [`LOCAL_WRITE`](Self::LOCAL_WRITE) alone is enough.
+    /// [`RELAXED_ORDERING`](Self::RELAXED_ORDERING) lets the bytes of an RDMA write land out of
+    /// order, which breaks a receiver that polls the last byte to see the write arrive.
     pub const PERMISSIVE: AccessFlags = AccessFlags(
         AccessFlags::LOCAL_WRITE.0 | AccessFlags::REMOTE_WRITE.0 | AccessFlags::REMOTE_READ.0,
     );
@@ -63,7 +67,11 @@ unsafe impl Send for MemoryRegionInner {}
 
 impl Drop for MemoryRegionInner {
     fn drop(&mut self) {
-        destroyed("ibv_dereg_mr", unsafe { ffi::ibv_dereg_mr(self.mr) });
+        destroyed(
+            "ibv_dereg_mr",
+            unsafe { ffi::ibv_dereg_mr(self.mr) },
+            || keep(&self._pd),
+        );
     }
 }
 
@@ -104,13 +112,13 @@ impl<O> MemoryRegion<O> {
     /// Get the remote key of this memory region: the key peers use to access it directly, usually
     /// communicated as part of [`remote`](Self::remote).
     pub fn rkey(&self) -> u32 {
-        unsafe { &*self.inner.mr }.rkey
+        unsafe { (*self.inner.mr).rkey }
     }
 
     /// Get the local key of this memory region (the one [`slice`](Self::slice) stamps on every
     /// scatter/gather entry).
     pub fn lkey(&self) -> u32 {
-        unsafe { &*self.inner.mr }.lkey
+        unsafe { (*self.inner.mr).lkey }
     }
 
     /// Returns the underlying `ibv_mr` pointer.
@@ -126,8 +134,8 @@ impl<O> MemoryRegion<O> {
     pub fn remote(&self) -> RemoteMemorySlice {
         RemoteMemorySlice {
             addr: self.inner.addr,
-            len: unsafe { *self.inner.mr }.length,
-            rkey: unsafe { *self.inner.mr }.rkey,
+            len: unsafe { (*self.inner.mr).length },
+            rkey: self.rkey(),
         }
     }
 
@@ -151,11 +159,11 @@ impl<O> MemoryRegion<O> {
     /// Panics if `bounds` is empty or falls outside the region.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) =
-            calc_addr_len(bounds, self.inner.addr, unsafe { *self.inner.mr }.length);
+            calc_addr_len(bounds, self.inner.addr, unsafe { (*self.inner.mr).length });
         let sge = ffi::ibv_sge {
             addr,
             length: length.try_into().unwrap(),
-            lkey: unsafe { *self.inner.mr }.lkey,
+            lkey: self.lkey(),
         };
         LocalMemorySlice { _sge: sge }
     }
@@ -281,11 +289,16 @@ impl RemoteMemorySlice {
     /// # Errors
     ///
     ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the encoded length does not fit
-    ///    this platform's `usize`.
+    ///    this platform's `usize`, or the range runs past the end of the 64-bit address space.
     pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
+        let addr = u64::from_be_bytes(bytes[0..8].try_into().expect("slice length is fixed"));
         let len = u64::from_be_bytes(bytes[8..16].try_into().expect("slice length is fixed"));
+        // The peer chose these: a range that wraps would make `slice` overflow its address.
+        if len != 0 && addr.checked_add(len - 1).is_none() {
+            return Err(Error::MalformedWireFormat);
+        }
         Ok(RemoteMemorySlice {
-            addr: u64::from_be_bytes(bytes[0..8].try_into().expect("slice length is fixed")),
+            addr,
             len: usize::try_from(len).map_err(|_| Error::MalformedWireFormat)?,
             rkey: u32::from_be_bytes(bytes[16..20].try_into().expect("slice length is fixed")),
         })
@@ -307,20 +320,21 @@ impl RemoteMemorySlice {
 }
 
 fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, usize) {
+    let outside = "the slice bounds fall outside the region";
     let start = match bounds.start_bound() {
         std::ops::Bound::Included(i) => *i,
-        std::ops::Bound::Excluded(i) => *i + 1,
+        std::ops::Bound::Excluded(i) => i.checked_add(1).expect(outside),
         std::ops::Bound::Unbounded => 0,
     };
     let end = match bounds.end_bound() {
-        std::ops::Bound::Included(i) => *i + 1,
+        std::ops::Bound::Included(i) => i.checked_add(1).expect(outside),
         std::ops::Bound::Excluded(i) => *i,
         std::ops::Bound::Unbounded => bytes_len,
     };
     assert!(start < end);
     assert!(start <= bytes_len);
     assert!(end <= bytes_len);
-    let addr = addr + start as u64;
+    let addr = addr.checked_add(start as u64).expect(outside);
     let len = end - start;
     (addr, len)
 }
@@ -338,6 +352,23 @@ mod test {
         };
         let encoded = remote.to_bytes();
         assert_eq!(RemoteMemorySlice::from_bytes(&encoded).unwrap(), remote);
+    }
+
+    #[test]
+    fn remote_memory_slice_rejects_a_wrapping_range() {
+        let mut bytes = RemoteMemorySlice {
+            addr: u64::MAX - 15,
+            len: 16,
+            rkey: 1,
+        }
+        .to_bytes();
+        // Ending at the last address is fine; one byte more wraps.
+        assert!(RemoteMemorySlice::from_bytes(&bytes).is_ok());
+        bytes[8..16].copy_from_slice(&17u64.to_be_bytes());
+        assert!(matches!(
+            RemoteMemorySlice::from_bytes(&bytes),
+            Err(Error::MalformedWireFormat)
+        ));
     }
 
     #[test]

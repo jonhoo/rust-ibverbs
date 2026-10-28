@@ -1,7 +1,7 @@
 use std::ptr;
 use std::sync::Arc;
 
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 use crate::qp::RecvRequest;
 
@@ -15,7 +15,11 @@ unsafe impl Send for SharedReceiveQueueInner {}
 
 impl Drop for SharedReceiveQueueInner {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_srq", unsafe { ffi::ibv_destroy_srq(self.srq) });
+        destroyed(
+            "ibv_destroy_srq",
+            unsafe { ffi::ibv_destroy_srq(self.srq) },
+            || keep(&self._pd),
+        );
     }
 }
 
@@ -149,7 +153,8 @@ impl SharedReceiveQueue {
     ///
     /// Each referenced memory region must stay valid until a work completion has been polled for
     /// the corresponding `wr_id` (i.e., until `CompletionQueue::poll` returns a completion for
-    /// that receive).
+    /// that receive), or until the shared receive queue is destroyed. After an `Err`, the requests
+    /// ahead of the one that failed were posted, so the same holds for theirs.
     ///
     /// # Errors
     ///
@@ -167,10 +172,7 @@ impl SharedReceiveQueue {
         let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let ctx = unsafe { *self.srq }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno =
-            unsafe { ops.post_srq_recv.as_mut().unwrap()(self.srq, head, &mut bad_wr as *mut _) };
+        let errno = unsafe { ffi::ibv_post_srq_recv(self.srq, head, &mut bad_wr) };
         if errno != 0 {
             Err(Error::errno(errno, Error::PostReceive))
         } else {

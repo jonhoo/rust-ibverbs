@@ -1,3 +1,5 @@
+use std::io;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -5,9 +7,9 @@ use std::sync::Arc;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
 use crate::context::{Context, PortAttr, PortState};
-use crate::error::{Error, Result, destroyed, nonnull};
+use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion};
-use crate::qp::{QueuePairBuilder, QueuePairType, Transport};
+use crate::qp::{QueuePairBuilder, Transport};
 use crate::srq::SharedReceiveQueue;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
@@ -34,81 +36,12 @@ impl From<MrAdvice> for ffi::ib_uverbs_advise_mr_advice {
     }
 }
 
-/// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
-#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub struct MrAdviseFlags(pub(crate) u32);
-
-impl MrAdviseFlags {
-    /// Perform the advise synchronously: the call returns only once the operation has completed.
-    pub const FLUSHABLE: MrAdviseFlags =
-        MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH.0);
-
-    /// No flags set.
-    #[must_use]
-    pub const fn empty() -> Self {
-        MrAdviseFlags(0)
-    }
-
-    /// Whether every flag set in `other` is also set in `self`.
-    #[must_use]
-    pub const fn contains(self, other: Self) -> bool {
-        self.0 & other.0 == other.0
-    }
-}
-
-impl std::ops::BitOr for MrAdviseFlags {
-    type Output = Self;
-    fn bitor(self, rhs: Self) -> Self {
-        MrAdviseFlags(self.0 | rhs.0)
-    }
-}
-
-impl std::ops::BitOrAssign for MrAdviseFlags {
-    fn bitor_assign(&mut self, rhs: Self) {
-        self.0 |= rhs.0;
-    }
-}
-
-impl std::ops::BitAnd for MrAdviseFlags {
-    type Output = Self;
-    fn bitand(self, rhs: Self) -> Self {
-        MrAdviseFlags(self.0 & rhs.0)
-    }
-}
-
-impl std::fmt::Debug for MrAdviseFlags {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("MrAdviseFlags(")?;
-        let mut rest = self.0;
-        let mut first = true;
-        if rest & MrAdviseFlags::FLUSHABLE.0 == MrAdviseFlags::FLUSHABLE.0 {
-            f.write_str("FLUSHABLE")?;
-            first = false;
-            rest &= !MrAdviseFlags::FLUSHABLE.0;
-        }
-        if rest != 0 {
-            if !first {
-                f.write_str(" | ")?;
-            }
-            write!(f, "{rest:#x}")?;
-            first = false;
-        }
-        if first {
-            f.write_str("0")?;
-        }
-        f.write_str(")")
-    }
-}
-
-impl From<ffi::ib_uverbs_advise_mr_flag> for MrAdviseFlags {
-    fn from(flag: ffi::ib_uverbs_advise_mr_flag) -> Self {
-        MrAdviseFlags(flag.0)
-    }
-}
-
-impl From<MrAdviseFlags> for u32 {
-    fn from(flags: MrAdviseFlags) -> Self {
-        flags.0
+flags_newtype! {
+    /// Flags for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_FLAG_*` values).
+    pub struct MrAdviseFlags(ffi::ib_uverbs_advise_mr_flag) {
+        /// Perform the advise synchronously: the call returns only once the operation has
+        /// completed.
+        FLUSHABLE = IB_UVERBS_ADVISE_MR_FLAG_FLUSH;
     }
 }
 
@@ -119,7 +52,11 @@ struct ProtectionDomainInner {
 
 impl Drop for ProtectionDomainInner {
     fn drop(&mut self) {
-        destroyed("ibv_dealloc_pd", unsafe { ffi::ibv_dealloc_pd(self.pd) });
+        destroyed(
+            "ibv_dealloc_pd",
+            unsafe { ffi::ibv_dealloc_pd(self.pd) },
+            || keep(&self.ctx),
+        );
     }
 }
 
@@ -199,7 +136,7 @@ impl ProtectionDomain {
             ffi::ibv_advise_mr(
                 self.inner.pd,
                 advice.into(),
-                flags.into(),
+                flags.0,
                 sg_list.as_ptr() as *mut ffi::ibv_sge,
                 sg_list.len() as u32,
             )
@@ -224,8 +161,8 @@ impl ProtectionDomain {
     ///
     /// `port_num` is the device port this queue pair uses; ports are numbered from 1.
     ///
-    /// Note that both this protection domain, *and* both provided completion queues, must outlive
-    /// the resulting `QueuePair`.
+    /// The queue pair keeps this protection domain and both completion queues alive for as long as
+    /// it exists.
     ///
     /// # Errors
     ///
@@ -240,17 +177,12 @@ impl ProtectionDomain {
         recv: &CompletionQueue,
         port_num: u8,
     ) -> Result<QueuePairBuilder<T>> {
-        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
-        //
-        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
-        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
-        //   recommended avoiding saving the result of this query, or to flush them when a new SM
-        //   (re)configures the subnet.
-        //
+        // Port attributes change (the subnet manager reassigns LIDs, for one), so they are read
+        // when each builder is created; `PreparedQueuePair::endpoint` documents the stale-LID case.
         let port_attr = self.context().query_port(port_num)?;
         require_active(port_num, &port_attr)?;
         // Only reliable connections carry RDMA read and atomic limits.
-        let rd_atomic_limits = if T::TYPE == QueuePairType::ReliableConnection {
+        let rd_atomic_limits = if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
             Some(self.context().rd_atomic_limits()?)
         } else {
             None
@@ -317,12 +249,14 @@ impl ProtectionDomain {
     ///
     ///  - [`Unsupported`](Error::Unsupported): the device cannot honor one of the access flags
     ///    (`EOPNOTSUPP`).
-    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): `ibv_reg_mr` failed (`EINVAL`
-    ///    for an invalid access value, `ENOMEM` when out of resources — either in the operating
-    ///    system or in the RDMA device).
+    ///  - [`RegisterMemoryRegion`](Error::RegisterMemoryRegion): allocating the buffer failed
+    ///    (`ENOMEM`), or `ibv_reg_mr` failed (`EINVAL` for an invalid access value, `ENOMEM` when
+    ///    out of resources — either in the operating system or in the RDMA device).
     pub fn allocate(&self, n: usize, access_flags: AccessFlags) -> Result<MemoryRegion<Box<[u8]>>> {
         assert!(n > 0);
-        let mut data = vec![0u8; n].into_boxed_slice();
+        let mut data = zeroed_buffer(n).ok_or_else(|| {
+            Error::RegisterMemoryRegion(io::Error::from_raw_os_error(nix::libc::ENOMEM))
+        })?;
         unsafe { self.reg_mr(data.as_mut_ptr() as *mut c_void, n, access_flags, data) }
     }
 
@@ -376,10 +310,11 @@ impl ProtectionDomain {
     /// exporter; the returned region only holds the registration, which is released when the
     /// region is dropped.
     ///
-    /// `fd` is the file descriptor of the DMA-BUF to register; it must refer to an already
-    /// allocated buffer. The region starts at `offset` bytes into the DMA-BUF and covers `len`
-    /// bytes. `iova` is the virtual base address of the region when accessed through an `lkey` or
-    /// `rkey`; it must have the same page offset as `offset`.
+    /// `fd` is the DMA-BUF to register; it must refer to an already allocated buffer. It is
+    /// borrowed for the call only: the region keeps the buffer itself registered, so the
+    /// descriptor may be closed afterwards. The region starts at `offset` bytes into the DMA-BUF
+    /// and covers `len` bytes. `iova` is the virtual base address of the region when accessed
+    /// through an `lkey` or `rkey`; it must have the same page offset as `offset`.
     ///
     /// # Errors
     ///
@@ -391,14 +326,21 @@ impl ProtectionDomain {
     /// [man]: https://man7.org/linux/man-pages/man3/ibv_reg_mr.3.html
     pub fn register_dmabuf(
         &self,
-        fd: i32,
+        fd: BorrowedFd<'_>,
         offset: u64,
         len: usize,
         iova: u64,
         access_flags: AccessFlags,
     ) -> Result<MemoryRegion<()>> {
         let mr = unsafe {
-            ffi::ibv_reg_dmabuf_mr(self.inner.pd, offset, len, iova, fd, access_flags.0 as i32)
+            ffi::ibv_reg_dmabuf_mr(
+                self.inner.pd,
+                offset,
+                len,
+                iova,
+                fd.as_raw_fd(),
+                access_flags.0 as i32,
+            )
         };
         // Promotes the EOPNOTSUPP of devices without DMA-BUF support, and the EPROTONOSUPPORT of
         // kernels that predate it, to Unsupported.
@@ -431,7 +373,7 @@ impl ProtectionDomain {
     ///
     /// See also [RDMAmojo's `ibv_create_srq` documentation][1] and the [man page][2].
     ///
-    /// [1]: https://www.rdmamojo.com/2013/01/30/ibv_create_srq/
+    /// [1]: https://www.rdmamojo.com/2012/11/24/ibv_create_srq/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_create_srq.3.html
     pub fn create_srq(
         &self,
@@ -453,6 +395,21 @@ impl ProtectionDomain {
         )?;
         Ok(SharedReceiveQueue::new(self.clone(), srq))
     }
+}
+
+/// `n` (nonzero) zeroed bytes on the heap, or `None` when the allocator cannot provide them —
+/// where `vec![0; n]` aborts the process, or panics for `n` above `isize::MAX`. Zeroed through
+/// `alloc_zeroed` like `vec!`, so a large buffer is not touched (and committed) up front.
+fn zeroed_buffer(n: usize) -> Option<Box<[u8]>> {
+    let layout = std::alloc::Layout::array::<u8>(n).ok()?;
+    // SAFETY: the layout's size is `n`, which is nonzero.
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr` is a fresh, zeroed allocation with the layout of `[u8; n]`, the one `Box`
+    // frees it with.
+    Some(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n)) })
 }
 
 /// Refuses a port that is neither `ACTIVE` nor `ARMED`, for [`ProtectionDomain::create_qp`].
@@ -491,20 +448,5 @@ mod test_conversions {
         ] {
             assert_eq!(ffi::ib_uverbs_advise_mr_advice::from(wrapper), raw);
         }
-    }
-
-    #[test]
-    fn mr_advise_flags_bits_and_debug() {
-        assert!(!MrAdviseFlags::empty().contains(MrAdviseFlags::FLUSHABLE));
-        let mut flags = MrAdviseFlags::empty();
-        flags |= MrAdviseFlags::FLUSHABLE;
-        assert!(flags.contains(MrAdviseFlags::FLUSHABLE));
-        assert_eq!(u32::from(flags), 1);
-        assert_eq!(
-            MrAdviseFlags::from(ffi::ib_uverbs_advise_mr_flag::IB_UVERBS_ADVISE_MR_FLAG_FLUSH),
-            MrAdviseFlags::FLUSHABLE
-        );
-        assert_eq!(format!("{flags:?}"), "MrAdviseFlags(FLUSHABLE)");
-        assert_eq!(format!("{:?}", MrAdviseFlags::empty()), "MrAdviseFlags(0)");
     }
 }

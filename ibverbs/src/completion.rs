@@ -7,12 +7,63 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::context::{Context, HcaClock};
-use crate::error::{Error, Result, destroyed, nonnull};
+use crate::error::{Error, Result, destroyed, keep, nonnull};
 
-/// Round `remaining` up to whole milliseconds, so a `poll(2)` wait (which has millisecond
-/// granularity) lasts at least the requested duration instead of returning fractionally early.
-pub(crate) fn ceil_to_millis(remaining: Duration) -> Duration {
-    Duration::from_millis(remaining.as_nanos().div_ceil(1_000_000) as u64)
+/// The deadline `timeout` from now: `None` (wait indefinitely) without a timeout, and also for a
+/// timeout too far out for an [`Instant`] to hold, which no wait could outlast anyway.
+pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
+    timeout.and_then(|timeout| Instant::now().checked_add(timeout))
+}
+
+/// Block until `fd` is readable (`true`) or `deadline` passes (`false`); with no deadline, wait
+/// indefinitely.
+///
+/// `poll(2)` waits at most `i32::MAX` milliseconds (about 24.8 days) per call, so a later deadline
+/// is waited out in slices; each is rounded up to whole milliseconds so the wait never ends
+/// fractionally early. A signal interrupting `poll(2)` (`EINTR`) resumes the wait.
+pub(crate) fn wait_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<bool> {
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+    loop {
+        let timeout = match deadline {
+            None => PollTimeout::NONE,
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let millis = remaining.as_nanos().div_ceil(1_000_000);
+                PollTimeout::try_from(millis).unwrap_or(PollTimeout::MAX)
+            }
+        };
+        match poll(&mut [PollFd::new(fd, PollFlags::POLLIN)], timeout) {
+            // A slice ran out: the wait is over only once the deadline itself has passed.
+            Ok(0) => {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    return Ok(false);
+                }
+            }
+            Ok(_) => return Ok(true),
+            Err(nix::errno::Errno::EINTR) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Set `fd` non-blocking, so reading it from an empty queue reports `EAGAIN` instead of blocking.
+pub(crate) fn set_nonblocking(fd: BorrowedFd<'_>) -> io::Result<()> {
+    use nix::fcntl::{F_GETFL, FcntlArg, OFlag, fcntl};
+    let flags = fcntl(fd, F_GETFL)?;
+    fcntl(
+        fd,
+        FcntlArg::F_SETFL(OFlag::from_bits_retain(flags) | OFlag::O_NONBLOCK),
+    )?;
+    Ok(())
+}
+
+/// The error for a provider's poll that failed with a negative code rather than an errno.
+#[cold]
+#[inline(never)]
+fn provider_poll_failure(verb: &str, code: i32) -> Error {
+    Error::PollCompletionQueue(io::Error::other(format!(
+        "{verb} failed in the provider (returned {code})"
+    )))
 }
 
 /// A completion channel: the file descriptor that delivers completion-queue notifications.
@@ -53,9 +104,11 @@ unsafe impl Sync for CompletionChannelInner {}
 
 impl Drop for CompletionChannelInner {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_comp_channel", unsafe {
-            ffi::ibv_destroy_comp_channel(self.cc)
-        });
+        destroyed(
+            "ibv_destroy_comp_channel",
+            unsafe { ffi::ibv_destroy_comp_channel(self.cc) },
+            || keep(&self._ctx),
+        );
     }
 }
 
@@ -75,21 +128,8 @@ impl CompletionChannel {
             }),
         };
         // If this fails, `channel` drops here and tears the half-created channel back down.
-        channel.set_nonblocking()?;
+        set_nonblocking(channel.as_fd()).map_err(Error::CreateCompletionChannel)?;
         Ok(channel)
-    }
-
-    /// Set this channel's file descriptor to non-blocking.
-    fn set_nonblocking(&self) -> Result<()> {
-        // SAFETY: the channel owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.cc).fd) };
-        let flags = nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL)
-            .map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::CreateCompletionChannel(e.into()))?;
-        Ok(())
     }
 
     /// Consume one pending notification from the channel, returning the context value of the
@@ -140,33 +180,20 @@ impl CompletionChannel {
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): waiting on the descriptor (`poll`)
     ///    or consuming the notification failed.
     pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        // A notification that is already pending needs no wait: take it without a `poll(2)` or
+        // reading the clock.
+        if let Some(context) = self.get_event()? {
+            return Ok(Some(context));
+        }
+        let deadline = deadline_after(timeout);
         loop {
-            let remaining = deadline
-                .map(|deadline| ceil_to_millis(deadline.saturating_duration_since(Instant::now())));
-            let pollfd = nix::poll::PollFd::new(self.as_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::PollCompletionQueue(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::PollCompletionQueue(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // notification first; if so, go back to waiting for the next one.
-                    if let Some(context) = self.get_event()? {
-                        return Ok(Some(context));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !wait_readable(self.as_fd(), deadline).map_err(Error::PollCompletionQueue)? {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the notification
+            // first; if so, go back to waiting for the next one.
+            if let Some(context) = self.get_event()? {
+                return Ok(Some(context));
             }
         }
     }
@@ -186,7 +213,7 @@ impl std::os::fd::AsRawFd for CompletionChannel {
     /// when a notification arrives for any queue built on it after
     /// [`req_notify`](CompletionQueue::req_notify).
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        unsafe { *self.inner.cc }.fd
+        unsafe { (*self.inner.cc).fd }
     }
 }
 
@@ -283,11 +310,32 @@ impl CompletionQueueBuilder {
     /// # Errors
     ///
     ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
-    ///    work-completion field (`EOPNOTSUPP`).
-    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `ibv_create_cq_ex` failed
-    ///    (`EINVAL` for an invalid `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`,
-    ///    or an invalid completion vector, `ENOMEM` when out of resources).
+    ///    work-completion field, or a completion channel (EFA devices without completion
+    ///    notifications) (`EOPNOTSUPP`).
+    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `min_cq_entries` is 0 or above
+    ///    `i32::MAX`, or the completion channel comes from another device context (both
+    ///    [`io::ErrorKind::InvalidInput`]), or `ibv_create_cq_ex` failed (`EINVAL` for an invalid
+    ///    `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`, or an invalid completion
+    ///    vector, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<CompletionQueue> {
+        // The legacy verbs take the size as an `int`, and providers do unsigned arithmetic on it
+        // that wraps near `u32::MAX` (mlx5 then accepts `u32::MAX` as a one-entry queue).
+        if self.min_cq_entries == 0 || self.min_cq_entries > i32::MAX as u32 {
+            return Err(Error::CreateCompletionQueue(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "min_cq_entries must be between 1 and i32::MAX",
+            )));
+        }
+        // The kernel looks a completion channel up in the creating context's own file table, so a
+        // channel from another context fails with nothing but `EBADF`.
+        if let Some(channel) = &self.comp_channel {
+            if unsafe { (*channel.as_raw()).context } != self.ctx.as_raw() {
+                return Err(Error::CreateCompletionQueue(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "the completion channel must come from the completion queue's device context",
+                )));
+            }
+        }
         // The queue holds a reference to its channel (if any), so the channel cannot be destroyed
         // out from under it.
         let cc = self.comp_channel.clone();
@@ -334,9 +382,14 @@ struct CompletionQueueInner {
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
         // An `ibv_cq_ex` starts with the `ibv_cq` it extends (`ibv_cq_ex_to_cq` in C).
-        destroyed("ibv_destroy_cq", unsafe {
-            ffi::ibv_destroy_cq(self.cq_ex as *mut ffi::ibv_cq)
-        });
+        destroyed(
+            "ibv_destroy_cq",
+            unsafe { ffi::ibv_destroy_cq(self.cq_ex as *mut ffi::ibv_cq) },
+            || {
+                keep(&self._ctx);
+                keep(&self.cc);
+            },
+        );
 
         // The queue's reference to its completion channel (if any) is released when the `cc` field
         // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel
@@ -494,39 +547,6 @@ impl From<ffi::ibv_wc_status> for WcStatus {
     }
 }
 
-impl From<WcStatus> for ffi::ibv_wc_status {
-    fn from(status: WcStatus) -> Self {
-        use ffi::ibv_wc_status as E;
-        match status {
-            WcStatus::Success => E::IBV_WC_SUCCESS,
-            WcStatus::LocalLengthError => E::IBV_WC_LOC_LEN_ERR,
-            WcStatus::LocalQpOperationError => E::IBV_WC_LOC_QP_OP_ERR,
-            WcStatus::LocalEecOperationError => E::IBV_WC_LOC_EEC_OP_ERR,
-            WcStatus::LocalProtectionError => E::IBV_WC_LOC_PROT_ERR,
-            WcStatus::WorkRequestFlushed => E::IBV_WC_WR_FLUSH_ERR,
-            WcStatus::MemoryWindowBindError => E::IBV_WC_MW_BIND_ERR,
-            WcStatus::BadResponse => E::IBV_WC_BAD_RESP_ERR,
-            WcStatus::LocalAccessError => E::IBV_WC_LOC_ACCESS_ERR,
-            WcStatus::RemoteInvalidRequest => E::IBV_WC_REM_INV_REQ_ERR,
-            WcStatus::RemoteAccessError => E::IBV_WC_REM_ACCESS_ERR,
-            WcStatus::RemoteOperationError => E::IBV_WC_REM_OP_ERR,
-            WcStatus::RetryExceeded => E::IBV_WC_RETRY_EXC_ERR,
-            WcStatus::RnrRetryExceeded => E::IBV_WC_RNR_RETRY_EXC_ERR,
-            WcStatus::LocalRddViolation => E::IBV_WC_LOC_RDD_VIOL_ERR,
-            WcStatus::RemoteInvalidRdRequest => E::IBV_WC_REM_INV_RD_REQ_ERR,
-            WcStatus::RemoteAborted => E::IBV_WC_REM_ABORT_ERR,
-            WcStatus::InvalidEecn => E::IBV_WC_INV_EECN_ERR,
-            WcStatus::InvalidEecState => E::IBV_WC_INV_EEC_STATE_ERR,
-            WcStatus::Fatal => E::IBV_WC_FATAL_ERR,
-            WcStatus::ResponseTimeout => E::IBV_WC_RESP_TIMEOUT_ERR,
-            WcStatus::GeneralError => E::IBV_WC_GENERAL_ERR,
-            WcStatus::TagMatchingError => E::IBV_WC_TM_ERR,
-            WcStatus::TagMatchingRendezvousIncomplete => E::IBV_WC_TM_RNDV_INCOMPLETE,
-            WcStatus::Unknown(raw) => ffi::ibv_wc_status(raw),
-        }
-    }
-}
-
 impl fmt::Display for WcStatus {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let msg = match self {
@@ -659,35 +679,6 @@ impl From<ffi::ibv_wc_opcode> for WcOpcode {
     }
 }
 
-impl From<WcOpcode> for ffi::ibv_wc_opcode {
-    fn from(opcode: WcOpcode) -> Self {
-        use ffi::ibv_wc_opcode as E;
-        match opcode {
-            WcOpcode::Send => E::IBV_WC_SEND,
-            WcOpcode::RdmaWrite => E::IBV_WC_RDMA_WRITE,
-            WcOpcode::RdmaRead => E::IBV_WC_RDMA_READ,
-            WcOpcode::CompSwap => E::IBV_WC_COMP_SWAP,
-            WcOpcode::FetchAdd => E::IBV_WC_FETCH_ADD,
-            WcOpcode::BindMw => E::IBV_WC_BIND_MW,
-            WcOpcode::LocalInv => E::IBV_WC_LOCAL_INV,
-            WcOpcode::Tso => E::IBV_WC_TSO,
-            WcOpcode::Flush => E::IBV_WC_FLUSH,
-            WcOpcode::AtomicWrite => E::IBV_WC_ATOMIC_WRITE,
-            WcOpcode::Recv => E::IBV_WC_RECV,
-            WcOpcode::RecvRdmaWithImm => E::IBV_WC_RECV_RDMA_WITH_IMM,
-            WcOpcode::TmAdd => E::IBV_WC_TM_ADD,
-            WcOpcode::TmDel => E::IBV_WC_TM_DEL,
-            WcOpcode::TmSync => E::IBV_WC_TM_SYNC,
-            WcOpcode::TmRecv => E::IBV_WC_TM_RECV,
-            WcOpcode::TmNoTag => E::IBV_WC_TM_NO_TAG,
-            WcOpcode::Driver1 => E::IBV_WC_DRIVER1,
-            WcOpcode::Driver2 => E::IBV_WC_DRIVER2,
-            WcOpcode::Driver3 => E::IBV_WC_DRIVER3,
-            WcOpcode::Unknown(raw) => ffi::ibv_wc_opcode(raw),
-        }
-    }
-}
-
 impl std::fmt::Display for WcOpcode {
     /// Formats the opcode as it is named in the C headers, for example `RDMA_WRITE` for
     /// [`RdmaWrite`](Self::RdmaWrite).
@@ -768,7 +759,8 @@ impl WorkCompletion<'_> {
     ///
     /// Like `len` and the other detail fields, this is only meaningful when the completion
     /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
-    /// [`wr_id`](Self::wr_id) and the status are defined.
+    /// [`wr_id`](Self::wr_id), the status and vendor error ([`WcError`]), and
+    /// [`qp_num`](Self::qp_num) are defined.
     #[inline]
     pub fn opcode(&self) -> WcOpcode {
         unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }.into()
@@ -966,8 +958,10 @@ pub struct TagMatchingInfo {
     pub private: u32,
 }
 
-/// One poll of a [`CompletionQueue`]: the work completions that were ready when it started,
-/// yielded one at a time.
+/// One poll of a [`CompletionQueue`]: its work completions, yielded one at a time. Each
+/// [`next`](Completions::next) reads the live queue, so completions that arrive during the loop are
+/// yielded too, and a loop over a busy queue may not end on its own (bound it if other threads
+/// poll or post to this queue's queue pairs, see below).
 ///
 /// Created by [`CompletionQueue::poll`]. This is a *lending* iterator: each [`WorkCompletion`]
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
@@ -988,8 +982,18 @@ pub struct TagMatchingInfo {
 /// - post to such a queue pair while its send or receive queue is full or nearly so: the
 ///   provider then re-checks how full it is under the lock before accepting the post.
 ///
+/// Made from another thread, those calls wait until the `Completions` drops instead, so a poll
+/// loop must not wait for a thread that might be making one of them.
+///
 /// Posting a reply or reposting a receive from inside the loop is fine while the work queue has
 /// room; when it may be full, drop the `Completions` first.
+///
+/// Some providers take the locks the other way around, so polling can wait for a posting thread
+/// too. hns moves a queue pair to `ERR` from inside the poll when it reads one of the pair's error
+/// completions, taking the pair's send and receive queue locks under the poll lock; so do not poll
+/// on a thread that has a [`SendBatch`](crate::SendBatch) open on a queue pair this queue serves.
+/// ionic holds the send completion queue's poll lock for as long as a send batch is open (see
+/// [`SendBatch`](crate::SendBatch)).
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
@@ -1097,23 +1101,35 @@ impl CompletionQueue {
         let cq = self.cq_ex;
         let mut attr = ffi::ibv_poll_cq_attr::default();
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
-        // paired with `end_poll`) when the queue is empty.
-        match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
-            0 => Ok(Completions {
-                cq,
-                open: true,
-                first: true,
-                done: false,
-                _cq: std::marker::PhantomData,
-            }),
-            e if e == nix::libc::ENOENT => Ok(Completions {
-                cq,
-                open: false,
-                first: false,
-                done: true,
-                _cq: std::marker::PhantomData,
-            }),
-            e => Err(Error::errno(e, Error::PollCompletionQueue)),
+        // paired with `end_poll`) when the queue is empty. On a queue with wallclock timestamps it
+        // can also fail transiently with EBUSY while the kernel updates the clock information (mlx5,
+        // ionic); the queue is left unchanged and ibv_create_cq_ex(3) says to retry.
+        loop {
+            match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
+                0 => {
+                    return Ok(Completions {
+                        cq,
+                        open: true,
+                        first: true,
+                        done: false,
+                        _cq: std::marker::PhantomData,
+                    });
+                }
+                e if e == nix::libc::ENOENT => {
+                    return Ok(Completions {
+                        cq,
+                        open: false,
+                        first: false,
+                        done: true,
+                        _cq: std::marker::PhantomData,
+                    });
+                }
+                e if e == nix::libc::EBUSY => std::hint::spin_loop(),
+                // mlx5 and hns report a malformed completion entry as a negative code, not an
+                // errno.
+                e if e < 0 => return Err(provider_poll_failure("ibv_start_poll", e)),
+                e => return Err(Error::errno(e, Error::PollCompletionQueue)),
+            }
         }
     }
 
@@ -1163,10 +1179,10 @@ impl CompletionQueue {
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
         let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
         if n < 0 {
-            // `ibv_poll_cq` signals failure with a negative return and does not define `errno`;
-            // surface whatever the provider left there as the cause, but do not promote it to
-            // `Unsupported` (`Error::os`), as an `EOPNOTSUPP` there would be a stale one.
-            return Err(Error::PollCompletionQueue(io::Error::last_os_error()));
+            // `ibv_poll_cq` signals failure with a negative return and leaves `errno` alone, so
+            // whatever is there is stale (in an event loop, typically the `EAGAIN` of the `get_event`
+            // just before, which would read as "try again"): report the provider's return instead.
+            return Err(provider_poll_failure("ibv_poll_cq", n));
         }
         Ok(&mut wc[..n as usize])
     }
@@ -1183,19 +1199,36 @@ impl CompletionQueue {
     /// without a channel ([`CompletionQueueBuilder::set_comp_channel`]), arming has nothing to
     /// notify.
     ///
-    /// If `solicited_only` is set, only completions of work requests that asked for a solicited
-    /// event generate a notification.
+    /// If `solicited_only` is set, only solicited completions generate a notification: receive
+    /// completions of messages whose sender asked for a solicited event
+    /// ([`SendOp::solicited`](crate::SendOp::solicited)), and every completion with an error
+    /// status. Not every provider can arm for solicited completions only (EFA returns
+    /// [`Unsupported`](Error::Unsupported)).
     ///
     /// Arm a given queue and consume its notifications from one thread at a time (see
     /// [Thread safety](crate#thread-safety)).
     ///
     /// # Errors
     ///
+    ///  - [`Unsupported`](Error::Unsupported): the provider cannot arm for solicited completions
+    ///    only (EFA).
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_req_notify_cq` failed.
     #[inline]
     pub fn req_notify(&self, solicited_only: bool) -> Result<()> {
+        // Without a channel there is nothing to notify, and providers disagree on what arming
+        // then does: EFA writes a doorbell the queue may not have, ionic fails with -ENOENT.
+        if self.inner.cc.is_none() {
+            return Ok(());
+        }
         let errno = unsafe { ffi::ibv_req_notify_cq(self.as_raw(), solicited_only as i32) };
         if errno != 0 {
+            if errno == nix::libc::EOPNOTSUPP {
+                // EFA cannot arm for solicited completions only; it is the arming, not the
+                // polling, that is unsupported.
+                return Err(Error::Unsupported {
+                    operation: &"ibv_req_notify_cq",
+                });
+            }
             return Err(Error::errno(errno, Error::PollCompletionQueue));
         }
         Ok(())
@@ -1207,8 +1240,9 @@ impl CompletionQueue {
         self.inner.cc.as_ref()
     }
 
-    /// The number of completions the queue can hold: the capacity the device granted, which is at
-    /// least the `min_cq_entries` asked of [`Context::create_cq`]. Keep fewer signaled work
+    /// The number of completions the queue can hold: the capacity the device granted, normally at
+    /// least the `min_cq_entries` asked of [`Context::create_cq`] (hns reports one less than its
+    /// power-of-two ring, so asking it for 64 reports 63). Keep fewer signaled work
     /// requests in flight across the queue pairs sharing this queue, or it overruns
     /// (`IBV_EVENT_CQ_ERR`) and stops working.
     pub fn capacity(&self) -> u32 {
@@ -1241,7 +1275,7 @@ mod test_conversions {
     use super::*;
 
     #[test]
-    fn wc_status_roundtrip() {
+    fn wc_status_from_raw() {
         for (wrapper, raw) in [
             (WcStatus::Success, ffi::ibv_wc_status::IBV_WC_SUCCESS),
             (
@@ -1258,7 +1292,6 @@ mod test_conversions {
             ),
         ] {
             assert_eq!(WcStatus::from(raw), wrapper);
-            assert_eq!(ffi::ibv_wc_status::from(wrapper), raw);
         }
     }
 
@@ -1276,7 +1309,7 @@ mod test_conversions {
     }
 
     #[test]
-    fn wc_opcode_roundtrip() {
+    fn wc_opcode_from_raw() {
         for (wrapper, raw) in [
             (WcOpcode::Send, ffi::ibv_wc_opcode::IBV_WC_SEND),
             (WcOpcode::RdmaRead, ffi::ibv_wc_opcode::IBV_WC_RDMA_READ),
@@ -1287,7 +1320,6 @@ mod test_conversions {
             ),
         ] {
             assert_eq!(WcOpcode::from(raw), wrapper);
-            assert_eq!(ffi::ibv_wc_opcode::from(wrapper), raw);
         }
     }
 }

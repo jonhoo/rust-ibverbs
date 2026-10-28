@@ -5,7 +5,7 @@ use std::io;
 
 use crate::completion::WorkCompletion;
 use crate::context::Context;
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
@@ -340,8 +340,14 @@ impl AddressHandleAttribute {
         self
     }
 
-    /// Set the service level.
+    /// Set the service level (0–15).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `service_level` is above 15: the field is 4 bits wide, and providers would
+    /// silently drop the extra bits.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
+        assert!(service_level <= 15, "the service level is a 4-bit value");
         self.attr.sl = service_level;
         self
     }
@@ -643,7 +649,11 @@ impl AddressHandle {
 
 impl Drop for AddressHandle {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_ah", unsafe { ffi::ibv_destroy_ah(self.ah) });
+        destroyed(
+            "ibv_destroy_ah",
+            unsafe { ffi::ibv_destroy_ah(self.ah) },
+            || keep(&self._pd),
+        );
     }
 }
 
