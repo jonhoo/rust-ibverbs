@@ -823,7 +823,8 @@ impl WorkCompletion<'_> {
     ///
     /// Like `len` and the other detail fields, this is only meaningful when the completion
     /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
-    /// [`wr_id`](Self::wr_id) and the status are defined.
+    /// [`wr_id`](Self::wr_id), the status and vendor error ([`WcError`]), and
+    /// [`qp_num`](Self::qp_num) are defined.
     #[inline]
     pub fn opcode(&self) -> WcOpcode {
         unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }.into()
