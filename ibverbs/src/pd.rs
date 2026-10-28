@@ -344,7 +344,8 @@ impl ProtectionDomain {
         };
         // Promotes the EOPNOTSUPP of devices without DMA-BUF support, and the EPROTONOSUPPORT of
         // kernels that predate it, to Unsupported.
-        let mr = nonnull(mr, Error::RegisterMemoryRegion)?;
+        let mr = nonnull(mr, Error::RegisterMemoryRegion)
+            .map_err(|e| e.for_operation(&"ibv_reg_dmabuf_mr"))?;
         Ok(MemoryRegion::new(self.clone(), mr, iova, ()))
     }
 

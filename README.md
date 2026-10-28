@@ -142,10 +142,17 @@ This crate dynamically links `libibverbs`, which is part of
 `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core` on Arch; `rdma-core-devel` on
 Fedora), plus `librdmacm`, `libefa`, and `libmlx5` when the corresponding features are enabled.
 
+Running needs two more pieces. `libibverbs` reaches a device through its provider library, which
+Debian and Ubuntu package separately as `ibverbs-providers`; without it, no device is listed. And
+the `rdmacm` feature reaches the kernel's connection manager through the `rdma_ucm` module, which
+may have to be loaded first (`sudo modprobe rdma_ucm`).
+
 At build time, `bindgen` generates the bindings from the `rdma-core` headers vendored in the
-`ibverbs-sys` crate, so building needs `libclang` but no RDMA development packages. To use
-installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
-not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
+`ibverbs-sys` crate, so building needs `libclang` but not the installed headers; the development
+packages are still needed for the unversioned library links (`libibverbs.so` and the like) that
+the linker looks for. To use installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR`
+and `RDMA_CORE_LIB_DIR`. You do not need to depend on `ibverbs-sys` directly: it is re-exported
+as `ibverbs::ffi`.
 `RDMA_CORE_LIB_DIR` also works alone when using vendored headers. The `mlx5` feature
 requires libraries exporting both Data Direct functions; newer headers do not upgrade
 older system libraries. Set the runtime library search path as well when linking a
@@ -169,7 +176,7 @@ are you will want to head over there. In particular, [this overview
 post](http://www.rdmamojo.com/2012/05/18/libibverbs/) may be a good place to start.
 
 For more information on RDMA verbs in general, see the [InfiniBand Architecture
-Specification](http://www.infinibandta.org/content/pages.php?pg=technology_public_specification)
+Specification](https://infinibandta.org/ibta-specification/)
 vol. 1, especially chapter 11, the RDMA Consortium's [RDMA Protocol Verbs
 Specification](https://tools.ietf.org/html/rfc5040), the upstream
 [`libibverbs/verbs.h`](https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h)
@@ -179,7 +186,7 @@ examples](https://github.com/linux-rdma/rdma-core/tree/master/libibverbs/example
 ## Testing without RDMA hardware
 
 Any modern Linux kernel can attach a software RDMA device
-([SoftRoCE](https://docs.kernel.org/infiniband/rxe.html)) to an ordinary network interface:
+([SoftRoCE](https://github.com/linux-rdma/rdma-core/blob/master/Documentation/rxe.md)) to an ordinary network interface:
 
 ```console
 $ sudo rdma link add rxe0 type rxe netdev <netdev>
@@ -189,3 +196,14 @@ The examples (except the EFA one, which needs EFA hardware) and the integration 
 against it unchanged. CI runs the whole data-path test suite (two-sided, one-sided, atomics,
 inline, UC/UD, and the connection manager) against a SoftRoCE device on every pull request and
 asserts on the transferred bytes; it builds the examples but does not run them.
+
+The tests that need a device are `#[ignore]`d. Run them the way CI does, one at a time (they
+share the device, and SoftRoCE drops completions when many queue pairs drive it at once), with
+the connection-manager and mlx5 suites under their features (the mlx5 one checks that SoftRoCE
+refuses the mlx5 calls):
+
+```console
+$ IBVERBS_TEST_DEVICE=rxe0 cargo test -- --ignored --test-threads=1
+$ IBVERBS_TEST_DEVICE=rxe0 cargo test --features rdmacm --test rdmacm -- --ignored --test-threads=1
+$ IBVERBS_TEST_DEVICE=rxe0 cargo test --no-default-features --features mlx5 --test mlx5 -- --ignored --test-threads=1
+```

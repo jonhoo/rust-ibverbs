@@ -75,7 +75,8 @@ fn provider_poll_failure(verb: &str, code: i32) -> Error {
 /// with [`CompletionQueue::req_notify`], drain it with [`poll`](CompletionQueue::poll), and block
 /// on the channel ([`wait`](Self::wait)), or watch its descriptor
 /// ([`AsFd`]/[`AsRawFd`](std::os::fd::AsRawFd)) from your own reactor and consume notifications
-/// with [`get_event`](Self::get_event), before draining and re-arming again.
+/// with [`get_event`](Self::get_event). After each notification, re-arm the queue and then drain
+/// it again, in that order (see [`req_notify`](CompletionQueue::req_notify)).
 ///
 /// Any number of queues can be built on one channel, collapsing their notifications onto a single
 /// file descriptor (what you want for a server driving many queue pairs from one `epoll`/reactor).
@@ -138,8 +139,8 @@ impl CompletionChannel {
     ///
     /// Demultiplexing several queues that share one channel works by draining notifications here
     /// after the channel's file descriptor becomes readable, and mapping each returned context
-    /// back to the queue, which you then [`poll`](CompletionQueue::poll) and re-arm with
-    /// [`req_notify`](CompletionQueue::req_notify). Give each queue a distinct
+    /// back to the queue, which you then re-arm with [`req_notify`](CompletionQueue::req_notify)
+    /// and only then drain with [`poll`](CompletionQueue::poll). Give each queue a distinct
     /// [`set_context`](CompletionQueueBuilder::set_context) value so they can be told apart.
     /// Acknowledgement is handled for you. Consume a given queue's notifications and re-arm it from
     /// one thread at a time (see [Thread safety](crate#thread-safety)).
@@ -156,7 +157,7 @@ impl CompletionChannel {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::os(e, Error::PollCompletionQueue));
+            return Err(Error::os(e, Error::PollCompletionQueue).for_operation(&"ibv_get_cq_event"));
         }
         // Every event from ibv_get_cq_event() must eventually be acknowledged.
         unsafe { ffi::ibv_ack_cq_events(out_cq, 1) };
@@ -172,8 +173,8 @@ impl CompletionChannel {
     /// descriptor for you rather than requiring an external reactor. Arm each queue with
     /// [`CompletionQueue::req_notify`] and drain it with [`poll`](CompletionQueue::poll) *before*
     /// blocking here; polling after arming closes the race where a completion lands between an
-    /// earlier poll and arming. Then call this to learn which queue fired, and poll and re-arm
-    /// that queue.
+    /// earlier poll and arming. Then call this to learn which queue fired, and re-arm that queue
+    /// before draining it, for the same reason.
     ///
     /// # Errors
     ///
@@ -800,9 +801,11 @@ impl WorkCompletion<'_> {
     /// device's free-running clock (the same time base as [`Context::query_rt_values_ex`]; see
     /// [`HcaClock`] for converting tick deltas to time).
     ///
-    /// Only valid on a completion queue that requested [`WcFields::COMPLETION_TIMESTAMP`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Calling this on a completion from any other
-    /// completion queue panics, because the provider did not install the timestamp reader.
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request [`WcFields::COMPLETION_TIMESTAMP`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]): the provider installs the timestamp reader only
+    /// on a queue that did.
     #[inline]
     pub fn completion_timestamp(&self) -> HcaClock {
         HcaClock(wc_reader!(
@@ -814,10 +817,12 @@ impl WorkCompletion<'_> {
 
     /// The wallclock hardware timestamp (in nanoseconds) captured when this work request completed.
     ///
-    /// Only valid on a completion queue that requested
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request
     /// [`WcFields::COMPLETION_TIMESTAMP_WALLCLOCK`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics on a completion from any other
-    /// completion queue, because the provider did not install the reader.
+    /// [`CompletionQueueBuilder::set_wc_flags`]): the provider installs the reader only on a
+    /// queue that did.
     #[inline]
     pub fn completion_wallclock_ns(&self) -> u64 {
         wc_reader!(
@@ -843,8 +848,10 @@ impl WorkCompletion<'_> {
 
     /// The source LID this message was sent from (relevant for datagram receive completions).
     ///
-    /// Only valid on a completion queue that requested [`WcFields::SLID`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request [`WcFields::SLID`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn slid(&self) -> u32 {
         wc_reader!(self.cq, read_slid, "the source LID")
@@ -852,8 +859,10 @@ impl WorkCompletion<'_> {
 
     /// The service level this message was sent with (relevant for datagram receive completions).
     ///
-    /// Only valid on a completion queue that requested [`WcFields::SL`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request [`WcFields::SL`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn sl(&self) -> u8 {
         wc_reader!(self.cq, read_sl, "the service level")
@@ -861,8 +870,10 @@ impl WorkCompletion<'_> {
 
     /// The destination LID path bits (relevant for datagram receive completions).
     ///
-    /// Only valid on a completion queue that requested [`WcFields::DLID_PATH_BITS`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request [`WcFields::DLID_PATH_BITS`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn dlid_path_bits(&self) -> u8 {
         wc_reader!(self.cq, read_dlid_path_bits, "the DLID path bits")
@@ -882,8 +893,10 @@ impl WorkCompletion<'_> {
 
     /// The customer VLAN tag (802.1Q) of the incoming packet.
     ///
-    /// Only valid on a completion queue that requested [`WcFields::CVLAN`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request [`WcFields::CVLAN`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn cvlan(&self) -> u16 {
         wc_reader!(self.cq, read_cvlan, "the customer VLAN")
@@ -891,8 +904,10 @@ impl WorkCompletion<'_> {
 
     /// The flow tag the device's steering rules attached to the incoming packet.
     ///
-    /// Only valid on a completion queue that requested [`WcFields::FLOW_TAG`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request [`WcFields::FLOW_TAG`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn flow_tag(&self) -> u32 {
         wc_reader!(self.cq, read_flow_tag, "the flow tag")
@@ -901,8 +916,10 @@ impl WorkCompletion<'_> {
     /// The tag-matching information of a tag-matching receive: the tag and the opaque user data
     /// from the tag-matching header.
     ///
-    /// Only valid on a completion queue that requested [`WcFields::TM_INFO`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]). Panics otherwise.
+    /// # Panics
+    ///
+    /// Panics if the completion queue did not request [`WcFields::TM_INFO`] (see
+    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn tag_matching(&self) -> TagMatchingInfo {
         let mut info = ffi::ibv_wc_tm_info::default();
@@ -1195,7 +1212,11 @@ impl CompletionQueue {
     /// notification on the [completion channel](Self::comp_channel) — either by blocking with
     /// [`CompletionChannel::wait`], or by watching its [`AsFd`] descriptor with
     /// your own reactor (for example `epoll` or a `tokio` `AsyncFd`) and consuming the notification
-    /// with [`CompletionChannel::get_event`]. Then drain again and re-arm. On a queue built
+    /// with [`CompletionChannel::get_event`]. Then re-arm, and only then drain again: arming
+    /// notifies of the completions that arrive after it, so a drain before it would leave one
+    /// arriving in between unnotified, and the loop waiting for a notification that never comes.
+    /// In this order a completion arriving between the arming and the drain is taken by the drain
+    /// and still notifies, so a notification can find the queue already empty. On a queue built
     /// without a channel ([`CompletionQueueBuilder::set_comp_channel`]), arming has nothing to
     /// notify.
     ///
@@ -1227,6 +1248,7 @@ impl CompletionQueue {
                 // polling, that is unsupported.
                 return Err(Error::Unsupported {
                     operation: &"ibv_req_notify_cq",
+                    errno,
                 });
             }
             return Err(Error::errno(errno, Error::PollCompletionQueue));

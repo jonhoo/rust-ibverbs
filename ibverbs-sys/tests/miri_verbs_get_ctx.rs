@@ -63,6 +63,17 @@ fn same_version_runtime_is_fine() {
 }
 
 #[test]
+fn a_context_not_marked_extended_is_not_read_behind() {
+    // A context libibverbs did not embed in a `verbs_context` has no `abi_compat` mark and nothing
+    // in front of it to read (`verbs_get_ctx` checks the mark first); under Miri, reading `sz`
+    // here would be out of bounds.
+    let mut ctx = Box::new(unsafe { std::mem::zeroed::<ffi::ibv_context>() });
+    let mut values = ffi::ibv_values_ex::default();
+    let rc = unsafe { ffi::ibv_query_rt_values_ex(&mut *ctx, &mut values) };
+    assert_ne!(rc, 0, "an unmarked context has no extended ops");
+}
+
+#[test]
 fn older_runtime_stays_in_bounds() {
     // rdma-core v39..v58 (Ubuntu 22.04 ships 39, Ubuntu 24.04 ships 50): 39 slots before `sz`.
     let (_mem, ctx) = runtime_context(39);

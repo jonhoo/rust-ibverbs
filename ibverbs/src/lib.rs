@@ -82,7 +82,7 @@
 //!
 //! - `rdmacm`: the `rdmacm` module, wrapping the `librdmacm` connection manager: connection setup
 //!   over IP addresses, blocking or event-loop driven, instead of an out-of-band endpoint
-//!   exchange. Links `librdmacm`.
+//!   exchange. Links `librdmacm`, and needs the kernel's `rdma_ucm` module loaded.
 //! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via the `Srd` transport
 //!   (`ProtectionDomain::create_qp::<Srd>`). Links `libefa`.
 //! - `mlx5`: mlx5 Data Direct DMA-BUF registration
@@ -95,12 +95,15 @@
 //! At runtime, this crate dynamically links `libibverbs`, which is part of [`rdma-core`] (the
 //! package is `libibverbs1`, with `libibverbs-dev` for linking, on Debian and Ubuntu; `rdma-core`
 //! on Arch; `rdma-core-devel` on Fedora), plus `librdmacm`, `libefa`, and `libmlx5` when the
-//! corresponding features are enabled.
+//! corresponding features are enabled. `libibverbs` in turn reaches a device through its provider
+//! library, which Debian and Ubuntu package separately as `ibverbs-providers`; without it, no
+//! device is listed.
 //!
 //! At build time, `bindgen` generates the bindings from the [`rdma-core`] headers vendored in
-//! `ibverbs-sys`, so building needs `libclang` but no RDMA development packages. To generate
-//! bindings from installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and
-//! `RDMA_CORE_LIB_DIR`.
+//! `ibverbs-sys`, so building needs `libclang` but not the installed headers; the development
+//! packages are still needed for the unversioned library links (`libibverbs.so` and the like)
+//! that the linker looks for. To generate bindings from installed `rdma-core` headers instead,
+//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
 //!
 //! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
 //! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
@@ -183,10 +186,10 @@
 //! [`libibverbs/verbs.h`]: https://github.com/linux-rdma/rdma-core/blob/master/libibverbs/verbs.h
 //! [C examples]: https://github.com/linux-rdma/rdma-core/tree/master/libibverbs/examples
 //! [examples]: https://github.com/jonhoo/rust-ibverbs/tree/main/ibverbs/examples
-//! [infini]: http://www.infinibandta.org/content/pages.php?pg=technology_public_specification
+//! [infini]: https://infinibandta.org/ibta-specification/
 //! [RFC5040]: https://tools.ietf.org/html/rfc5040
 //! [safe]: http://www.rdmamojo.com/2013/07/26/libibverbs-thread-safe-level/
-//! [soft]: https://docs.kernel.org/infiniband/rxe.html
+//! [soft]: https://github.com/linux-rdma/rdma-core/blob/master/Documentation/rxe.md
 //! [RDMAmojo]: http://www.rdmamojo.com/
 //! [overview]: http://www.rdmamojo.com/2012/05/18/libibverbs/
 

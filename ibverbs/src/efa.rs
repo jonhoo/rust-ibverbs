@@ -53,7 +53,11 @@ impl Datagram for Srd {}
 impl QueuePairBuilder<Srd> {
     /// Create the EFA SRD queue pair described by this builder (`efadv_create_qp_ex`).
     ///
-    /// It enables the send and one-sided RDMA doorbell operations; activate the result with
+    /// The queue pair is created with the builder's send operations
+    /// ([`send_ops`](QueuePairBuilder::send_ops): by default SEND and RDMA WRITE, with and without
+    /// an immediate, and RDMA READ). EFA grants RDMA READ and WRITE only on a device with those
+    /// capabilities (`efadv_query_device`), so on one without them request SEND alone with
+    /// [`set_send_ops`](QueuePairBuilder::set_send_ops). Activate the result with
     /// [`activate`](PreparedQueuePair::activate).
     ///
     /// # Errors
@@ -62,8 +66,9 @@ impl QueuePairBuilder<Srd> {
     ///    device context than the protection domain, or `efadv_create_qp_ex` failed (`EINVAL` for
     ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
     ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
+    ///    operations (`EOPNOTSUPP`; RDMA READ or WRITE on a device without them), or created the
+    ///    queue pair without the extended work-request interface this crate posts through
+    ///    (`ibv_qp_to_qp_ex` returned no handle).
     pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
         self.check_same_context()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
@@ -87,7 +92,9 @@ impl QueuePairBuilder<Srd> {
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
             )
         };
-        self.prepared(nonnull(qp, Error::CreateQueuePair)?, &attr)
+        let qp = nonnull(qp, Error::CreateQueuePair)
+            .map_err(|e| e.for_operation(&"efadv_create_qp_ex"))?;
+        self.prepared(qp, &attr)
     }
 }
 

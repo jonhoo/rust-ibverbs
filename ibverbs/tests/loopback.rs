@@ -1089,6 +1089,37 @@ fn advise_mr() {
     }
 }
 
+/// A device that cannot register DMA-BUFs (Soft-RoCE among them) refuses it naming the verb that
+/// was called, `ibv_reg_dmabuf_mr`, not `ibv_reg_mr`.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn dmabuf_registration_names_its_verb() {
+    use std::os::fd::AsFd;
+
+    let ctx = open_test_device();
+    let soft_roce = ctx
+        .query_device()
+        .expect("failed to query device")
+        .vendor_id
+        == SOFT_ROCE_VENDOR_ID;
+    let pd = ctx
+        .alloc_pd()
+        .expect("failed to allocate protection domain");
+    let not_dmabuf = std::fs::File::open("/dev/null").expect("failed to open /dev/null");
+    match pd.register_dmabuf(not_dmabuf.as_fd(), 0, 4096, 0, AccessFlags::LOCAL_WRITE) {
+        Err(Error::Unsupported { operation, errno }) => {
+            assert_eq!(*operation, "ibv_reg_dmabuf_mr");
+            assert_eq!(errno, nix::libc::EOPNOTSUPP);
+        }
+        // A device that registers DMA-BUFs refuses a descriptor that is not one.
+        Err(Error::RegisterMemoryRegion(_)) if !soft_roce => {}
+        other => panic!(
+            "expected ibv_reg_dmabuf_mr to be refused, got {:?}",
+            other.err()
+        ),
+    }
+}
+
 /// Registering externally managed memory through the unsafe raw entry point, then using it for a
 /// loopback transfer. The caller owns the buffers and keeps them alive past the regions.
 #[test]
@@ -1173,6 +1204,42 @@ fn split_queue_pair_across_threads() {
         );
     }
     assert_eq!(recv.bytes(), send.bytes());
+}
+
+/// A receive batch longer than the queue's room fails at the first request that does not fit, and
+/// the error counts the ones posted ahead of it, on a queue pair's receive queue and on a shared
+/// receive queue alike.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn post_recv_reports_how_many_were_posted() {
+    let mut lb = loopback();
+    let srq = lb.pd.create_srq(4, 1, 0).expect("failed to create SRQ");
+    let recv = mr(&lb.pd, 8);
+    let sges = [recv.slice(..8)];
+    let overflow = |room: u32| -> Vec<RecvRequest<'_>> {
+        (0..u64::from(room) + 3)
+            .map(|i| RecvRequest::new(i, &sges))
+            .collect()
+    };
+    let expect_room = |result: Result<(), Error>, room: u32| match result {
+        Err(Error::PostReceive { posted, source }) => {
+            assert_eq!(posted, room, "{source}");
+            assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM), "{source}");
+        }
+        other => panic!("expected the batch to overflow the queue, got {other:?}"),
+    };
+
+    let (_, caps) = lb
+        .qp
+        .query(QueuePairAttributeMask::empty())
+        .expect("failed to query queue pair");
+    let room = caps.max_recv_wr;
+    expect_room(unsafe { lb.qp.post_recv(overflow(room)) }, room);
+    let room = srq.query().expect("failed to query SRQ").max_wr;
+    expect_room(unsafe { srq.post_recv(overflow(room)) }, room);
+
+    // Destroy the queues, discarding the posted receives, before the buffer they point at.
+    drop((lb, srq));
 }
 
 /// Batched receive: two receives posted in one `post_recv` (caller-owned array) catch two sends, in
@@ -1291,6 +1358,43 @@ fn query_device_and_port() {
     let _ = port.active_width();
     let _ = port.link_layer();
     let _ = port.phys_state();
+}
+
+/// The `ibv_create_qp_ex` shim creates a queue pair whose attributes go no further than a
+/// protection domain through the legacy `ibv_create_qp`, as the C inline does.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn create_qp_ex_with_only_a_protection_domain() {
+    use ibverbs::ffi;
+
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut attr = ffi::ibv_qp_init_attr_ex {
+        send_cq: cq.as_raw(),
+        recv_cq: cq.as_raw(),
+        cap: ffi::ibv_qp_cap {
+            max_send_wr: 1,
+            max_recv_wr: 1,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+        },
+        qp_type: ffi::ibv_qp_type::IBV_QPT_RC,
+        comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0,
+        pd: pd.as_raw(),
+        ..Default::default()
+    };
+    let qp = unsafe { ffi::ibv_create_qp_ex(ctx.as_raw(), &mut attr) };
+    assert!(
+        !qp.is_null(),
+        "ibv_create_qp_ex: {}",
+        std::io::Error::last_os_error()
+    );
+    unsafe {
+        assert_eq!((*qp).pd, pd.as_raw());
+        assert_eq!(ffi::ibv_destroy_qp(qp), 0);
+    }
 }
 
 /// The raw-handle escape hatches return the live, non-null FFI pointers for each resource.
@@ -1726,6 +1830,32 @@ fn gid_and_device_introspection() {
                 entry.ndev_ifindex
             );
         }
+    }
+}
+
+/// An empty slot of the GID table is refused with `ENODATA`, as `ibv_query_gid_ex` reports it,
+/// rather than returned as the all-zero GID `ibv_query_gid` fills in.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn empty_gid_slot_is_refused() {
+    let ctx = open_test_device();
+    let len = ctx.query_port(1).expect("failed to query port").gid_tbl_len;
+    let table = ctx.gid_table().expect("failed to read GID table");
+    let used = |index: u32| {
+        table
+            .iter()
+            .any(|e| e.port_num == 1 && e.gid_index == index)
+    };
+    // Soft-RoCE's table has 1024 slots, of which an interface's addresses use a few.
+    let Some(empty) = (0..len.max(0) as u32).find(|&index| !used(index)) else {
+        eprintln!("every GID slot of port 1 is in use; nothing to check");
+        return;
+    };
+    match ctx.query_gid(1, empty) {
+        Err(Error::QueryGid { source, .. }) => {
+            assert_eq!(source.raw_os_error(), Some(nix::libc::ENODATA), "{source}");
+        }
+        other => panic!("expected ENODATA for empty GID slot {empty}, got {other:?}"),
     }
 }
 
@@ -2176,6 +2306,39 @@ fn roce_handshake_needs_a_gid() {
     match prepared.handshake(endpoint) {
         Err(Error::GidRequired) => {}
         other => panic!("expected GidRequired, got {:?}", other.err()),
+    }
+}
+
+/// An address vector holds the source GID index in 8 bits, so routing from a higher index
+/// (Soft-RoCE's GID table has 1024 entries) is refused rather than truncated to another entry.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn gid_index_above_255_is_refused() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let remote = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP")
+        .set_gid_index(gid_index(&ctx))
+        .build()
+        .expect("failed to build QP")
+        .endpoint()
+        .expect("failed to read endpoint");
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create QP")
+        .set_gid_index(256 + gid_index(&ctx))
+        .build()
+        .expect("failed to build QP");
+    match prepared.rtr_attributes(&remote) {
+        Err(Error::ModifyQueuePair(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            assert!(e.to_string().contains("above 255"), "{e}");
+        }
+        other => panic!(
+            "expected an InvalidInput ModifyQueuePair, got {:?}",
+            other.err()
+        ),
     }
 }
 

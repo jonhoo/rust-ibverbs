@@ -20,8 +20,9 @@ fn registration_unsupported_names_the_mlx5_operation() {
         assert!(matches!(
             err,
             Error::Unsupported {
-                operation: &"mlx5dv_reg_dmabuf_mr"
-            }
+                operation: &"mlx5dv_reg_dmabuf_mr",
+                errno: e,
+            } if e == errno
         ));
         assert!(err.os_error().is_none());
         assert_eq!(

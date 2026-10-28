@@ -475,7 +475,7 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
 /// [RDMAmojo]: http://www.rdmamojo.com/2013/01/12/ibv_modify_qp/
 #[must_use = "a queue-pair builder creates nothing until `build` is called"]
 pub struct QueuePairBuilder<T: Transport> {
-    ctx: isize,
+    ctx: u64,
     pub(crate) pd: ProtectionDomain,
     /// port local identifier
     lid: u16,
@@ -593,7 +593,8 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The entry corresponds to the index in [`Context::gid_table`](crate::Context::gid_table).
     /// [`PreparedQueuePair::endpoint`] embeds the GID at this index in the local endpoint, and
     /// [`handshake`](PreparedQueuePair::handshake) routes with it when the remote endpoint
-    /// carries a `gid`.
+    /// carries a `gid`. Only indexes up to 255 can route (an address vector holds the source GID
+    /// index in 8 bits), so the handshake refuses a larger one.
     ///
     /// Defaults to unset.
     pub fn set_gid_index(&mut self, gid_index: u32) -> &mut Self {
@@ -618,10 +619,12 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the opaque context value for the new `QueuePair`.
+    /// Set the opaque context value for the new `QueuePair` (its `qp_context`), an integer like
+    /// the one [`CompletionQueueBuilder::set_context`](crate::CompletionQueueBuilder::set_context)
+    /// takes.
     ///
     /// Defaults to 0.
-    pub fn set_context(&mut self, ctx: isize) -> &mut Self {
+    pub fn set_context(&mut self, ctx: u64) -> &mut Self {
         self.ctx = ctx;
         self
     }
@@ -632,9 +635,14 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// [`handshake`] sets the local receive-queue PSN from the remote endpoint, so the two sides
     /// agree without further configuration (the datagram transports' `activate` also starts the
     /// send queue here). Applications that reuse queue pairs typically pick a random starting PSN
-    /// per connection so stale packets from an earlier connection are not mistaken for new ones.
+    /// per connection so stale packets from an earlier connection are not mistaken for new ones;
+    /// a PSN is 24 bits, so take a random `u32` modulo `1 << 24`.
     ///
     /// Defaults to 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `psn > 0xFF_FFFF` (the field is 24 bits).
     ///
     /// [`endpoint`]: PreparedQueuePair::endpoint
     /// [`handshake`]: PreparedQueuePair::handshake
@@ -763,6 +771,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// protection domain. The shared receive queue is left to the caller.
     pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
         ffi::ibv_qp_init_attr_ex {
+            // The cookie is a plain integer to the caller; the C ABI carries it as a pointer.
             qp_context: self.ctx as usize as *mut c_void,
             send_cq: self.send.as_raw(),
             recv_cq: self.recv.as_raw(),
@@ -840,6 +849,7 @@ impl<T: Transport> QueuePairBuilder<T> {
         if qp_ex.is_null() {
             return Err(Error::Unsupported {
                 operation: &"ibv_qp_to_qp_ex",
+                errno: nix::libc::EOPNOTSUPP,
             });
         }
         Ok(prepared)
@@ -1049,6 +1059,11 @@ struct BringUp {
     rts: QueuePairAttribute,
 }
 
+/// The largest queue pair number and packet sequence number: both are 24-bit fields, and the
+/// setters refuse wider values rather than leave the excess bits to the provider, which ionic,
+/// EFA, irdma, and mana pass on to the device with the PSNs.
+pub(crate) const MAX_24_BITS: u32 = 0xFF_FFFF;
+
 /// An identifier for the network endpoint of a `QueuePair`. Returned by
 /// [`PreparedQueuePair::endpoint`], to exchange with the peer through
 /// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
@@ -1059,14 +1074,14 @@ struct BringUp {
 /// atomics it services at once.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct QueuePairEndpoint {
-    /// the `QueuePair`'s `qp_num`
+    /// the `QueuePair`'s `qp_num` (24 bits)
     pub qp_num: u32,
     /// the port's `lid`
     pub lid: u16,
     /// the port's `gid` at the configured index, used for global routing
     pub gid: Option<Gid>,
-    /// the packet sequence number this queue pair's send queue starts at, which the peer's receive
-    /// queue must expect (see [`QueuePairBuilder::set_sq_psn`])
+    /// the packet sequence number (24 bits) this queue pair's send queue starts at, which the
+    /// peer's receive queue must expect (see [`QueuePairBuilder::set_sq_psn`])
     pub psn: u32,
     /// how many incoming RDMA reads and atomics this queue pair services at once (its responder
     /// resources, see [`QueuePairBuilder::set_max_dest_rd_atomic`]); the peer issues at most this
@@ -1103,7 +1118,7 @@ impl QueuePairEndpoint {
     /// # Errors
     ///
     ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the flags byte carries bits this
-    ///    version does not know.
+    ///    version does not know, or the queue pair number or PSN is wider than its 24 bits.
     pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
         let gid = match bytes[0] {
             0 => None,
@@ -1113,11 +1128,16 @@ impl QueuePairEndpoint {
             }
             _ => return Err(Error::MalformedWireFormat),
         };
+        let qp_num = u32::from_be_bytes(bytes[1..5].try_into().expect("slice length is fixed"));
+        let psn = u32::from_be_bytes(bytes[23..27].try_into().expect("slice length is fixed"));
+        if qp_num > MAX_24_BITS || psn > MAX_24_BITS {
+            return Err(Error::MalformedWireFormat);
+        }
         Ok(QueuePairEndpoint {
-            qp_num: u32::from_be_bytes(bytes[1..5].try_into().expect("slice length is fixed")),
+            qp_num,
             lid: u16::from_be_bytes(bytes[5..7].try_into().expect("slice length is fixed")),
             gid,
-            psn: u32::from_be_bytes(bytes[23..27].try_into().expect("slice length is fixed")),
+            psn,
             max_dest_rd_atomic: bytes[27],
         })
     }
@@ -1151,7 +1171,7 @@ impl<T: Transport> PreparedQueuePair<T> {
     /// # Errors
     ///
     ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
-    ///    (`ibv_query_gid`).
+    ///    (`ibv_query_gid`), or that entry of the GID table is empty (`ENODATA`).
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
         let qp_num = unsafe { (*self.qp.qp).qp_num };
         let gid = if let Some(gid_index) = self.gid_index {
@@ -1235,16 +1255,39 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`GidMismatch`](Error::GidMismatch): `remote` carries a GID, but no `gid_index` was
     ///    set on the builder to route from.
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but `remote` carries no GID.
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): the path MTU is not a valid MTU encoding
-    ///    ([`io::ErrorKind::InvalidInput`]), as when the port reported no active MTU to default
-    ///    to and none was set with [`QueuePairBuilder::set_path_mtu`].
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
+    ///    path MTU is not a valid MTU encoding, as when the port reported no active MTU to default
+    ///    to and none was set with [`QueuePairBuilder::set_path_mtu`]; or `remote` carries a GID
+    ///    and the builder's GID index is above 255, more than an address vector can hold; or
+    ///    `remote`'s queue pair number or PSN is wider than 24 bits (which
+    ///    [`from_bytes`](QueuePairEndpoint::from_bytes) refuses, but its fields are public).
     pub fn rtr_attributes(&self, remote: &QueuePairEndpoint) -> Result<QueuePairAttribute> {
+        if remote.qp_num > MAX_24_BITS || remote.psn > MAX_24_BITS {
+            return Err(Error::ModifyQueuePair(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the remote queue pair number {:#x} and PSN {:#x} must fit in 24 bits",
+                    remote.qp_num, remote.psn
+                ),
+            )));
+        }
         let mut path = AddressHandleAttribute::new(self.port_num);
         path.set_dest_lid(remote.lid)
             .set_service_level(self.service_level);
         if let Some(gid) = remote.gid {
             let sgid_index = self.gid_index.ok_or(Error::GidMismatch)?;
-            path.set_grh(gid, sgid_index as u8, 0xff, self.traffic_class);
+            // The address vector carries the index in 8 bits (`ibv_global_route.sgid_index`, and
+            // the kernel ABI's), so a larger one would route from whatever entry it truncates to.
+            let sgid_index = u8::try_from(sgid_index).map_err(|_| {
+                Error::ModifyQueuePair(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "GID index {sgid_index} is above 255, the highest an address vector can \
+                         route from"
+                    ),
+                ))
+            })?;
+            path.set_grh(gid, sgid_index, 0xff, self.traffic_class);
         } else if self.roce {
             // RoCE routes every packet by GID; the kernel refuses an address vector without one
             // with nothing but `EINVAL`.
@@ -1309,7 +1352,9 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but the remote endpoint carries
     ///    no GID.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
-    ///    path MTU is not a valid MTU encoding (see [`rtr_attributes`](Self::rtr_attributes)).
+    ///    path MTU is not a valid MTU encoding, the GID index to route from is above 255, or the
+    ///    remote queue pair number or PSN is wider than 24 bits (see
+    ///    [`rtr_attributes`](Self::rtr_attributes)).
     ///  - The errors of [`QueuePair::modify`]: [`ModifyQueuePair`](Error::ModifyQueuePair) when
     ///    a transition fails (for example because the remote endpoint is unreachable — on RoCE,
     ///    the error spells out the route that failed), or its typed diagnoses of a rejected
@@ -1896,22 +1941,44 @@ impl SendOp<'_, '_, Ud> {
     }
 }
 
-/// The error for a failed `ibv_post_recv` on a queue pair, kept out of line. A queue pair that
-/// receives through a shared receive queue has no receive queue of its own, and the providers
-/// refuse posts to it with errnos that point elsewhere (mlx5 reports a full queue, hns
-/// `EOPNOTSUPP`, rxe `EINVAL`), so name the mistake instead. ionic returns its errnos negated
-/// (`-EAGAIN` when the device still owns the slot, so posting again soon succeeds); the others
-/// return them as they are.
+/// The error for a failed `ibv_post_recv` or `ibv_post_srq_recv` of `recvs`, kept out of line.
+///
+/// `bad_wr` is the first request the provider refused, so its index in `recvs` counts the ones it
+/// posted; rxe refuses a whole batch up front (on a queue pair in `RESET`, say) without setting
+/// it, and a null `bad_wr` counts none. The errno is not promoted to
+/// [`Unsupported`](Error::Unsupported), which would lose that count.
+///
+/// A queue pair that receives through a shared receive queue has no receive queue of its own,
+/// and the providers refuse posts to it with errnos that point elsewhere (mlx5 reports a full
+/// queue, hns `EOPNOTSUPP`, rxe `EINVAL`), so name the mistake instead. ionic returns its errnos
+/// negated (`-EAGAIN` when the device still owns the slot, so posting again soon succeeds); the
+/// others return them as they are.
 #[cold]
 #[inline(never)]
-fn post_recv_error(errno: i32, srq_attached: bool) -> Error {
-    if srq_attached {
-        return Error::PostReceive(io::Error::new(
+pub(crate) fn post_recv_error(
+    errno: i32,
+    recvs: &[RecvRequest<'_>],
+    bad_wr: *const ffi::ibv_recv_wr,
+    srq_attached: bool,
+) -> Error {
+    // A null `bad_wr` lands past the end. Plain address arithmetic, since a provider's pointer is
+    // only compared, never followed.
+    let index = (bad_wr as usize).wrapping_sub(recvs.as_ptr() as usize)
+        / std::mem::size_of::<RecvRequest<'_>>();
+    let posted = if index < recvs.len() {
+        u32::try_from(index).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let source = if srq_attached {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             "this queue pair receives through its shared receive queue; post receives there",
-        ));
-    }
-    Error::errno(errno.abs(), Error::PostReceive)
+        )
+    } else {
+        io::Error::from_raw_os_error(errno.abs())
+    };
+    Error::PostReceive { posted, source }
 }
 
 /// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
@@ -2073,22 +2140,46 @@ impl QueuePairAttribute {
         self
     }
 
-    /// Set the destination queue-pair number (24 bits; RC/UC only).
+    /// Set the destination queue-pair number (RC/UC only).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dest_qp_num > 0xFF_FFFF` (the field is 24 bits).
     pub fn set_dest_qp_num(&mut self, dest_qp_num: u32) -> &mut Self {
+        assert!(
+            dest_qp_num <= MAX_24_BITS,
+            "a queue pair number is 24 bits, got {dest_qp_num:#x}"
+        );
         self.attr.dest_qp_num = dest_qp_num;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN;
         self
     }
 
-    /// Set the receive-queue packet sequence number (24 bits).
+    /// Set the receive-queue packet sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rq_psn > 0xFF_FFFF` (the field is 24 bits).
     pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
+        assert!(
+            rq_psn <= MAX_24_BITS,
+            "a packet sequence number is 24 bits, got {rq_psn:#x}"
+        );
         self.attr.rq_psn = rq_psn;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN;
         self
     }
 
-    /// Set the send-queue packet sequence number (24 bits).
+    /// Set the send-queue packet sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `sq_psn > 0xFF_FFFF` (the field is 24 bits).
     pub fn set_sq_psn(&mut self, sq_psn: u32) -> &mut Self {
+        assert!(
+            sq_psn <= MAX_24_BITS,
+            "a packet sequence number is 24 bits, got {sq_psn:#x}"
+        );
         self.attr.sq_psn = sq_psn;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
         self
@@ -2449,6 +2540,12 @@ impl<T: Transport> QueuePair<T> {
         unsafe { (*self.qp).qp_num }
     }
 
+    /// Whether this queue pair receives through a shared receive queue.
+    #[cfg(feature = "rdmacm")]
+    pub(crate) fn uses_srq(&self) -> bool {
+        self._srq.is_some()
+    }
+
     /// Returns the underlying `ibv_qp` pointer.
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. The send path uses the
@@ -2601,14 +2698,15 @@ impl<T: Transport> QueuePair<T> {
     /// Each referenced memory region must stay valid until a work completion has been polled for the
     /// corresponding `wr_id`, or until the queue pair has been reset or destroyed (which discards
     /// its outstanding receives). After an `Err`, the requests ahead of the one that failed were
-    /// posted, so the same holds for theirs.
+    /// posted (the error's `posted` counts them), so the same holds for theirs.
     ///
     /// # Errors
     ///
     ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
     ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
     ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
-    ///    of resources).
+    ///    of resources). Its `posted` counts the requests at the front of `recvs` that were posted
+    ///    before the one that failed, so the rest can be posted again once there is room.
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
@@ -2619,7 +2717,7 @@ impl<T: Transport> QueuePair<T> {
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
         let errno = unsafe { ffi::ibv_post_recv(self.qp, head, &mut bad_wr) };
         if errno != 0 {
-            Err(post_recv_error(errno, self._srq.is_some()))
+            Err(post_recv_error(errno, recvs, bad_wr, self._srq.is_some()))
         } else {
             Ok(())
         }
@@ -2769,6 +2867,34 @@ mod test_recv_link {
 
         let mut one = [RecvRequest::new(4, &sges)];
         assert_eq!(walk(RecvRequest::link(&mut one)), [4]);
+    }
+
+    #[test]
+    fn a_failed_post_counts_the_requests_ahead_of_bad_wr() {
+        let sges = [LocalMemorySlice::default()];
+        let mut recvs = [
+            RecvRequest::new(1, &sges),
+            RecvRequest::new(2, &sges),
+            RecvRequest::new(3, &sges),
+        ];
+        let head = RecvRequest::link(&mut recvs);
+        let posted = |bad_wr| match post_recv_error(nix::libc::ENOMEM, &recvs, bad_wr, false) {
+            Error::PostReceive { posted, source } => {
+                assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM));
+                posted
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(posted(head), 0);
+        assert_eq!(posted(unsafe { (*head).next }), 1);
+        assert_eq!(posted(unsafe { (*(*head).next).next }), 2);
+        // A provider that refuses the batch up front without naming a request posted none.
+        assert_eq!(posted(ptr::null()), 0);
+        // Not even an unsupported errno loses the count.
+        assert!(matches!(
+            post_recv_error(nix::libc::EOPNOTSUPP, &recvs, head, false),
+            Error::PostReceive { posted: 0, .. }
+        ));
     }
 
     #[repr(C)]
@@ -2954,6 +3080,24 @@ mod test_conversions {
         ));
         assert_eq!(attr.state(), QueuePairState::Init);
         assert_eq!(attr.access_flags(), AccessFlags::LOCAL_WRITE);
+    }
+
+    #[test]
+    fn sequence_and_queue_pair_number_setters_refuse_more_than_24_bits() {
+        let mut attr = QueuePairAttribute::new();
+        attr.set_sq_psn(0xFF_FFFF)
+            .set_rq_psn(0xFF_FFFF)
+            .set_dest_qp_num(0xFF_FFFF);
+        for set in [
+            QueuePairAttribute::set_sq_psn,
+            QueuePairAttribute::set_rq_psn,
+            QueuePairAttribute::set_dest_qp_num,
+        ] {
+            let wide = std::panic::catch_unwind(|| {
+                set(&mut QueuePairAttribute::new(), 0x100_0000);
+            });
+            assert!(wide.is_err());
+        }
     }
 }
 

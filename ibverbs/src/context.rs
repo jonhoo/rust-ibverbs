@@ -273,9 +273,11 @@ impl Context {
     ///
     /// Not every entry routes. On RoCE over plain Ethernet, peers answer on the RoCE v2 entry that
     /// holds the interface's IP address, and for an IPv4 network that is the IPv4-mapped one
-    /// (`::ffff:a.b.c.d`); this prefers such an entry and otherwise falls back to the port's first
-    /// entry (on InfiniBand, the port GID at index 0, where any entry routes). Pass the entry's
-    /// [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
+    /// (`::ffff:a.b.c.d`). This prefers such an entry, then any other RoCE v2 entry (an IPv6
+    /// address, or the link-local one), and otherwise falls back to the port's first entry: on
+    /// InfiniBand the port GID at index 0, where any entry routes, and on RoCE a RoCE v1 entry,
+    /// which reaches only peers on the same Ethernet segment that still speak RoCE v1. Pass the
+    /// entry's [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
     /// [`gid`](GidEntry::gid) to the peer or to [`AddressHandleAttribute::set_grh`]. Choose
     /// differently from [`gid_table`](Self::gid_table) when the network needs another entry.
     ///
@@ -285,35 +287,36 @@ impl Context {
     ///
     /// [`AddressHandleAttribute::set_grh`]: crate::AddressHandleAttribute::set_grh
     pub fn routable_gid(&self, port_num: u8) -> Result<Option<GidEntry>> {
-        let table = self.gid_table()?;
-        let on_port = |entry: &&GidEntry| entry.port_num == port_num;
-        let entry = table
-            .iter()
-            .filter(on_port)
-            .find(|entry| entry.gid_type == GidType::RoceV2 && entry.gid.is_ipv4_mapped())
-            .or_else(|| table.iter().find(on_port));
-        Ok(entry.cloned())
+        Ok(routable_entry(&self.gid_table()?, port_num).cloned())
     }
 
     /// Query a single entry of a port's GID table (`ibv_query_gid`).
     ///
     /// Ports are numbered from 1. For the full table at once (with the GID type and associated net
-    /// device of each entry), use [`gid_table`](Self::gid_table).
+    /// device of each entry), use [`gid_table`](Self::gid_table), which lists only the entries
+    /// that hold a GID.
     ///
     /// # Errors
     ///
     ///  - [`QueryGid`](Error::QueryGid): `ibv_query_gid` failed (`EINVAL` for an invalid
-    ///    `port_num` or `gid_index`).
+    ///    `port_num` or `gid_index`), or the entry is empty (`ENODATA`).
     pub fn query_gid(&self, port_num: u8, gid_index: u32) -> Result<Gid> {
         let mut gid = ffi::ibv_gid::default();
         let rc =
             unsafe { ffi::ibv_query_gid(self.inner.ctx, port_num, gid_index as i32, &mut gid) };
-        check(rc, |e| Error::QueryGid {
+        let error = |source| Error::QueryGid {
             port_num,
             gid_index,
-            source: e,
-        })?;
-        Ok(gid.into())
+            source,
+        };
+        check(rc, error)?;
+        let gid = Gid::from(gid);
+        // `ibv_query_gid` reports an empty entry as the all-zero GID `::`, which is not a GID any
+        // port holds; `ibv_query_gid_ex` reports it as `ENODATA`, and so does this.
+        if gid == Gid::default() {
+            return Err(error(io::Error::from_raw_os_error(nix::libc::ENODATA)));
+        }
+        Ok(gid)
     }
 
     /// The number of completion vectors the device supports: the exclusive upper bound for
@@ -369,7 +372,9 @@ impl Context {
             ffi::ibv_query_device_ex(self.inner.ctx, std::ptr::null(), &mut device_attr as *mut _)
         };
         if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
+            return Err(
+                Error::errno(errno, Error::QueryDevice).for_operation(&"ibv_query_device_ex")
+            );
         }
         Ok(DeviceAttrEx(device_attr))
     }
@@ -443,6 +448,17 @@ impl Context {
                 .wrapping_add(values.raw_clock.tv_nsec as u64),
         ))
     }
+}
+
+/// The entry of `table` that [`Context::routable_gid`] picks for `port_num`.
+fn routable_entry(table: &[GidEntry], port_num: u8) -> Option<&GidEntry> {
+    let on_port = || table.iter().filter(move |entry| entry.port_num == port_num);
+    let roce_v2 = |entry: &&GidEntry| entry.gid_type == GidType::RoceV2;
+    on_port()
+        .filter(roce_v2)
+        .find(|entry| entry.gid.is_ipv4_mapped())
+        .or_else(|| on_port().find(roce_v2))
+        .or_else(|| on_port().next())
 }
 
 /// [`Context::query_device`] for any open context.
@@ -656,6 +672,13 @@ impl std::fmt::Display for AsyncEventType {
 /// [`ticks`](Self::ticks)) to time using the device's clock frequency,
 /// [`DeviceAttrEx::hca_core_clock_khz`].
 ///
+/// The clock wraps around: past `u64::MAX`, or on a device whose clock is narrower, past its
+/// [`DeviceAttrEx::completion_timestamp_mask`] (ionic's counts at most 48 bits). Subtraction
+/// wraps too, so a later reading minus an earlier one counts the ticks between them across a
+/// wrap; on a narrower clock, mask the difference with the device's mask:
+/// `(later - earlier) & mask`. Readings more than one wrap apart cannot be told apart, and a wrap
+/// between two readings reverses how they compare.
+///
 /// [`Sub`]: std::ops::Sub
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HcaClock(pub(crate) u64);
@@ -670,9 +693,10 @@ impl HcaClock {
 impl std::ops::Sub for HcaClock {
     type Output = u64;
 
-    /// The number of ticks from `rhs` to `self`.
+    /// The number of ticks from `rhs` to `self`, wrapping around as the clock does (see
+    /// [`HcaClock`]).
     fn sub(self, rhs: HcaClock) -> u64 {
-        self.0 - rhs.0
+        self.0.wrapping_sub(rhs.0)
     }
 }
 
@@ -1311,6 +1335,47 @@ mod test_display {
         ] {
             assert_eq!(AsyncEventType::from(raw), wrapper);
         }
+    }
+
+    #[test]
+    fn routable_entry_prefers_roce_v2() {
+        let entry = |gid_index, port_num, gid: &str, gid_type| GidEntry {
+            gid: Gid::from(gid.parse::<std::net::Ipv6Addr>().unwrap()),
+            gid_index,
+            port_num,
+            gid_type,
+            ndev_ifindex: 0,
+        };
+        let routable = |table: &[GidEntry]| routable_entry(table, 1).map(|e| e.gid_index);
+        // What a RoCE port with an IPv4 and an IPv6 address lists, plus another port's entry.
+        let mut table = vec![
+            entry(0, 2, "::ffff:192.0.2.2", GidType::RoceV2),
+            entry(0, 1, "fe80::1", GidType::RoceV1),
+            entry(1, 1, "fe80::1", GidType::RoceV2),
+            entry(2, 1, "2001:db8::1", GidType::RoceV1),
+            entry(3, 1, "2001:db8::1", GidType::RoceV2),
+            entry(4, 1, "::ffff:192.0.2.1", GidType::RoceV1),
+            entry(5, 1, "::ffff:192.0.2.1", GidType::RoceV2),
+        ];
+        assert_eq!(routable(&table), Some(5));
+        // Without an IPv4 address, any RoCE v2 entry rather than the RoCE v1 one at index 0.
+        table.truncate(5);
+        assert_eq!(routable(&table), Some(1));
+        let ib = [
+            entry(0, 1, "fe80::2", GidType::Ib),
+            entry(1, 1, "fe80::3", GidType::Ib),
+        ];
+        assert_eq!(routable(&ib), Some(0));
+        assert_eq!(routable(&table[..1]), None);
+    }
+
+    #[test]
+    fn clock_differences_wrap() {
+        assert_eq!(HcaClock(10) - HcaClock(4), 6);
+        assert_eq!(HcaClock(2) - HcaClock(u64::MAX), 3);
+        // A 48-bit clock (ionic's widest) that wrapped between the two readings.
+        let mask = (1 << 48) - 1;
+        assert_eq!((HcaClock(1) - HcaClock(mask - 1)) & mask, 3);
     }
 
     #[test]
