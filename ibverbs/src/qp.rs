@@ -656,10 +656,17 @@ impl<T: Transport> QueuePairBuilder<T> {
 
     /// Set the service level of the new `QueuePair`.
     ///
-    /// The service level (0–15); higher values mean higher priority.
+    /// The service level (0–15) selects the virtual lane on InfiniBand, through the subnet
+    /// manager's SL-to-VL mapping; on RoCE, its low 3 bits become the packets' 802.1p priority.
     ///
     /// Defaults to 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `service_level` is above 15: the field is 4 bits wide, and providers would
+    /// silently drop the extra bits.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
+        assert!(service_level <= 15, "the service level is a 4-bit value");
         self.service_level = service_level;
         self
     }
