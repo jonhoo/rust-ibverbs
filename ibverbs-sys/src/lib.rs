@@ -378,10 +378,30 @@ macro_rules! verbs_get_ctx_op {
     }};
 }
 
-// The errno values the shims report or recognize, as on Linux, the only platform rdma-core targets.
+// The errno values the shims report or recognize: Linux's, the only platform rdma-core targets,
+// which numbers `ENOSYS` and `EOPNOTSUPP` differently on mips and sparc.
+const MIPS: bool = cfg!(any(
+    target_arch = "mips",
+    target_arch = "mips32r6",
+    target_arch = "mips64",
+    target_arch = "mips64r6"
+));
+const SPARC: bool = cfg!(any(target_arch = "sparc", target_arch = "sparc64"));
 const EINVAL: ::std::os::raw::c_int = 22;
-const ENOSYS: ::std::os::raw::c_int = 38;
-const EOPNOTSUPP: ::std::os::raw::c_int = 95;
+const ENOSYS: ::std::os::raw::c_int = if MIPS {
+    89
+} else if SPARC {
+    90
+} else {
+    38
+};
+const EOPNOTSUPP: ::std::os::raw::c_int = if MIPS {
+    122
+} else if SPARC {
+    45
+} else {
+    95
+};
 
 /// Query a port's attributes, including the extended fields (rdma-core's `___ibv_query_port`,
 /// which the `ibv_query_port` macro resolves to in C).
