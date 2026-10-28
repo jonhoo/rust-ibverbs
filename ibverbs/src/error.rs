@@ -195,9 +195,17 @@ pub enum Error {
     #[error("failed to post a send work request")]
     PostSend(#[source] io::Error),
 
-    /// Posting a receive work request failed.
-    #[error("failed to post a receive work request")]
-    PostReceive(#[source] io::Error),
+    /// Posting a batch of receive work requests failed (`ibv_post_recv` / `ibv_post_srq_recv`)
+    /// at one of its requests; the ones ahead of it were posted.
+    #[error("failed to post a receive work request after posting {posted} of the batch")]
+    PostReceive {
+        /// How many requests at the front of the batch were posted before the one that failed:
+        /// they are on the queue like any other posted receive, so their buffers are in use.
+        posted: u32,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
 
     /// Polling a completion queue failed.
     #[error("failed to poll the completion queue")]
@@ -307,7 +315,7 @@ impl Error {
             Error::ModifySharedReceiveQueue(_) => &"ibv_modify_srq",
             Error::QuerySharedReceiveQueue(_) => &"ibv_query_srq",
             Error::PostSend(_) => &"ibv_wr_complete",
-            Error::PostReceive(_) => &"ibv_post_recv",
+            Error::PostReceive { .. } => &"ibv_post_recv",
             Error::PollCompletionQueue(_) => &"completion-queue polling",
             Error::AsyncEvent(_) => &"ibv_get_async_event",
             Error::MalformedWireFormat => &"wire-format decoding",

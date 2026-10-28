@@ -1206,6 +1206,42 @@ fn split_queue_pair_across_threads() {
     assert_eq!(recv.bytes(), send.bytes());
 }
 
+/// A receive batch longer than the queue's room fails at the first request that does not fit, and
+/// the error counts the ones posted ahead of it, on a queue pair's receive queue and on a shared
+/// receive queue alike.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn post_recv_reports_how_many_were_posted() {
+    let mut lb = loopback();
+    let srq = lb.pd.create_srq(4, 1, 0).expect("failed to create SRQ");
+    let recv = mr(&lb.pd, 8);
+    let sges = [recv.slice(..8)];
+    let overflow = |room: u32| -> Vec<RecvRequest<'_>> {
+        (0..u64::from(room) + 3)
+            .map(|i| RecvRequest::new(i, &sges))
+            .collect()
+    };
+    let expect_room = |result: Result<(), Error>, room: u32| match result {
+        Err(Error::PostReceive { posted, source }) => {
+            assert_eq!(posted, room, "{source}");
+            assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM), "{source}");
+        }
+        other => panic!("expected the batch to overflow the queue, got {other:?}"),
+    };
+
+    let (_, caps) = lb
+        .qp
+        .query(QueuePairAttributeMask::empty())
+        .expect("failed to query queue pair");
+    let room = caps.max_recv_wr;
+    expect_room(unsafe { lb.qp.post_recv(overflow(room)) }, room);
+    let room = srq.query().expect("failed to query SRQ").max_wr;
+    expect_room(unsafe { srq.post_recv(overflow(room)) }, room);
+
+    // Destroy the queues, discarding the posted receives, before the buffer they point at.
+    drop((lb, srq));
+}
+
 /// Batched receive: two receives posted in one `post_recv` (caller-owned array) catch two sends, in
 /// order, on the same RC queue pair.
 #[test]

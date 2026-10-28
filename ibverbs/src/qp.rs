@@ -1941,22 +1941,44 @@ impl SendOp<'_, '_, Ud> {
     }
 }
 
-/// The error for a failed `ibv_post_recv` on a queue pair, kept out of line. A queue pair that
-/// receives through a shared receive queue has no receive queue of its own, and the providers
-/// refuse posts to it with errnos that point elsewhere (mlx5 reports a full queue, hns
-/// `EOPNOTSUPP`, rxe `EINVAL`), so name the mistake instead. ionic returns its errnos negated
-/// (`-EAGAIN` when the device still owns the slot, so posting again soon succeeds); the others
-/// return them as they are.
+/// The error for a failed `ibv_post_recv` or `ibv_post_srq_recv` of `recvs`, kept out of line.
+///
+/// `bad_wr` is the first request the provider refused, so its index in `recvs` counts the ones it
+/// posted; rxe refuses a whole batch up front (on a queue pair in `RESET`, say) without setting
+/// it, and a null `bad_wr` counts none. The errno is not promoted to
+/// [`Unsupported`](Error::Unsupported), which would lose that count.
+///
+/// A queue pair that receives through a shared receive queue has no receive queue of its own,
+/// and the providers refuse posts to it with errnos that point elsewhere (mlx5 reports a full
+/// queue, hns `EOPNOTSUPP`, rxe `EINVAL`), so name the mistake instead. ionic returns its errnos
+/// negated (`-EAGAIN` when the device still owns the slot, so posting again soon succeeds); the
+/// others return them as they are.
 #[cold]
 #[inline(never)]
-fn post_recv_error(errno: i32, srq_attached: bool) -> Error {
-    if srq_attached {
-        return Error::PostReceive(io::Error::new(
+pub(crate) fn post_recv_error(
+    errno: i32,
+    recvs: &[RecvRequest<'_>],
+    bad_wr: *const ffi::ibv_recv_wr,
+    srq_attached: bool,
+) -> Error {
+    // A null `bad_wr` lands past the end. Plain address arithmetic, since a provider's pointer is
+    // only compared, never followed.
+    let index = (bad_wr as usize).wrapping_sub(recvs.as_ptr() as usize)
+        / std::mem::size_of::<RecvRequest<'_>>();
+    let posted = if index < recvs.len() {
+        u32::try_from(index).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    let source = if srq_attached {
+        io::Error::new(
             io::ErrorKind::InvalidInput,
             "this queue pair receives through its shared receive queue; post receives there",
-        ));
-    }
-    Error::errno(errno.abs(), Error::PostReceive)
+        )
+    } else {
+        io::Error::from_raw_os_error(errno.abs())
+    };
+    Error::PostReceive { posted, source }
 }
 
 /// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
@@ -2670,14 +2692,15 @@ impl<T: Transport> QueuePair<T> {
     /// Each referenced memory region must stay valid until a work completion has been polled for the
     /// corresponding `wr_id`, or until the queue pair has been reset or destroyed (which discards
     /// its outstanding receives). After an `Err`, the requests ahead of the one that failed were
-    /// posted, so the same holds for theirs.
+    /// posted (the error's `posted` counts them), so the same holds for theirs.
     ///
     /// # Errors
     ///
     ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
     ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
     ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
-    ///    of resources).
+    ///    of resources). Its `posted` counts the requests at the front of `recvs` that were posted
+    ///    before the one that failed, so the rest can be posted again once there is room.
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
@@ -2688,7 +2711,7 @@ impl<T: Transport> QueuePair<T> {
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
         let errno = unsafe { ffi::ibv_post_recv(self.qp, head, &mut bad_wr) };
         if errno != 0 {
-            Err(post_recv_error(errno, self._srq.is_some()))
+            Err(post_recv_error(errno, recvs, bad_wr, self._srq.is_some()))
         } else {
             Ok(())
         }
@@ -2838,6 +2861,34 @@ mod test_recv_link {
 
         let mut one = [RecvRequest::new(4, &sges)];
         assert_eq!(walk(RecvRequest::link(&mut one)), [4]);
+    }
+
+    #[test]
+    fn a_failed_post_counts_the_requests_ahead_of_bad_wr() {
+        let sges = [LocalMemorySlice::default()];
+        let mut recvs = [
+            RecvRequest::new(1, &sges),
+            RecvRequest::new(2, &sges),
+            RecvRequest::new(3, &sges),
+        ];
+        let head = RecvRequest::link(&mut recvs);
+        let posted = |bad_wr| match post_recv_error(nix::libc::ENOMEM, &recvs, bad_wr, false) {
+            Error::PostReceive { posted, source } => {
+                assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM));
+                posted
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(posted(head), 0);
+        assert_eq!(posted(unsafe { (*head).next }), 1);
+        assert_eq!(posted(unsafe { (*(*head).next).next }), 2);
+        // A provider that refuses the batch up front without naming a request posted none.
+        assert_eq!(posted(ptr::null()), 0);
+        // Not even an unsupported errno loses the count.
+        assert!(matches!(
+            post_recv_error(nix::libc::EOPNOTSUPP, &recvs, head, false),
+            Error::PostReceive { posted: 0, .. }
+        ));
     }
 
     #[repr(C)]

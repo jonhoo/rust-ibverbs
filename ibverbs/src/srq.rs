@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
-use crate::qp::RecvRequest;
+use crate::qp::{RecvRequest, post_recv_error};
 
 struct SharedReceiveQueueInner {
     _pd: ProtectionDomain,
@@ -154,13 +154,16 @@ impl SharedReceiveQueue {
     /// Each referenced memory region must stay valid until a work completion has been polled for
     /// the corresponding `wr_id` (i.e., until `CompletionQueue::poll` returns a completion for
     /// that receive), or until the shared receive queue is destroyed. After an `Err`, the requests
-    /// ahead of the one that failed were posted, so the same holds for theirs.
+    /// ahead of the one that failed were posted (the error's `posted` counts them), so the same
+    /// holds for theirs.
     ///
     /// # Errors
     ///
     ///  - [`PostReceive`](Error::PostReceive): `ibv_post_srq_recv` failed (`EINVAL` for an invalid
     ///    value in one of the work requests, `ENOMEM` when the SRQ is full or out of resources,
-    ///    `EFAULT` for an invalid `SharedReceiveQueue`).
+    ///    `EFAULT` for an invalid `SharedReceiveQueue`). Its `posted` counts the requests at the
+    ///    front of `recvs` that were posted before the one that failed, so the rest can be posted
+    ///    again once there is room.
     ///
     /// [1]: https://www.rdmamojo.com/2013/02/08/ibv_post_srq_recv/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_post_srq_recv.3.html
@@ -174,7 +177,7 @@ impl SharedReceiveQueue {
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
         let errno = unsafe { ffi::ibv_post_srq_recv(self.srq, head, &mut bad_wr) };
         if errno != 0 {
-            Err(Error::errno(errno, Error::PostReceive))
+            Err(post_recv_error(errno, recvs, bad_wr, false))
         } else {
             Ok(())
         }
