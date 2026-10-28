@@ -226,11 +226,11 @@ impl Default for ibv_wc {
     }
 }
 
-// `ibv_create_cq_ex` and `ibv_create_qp_ex` are `static inline` in verbs.h: they reach the provider
-// through the op table embedded in `verbs_context`, so there is no exported symbol for bindgen to
-// bind. The functions below reimplement that dispatch (the `verbs_get_ctx` container_of and the
-// `verbs_get_ctx_op` availability check) so the crate can create extended queue pairs and
-// completion queues.
+// `___ibv_query_port`, `ibv_create_cq_ex`, `ibv_create_qp_ex`, `ibv_advise_mr`,
+// `ibv_query_rt_values_ex`, and `ibv_query_device_ex` are `static inline` in verbs.h: they reach
+// the provider through the op table embedded in `verbs_context`, so there is no exported symbol
+// for bindgen to bind. The functions below reimplement that dispatch (`verbs_get_ctx_op`'s
+// availability check and op lookup).
 
 /// The provider's implementation of the extended op `$op` on `$context`, or `None` when the
 /// provider leaves it out or its `verbs_context` predates it (rdma-core's `verbs_get_ctx_op`).

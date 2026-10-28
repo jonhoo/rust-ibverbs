@@ -1549,7 +1549,9 @@ pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
     max_inline_data: u32,
     max_send_sge: u32,
-    _qp: std::marker::PhantomData<&'qp mut QueuePair<T>>,
+    // Opened through a shared borrow (`QueuePair::open_batch`); what keeps a second batch out is
+    // that every caller holds the send queue exclusively.
+    _qp: std::marker::PhantomData<&'qp QueuePair<T>>,
 }
 
 impl<'qp, T: Connected> SendBatch<'qp, T> {
