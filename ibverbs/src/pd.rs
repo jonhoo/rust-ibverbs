@@ -230,8 +230,8 @@ impl ProtectionDomain {
     ///
     /// `port_num` is the device port this queue pair uses; ports are numbered from 1.
     ///
-    /// Note that both this protection domain, *and* both provided completion queues, must outlive
-    /// the resulting `QueuePair`.
+    /// The queue pair keeps this protection domain and both completion queues alive for as long as
+    /// it exists.
     ///
     /// # Errors
     ///
@@ -246,13 +246,8 @@ impl ProtectionDomain {
         recv: &CompletionQueue,
         port_num: u8,
     ) -> Result<QueuePairBuilder<T>> {
-        // TODO: from http://www.rdmamojo.com/2012/07/21/ibv_query_port/
-        //
-        //   Most of the port attributes, returned by ibv_query_port(), aren't constant and may be
-        //   changed, mainly by the SM (in InfiniBand), or by the Hardware. It is highly
-        //   recommended avoiding saving the result of this query, or to flush them when a new SM
-        //   (re)configures the subnet.
-        //
+        // Port attributes change (the subnet manager reassigns LIDs, for one), so they are read
+        // when each builder is created; `PreparedQueuePair::endpoint` documents the stale-LID case.
         let port_attr = self.context().query_port(port_num)?;
         require_active(port_num, &port_attr)?;
         // Only reliable connections carry RDMA read and atomic limits.
