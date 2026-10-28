@@ -101,8 +101,6 @@ pub enum PortSpace {
     Udp,
     /// The InfiniBand port space, for any port number.
     Ib,
-    /// A value this version of the crate does not know.
-    Unknown(u32),
 }
 
 impl From<PortSpace> for ffi::rdma_port_space {
@@ -113,7 +111,6 @@ impl From<PortSpace> for ffi::rdma_port_space {
             PortSpace::Tcp => E::RDMA_PS_TCP,
             PortSpace::Udp => E::RDMA_PS_UDP,
             PortSpace::Ib => E::RDMA_PS_IB,
-            PortSpace::Unknown(raw) => ffi::rdma_port_space(raw),
         }
     }
 }
@@ -210,7 +207,6 @@ impl std::fmt::Display for PortSpace {
             PortSpace::Tcp => "TCP",
             PortSpace::Udp => "UDP",
             PortSpace::Ib => "IB",
-            PortSpace::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(name)
     }
