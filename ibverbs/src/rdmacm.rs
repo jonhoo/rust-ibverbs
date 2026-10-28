@@ -334,7 +334,10 @@ fn require_connected_port_space(port_space: PortSpace, helper: &str) -> Result<(
     }
 }
 
-/// Whether a connection-manager event reports a failure that aborts setup.
+/// Whether a connection-manager event reports a failure that aborts setup: an error, or the end of
+/// the connection being set up. The passive side sees the peer's disconnect before the
+/// establishment when the peer's ready-to-use message was lost, and nothing follows a disconnect
+/// but the timewait exit.
 fn is_failure(event: CmEventType) -> bool {
     matches!(
         event,
@@ -344,6 +347,8 @@ fn is_failure(event: CmEventType) -> bool {
             | CmEventType::Unreachable
             | CmEventType::Rejected
             | CmEventType::DeviceRemoval
+            | CmEventType::Disconnected
+            | CmEventType::TimewaitExit
     )
 }
 
@@ -1556,7 +1561,8 @@ impl Incoming {
     ///  - [`Accept`](Error::Accept): `rdma_accept` failed, or the private data does not fit a
     ///    reply (see [`ConnectionParameter::set_private_data`]).
     ///  - [`ConnectionManager`](Error::ConnectionManager): the peer gave up after this side
-    ///    replied, before the connection was established.
+    ///    replied, before the connection was established, or disconnected before this side saw
+    ///    it established (its ready-to-use message was lost).
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
     ///    is not on the device of [`context`](Self::context).
     ///  - [`TimedOut`](Error::TimedOut): the connection was not established in time.
@@ -1757,6 +1763,9 @@ mod test_conversions {
     fn failure_events_are_failures() {
         assert!(is_failure(CmEventType::Rejected));
         assert!(is_failure(CmEventType::AddressError));
+        // A peer that disconnects while this side still waits for the establishment.
+        assert!(is_failure(CmEventType::Disconnected));
+        assert!(is_failure(CmEventType::TimewaitExit));
         assert!(!is_failure(CmEventType::Established));
         assert!(!is_failure(CmEventType::ConnectRequest));
     }
