@@ -1159,7 +1159,8 @@ impl DeviceAttrEx {
     }
 
     /// The device's PCI atomic capabilities. Each field (`fetch_add`, `swap`, `compare_swap`) is a
-    /// bitmask of the operand sizes, in bytes, the device can operate on atomically across PCIe.
+    /// bitmask of the operand sizes the device can operate on atomically across PCIe, as
+    /// `IBV_PCI_ATOMIC_OPERATION_{4,8,16}_BYTE_SIZE_SUP` bits (1, 2, and 4), not byte counts.
     pub fn pci_atomic_caps(&self) -> ffi::ibv_pci_atomic_caps {
         self.0.pci_atomic_caps
     }
