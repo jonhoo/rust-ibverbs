@@ -369,10 +369,29 @@ pub unsafe fn ibv_create_cq_ex(
     }
 }
 
+// `ibv_create_qp_ex` hands an `ibv_qp_init_attr_ex` to `ibv_create_qp` as the
+// `ibv_qp_init_attr` it begins with, as the C inline does.
+const _: () = {
+    use ::std::mem::offset_of;
+    assert!(
+        offset_of!(ibv_qp_init_attr_ex, qp_context) == offset_of!(ibv_qp_init_attr, qp_context)
+    );
+    assert!(offset_of!(ibv_qp_init_attr_ex, send_cq) == offset_of!(ibv_qp_init_attr, send_cq));
+    assert!(offset_of!(ibv_qp_init_attr_ex, recv_cq) == offset_of!(ibv_qp_init_attr, recv_cq));
+    assert!(offset_of!(ibv_qp_init_attr_ex, srq) == offset_of!(ibv_qp_init_attr, srq));
+    assert!(offset_of!(ibv_qp_init_attr_ex, cap) == offset_of!(ibv_qp_init_attr, cap));
+    assert!(offset_of!(ibv_qp_init_attr_ex, qp_type) == offset_of!(ibv_qp_init_attr, qp_type));
+    assert!(
+        offset_of!(ibv_qp_init_attr_ex, sq_sig_all) == offset_of!(ibv_qp_init_attr, sq_sig_all)
+    );
+};
+
 /// Create an extended queue pair (`ibv_create_qp_ex`).
 ///
-/// Returns null with `errno` set to `EOPNOTSUPP` if the provider does not implement the extended
-/// verb (matching the C inline).
+/// Like the C inline, this creates a queue pair whose attributes extend the legacy ones by
+/// nothing but the protection domain (`comp_mask` is exactly `IBV_QP_INIT_ATTR_PD`) with the
+/// legacy `ibv_create_qp`, and otherwise returns null with `errno` set to `EOPNOTSUPP` if the
+/// provider does not implement the extended verb.
 ///
 /// # Safety
 ///
@@ -383,6 +402,9 @@ pub unsafe fn ibv_create_qp_ex(
     qp_attr: *mut ibv_qp_init_attr_ex,
 ) -> *mut ibv_qp {
     unsafe {
+        if (*qp_attr).comp_mask == ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0 {
+            return ibv_create_qp((*qp_attr).pd, qp_attr.cast::<ibv_qp_init_attr>());
+        }
         match verbs_get_ctx_op!(context, create_qp_ex) {
             Some(create_qp_ex) => create_qp_ex(context, qp_attr),
             None => {

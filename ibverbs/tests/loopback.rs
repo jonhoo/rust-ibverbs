@@ -1360,6 +1360,43 @@ fn query_device_and_port() {
     let _ = port.phys_state();
 }
 
+/// The `ibv_create_qp_ex` shim creates a queue pair whose attributes go no further than a
+/// protection domain through the legacy `ibv_create_qp`, as the C inline does.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn create_qp_ex_with_only_a_protection_domain() {
+    use ibverbs::ffi;
+
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let mut attr = ffi::ibv_qp_init_attr_ex {
+        send_cq: cq.as_raw(),
+        recv_cq: cq.as_raw(),
+        cap: ffi::ibv_qp_cap {
+            max_send_wr: 1,
+            max_recv_wr: 1,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 0,
+        },
+        qp_type: ffi::ibv_qp_type::IBV_QPT_RC,
+        comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0,
+        pd: pd.as_raw(),
+        ..Default::default()
+    };
+    let qp = unsafe { ffi::ibv_create_qp_ex(ctx.as_raw(), &mut attr) };
+    assert!(
+        !qp.is_null(),
+        "ibv_create_qp_ex: {}",
+        std::io::Error::last_os_error()
+    );
+    unsafe {
+        assert_eq!((*qp).pd, pd.as_raw());
+        assert_eq!(ffi::ibv_destroy_qp(qp), 0);
+    }
+}
+
 /// The raw-handle escape hatches return the live, non-null FFI pointers for each resource.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
