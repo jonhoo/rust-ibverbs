@@ -154,6 +154,13 @@
 //! through the escape hatches still reference the resource — the drop panics rather than silently
 //! leak the resource. The resource then stays allocated, and so do the ones it was created on.
 //!
+//! # Forking
+//!
+//! Since Linux 5.13, registered memory stays intact across `fork()` without `ibv_fork_init`. A
+//! forked child shares the parent's device handles, though, and its drops destroy the parent's
+//! resources (the parent's own drops then fail): a child must `exec` or exit without dropping the
+//! ibverbs objects it inherited.
+//!
 //! # For the detail-oriented
 //!
 //! The control path is implemented through system calls to the `uverbs` kernel module, which
