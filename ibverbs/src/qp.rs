@@ -633,9 +633,14 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// [`handshake`] sets the local receive-queue PSN from the remote endpoint, so the two sides
     /// agree without further configuration (the datagram transports' `activate` also starts the
     /// send queue here). Applications that reuse queue pairs typically pick a random starting PSN
-    /// per connection so stale packets from an earlier connection are not mistaken for new ones.
+    /// per connection so stale packets from an earlier connection are not mistaken for new ones;
+    /// a PSN is 24 bits, so take a random `u32` modulo `1 << 24`.
     ///
     /// Defaults to 0.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `psn > 0xFF_FFFF` (the field is 24 bits).
     ///
     /// [`endpoint`]: PreparedQueuePair::endpoint
     /// [`handshake`]: PreparedQueuePair::handshake
@@ -1050,6 +1055,11 @@ struct BringUp {
     rts: QueuePairAttribute,
 }
 
+/// The largest queue pair number and packet sequence number: both are 24-bit fields, and the
+/// setters refuse wider values rather than leave the excess bits to the provider, which ionic,
+/// EFA, irdma, and mana pass on to the device with the PSNs.
+pub(crate) const MAX_24_BITS: u32 = 0xFF_FFFF;
+
 /// An identifier for the network endpoint of a `QueuePair`. Returned by
 /// [`PreparedQueuePair::endpoint`], to exchange with the peer through
 /// [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes) — small enough to ride in an
@@ -1060,14 +1070,14 @@ struct BringUp {
 /// atomics it services at once.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct QueuePairEndpoint {
-    /// the `QueuePair`'s `qp_num`
+    /// the `QueuePair`'s `qp_num` (24 bits)
     pub qp_num: u32,
     /// the port's `lid`
     pub lid: u16,
     /// the port's `gid` at the configured index, used for global routing
     pub gid: Option<Gid>,
-    /// the packet sequence number this queue pair's send queue starts at, which the peer's receive
-    /// queue must expect (see [`QueuePairBuilder::set_sq_psn`])
+    /// the packet sequence number (24 bits) this queue pair's send queue starts at, which the
+    /// peer's receive queue must expect (see [`QueuePairBuilder::set_sq_psn`])
     pub psn: u32,
     /// how many incoming RDMA reads and atomics this queue pair services at once (its responder
     /// resources, see [`QueuePairBuilder::set_max_dest_rd_atomic`]); the peer issues at most this
@@ -1104,7 +1114,7 @@ impl QueuePairEndpoint {
     /// # Errors
     ///
     ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the flags byte carries bits this
-    ///    version does not know.
+    ///    version does not know, or the queue pair number or PSN is wider than its 24 bits.
     pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
         let gid = match bytes[0] {
             0 => None,
@@ -1114,11 +1124,16 @@ impl QueuePairEndpoint {
             }
             _ => return Err(Error::MalformedWireFormat),
         };
+        let qp_num = u32::from_be_bytes(bytes[1..5].try_into().expect("slice length is fixed"));
+        let psn = u32::from_be_bytes(bytes[23..27].try_into().expect("slice length is fixed"));
+        if qp_num > MAX_24_BITS || psn > MAX_24_BITS {
+            return Err(Error::MalformedWireFormat);
+        }
         Ok(QueuePairEndpoint {
-            qp_num: u32::from_be_bytes(bytes[1..5].try_into().expect("slice length is fixed")),
+            qp_num,
             lid: u16::from_be_bytes(bytes[5..7].try_into().expect("slice length is fixed")),
             gid,
-            psn: u32::from_be_bytes(bytes[23..27].try_into().expect("slice length is fixed")),
+            psn,
             max_dest_rd_atomic: bytes[27],
         })
     }
@@ -1239,8 +1254,19 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
     ///    path MTU is not a valid MTU encoding, as when the port reported no active MTU to default
     ///    to and none was set with [`QueuePairBuilder::set_path_mtu`]; or `remote` carries a GID
-    ///    and the builder's GID index is above 255, more than an address vector can hold.
+    ///    and the builder's GID index is above 255, more than an address vector can hold; or
+    ///    `remote`'s queue pair number or PSN is wider than 24 bits (which
+    ///    [`from_bytes`](QueuePairEndpoint::from_bytes) refuses, but its fields are public).
     pub fn rtr_attributes(&self, remote: &QueuePairEndpoint) -> Result<QueuePairAttribute> {
+        if remote.qp_num > MAX_24_BITS || remote.psn > MAX_24_BITS {
+            return Err(Error::ModifyQueuePair(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the remote queue pair number {:#x} and PSN {:#x} must fit in 24 bits",
+                    remote.qp_num, remote.psn
+                ),
+            )));
+        }
         let mut path = AddressHandleAttribute::new(self.port_num);
         path.set_dest_lid(remote.lid)
             .set_service_level(self.service_level);
@@ -1322,7 +1348,8 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but the remote endpoint carries
     ///    no GID.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
-    ///    path MTU is not a valid MTU encoding, or the GID index to route from is above 255 (see
+    ///    path MTU is not a valid MTU encoding, the GID index to route from is above 255, or the
+    ///    remote queue pair number or PSN is wider than 24 bits (see
     ///    [`rtr_attributes`](Self::rtr_attributes)).
     ///  - The errors of [`QueuePair::modify`]: [`ModifyQueuePair`](Error::ModifyQueuePair) when
     ///    a transition fails (for example because the remote endpoint is unreachable — on RoCE,
@@ -2087,22 +2114,46 @@ impl QueuePairAttribute {
         self
     }
 
-    /// Set the destination queue-pair number (24 bits; RC/UC only).
+    /// Set the destination queue-pair number (RC/UC only).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `dest_qp_num > 0xFF_FFFF` (the field is 24 bits).
     pub fn set_dest_qp_num(&mut self, dest_qp_num: u32) -> &mut Self {
+        assert!(
+            dest_qp_num <= MAX_24_BITS,
+            "a queue pair number is 24 bits, got {dest_qp_num:#x}"
+        );
         self.attr.dest_qp_num = dest_qp_num;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_DEST_QPN;
         self
     }
 
-    /// Set the receive-queue packet sequence number (24 bits).
+    /// Set the receive-queue packet sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rq_psn > 0xFF_FFFF` (the field is 24 bits).
     pub fn set_rq_psn(&mut self, rq_psn: u32) -> &mut Self {
+        assert!(
+            rq_psn <= MAX_24_BITS,
+            "a packet sequence number is 24 bits, got {rq_psn:#x}"
+        );
         self.attr.rq_psn = rq_psn;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_RQ_PSN;
         self
     }
 
-    /// Set the send-queue packet sequence number (24 bits).
+    /// Set the send-queue packet sequence number.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `sq_psn > 0xFF_FFFF` (the field is 24 bits).
     pub fn set_sq_psn(&mut self, sq_psn: u32) -> &mut Self {
+        assert!(
+            sq_psn <= MAX_24_BITS,
+            "a packet sequence number is 24 bits, got {sq_psn:#x}"
+        );
         self.attr.sq_psn = sq_psn;
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_SQ_PSN;
         self
@@ -2968,6 +3019,24 @@ mod test_conversions {
         ));
         assert_eq!(attr.state(), QueuePairState::Init);
         assert_eq!(attr.access_flags(), AccessFlags::LOCAL_WRITE);
+    }
+
+    #[test]
+    fn sequence_and_queue_pair_number_setters_refuse_more_than_24_bits() {
+        let mut attr = QueuePairAttribute::new();
+        attr.set_sq_psn(0xFF_FFFF)
+            .set_rq_psn(0xFF_FFFF)
+            .set_dest_qp_num(0xFF_FFFF);
+        for set in [
+            QueuePairAttribute::set_sq_psn,
+            QueuePairAttribute::set_rq_psn,
+            QueuePairAttribute::set_dest_qp_num,
+        ] {
+            let wide = std::panic::catch_unwind(|| {
+                set(&mut QueuePairAttribute::new(), 0x100_0000);
+            });
+            assert!(wide.is_err());
+        }
     }
 }
 

@@ -1225,7 +1225,15 @@ impl ConnectionParameter {
     /// built and are connecting or accepting with. The blocking [`Resolved::connect`] /
     /// [`Incoming::accept`] helpers set this for you; set it yourself when driving [`CmId::connect`]
     /// or [`CmId::accept`] directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `qp_num > 0xFF_FFFF` (queue pair numbers are 24 bits).
     pub fn set_qp_num(mut self, qp_num: u32) -> Self {
+        assert!(
+            qp_num <= crate::qp::MAX_24_BITS,
+            "a queue pair number is 24 bits, got {qp_num:#x}"
+        );
         self.param.qp_num = qp_num;
         self
     }

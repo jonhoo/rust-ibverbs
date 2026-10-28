@@ -236,16 +236,17 @@ mod test_wire {
 
     #[test]
     fn endpoint_bytes_roundtrip_without_gid() {
+        // The largest 24-bit queue pair number and PSN.
         let qpe = QueuePairEndpoint {
-            qp_num: u32::MAX,
+            qp_num: 0xff_ffff,
             lid: 0xbeef,
             gid: None,
-            psn: u32::MAX - 1,
+            psn: 0xff_fffe,
             max_dest_rd_atomic: 0xab,
         };
         let encoded = qpe.to_bytes();
         assert_eq!(encoded[0], 0);
-        assert_eq!(&encoded[23..27], &[0xff, 0xff, 0xff, 0xfe]);
+        assert_eq!(&encoded[23..27], &[0x00, 0xff, 0xff, 0xfe]);
         assert_eq!(encoded[27], 0xab);
         assert_eq!(QueuePairEndpoint::from_bytes(&encoded).unwrap(), qpe);
     }
@@ -265,6 +266,27 @@ mod test_wire {
             QueuePairEndpoint::from_bytes(&encoded),
             Err(crate::Error::MalformedWireFormat)
         ));
+    }
+
+    #[test]
+    fn endpoint_bytes_rejects_more_than_24_bits() {
+        let encoded = QueuePairEndpoint {
+            qp_num: 1,
+            lid: 1,
+            gid: None,
+            psn: 0,
+            max_dest_rd_atomic: 0,
+        }
+        .to_bytes();
+        // The top byte of the big-endian queue pair number, then of the PSN.
+        for top in [1, 23] {
+            let mut wide = encoded;
+            wide[top] = 1;
+            assert!(matches!(
+                QueuePairEndpoint::from_bytes(&wide),
+                Err(crate::Error::MalformedWireFormat)
+            ));
+        }
     }
 }
 

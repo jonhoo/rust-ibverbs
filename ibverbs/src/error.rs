@@ -213,7 +213,8 @@ pub enum Error {
     /// or [`RemoteMemorySlice::from_bytes`](crate::RemoteMemorySlice::from_bytes)) failed: the
     /// bytes carry a flag or value this version does not understand. A length in a
     /// [`RemoteMemorySlice`](crate::RemoteMemorySlice) encoding that does not fit the platform's
-    /// `usize` also produces this error.
+    /// `usize` also produces this error, and so does a queue pair number or PSN wider than its 24
+    /// bits in a [`QueuePairEndpoint`](crate::QueuePairEndpoint) encoding.
     #[error("malformed wire-format encoding")]
     MalformedWireFormat,
 
