@@ -1283,7 +1283,7 @@ fn query_device_and_port() {
         port.gid_tbl_len > 0,
         "a RoCE port should expose a GID table"
     );
-    // `open_test_device` only succeeds on an active port, so the typed state reflects that, and the
+    // The data-path tests need an active port 1, so the typed state reflects that, and the
     // remaining typed accessors decode without panicking.
     assert!(matches!(port.state(), PortState::Active | PortState::Armed));
     let _ = port.active_mtu();
