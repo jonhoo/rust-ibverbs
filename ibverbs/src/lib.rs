@@ -98,9 +98,10 @@
 //! corresponding features are enabled.
 //!
 //! At build time, `bindgen` generates the bindings from the [`rdma-core`] headers vendored in
-//! `ibverbs-sys`, so building needs `libclang` but no RDMA development packages. To generate
-//! bindings from installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and
-//! `RDMA_CORE_LIB_DIR`.
+//! `ibverbs-sys`, so building needs `libclang` but not the installed headers; the development
+//! packages are still needed for the unversioned library links (`libibverbs.so` and the like)
+//! that the linker looks for. To generate bindings from installed `rdma-core` headers instead,
+//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
 //!
 //! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
 //! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a

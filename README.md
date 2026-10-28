@@ -143,9 +143,11 @@ This crate dynamically links `libibverbs`, which is part of
 Fedora), plus `librdmacm`, `libefa`, and `libmlx5` when the corresponding features are enabled.
 
 At build time, `bindgen` generates the bindings from the `rdma-core` headers vendored in the
-`ibverbs-sys` crate, so building needs `libclang` but no RDMA development packages. To use
-installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`. You do
-not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
+`ibverbs-sys` crate, so building needs `libclang` but not the installed headers; the development
+packages are still needed for the unversioned library links (`libibverbs.so` and the like) that
+the linker looks for. To use installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR`
+and `RDMA_CORE_LIB_DIR`. You do not need to depend on `ibverbs-sys` directly: it is re-exported
+as `ibverbs::ffi`.
 `RDMA_CORE_LIB_DIR` also works alone when using vendored headers. The `mlx5` feature
 requires libraries exporting both Data Direct functions; newer headers do not upgrade
 older system libraries. Set the runtime library search path as well when linking a
