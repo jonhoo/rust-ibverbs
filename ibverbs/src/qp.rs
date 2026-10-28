@@ -1531,6 +1531,17 @@ impl<'a> RecvRequest<'a> {
 /// op.send(1, sges);
 /// # }
 /// ```
+///
+/// # Deadlocks
+///
+/// The provider holds the send queue's lock from [`start_send`](QueuePair::start_send) until the
+/// batch is submitted or dropped. On ionic, an open batch holds the lock of the queue pair's send
+/// completion queue too, which polling and arming that completion queue take, and so does posting
+/// a receive to a queue pair whose receive completion queue is the same one. So on ionic, while a
+/// batch is open, the thread holding it must not poll or arm its send completion queue or post
+/// receives through it, and other threads doing so wait until the batch ends. On hns, polling a
+/// failed completion takes the send queue's lock, so do not poll this queue pair's completion
+/// queues while holding an open batch either (see [`Completions`](crate::Completions)).
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
@@ -2748,8 +2759,11 @@ impl<T: Transport> QueuePair<T> {
     }
 
     /// Splits the queue pair into its send and receive halves, so that one thread can build and
-    /// submit send batches while others post receives. The providers lock the two queues
-    /// separately, so neither half waits for the other.
+    /// submit send batches while others post receives. mlx5, rxe, EFA, and hns lock the two queues
+    /// separately, so neither half waits for the other. ionic is the exception: an open send batch
+    /// also holds its send completion queue's lock, so when one completion queue serves both
+    /// queues, receives posted meanwhile wait for the batch to end, and the thread holding the
+    /// batch must not post receives through it (see [`SendBatch`]).
     ///
     /// Both halves borrow the queue pair, which is usable again once they are dropped.
     ///
