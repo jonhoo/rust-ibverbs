@@ -2742,14 +2742,15 @@ impl<T: Transport> QueuePair<T> {
         self.open_batch()
     }
 
-    /// Splits the queue pair into its send and receive halves, so that one thread can build and
-    /// submit send batches while others post receives. mlx5, rxe, EFA, and hns lock the two queues
-    /// separately, so neither half waits for the other. ionic is the exception: an open send batch
-    /// also holds its send completion queue's lock, so when one completion queue serves both
-    /// queues, receives posted meanwhile wait for the batch to end, and the thread holding the
-    /// batch must not post receives through it (see [`SendBatch`]).
+    /// Splits the queue pair into its send half and a shared reference for the receive side, so
+    /// that one thread can build and submit send batches while others post receives
+    /// ([`post_recv`](Self::post_recv) takes `&self`). mlx5, rxe, EFA, and hns lock the two
+    /// queues separately, so neither side waits for the other. ionic is the exception: an open
+    /// send batch also holds its send completion queue's lock, so when one completion queue serves
+    /// both queues, receives posted meanwhile wait for the batch to end, and the thread holding the
+    /// batch must not post receives itself (see [`SendBatch`]).
     ///
-    /// Both halves borrow the queue pair, which is usable again once they are dropped.
+    /// Both borrow the queue pair, which is usable again once they are dropped.
     ///
     /// # Examples
     ///
@@ -2767,8 +2768,8 @@ impl<T: Transport> QueuePair<T> {
     /// });
     /// # }
     /// ```
-    pub fn split(&mut self) -> (SendQueue<'_, T>, RecvQueue<'_, T>) {
-        (SendQueue { qp: self }, RecvQueue { qp: self })
+    pub fn split(&mut self) -> (SendQueue<'_, T>, &Self) {
+        (SendQueue { qp: self }, self)
     }
 
     /// Opens a work-request block on the send queue (`wr_start`). Every caller holds the send
@@ -2809,34 +2810,6 @@ impl<T: Transport> SendQueue<'_, T> {
     #[inline]
     pub fn start_send(&mut self) -> SendBatch<'_, T> {
         self.qp.open_batch()
-    }
-}
-
-/// The receive half of a [`QueuePair`], from [`QueuePair::split`]. It can be shared between
-/// threads: each may post receives.
-pub struct RecvQueue<'qp, T: Transport> {
-    qp: &'qp QueuePair<T>,
-}
-
-impl<T: Transport> RecvQueue<'_, T> {
-    /// Posts a batch of receive work requests, as [`QueuePair::post_recv`] does.
-    ///
-    /// # Safety
-    ///
-    /// Each referenced memory region must stay valid until a work completion has been polled for
-    /// the corresponding `wr_id`, or until the queue pair has been reset or destroyed (which
-    /// discards its outstanding receives). After an `Err`, the requests ahead of the one that
-    /// failed were posted, so the same holds for theirs.
-    ///
-    /// # Errors
-    ///
-    ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
-    ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
-    ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
-    ///    of resources).
-    #[inline]
-    pub unsafe fn post_recv<'a>(&self, recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
-        unsafe { self.qp.post_recv(recvs) }
     }
 }
 
@@ -3035,8 +3008,8 @@ mod test_conversions {
         fn send<T: Send>() {}
         fn sync<T: Sync>() {}
         send::<SendQueue<'static, Rc>>();
-        send::<RecvQueue<'static, Rc>>();
-        sync::<RecvQueue<'static, Rc>>();
+        send::<&'static QueuePair<Rc>>();
+        sync::<QueuePair<Rc>>();
     }
 
     #[test]
