@@ -473,9 +473,12 @@ pub unsafe fn ibv_query_device_ex(
     }
 }
 
-// `ibv_poll_cq` and `ibv_req_notify_cq` are `static inline` as well, but dispatch through the
-// legacy op table in `ibv_context` itself, which libibverbs fills completely (with a stub that
-// fails for any op the provider leaves out), so they need no availability check.
+// `ibv_poll_cq`, `ibv_req_notify_cq`, `ibv_post_recv`, and `ibv_post_srq_recv` are `static inline`
+// as well, but dispatch through the legacy op table in `ibv_context` itself, which libibverbs fills
+// completely (a stub returning `EOPNOTSUPP` stands in for any op the provider leaves out; every
+// provider that creates completion queues implements `poll_cq`, for which that would read as a
+// count), so they need no availability check. They read only the op pointer: other threads write
+// other fields of the queue pair, the queue, and the context.
 
 /// Poll a completion queue for up to `num_entries` work completions, copying them into `wc`
 /// (`ibv_poll_cq`).
@@ -510,6 +513,42 @@ pub unsafe fn ibv_req_notify_cq(
     solicited_only: ::std::os::raw::c_int,
 ) -> ::std::os::raw::c_int {
     unsafe { (*(*cq).context).ops.req_notify_cq.unwrap()(cq, solicited_only) }
+}
+
+/// Post a linked list of receive work requests to a queue pair's receive queue (`ibv_post_recv`).
+///
+/// Returns 0 on success, or the `errno` value on failure, with `bad_wr` set to the first request
+/// that was not posted.
+///
+/// # Safety
+///
+/// `qp` must be a valid queue pair, `wr` a valid list of receive work requests whose buffers stay
+/// valid until they complete, and `bad_wr` valid for writes.
+#[inline]
+pub unsafe fn ibv_post_recv(
+    qp: *mut ibv_qp,
+    wr: *mut ibv_recv_wr,
+    bad_wr: *mut *mut ibv_recv_wr,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*qp).context).ops.post_recv.unwrap()(qp, wr, bad_wr) }
+}
+
+/// Post a linked list of receive work requests to a shared receive queue (`ibv_post_srq_recv`).
+///
+/// Returns 0 on success, or the `errno` value on failure, with `bad_recv_wr` set to the first
+/// request that was not posted.
+///
+/// # Safety
+///
+/// `srq` must be a valid shared receive queue, `recv_wr` a valid list of receive work requests
+/// whose buffers stay valid until they complete, and `bad_recv_wr` valid for writes.
+#[inline]
+pub unsafe fn ibv_post_srq_recv(
+    srq: *mut ibv_srq,
+    recv_wr: *mut ibv_recv_wr,
+    bad_recv_wr: *mut *mut ibv_recv_wr,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*srq).context).ops.post_srq_recv.unwrap()(srq, recv_wr, bad_recv_wr) }
 }
 
 // `rdma_get_local_addr` and `rdma_get_peer_addr` are `static inline` in rdma_cma.h: they return

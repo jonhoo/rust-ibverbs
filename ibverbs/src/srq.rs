@@ -172,10 +172,7 @@ impl SharedReceiveQueue {
         let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        // Read only the op pointer, as `QueuePair::post_recv` does: acknowledging the SRQ's
-        // limit event writes its mutex and event count from another thread.
-        let post_srq_recv = unsafe { (*(*self.srq).context).ops.post_srq_recv }.unwrap();
-        let errno = unsafe { post_srq_recv(self.srq, head, &mut bad_wr) };
+        let errno = unsafe { ffi::ibv_post_srq_recv(self.srq, head, &mut bad_wr) };
         if errno != 0 {
             Err(Error::errno(errno, Error::PostReceive))
         } else {

@@ -2617,11 +2617,7 @@ impl<T: Transport> QueuePair<T> {
         let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        // Read only the op pointer: libibverbs and the provider write other fields of the queue
-        // pair and its context (the cached state, the async-event count, the mutexes) from other
-        // threads, so copying the whole structs here would race with them.
-        let post_recv = unsafe { (*(*self.qp).context).ops.post_recv }.unwrap();
-        let errno = unsafe { post_recv(self.qp, head, &mut bad_wr) };
+        let errno = unsafe { ffi::ibv_post_recv(self.qp, head, &mut bad_wr) };
         if errno != 0 {
             Err(post_recv_error(errno, self._srq.is_some()))
         } else {
