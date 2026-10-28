@@ -18,7 +18,8 @@ use std::time::{Duration, Instant};
 
 use common::{mr, open_test_device, poll_until};
 use ibverbs::rdmacm::{
-    Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, PortSpace,
+    Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, EventChannel,
+    PortSpace,
 };
 use ibverbs::{
     AccessFlags, AckTimeout, CompletionQueue, Context, Error, PreparedQueuePair, ProtectionDomain,
@@ -732,6 +733,119 @@ fn low_level_connect_and_send() {
         .expect("server received the message");
     id.disconnect().ok();
     join(server);
+}
+
+/// Poll `channel` without blocking until its next event arrives, and check that it is a `want`
+/// event about `id`.
+fn next_on(channel: &EventChannel, want: CmEventType, id: &CmId) -> CmEvent {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(event) = channel.poll_cm_event().expect("poll the shared channel") {
+            assert_eq!(event.event_type(), want, "status {}", event.status());
+            let about = event.id().expect("the event's id is alive");
+            assert_eq!(about.as_raw(), id.as_raw(), "{want:?} is about another id");
+            return event;
+        }
+        assert!(Instant::now() < deadline, "timed out waiting for {want:?}");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Moves `qp` to the states the connection manager computes for `id`.
+fn transition(id: &CmId, qp: &mut ibverbs::QueuePair<Rc>, states: &[QueuePairState]) {
+    for &state in states {
+        let attr = id.init_qp_attr(state).expect("init_qp_attr");
+        qp.modify(&attr).expect("modify");
+    }
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn shared_event_channel_routes_events_by_id() {
+    // A listener, a client, and the connection the listener accepts share one event channel and
+    // one thread: every event comes off the one descriptor, and its id says whose it is.
+    let ip = device_ip(&open_test_device());
+    let channel = EventChannel::new().expect("event channel");
+    let listener = retry_enodev(ip, |addr| {
+        let id = CmId::create_on(&channel, PortSpace::Tcp).expect("listener");
+        id.bind_addr(addr).map(|()| id)
+    });
+    listener.listen(1).expect("listen");
+    let addr = listener.local_addr().expect("listen address");
+
+    let client = CmId::create_on(&channel, PortSpace::Tcp).expect("client id");
+    assert_eq!(client.as_raw_fd(), channel.as_raw_fd());
+    client
+        .resolve_addr(addr, Duration::from_secs(5))
+        .expect("resolve_addr");
+    next_on(&channel, CmEventType::AddressResolved, &client);
+    client
+        .resolve_route(Duration::from_secs(5))
+        .expect("resolve_route");
+    next_on(&channel, CmEventType::RouteResolved, &client);
+    let ctx = client.context().expect("client device context");
+    let (client_pd, client_cq, qp) = resources(&ctx, client.port_num().expect("client port"));
+    let mut client_qp = qp.into_queue_pair();
+    transition(&client, &mut client_qp, &[QueuePairState::Init]);
+    client
+        .connect(&ConnectionParameter::default().set_qp_num(client_qp.qp_num()))
+        .expect("connect");
+
+    let server = next_on(&channel, CmEventType::ConnectRequest, &listener)
+        .connection_request()
+        .expect("connection request");
+    // The connection stays on the listener's channel instead of opening one of its own.
+    assert_eq!(server.as_raw_fd(), channel.as_raw_fd());
+    let ctx = server.context().expect("server device context");
+    let (server_pd, server_cq, qp) = resources(&ctx, server.port_num().expect("server port"));
+    let mut server_qp = qp.into_queue_pair();
+    transition(
+        &server,
+        &mut server_qp,
+        &[
+            QueuePairState::Init,
+            QueuePairState::ReadyToReceive,
+            QueuePairState::ReadyToSend,
+        ],
+    );
+    let mut recv = mr(&server_pd, 64);
+    unsafe { server_qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) }
+        .expect("post_recv");
+    server
+        .accept(&ConnectionParameter::default().set_qp_num(server_qp.qp_num()))
+        .expect("accept");
+
+    next_on(&channel, CmEventType::ConnectResponse, &client);
+    transition(
+        &client,
+        &mut client_qp,
+        &[
+            QueuePairState::Init,
+            QueuePairState::ReadyToReceive,
+            QueuePairState::ReadyToSend,
+        ],
+    );
+    client.establish().expect("establish");
+    next_on(&channel, CmEventType::Established, &server);
+
+    let mut send = mr(&client_pd, 64);
+    send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
+    let mut batch = client_qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .send(2, &[send.slice(..MESSAGE.len())]);
+    unsafe { batch.submit() }.expect("send");
+    wait_for(&client_cq, 2);
+    wait_for(&server_cq, 1);
+    assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
+
+    // Both ends report the disconnect on the one channel: the server's request, then (once the
+    // server answers it) the client's.
+    client.disconnect().expect("client disconnect");
+    next_on(&channel, CmEventType::Disconnected, &server);
+    server.disconnect().expect("server disconnect");
+    next_on(&channel, CmEventType::Disconnected, &client);
 }
 
 /// Bring the passive side of a low-level connection to `RTS` and accept it, returning once the

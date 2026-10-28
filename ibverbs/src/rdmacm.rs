@@ -64,6 +64,10 @@
 //! `Init`, `ReadyToReceive`, and `ReadyToSend` before [`accept`]. The blocking helpers are written
 //! on top of this same API.
 //!
+//! Each [`CmId::create`] opens an event channel, and so a file descriptor, of its own. An event
+//! loop that drives many ids can put them all on one [`EventChannel`] instead
+//! ([`CmId::create_on`]), read their events there, and route each by [`CmEvent::id`].
+//!
 //! [`resolve_addr`]: CmId::resolve_addr
 //! [`connect`]: CmId::connect
 //! [`accept`]: CmId::accept
@@ -71,12 +75,13 @@
 //! [`AsRawFd`]: std::os::fd::AsRawFd
 //! [`AsFd`]: std::os::fd::AsFd
 
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage};
@@ -354,121 +359,106 @@ fn is_failure(event: CmEventType) -> bool {
     )
 }
 
-/// An rdma_cm event channel. Owned 1:1 by the [`CmId`] whose events it carries; it is created with
-/// the id and destroyed after it.
-struct EventChannel {
+/// A connection-manager event channel: the file descriptor that delivers the events of the
+/// [`CmId`]s on it.
+///
+/// [`CmId::create`] gives every id a channel of its own, which costs a file descriptor per
+/// connection. A server that drives many connections from one event loop can instead create one
+/// channel, put its ids on it with [`CmId::create_on`] (the connection requests that arrive at a
+/// listener on it stay on it too), and read all their events here, telling them apart by
+/// [`CmEvent::id`]. The file descriptor ([`AsFd`]/[`AsRawFd`]) is non-blocking, for a reactor
+/// to watch.
+///
+/// Cloning is cheap (reference counted); the channel is destroyed once the last clone and the
+/// last id on it are gone.
+#[derive(Clone)]
+pub struct EventChannel {
+    inner: Arc<EventChannelInner>,
+}
+
+struct EventChannelInner {
     chan: *mut ffi::rdma_event_channel,
+    /// Whether ids share the channel ([`EventChannel::new`]) rather than one owning it
+    /// ([`CmId::create`]): a connection request that arrives on a shared channel stays on it, and
+    /// one that arrives on an id's own channel moves to a channel of its own.
+    shared: bool,
+    /// The ids on the channel by address, for routing its events to them. Weak, so that holding
+    /// the channel does not keep the ids alive.
+    ids: Mutex<HashMap<usize, Weak<CmIdInner>>>,
 }
 
-impl EventChannel {
-    /// Opens a new event channel, with its file descriptor set non-blocking so reading an event
-    /// ([`CmId::poll_cm_event`]) reports an empty channel instead of blocking.
-    fn new() -> Result<EventChannel> {
-        let chan = nonnull(
-            unsafe { ffi::rdma_create_event_channel() },
-            Error::ConnectionSetup,
-        )?;
-        let channel = EventChannel { chan };
-        // SAFETY: the channel owns this fd, and the borrow ends within this call.
-        let fd = unsafe { BorrowedFd::borrow_raw((*chan).fd) };
-        // If this fails, `channel` drops here and destroys the channel again.
-        crate::completion::set_nonblocking(fd).map_err(Error::ConnectionSetup)?;
-        Ok(channel)
-    }
-}
+// The channel, and the map of its ids, can be moved (and shared) between threads.
+unsafe impl Send for EventChannelInner {}
+unsafe impl Sync for EventChannelInner {}
 
-impl Drop for EventChannel {
+impl Drop for EventChannelInner {
     fn drop(&mut self) {
+        // Every id on the channel holds it, so they are all destroyed by now, as librdmacm
+        // requires.
         unsafe { ffi::rdma_destroy_event_channel(self.chan) };
     }
 }
 
-/// The shared ownership of an `rdma_cm_id` and its event channel: destroyed once the last
-/// [`CmId`] clone drops.
-struct CmIdInner {
-    channel: EventChannel,
-    id: *mut ffi::rdma_cm_id,
-}
-
-// Ownership of an `rdma_cm_id` and its channel can be moved (and shared) between threads.
-unsafe impl Send for CmIdInner {}
-unsafe impl Sync for CmIdInner {}
-
-impl Drop for CmIdInner {
-    fn drop(&mut self) {
-        // Destroy the id before its channel (the `channel` field drops right after this).
-        unsafe { ffi::rdma_destroy_id(self.id) };
-    }
-}
-
-/// An rdma_cm identifier (a connection or a listener) together with its own event channel.
-/// Created by [`CmId::create`] (or [`CmEvent::connection_request`] on the passive side).
-///
-/// This is the low-level connection-manager handle: it exposes every step of connection setup so
-/// you can drive the state machine yourself, from an event loop if you like, instead of using the
-/// blocking [`Connector`]/[`Acceptor`] helpers (which are built on top of it). See the
-/// [module-level docs](self#low-level-control) for the overall flow. A typical active-side sequence
-/// is [`resolve_addr`](Self::resolve_addr), [`resolve_route`](Self::resolve_route),
-/// [`connect`](Self::connect), [`establish`](Self::establish), pumping for the matching
-/// [`CmEvent`] after each with [`get_cm_event`](Self::get_cm_event) (blocking) or
-/// [`poll_cm_event`](Self::poll_cm_event) (non-blocking); the queue pair is built on
-/// [`context`](Self::context) and [`port_num`](Self::port_num), and transitioned with
-/// [`init_qp_attr`](Self::init_qp_attr).
-///
-/// Cloning is cheap (reference counted); the id (and then its channel) is destroyed once the last
-/// clone drops, which ends whatever it was doing: a listener stops listening, a request not yet
-/// accepted is declined, a connection is disconnected. Resources built on its
-/// [`context`](Self::context) do not keep it alive.
-#[derive(Clone)]
-pub struct CmId {
-    inner: Arc<CmIdInner>,
-}
-
-impl CmId {
-    /// Creates a new identifier on its own fresh event channel, for the given port space (use
-    /// [`PortSpace::Tcp`] for reliable connections).
+impl EventChannel {
+    /// Opens an event channel for several ids to share ([`CmId::create_on`]), with its file
+    /// descriptor set non-blocking so [`poll_cm_event`](Self::poll_cm_event) reports an empty
+    /// channel instead of blocking.
     ///
-    /// This is the entry point for driving connection setup yourself; see the [type-level
-    /// docs](Self) for the sequence of calls.
-    pub fn create(port_space: PortSpace) -> Result<CmId> {
-        let channel = EventChannel::new()?;
-        let mut id: *mut ffi::rdma_cm_id = ptr::null_mut();
-        let ret = unsafe {
-            ffi::rdma_create_id(
-                channel.chan,
-                &mut id,
-                ptr::null_mut::<c_void>(),
-                port_space.into(),
-            )
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_create_event_channel` failed
+    ///    (`ENODEV` when there is no RDMA device, `EPERM` when the kernel's connection manager,
+    ///    the `rdma_ucm` module, is not loaded), or making its file descriptor non-blocking
+    ///    failed.
+    pub fn new() -> Result<EventChannel> {
+        EventChannel::open(true)
+    }
+
+    /// Opens a channel, shared or for one id ([`CmId::create`]), set non-blocking.
+    fn open(shared: bool) -> Result<EventChannel> {
+        let chan = nonnull(
+            unsafe { ffi::rdma_create_event_channel() },
+            Error::ConnectionSetup,
+        )?;
+        let channel = EventChannel {
+            inner: Arc::new(EventChannelInner {
+                chan,
+                shared,
+                ids: Mutex::new(HashMap::new()),
+            }),
         };
-        // On failure `channel` drops on return, destroying the event channel.
-        check(ret, Error::ConnectionSetup)?;
-        Ok(CmId {
-            inner: Arc::new(CmIdInner { channel, id }),
-        })
+        // If this fails, `channel` drops here and destroys the channel again.
+        crate::completion::set_nonblocking(channel.as_fd()).map_err(Error::ConnectionSetup)?;
+        Ok(channel)
     }
 
-    /// Blocks until the next event on this id's channel is available and returns it, even if other
-    /// threads race it for events.
+    /// Blocks until the next event on the channel is available and returns it, even if other
+    /// threads race it for events. The event is acknowledged when the returned [`CmEvent`] drops;
+    /// [`CmEvent::id`] says which id it is about.
     ///
-    /// The event is acknowledged automatically when the returned [`CmEvent`] drops. To wait from
-    /// an event loop instead, use [`poll_cm_event`](Self::poll_cm_event).
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the file descriptor (`poll`)
+    ///    or reading the event (`rdma_get_cm_event`) failed.
     pub fn get_cm_event(&self) -> Result<CmEvent> {
         self.get_cm_event_deadline(None)
     }
 
-    /// Returns the next event on this id's channel, or `None` if none is currently pending. This
-    /// never blocks.
+    /// Returns the next event on the channel, or `None` if none is currently pending. This never
+    /// blocks: wait for the file descriptor ([`AsRawFd`]/[`AsFd`]) to become readable with your
+    /// reactor of choice, then drain the pending events with this method (each acknowledged when
+    /// it drops). [`CmEvent::id`] says which id an event is about.
     ///
-    /// Intended for event-loop use: wait for the (non-blocking) file descriptor from
-    /// [`AsRawFd`]/[`AsFd`] to become readable with your
-    /// reactor of choice, then drain pending events with this method (acknowledged on drop).
+    /// # Errors
+    ///
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): reading the event (`rdma_get_cm_event`)
+    ///    failed.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
         // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so an
         // empty one reports `EAGAIN`.
         let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
         nix::errno::Errno::clear();
-        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.channel.chan, &mut event) };
+        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.chan, &mut event) };
         if ret != 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::WouldBlock {
@@ -487,12 +477,195 @@ impl CmId {
                 status = -errno;
             }
         }
+        // A connection request is about the listener it arrived at: the event's own id is the
+        // request's new one, which `connection_request` takes over.
+        let about = unsafe {
+            if (*event).event == ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
+                (*event).listen_id
+            } else {
+                (*event).id
+            }
+        };
         Ok(Some(CmEvent {
             event,
             status,
-            _id: self.clone(),
+            id: self.id(about),
+            channel: self.clone(),
             taken: false,
         }))
+    }
+
+    /// Blocks until the next event arrives (up to `deadline`, indefinitely with `None`) and returns
+    /// it, or [`TimedOut`](Error::TimedOut) once the deadline passes. The file descriptor is
+    /// `poll(2)`ed with the remaining time and the event then read without blocking, so the wait
+    /// never runs past the deadline.
+    fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<CmEvent> {
+        loop {
+            if !crate::completion::wait_readable(self.as_fd(), deadline)
+                .map_err(Error::ConnectionSetup)?
+            {
+                return Err(Error::TimedOut);
+            }
+            // The descriptor was readable, but another thread may have taken the event first, or
+            // librdmacm consumed it internally; if so, go back to waiting for the next one with
+            // whatever time is left.
+            if let Some(event) = self.poll_cm_event()? {
+                return Ok(event);
+            }
+        }
+    }
+
+    /// The ids on the channel, by address.
+    fn ids(&self) -> std::sync::MutexGuard<'_, HashMap<usize, Weak<CmIdInner>>> {
+        // Nothing panics while holding the lock, so a poisoned map is still whole.
+        self.inner
+            .ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The live [`CmId`] for `id` on this channel, if there is one.
+    fn id(&self, id: *mut ffi::rdma_cm_id) -> Option<CmId> {
+        let inner = self.ids().get(&(id as usize))?.upgrade()?;
+        Some(CmId { inner })
+    }
+
+    /// Returns the underlying `rdma_event_channel` pointer.
+    ///
+    /// This is an escape hatch for librdmacm calls this crate does not yet wrap. The pointer stays
+    /// valid only while a clone of this [`EventChannel`] or an id on it is alive; do not destroy
+    /// it.
+    pub fn as_raw(&self) -> *mut ffi::rdma_event_channel {
+        self.inner.chan
+    }
+}
+
+impl AsRawFd for EventChannel {
+    /// The raw file descriptor of the channel, for a reactor to drive the ids on it without
+    /// blocking. It is non-blocking and becomes readable when an event is pending, to be consumed
+    /// with [`poll_cm_event`](EventChannel::poll_cm_event).
+    fn as_raw_fd(&self) -> RawFd {
+        unsafe { (*self.inner.chan).fd }
+    }
+}
+
+impl AsFd for EventChannel {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        // SAFETY: the channel fd lives until the last `EventChannelInner` drops, and the borrow is
+        // tied to `&self`.
+        unsafe { BorrowedFd::borrow_raw((*self.inner.chan).fd) }
+    }
+}
+
+/// The shared ownership of an `rdma_cm_id`: destroyed once the last [`CmId`] clone drops, and its
+/// event channel once the last id on it is gone as well.
+struct CmIdInner {
+    channel: EventChannel,
+    id: *mut ffi::rdma_cm_id,
+}
+
+// Ownership of an `rdma_cm_id` can be moved (and shared) between threads.
+unsafe impl Send for CmIdInner {}
+unsafe impl Sync for CmIdInner {}
+
+impl Drop for CmIdInner {
+    fn drop(&mut self) {
+        // Stop routing events to the id first, while its address is still its own: any of its
+        // events read from here on, which `rdma_destroy_id` waits to see acknowledged, come
+        // without one.
+        self.channel.ids().remove(&(self.id as usize));
+        // Destroy the id before its channel (the `channel` field drops right after this).
+        unsafe { ffi::rdma_destroy_id(self.id) };
+    }
+}
+
+/// An rdma_cm identifier (a connection or a listener), on the event channel that delivers its
+/// events: one of its own, or an [`EventChannel`] shared with other ids. Created by
+/// [`CmId::create`] or [`CmId::create_on`] (or [`CmEvent::connection_request`] on the passive
+/// side).
+///
+/// This is the low-level connection-manager handle: it exposes every step of connection setup so
+/// you can drive the state machine yourself, from an event loop if you like, instead of using the
+/// blocking [`Connector`]/[`Acceptor`] helpers (which are built on top of it). See the
+/// [module-level docs](self#low-level-control) for the overall flow. A typical active-side sequence
+/// is [`resolve_addr`](Self::resolve_addr), [`resolve_route`](Self::resolve_route),
+/// [`connect`](Self::connect), [`establish`](Self::establish), pumping for the matching
+/// [`CmEvent`] after each with [`get_cm_event`](Self::get_cm_event) (blocking) or
+/// [`poll_cm_event`](Self::poll_cm_event) (non-blocking); the queue pair is built on
+/// [`context`](Self::context) and [`port_num`](Self::port_num), and transitioned with
+/// [`init_qp_attr`](Self::init_qp_attr).
+///
+/// Cloning is cheap (reference counted); the id is destroyed once the last clone drops, which ends
+/// whatever it was doing: a listener stops listening, a request not yet accepted is declined, a
+/// connection is disconnected. Its channel goes with it, unless other ids or [`EventChannel`]
+/// handles still hold it. Resources built on its [`context`](Self::context) do not keep it alive.
+#[derive(Clone)]
+pub struct CmId {
+    inner: Arc<CmIdInner>,
+}
+
+impl CmId {
+    /// Creates a new identifier on its own fresh event channel, for the given port space (use
+    /// [`PortSpace::Tcp`] for reliable connections).
+    ///
+    /// This is the entry point for driving connection setup yourself; see the [type-level
+    /// docs](Self) for the sequence of calls.
+    pub fn create(port_space: PortSpace) -> Result<CmId> {
+        CmId::create_in(EventChannel::open(false)?, port_space)
+    }
+
+    /// Creates a new identifier on `channel`, for the given port space, to share it with the
+    /// other ids there: read their events from the channel ([`EventChannel::poll_cm_event`]) and
+    /// route each by [`CmEvent::id`].
+    pub fn create_on(channel: &EventChannel, port_space: PortSpace) -> Result<CmId> {
+        CmId::create_in(channel.clone(), port_space)
+    }
+
+    /// Creates an identifier on `channel`.
+    fn create_in(channel: EventChannel, port_space: PortSpace) -> Result<CmId> {
+        let mut id: *mut ffi::rdma_cm_id = ptr::null_mut();
+        let ret = unsafe {
+            ffi::rdma_create_id(
+                channel.as_raw(),
+                &mut id,
+                ptr::null_mut::<c_void>(),
+                port_space.into(),
+            )
+        };
+        // On failure `channel` drops on return, destroying an event channel of the id's own.
+        check(ret, Error::ConnectionSetup)?;
+        Ok(CmId::on(channel, id))
+    }
+
+    /// Takes ownership of `id`, which delivers its events on `channel`, and routes those to it.
+    fn on(channel: EventChannel, id: *mut ffi::rdma_cm_id) -> CmId {
+        let inner = Arc::new(CmIdInner { channel, id });
+        inner
+            .channel
+            .ids()
+            .insert(id as usize, Arc::downgrade(&inner));
+        CmId { inner }
+    }
+
+    /// Blocks until the next event on this id's channel is available and returns it, even if other
+    /// threads race it for events. On an [`EventChannel`] shared with other ids, that can be
+    /// another id's event (see [`CmEvent::id`]).
+    ///
+    /// The event is acknowledged automatically when the returned [`CmEvent`] drops. To wait from
+    /// an event loop instead, use [`poll_cm_event`](Self::poll_cm_event).
+    pub fn get_cm_event(&self) -> Result<CmEvent> {
+        self.get_cm_event_deadline(None)
+    }
+
+    /// Returns the next event on this id's channel, or `None` if none is currently pending. This
+    /// never blocks. On an [`EventChannel`] shared with other ids, the event can be another id's
+    /// (see [`CmEvent::id`]).
+    ///
+    /// Intended for event-loop use: wait for the (non-blocking) file descriptor from
+    /// [`AsRawFd`]/[`AsFd`] to become readable with your
+    /// reactor of choice, then drain pending events with this method (acknowledged on drop).
+    pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
+        self.inner.channel.poll_cm_event()
     }
 
     /// A context on the device the connection manager has bound this id to. Build the queue pair
@@ -557,24 +730,10 @@ impl CmId {
         Ok(QueuePairAttribute::from_raw(attr, mask))
     }
 
-    /// Blocks until the next event arrives (up to `deadline`, indefinitely with `None`) and returns
-    /// it, or [`TimedOut`](Error::TimedOut) once the deadline passes. The channel's file descriptor
-    /// is `poll(2)`ed with the remaining time and the event then read without blocking, so the wait
-    /// never runs past the deadline.
+    /// Blocks until the next event on this id's channel arrives (up to `deadline`, indefinitely
+    /// with `None`) and returns it, or [`TimedOut`](Error::TimedOut) once the deadline passes.
     fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<CmEvent> {
-        loop {
-            if !crate::completion::wait_readable(self.as_fd(), deadline)
-                .map_err(Error::ConnectionSetup)?
-            {
-                return Err(Error::TimedOut);
-            }
-            // The descriptor was readable, but another thread may have taken the event first, or
-            // librdmacm consumed it internally; if so, go back to waiting for the next one with
-            // whatever time is left.
-            if let Some(event) = self.poll_cm_event()? {
-                return Ok(event);
-            }
-        }
+        self.inner.channel.get_cm_event_deadline(deadline)
     }
 
     /// Blocks until an `expected` event arrives (up to `deadline`) and returns it, acknowledging
@@ -1006,37 +1165,39 @@ impl CmId {
 }
 
 impl AsRawFd for CmId {
-    /// The raw file descriptor of this id's event channel, for a reactor to drive connection setup
-    /// without blocking. It is non-blocking and becomes readable when a connection-manager event
-    /// is pending, to be consumed with [`poll_cm_event`](CmId::poll_cm_event).
+    /// The raw file descriptor of this id's event channel (shared with the other ids on it, if
+    /// any), for a reactor to drive connection setup without blocking. It is non-blocking and
+    /// becomes readable when a connection-manager event is pending, to be consumed with
+    /// [`poll_cm_event`](CmId::poll_cm_event).
     fn as_raw_fd(&self) -> RawFd {
-        unsafe { (*self.inner.channel.chan).fd }
+        self.inner.channel.as_raw_fd()
     }
 }
 
 impl AsFd for CmId {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        // SAFETY: the channel fd lives as long as this `CmId` (its inner `channel` field), and the
-        // borrow is tied to `&self`.
-        unsafe { BorrowedFd::borrow_raw((*self.inner.channel.chan).fd) }
+        self.inner.channel.as_fd()
     }
 }
 
-/// A connection-manager event, retrieved with [`CmId::get_cm_event`]/[`CmId::poll_cm_event`] and
-/// acknowledged automatically when dropped.
+/// A connection-manager event, retrieved with [`CmId::get_cm_event`]/[`CmId::poll_cm_event`] (or
+/// from an [`EventChannel`]) and acknowledged automatically when dropped.
 ///
-/// The event keeps the id whose channel delivered it alive: `rdma_destroy_id` blocks until every
-/// event delivered for an id has been acknowledged, so the id cannot go away underneath an
+/// The event keeps the id it is about ([`id`](Self::id)) alive: `rdma_destroy_id` blocks until
+/// every event delivered for an id has been acknowledged, so the id cannot go away underneath an
 /// outstanding event. A [`ConnectRequest`](CmEventType::ConnectRequest) whose new id is never
 /// taken with [`connection_request`](Self::connection_request) is rejected on drop, so the peer
 /// learns right away rather than after its retries time out.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
     /// The event's status, with librdmacm's own failures turned into a negative errno (see
-    /// [`CmId::poll_cm_event`]).
+    /// [`EventChannel::poll_cm_event`]).
     status: i32,
-    /// The id whose channel delivered the event (the listener, for a connection request).
-    _id: CmId,
+    /// The id the event is about (the listener, for a connection request), if it is still alive.
+    id: Option<CmId>,
+    /// The channel that delivered the event, which a connection request's new id stays on when it
+    /// is shared.
+    channel: EventChannel,
     /// Whether a connection request's new id has been taken over by
     /// [`connection_request`](Self::connection_request).
     taken: bool,
@@ -1111,6 +1272,19 @@ impl CmEvent {
         )))
     }
 
+    /// The id this event is about: for a [`ConnectRequest`](CmEventType::ConnectRequest), the
+    /// listener it arrived at (the request's own id is the one
+    /// [`connection_request`](Self::connection_request) takes), and for any other event the id
+    /// it reports on. On an [`EventChannel`] shared by several ids, this is how their events are
+    /// told apart.
+    ///
+    /// `None` when that id was not created through this crate, or is going away: its last handle
+    /// was dropped after the event was queued, and destroying it waits for this event to be
+    /// acknowledged (dropped).
+    pub fn id(&self) -> Option<&CmId> {
+        self.id.as_ref()
+    }
+
     /// The kind of event. Match on the [`CmEventType`] to decide what to do next; see [`CmId`] for
     /// the expected sequence.
     pub fn event_type(&self) -> CmEventType {
@@ -1160,10 +1334,11 @@ impl CmEvent {
         self.event
     }
 
-    /// Consumes a [`CmEventType::ConnectRequest`] event, taking the new connection id it carries
-    /// and migrating it onto its own fresh event channel, so its later events are isolated rather
-    /// than colliding with the listener's. Only valid on that event type. The event is acknowledged
-    /// on return.
+    /// Consumes a [`CmEventType::ConnectRequest`] event, taking the new connection id it carries.
+    /// A request that arrived at a listener with a channel of its own ([`CmId::create`]) moves
+    /// onto a fresh channel of its own, so its later events are isolated rather than colliding
+    /// with the listener's; one that arrived on a shared [`EventChannel`] stays there. Only valid
+    /// on that event type. The event is acknowledged on return.
     ///
     /// The returned id is the passive side of the new connection: build a queue pair on its
     /// [`context`](CmId::context) and [`port_num`](CmId::port_num), move it to `RTS`, and
@@ -1180,20 +1355,23 @@ impl CmEvent {
                 format!("not a connection request: {}", self.event_type()),
             )));
         }
-        let channel = EventChannel::new()?;
         let id = unsafe { (*self.event).id };
+        if self.channel.inner.shared {
+            // From here on the id is ours to release: `Drop` must no longer reject and destroy it.
+            self.taken = true;
+            return Ok(CmId::on(self.channel.clone(), id));
+        }
+        let channel = EventChannel::open(false)?;
         // From here on the id is ours to release: `Drop` must no longer reject and destroy it.
         self.taken = true;
-        let ret = unsafe { ffi::rdma_migrate_id(id, channel.chan) };
+        let ret = unsafe { ffi::rdma_migrate_id(id, channel.as_raw()) };
         if ret != 0 {
             let err = io::Error::last_os_error();
             // The request id is ours to destroy once we abandon it; `channel` drops after.
             unsafe { ffi::rdma_destroy_id(id) };
             return Err(Error::os(err, Error::ConnectionSetup));
         }
-        Ok(CmId {
-            inner: Arc::new(CmIdInner { channel, id }),
-        })
+        Ok(CmId::on(channel, id))
     }
 }
 
