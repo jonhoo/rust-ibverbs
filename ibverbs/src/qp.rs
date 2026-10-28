@@ -1152,7 +1152,7 @@ impl<T: Transport> PreparedQueuePair<T> {
     /// # Errors
     ///
     ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
-    ///    (`ibv_query_gid`).
+    ///    (`ibv_query_gid`), or that entry of the GID table is empty (`ENODATA`).
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
         let qp_num = unsafe { (*self.qp.qp).qp_num };
         let gid = if let Some(gid_index) = self.gid_index {

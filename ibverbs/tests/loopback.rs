@@ -1729,6 +1729,32 @@ fn gid_and_device_introspection() {
     }
 }
 
+/// An empty slot of the GID table is refused with `ENODATA`, as `ibv_query_gid_ex` reports it,
+/// rather than returned as the all-zero GID `ibv_query_gid` fills in.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn empty_gid_slot_is_refused() {
+    let ctx = open_test_device();
+    let len = ctx.query_port(1).expect("failed to query port").gid_tbl_len;
+    let table = ctx.gid_table().expect("failed to read GID table");
+    let used = |index: u32| {
+        table
+            .iter()
+            .any(|e| e.port_num == 1 && e.gid_index == index)
+    };
+    // Soft-RoCE's table has 1024 slots, of which an interface's addresses use a few.
+    let Some(empty) = (0..len.max(0) as u32).find(|&index| !used(index)) else {
+        eprintln!("every GID slot of port 1 is in use; nothing to check");
+        return;
+    };
+    match ctx.query_gid(1, empty) {
+        Err(Error::QueryGid { source, .. }) => {
+            assert_eq!(source.raw_os_error(), Some(nix::libc::ENODATA), "{source}");
+        }
+        other => panic!("expected ENODATA for empty GID slot {empty}, got {other:?}"),
+    }
+}
+
 /// `query` and `modify` inspect and change a queue pair's attributes after `handshake`.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]

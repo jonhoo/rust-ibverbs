@@ -298,22 +298,30 @@ impl Context {
     /// Query a single entry of a port's GID table (`ibv_query_gid`).
     ///
     /// Ports are numbered from 1. For the full table at once (with the GID type and associated net
-    /// device of each entry), use [`gid_table`](Self::gid_table).
+    /// device of each entry), use [`gid_table`](Self::gid_table), which lists only the entries
+    /// that hold a GID.
     ///
     /// # Errors
     ///
     ///  - [`QueryGid`](Error::QueryGid): `ibv_query_gid` failed (`EINVAL` for an invalid
-    ///    `port_num` or `gid_index`).
+    ///    `port_num` or `gid_index`), or the entry is empty (`ENODATA`).
     pub fn query_gid(&self, port_num: u8, gid_index: u32) -> Result<Gid> {
         let mut gid = ffi::ibv_gid::default();
         let rc =
             unsafe { ffi::ibv_query_gid(self.inner.ctx, port_num, gid_index as i32, &mut gid) };
-        check(rc, |e| Error::QueryGid {
+        let error = |source| Error::QueryGid {
             port_num,
             gid_index,
-            source: e,
-        })?;
-        Ok(gid.into())
+            source,
+        };
+        check(rc, error)?;
+        let gid = Gid::from(gid);
+        // `ibv_query_gid` reports an empty entry as the all-zero GID `::`, which is not a GID any
+        // port holds; `ibv_query_gid_ex` reports it as `ENODATA`, and so does this.
+        if gid == Gid::default() {
+            return Err(error(io::Error::from_raw_os_error(nix::libc::ENODATA)));
+        }
+        Ok(gid)
     }
 
     /// The number of completion vectors the device supports: the exclusive upper bound for
