@@ -1389,6 +1389,9 @@ impl Resolved {
     /// `timeout` bounds how long to wait for the remote's response: on expiry
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
     ///
+    /// The peer can send as soon as the connection is established, before this returns; to have
+    /// receives posted for its first messages, connect with [`connect_with`](Self::connect_with).
+    ///
     /// # Errors
     ///
     ///  - [`ConnectionManager`](Error::ConnectionManager): the peer rejected the request (with
@@ -1407,6 +1410,26 @@ impl Resolved {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
+        self.connect_with(qp, param, timeout, |_| Ok(()))
+    }
+
+    /// As [`connect`](Self::connect), running `prepare` on the queue pair once it is ready to
+    /// receive, before the connection is established and the peer can send: the place to post
+    /// the receives the peer's first messages need. Posted after `connect` returns instead, they
+    /// race the peer's first send, which on missing them waits out a receiver-not-ready back-off
+    /// (655 ms with the timer the connection manager sets) or, with no retries left, fails.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`connect`](Self::connect), plus whatever `prepare` returns, which abandons the
+    /// connection (the queue pair is destroyed, discarding what was posted to it).
+    pub fn connect_with(
+        self,
+        qp: PreparedQueuePair<Rc>,
+        param: ConnectionParameter,
+        timeout: Option<Duration>,
+        prepare: impl FnOnce(&QueuePair<Rc>) -> Result<()>,
+    ) -> Result<Connection> {
         let deadline = crate::completion::deadline_after(timeout);
         self.id.check_connect_private_data(&param)?;
         let mut qp = self.id.init_qp(qp)?;
@@ -1422,6 +1445,7 @@ impl Resolved {
         // librdmacm does — before moving on. The RDMA limits come from the negotiated reply.
         self.id.transition(&mut qp, QueuePairState::Init)?;
         self.id.ready(&mut qp, None, None)?;
+        prepare(&qp)?;
         self.id.establish()?;
         Ok(Connection {
             id: self.id,
@@ -1558,6 +1582,9 @@ impl Incoming {
     /// `timeout` bounds how long to wait for the connection to establish: on expiry
     /// [`TimedOut`](Error::TimedOut) is returned, and `None` waits indefinitely.
     ///
+    /// The peer can send as soon as it has the reply, before this returns; to have receives
+    /// posted for its first messages, accept with [`accept_with`](Self::accept_with).
+    ///
     /// # Errors
     ///
     ///  - [`Accept`](Error::Accept): `rdma_accept` failed, or the private data does not fit a
@@ -1580,6 +1607,26 @@ impl Incoming {
         param: ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
+        self.accept_with(qp, param, timeout, |_| Ok(()))
+    }
+
+    /// As [`accept`](Self::accept), running `prepare` on the queue pair once it is ready to
+    /// receive, before the reply goes out and the peer can send: the place to post the receives
+    /// the peer's first messages need. Posted after `accept` returns instead, they race the peer's
+    /// first send, which on missing them waits out a receiver-not-ready back-off (655 ms with the
+    /// timer the connection manager sets) or, with no retries left, fails.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`accept`](Self::accept), plus whatever `prepare` returns, which declines the
+    /// request (the queue pair is destroyed, discarding what was posted to it).
+    pub fn accept_with(
+        self,
+        qp: PreparedQueuePair<Rc>,
+        param: ConnectionParameter,
+        timeout: Option<Duration>,
+        prepare: impl FnOnce(&QueuePair<Rc>) -> Result<()>,
+    ) -> Result<Connection> {
         let deadline = crate::completion::deadline_after(timeout);
         let mut qp = self.id.init_qp(qp)?;
         let responder_resources = (param.param.responder_resources != RDMA_MAX_RESP_RES)
@@ -1588,6 +1635,7 @@ impl Incoming {
             .then_some(param.param.initiator_depth);
         self.id
             .ready(&mut qp, responder_resources, initiator_depth)?;
+        prepare(&qp)?;
         let param = param.set_qp_num(qp.qp_num());
         self.id.accept(&param)?;
         self.id.wait_for(CmEventType::Established, deadline)?;

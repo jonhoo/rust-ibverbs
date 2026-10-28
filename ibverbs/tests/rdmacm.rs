@@ -216,6 +216,78 @@ fn connect_and_send() {
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn receives_posted_while_connecting_catch_the_first_messages() {
+    // Each side sends as soon as its setup returns. A first message that found no receive would
+    // fail at once, since neither side retries after a receiver-not-ready NAK (a side's count is
+    // the one its peer asks for); the receives posted from the setup hooks are in place first.
+    let ip = device_ip(&open_test_device());
+    let no_rnr_retries = || ConnectionParameter::default().set_rnr_retry_count(0);
+    // Send `MESSAGE` as work request 2 and wait for it and receive 1 to complete.
+    fn exchange(conn: &mut Connection, cq: &CompletionQueue, pd: &ProtectionDomain) {
+        let mut send = mr(pd, 64);
+        send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
+        let mut batch = conn.queue_pair().start_send();
+        batch
+            .op()
+            .signaled()
+            .send(2, &[send.slice(..MESSAGE.len())]);
+        unsafe { batch.submit() }.expect("send");
+        let mut pending = vec![1, 2];
+        assert!(
+            poll_until(cq, |wc| {
+                pending.retain(|&wr_id| wr_id != wc.wr_id());
+                pending.is_empty()
+            }),
+            "timed out waiting for completions {pending:?}"
+        );
+    }
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (done_tx, done_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
+        let (pd, cq, qp) = resources(&ctx, port);
+        let recv = mr(&pd, 64);
+        let mut conn = incoming
+            .accept_with(qp, no_rnr_retries(), SETUP_TIMEOUT, |qp| unsafe {
+                qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
+            })
+            .expect("accept");
+        exchange(&mut conn, &cq, &pd);
+        assert_eq!(&recv.bytes()[..MESSAGE.len()], MESSAGE);
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("client done");
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (pd, cq, qp) = resources(&ctx, port);
+    let recv = mr(&pd, 64);
+    let mut conn = resolved
+        .connect_with(qp, no_rnr_retries(), SETUP_TIMEOUT, |qp| unsafe {
+            qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
+        })
+        .expect("connect");
+    exchange(&mut conn, &cq, &pd);
+    assert_eq!(&recv.bytes()[..MESSAGE.len()], MESSAGE);
+    let _ = done_tx.send(());
+    join(server);
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn accept_times_out() {
     // An acceptor with a timeout and no client reports TimedOut instead of blocking forever.
     let acceptor = bind_acceptor(device_ip(&open_test_device()), 1);
