@@ -25,14 +25,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[non_exhaustive]
 pub enum Error {
     /// The device, provider, or kernel does not support the requested operation or
-    /// work-completion field (`EOPNOTSUPP`, `EPROTONOSUPPORT` from a kernel older than the
-    /// request, or `ENOSYS` for a connection-manager option the kernel does not know);
-    /// `operation` names the verb that was declined.
+    /// work-completion field; `operation` names the verb that was declined, and `errno` who
+    /// declined it.
     #[error("{operation} is not supported by the device, provider, or kernel")]
     Unsupported {
         /// The verb (or the capability it asked for) the device, provider, or kernel declined. A
         /// reference to the name rather than the name itself, so that `Error` stays two words.
         operation: &'static &'static str,
+        /// The errno it was declined with: `EOPNOTSUPP` when the device or provider lacks the
+        /// operation, `EPROTONOSUPPORT` when the kernel is older than the request, `ENOSYS` for a
+        /// connection-manager option the kernel does not know, and `ENODEV` for an mlx5 device
+        /// without a Data Direct device.
+        errno: i32,
     },
 
     /// The device port is not in the `ACTIVE` or `ARMED` state, so its GID table and routing are
@@ -260,8 +264,8 @@ impl Error {
     /// The operating-system error (`errno`) underlying this error, for the variants that wrap one:
     /// the uniform way to branch on `ENOMEM`, `EINVAL`, and friends without matching every
     /// variant. `None` for the variants this crate diagnoses itself, and for
-    /// [`Unsupported`](Error::Unsupported), which does not keep whether the errno was
-    /// `EOPNOTSUPP` or `EPROTONOSUPPORT`. The crate's checks of its own inputs (a queue from
+    /// [`Unsupported`](Error::Unsupported), which carries its errno as a field instead. The
+    /// crate's checks of its own inputs (a queue from
     /// another context, oversized private data, and the like) are reported in the operation's
     /// variant as an [`io::ErrorKind::InvalidInput`] error with no errno, so for them this is
     /// `Some` but [`raw_os_error`](io::Error::raw_os_error) is `None`. For the connection
@@ -274,7 +278,7 @@ impl Error {
     /// The verb (or step) this error came from, as [`Unsupported`](Self::Unsupported) names it.
     pub(crate) fn operation(&self) -> &'static &'static str {
         match self {
-            Error::Unsupported { operation } => operation,
+            Error::Unsupported { operation, .. } => operation,
             Error::PortNotActive(_) => &"port activation",
             Error::GidMismatch | Error::GidRequired => &"GID routing",
             Error::DeviceIndexUnavailable => &"the device index",
@@ -342,14 +346,14 @@ impl Error {
     /// (naming the operation `wrap` identifies) and otherwise tagging it with `wrap` (the variant
     /// identifying the operation that failed).
     pub(crate) fn os(err: io::Error, wrap: impl FnOnce(io::Error) -> Error) -> Error {
-        let unsupported = Error::is_unsupported(&err);
+        let unsupported = err.raw_os_error().filter(|_| Error::is_unsupported(&err));
         let wrapped = wrap(err);
-        if unsupported {
-            Error::Unsupported {
+        match unsupported {
+            Some(errno) => Error::Unsupported {
                 operation: wrapped.operation(),
-            }
-        } else {
-            wrapped
+                errno,
+            },
+            None => wrapped,
         }
     }
 
@@ -416,7 +420,8 @@ mod tests {
             matches!(
                 err,
                 Error::Unsupported {
-                    operation: &"ibv_create_qp_ex"
+                    operation: &"ibv_create_qp_ex",
+                    errno: nix::libc::EOPNOTSUPP,
                 }
             ),
             "{err:?}"
@@ -435,7 +440,8 @@ mod tests {
             matches!(
                 err,
                 Error::Unsupported {
-                    operation: &"ibv_reg_mr"
+                    operation: &"ibv_reg_mr",
+                    errno: nix::libc::EPROTONOSUPPORT,
                 }
             ),
             "{err:?}"

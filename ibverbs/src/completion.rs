@@ -1227,6 +1227,7 @@ impl CompletionQueue {
                 // polling, that is unsupported.
                 return Err(Error::Unsupported {
                     operation: &"ibv_req_notify_cq",
+                    errno,
                 });
             }
             return Err(Error::errno(errno, Error::PollCompletionQueue));

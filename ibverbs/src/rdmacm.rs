@@ -759,6 +759,7 @@ impl CmId {
             if err.raw_os_error() == Some(nix::libc::ENOSYS) {
                 return Err(Error::Unsupported {
                     operation: &"rdma_set_option",
+                    errno: nix::libc::ENOSYS,
                 });
             }
             return Err(Error::os(err, Error::ConnectionSetup));

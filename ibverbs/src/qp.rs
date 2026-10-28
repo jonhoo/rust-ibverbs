@@ -849,6 +849,7 @@ impl<T: Transport> QueuePairBuilder<T> {
         if qp_ex.is_null() {
             return Err(Error::Unsupported {
                 operation: &"ibv_qp_to_qp_ex",
+                errno: nix::libc::EOPNOTSUPP,
             });
         }
         Ok(prepared)

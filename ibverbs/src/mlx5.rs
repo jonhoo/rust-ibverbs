@@ -65,6 +65,7 @@ impl ProtectionDomain {
             {
                 return Err(Error::Unsupported {
                     operation: &"mlx5dv_reg_dmabuf_mr",
+                    errno: nix::libc::ENODEV,
                 });
             }
             return Err(registration_error(err));
@@ -134,12 +135,12 @@ fn has_data_direct_device(ctx: &Context) -> bool {
 }
 
 fn registration_error(err: io::Error) -> Error {
-    if Error::is_unsupported(&err) {
-        Error::Unsupported {
+    match err.raw_os_error().filter(|_| Error::is_unsupported(&err)) {
+        Some(errno) => Error::Unsupported {
             operation: &"mlx5dv_reg_dmabuf_mr",
-        }
-    } else {
-        Error::RegisterMemoryRegion(err)
+            errno,
+        },
+        None => Error::RegisterMemoryRegion(err),
     }
 }
 
