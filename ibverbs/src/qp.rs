@@ -1279,6 +1279,9 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///  - [`GidMismatch`](Error::GidMismatch): `remote` carries a GID, but no `gid_index` was
     ///    set on the builder to route from.
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but `remote` carries no GID.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): the path MTU is not a valid MTU encoding
+    ///    ([`io::ErrorKind::InvalidInput`]), as when the port reported no active MTU to default
+    ///    to and none was set with [`QueuePairBuilder::set_path_mtu`].
     pub fn rtr_attributes(&self, remote: &QueuePairEndpoint) -> Result<QueuePairAttribute> {
         let mut path = AddressHandleAttribute::new(self.port_num);
         path.set_dest_lid(remote.lid)
@@ -1292,6 +1295,18 @@ impl<T: Connected> PreparedQueuePair<T> {
             return Err(Error::GidRequired);
         }
         let mut attr = self.bring_up.rtr.clone();
+        // A port that reports no active MTU (rxe on a netdev whose MTU is too small for 256-byte
+        // packets, or mlx5 RoCE without a netdev) leaves the default path MTU unknown, which mlx5
+        // refuses with nothing but `EINVAL` and rxe accepts as an MTU of -1.
+        if let Mtu::Unknown(raw) = attr.path_mtu() {
+            return Err(Error::ModifyQueuePair(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "the path MTU {raw} is not a valid MTU encoding (the port reports no active \
+                     MTU); set one with QueuePairBuilder::set_path_mtu"
+                ),
+            )));
+        }
         attr.set_address_vector(&path)
             .set_dest_qp_num(remote.qp_num)
             // The receive queue starts at the PSN the peer's send queue starts at.
@@ -1337,6 +1352,8 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///    `gid_index` was set on the builder to route from.
     ///  - [`GidRequired`](Error::GidRequired): the port is RoCE, but the remote endpoint carries
     ///    no GID.
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair) with [`io::ErrorKind::InvalidInput`]: the
+    ///    path MTU is not a valid MTU encoding (see [`rtr_attributes`](Self::rtr_attributes)).
     ///  - The errors of [`QueuePair::modify`]: [`ModifyQueuePair`](Error::ModifyQueuePair) when
     ///    a transition fails (for example because the remote endpoint is unreachable — on RoCE,
     ///    the error spells out the route that failed), or its typed diagnoses of a rejected
