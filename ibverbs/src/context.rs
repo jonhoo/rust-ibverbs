@@ -656,6 +656,13 @@ impl std::fmt::Display for AsyncEventType {
 /// [`ticks`](Self::ticks)) to time using the device's clock frequency,
 /// [`DeviceAttrEx::hca_core_clock_khz`].
 ///
+/// The clock wraps around: past `u64::MAX`, or on a device whose clock is narrower, past its
+/// [`DeviceAttrEx::completion_timestamp_mask`] (ionic's counts at most 48 bits). Subtraction
+/// wraps too, so a later reading minus an earlier one counts the ticks between them across a
+/// wrap; on a narrower clock, mask the difference with the device's mask:
+/// `(later - earlier) & mask`. Readings more than one wrap apart cannot be told apart, and a wrap
+/// between two readings reverses how they compare.
+///
 /// [`Sub`]: std::ops::Sub
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HcaClock(pub(crate) u64);
@@ -670,9 +677,10 @@ impl HcaClock {
 impl std::ops::Sub for HcaClock {
     type Output = u64;
 
-    /// The number of ticks from `rhs` to `self`.
+    /// The number of ticks from `rhs` to `self`, wrapping around as the clock does (see
+    /// [`HcaClock`]).
     fn sub(self, rhs: HcaClock) -> u64 {
-        self.0 - rhs.0
+        self.0.wrapping_sub(rhs.0)
     }
 }
 
@@ -1311,6 +1319,15 @@ mod test_display {
         ] {
             assert_eq!(AsyncEventType::from(raw), wrapper);
         }
+    }
+
+    #[test]
+    fn clock_differences_wrap() {
+        assert_eq!(HcaClock(10) - HcaClock(4), 6);
+        assert_eq!(HcaClock(2) - HcaClock(u64::MAX), 3);
+        // A 48-bit clock (ionic's widest) that wrapped between the two readings.
+        let mask = (1 << 48) - 1;
+        assert_eq!((HcaClock(1) - HcaClock(mask - 1)) & mask, 3);
     }
 
     #[test]
