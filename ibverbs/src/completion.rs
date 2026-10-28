@@ -1046,8 +1046,18 @@ pub struct TagMatchingInfo {
 /// - post to such a queue pair while its send or receive queue is full or nearly so: the
 ///   provider then re-checks how full it is under the lock before accepting the post.
 ///
+/// Made from another thread, those calls wait until the `Completions` drops instead, so a poll
+/// loop must not wait for a thread that might be making one of them.
+///
 /// Posting a reply or reposting a receive from inside the loop is fine while the work queue has
 /// room; when it may be full, drop the `Completions` first.
+///
+/// Some providers take the locks the other way around, so polling can wait for a posting thread
+/// too. hns moves a queue pair to `ERR` from inside the poll when it reads one of the pair's error
+/// completions, taking the pair's send and receive queue locks under the poll lock; so do not poll
+/// on a thread that has a [`SendBatch`](crate::SendBatch) open on a queue pair this queue serves.
+/// ionic holds the send completion queue's poll lock for as long as a send batch is open (see
+/// [`SendBatch`](crate::SendBatch)).
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
