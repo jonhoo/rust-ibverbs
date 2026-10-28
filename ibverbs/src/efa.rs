@@ -11,12 +11,12 @@
 use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
 use crate::qp::{
-    AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePair, QueuePairBuilder,
-    QueuePairType, Transport, sealed,
+    AddressedSendOp, Datagram, Payload, PreparedQueuePair, QueuePairBuilder, QueuePairType, SendOp,
+    Transport, sealed,
 };
 
 #[cfg(doc)]
-use crate::{AddressHandle, ProtectionDomain};
+use crate::{AddressHandle, ProtectionDomain, QueuePair};
 
 /// The EFA SRD (Scalable Reliable Datagram) transport: reliable like RC but connectionless and
 /// addressed like UD ([`QueuePairType::Driver`]).
@@ -92,23 +92,6 @@ impl QueuePairBuilder<Srd> {
     }
 }
 
-impl PreparedQueuePair<Srd> {
-    /// Transition this EFA SRD queue pair to ready with the given Q_Key.
-    ///
-    /// SRD is connectionless, so this needs no remote endpoint; the transitions are the same as a UD
-    /// queue pair's. Address each send with an [`AddressHandle`] (see
-    /// [`SendBatch::to`](crate::SendBatch::to)).
-    ///
-    /// # Errors
-    ///
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
-    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
-    ///    privileged `qkey`, one with its most significant bit set, without `CAP_NET_RAW`).
-    pub fn activate(self, qkey: u32) -> Result<QueuePair<Srd>> {
-        self.activate_impl(qkey)
-    }
-}
-
 impl AddressedSendOp<'_, '_, Srd> {
     /// Post an RDMA WRITE of `local` into `remote`, with the immediate set by [`imm`](Self::imm)
     /// if any.
@@ -124,14 +107,8 @@ impl AddressedSendOp<'_, '_, Srd> {
     #[inline]
     pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
         let imm = self.op.imm;
-        self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            match imm {
-                Some(imm) => {
-                    (*q).wr_rdma_write_imm.unwrap()(q, remote.rkey, remote.addr, imm.to_be())
-                }
-                None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
-            }
-        })
+        let op = SendOp::<Srd>::write_op(imm, remote);
+        self.op.build(wr_id, Payload::Sges(local), op)
     }
 
     /// Post an RDMA READ from `remote` into `local`.
@@ -142,8 +119,7 @@ impl AddressedSendOp<'_, '_, Srd> {
     /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.op.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
-        })
+        let op = SendOp::<Srd>::read_op(remote);
+        self.op.build(wr_id, Payload::Sges(local), op)
     }
 }

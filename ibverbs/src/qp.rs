@@ -1268,9 +1268,25 @@ impl<T: Datagram> PreparedQueuePair<T> {
         [init, rtr, rts]
     }
 
-    /// The connectionless bring-up shared by the datagram transports' `activate` (UD here, SRD in
-    /// `efa.rs`): applies [`activate_attributes`](Self::activate_attributes) in order.
-    pub(crate) fn activate_impl(self, qkey: u32) -> Result<QueuePair<T>> {
+    /// Activate this datagram queue pair (UD, or SRD behind the `efa` feature).
+    ///
+    /// Unlike a connected transport's handshake, a datagram transport is connectionless: there is
+    /// no remote endpoint to exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with
+    /// the given `qkey` ([`activate_attributes`](Self::activate_attributes)). Incoming datagrams
+    /// whose Q_Key does not match `qkey` are discarded (a sender whose work request sets the
+    /// Q_Key's most significant bit transmits with its own QP's Q_Key instead). A `qkey` with that
+    /// bit set is a privileged one: since Linux 6.4, using it needs `CAP_NET_RAW` (or, since 6.7,
+    /// `rdma system set privileged-qkey on`).
+    ///
+    /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
+    /// [`SendBatch::to`].
+    ///
+    /// # Errors
+    ///
+    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
+    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
+    ///    privileged `qkey` without the privilege).
+    pub fn activate(self, qkey: u32) -> Result<QueuePair<T>> {
         let attributes = self.activate_attributes(qkey);
         let mut qp = self.qp;
         for attr in &attributes {
@@ -1418,29 +1434,6 @@ impl<T: Connected> PreparedQueuePair<T> {
         }
         qp.modify(&rts)?;
         Ok(qp)
-    }
-}
-
-impl PreparedQueuePair<Ud> {
-    /// Activate this unreliable datagram (UD) queue pair.
-    ///
-    /// Unlike a connected transport's handshake, UD is connectionless: there is no remote
-    /// endpoint to exchange, so the queue pair is transitioned `INIT -> RTR -> RTS` with the given
-    /// `qkey`. Incoming datagrams whose Q_Key does not match `qkey` are discarded (a sender whose
-    /// work request sets the Q_Key's most significant bit transmits with its own QP's Q_Key
-    /// instead). A `qkey` with that bit set is a privileged one: since Linux 6.4, using it needs
-    /// `CAP_NET_RAW` (or, since 6.7, `rdma system set privileged-qkey on`).
-    ///
-    /// Each datagram is addressed individually at send time with an [`AddressHandle`]; see
-    /// [`SendBatch::to`].
-    ///
-    /// # Errors
-    ///
-    ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a state transition failed (`EINVAL` for an
-    ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
-    ///    privileged `qkey` without the privilege).
-    pub fn activate(self, qkey: u32) -> Result<QueuePair<Ud>> {
-        self.activate_impl(qkey)
     }
 }
 
@@ -1830,7 +1823,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
     /// The opcode builder for an RDMA WRITE into `remote`, with or without the immediate set by
     /// [`imm`](Self::imm).
     #[inline]
-    fn write_op(
+    pub(crate) fn write_op(
         imm: Option<u32>,
         remote: RemoteMemorySlice,
     ) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
@@ -1842,6 +1835,12 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 None => (*q).wr_rdma_write.unwrap()(q, remote.rkey, remote.addr),
             }
         }
+    }
+
+    /// The opcode builder for an RDMA READ from `remote`.
+    #[inline]
+    pub(crate) fn read_op(remote: RemoteMemorySlice) -> impl FnOnce(*mut ffi::ibv_qp_ex) + use<T> {
+        move |q| unsafe { (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr) }
     }
 }
 
@@ -1899,9 +1898,7 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
     pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        self.build(wr_id, Payload::Sges(local), move |q| unsafe {
-            (*q).wr_rdma_read.unwrap()(q, remote.rkey, remote.addr)
-        })
+        self.build(wr_id, Payload::Sges(local), Self::read_op(remote))
     }
 
     /// Post an atomic compare-and-swap on the 8-byte value at `remote`: if it equals `compare`, it
