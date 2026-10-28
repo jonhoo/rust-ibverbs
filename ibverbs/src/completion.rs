@@ -1,3 +1,4 @@
+use std::cell::UnsafeCell;
 use std::fmt;
 use std::io;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -280,13 +281,19 @@ impl CompletionQueueBuilder {
 
     /// Create the completion queue.
     ///
+    /// When the provider declines `ibv_create_cq_ex` with `EOPNOTSUPP` and only fields present in
+    /// a classic `ibv_wc` were requested, creation falls back to `ibv_create_cq` and emulates the
+    /// extended polling interface in software.
+    ///
     /// # Errors
     ///
-    ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
-    ///    work-completion field (`EOPNOTSUPP`).
-    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `ibv_create_cq_ex` failed
-    ///    (`EINVAL` for an invalid `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`,
-    ///    or an invalid completion vector, `ENOMEM` when out of resources).
+    ///  - [`Unsupported`](Error::Unsupported): the device does not support an extended-only
+    ///    work-completion field (such as hardware timestamps or flow tags), or legacy
+    ///    `ibv_create_cq` also failed with `EOPNOTSUPP`.
+    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `ibv_create_cq_ex` (or the
+    ///    `ibv_create_cq` fallback) failed (`EINVAL` for an invalid `min_cq_entries`, which must
+    ///    be `1 <= cqe <= dev_cap.max_cqe`, or an invalid completion vector, `ENOMEM` when out of
+    ///    resources).
     pub fn build(&self) -> Result<CompletionQueue> {
         // The queue holds a reference to its channel (if any), so the channel cannot be destroyed
         // out from under it.
@@ -294,11 +301,7 @@ impl CompletionQueueBuilder {
 
         // Always request the standard work-completion fields so the lazy readers in `WorkCompletion`
         // can serve them, then add any caller-requested extras (such as the completion timestamp).
-        let wc_flags = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
-            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
-            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
-            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0
-            | self.wc_flags;
+        let wc_flags = STANDARD_WC_FLAGS | self.wc_flags;
         let mut cq_attr = ffi::ibv_cq_init_attr_ex {
             cqe: self.min_cq_entries,
             // The cookie is a plain integer to the caller; the C ABI carries it as a pointer.
@@ -310,37 +313,271 @@ impl CompletionQueueBuilder {
             wc_flags: wc_flags as u64,
             ..Default::default()
         };
-        let cq_ex = nonnull(
+
+        let (cq, cq_ex, _legacy_cq_ex) = match nonnull(
             unsafe { ffi::ibv_create_cq_ex(self.ctx.as_raw(), &mut cq_attr) },
             Error::CreateCompletionQueue,
-        )?;
+        ) {
+            Ok(cq_ex) => (cq_ex as *mut ffi::ibv_cq, cq_ex, None),
+            Err(Error::Unsupported { .. }) if can_emulate_legacy_cq(self.wc_flags) => {
+                let cq = nonnull(
+                    unsafe {
+                        ffi::ibv_create_cq(
+                            self.ctx.as_raw(),
+                            self.min_cq_entries.min(i32::MAX as u32) as i32,
+                            cq_attr.cq_context,
+                            cq_attr.channel,
+                            self.comp_vector.min(i32::MAX as u32) as i32,
+                        )
+                    },
+                    Error::CreateCompletionQueue,
+                )?;
+                let legacy = OwnedLegacyCqEx::new(cq, wc_flags);
+                let cq_ex = legacy.as_cq_ex_ptr();
+                (cq, cq_ex, Some(legacy))
+            }
+            Err(err) => return Err(err),
+        };
         Ok(CompletionQueue {
             inner: Arc::new(CompletionQueueInner {
                 _ctx: self.ctx.clone(),
+                cq,
+                _legacy_cq_ex,
                 cc,
-                cq_ex,
             }),
+            cq,
             cq_ex,
         })
     }
 }
 
+const STANDARD_WC_FLAGS: u32 = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
+    | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
+    | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
+    | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0;
+
+// Classic `ibv_wc` entries always carry the standard fields plus SLID, SL, and DLID_PATH_BITS.
+// Only extended-only fields (such as hardware timestamps, CVLAN, flow tag, or tag matching)
+// require native `ibv_create_cq_ex` support from the provider.
+const LEGACY_SUPPORTED_WC_FIELDS: u32 = STANDARD_WC_FLAGS
+    | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID.0
+    | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL.0
+    | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_DLID_PATH_BITS.0;
+
+#[inline]
+fn can_emulate_legacy_cq(wc_flags: u32) -> bool {
+    wc_flags & !LEGACY_SUPPORTED_WC_FIELDS == 0
+}
+
+struct OwnedLegacyCqEx(ptr::NonNull<LegacyCqEx>);
+
+impl OwnedLegacyCqEx {
+    fn new(cq: *mut ffi::ibv_cq, wc_flags: u32) -> Self {
+        let ptr = Box::into_raw(LegacyCqEx::new(cq, wc_flags));
+        Self(unsafe { ptr::NonNull::new_unchecked(ptr) })
+    }
+
+    #[inline]
+    fn as_cq_ex_ptr(&self) -> *mut ffi::ibv_cq_ex {
+        self.0.as_ptr().cast::<ffi::ibv_cq_ex>()
+    }
+}
+
+impl Drop for OwnedLegacyCqEx {
+    fn drop(&mut self) {
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
 struct CompletionQueueInner {
     _ctx: Context,
-    cq_ex: *mut ffi::ibv_cq_ex,
+    cq: *mut ffi::ibv_cq,
+    _legacy_cq_ex: Option<OwnedLegacyCqEx>,
     cc: Option<CompletionChannel>,
 }
 
 impl Drop for CompletionQueueInner {
     fn drop(&mut self) {
-        // An `ibv_cq_ex` starts with the `ibv_cq` it extends (`ibv_cq_ex_to_cq` in C).
-        destroyed("ibv_destroy_cq", unsafe {
-            ffi::ibv_destroy_cq(self.cq_ex as *mut ffi::ibv_cq)
-        });
+        destroyed("ibv_destroy_cq", unsafe { ffi::ibv_destroy_cq(self.cq) });
 
-        // The queue's reference to its completion channel (if any) is released when the `cc` field
-        // drops after this, ordered after `ibv_destroy_cq` as the provider requires. The channel
-        // itself is destroyed once its other queues and clones are gone too.
+        // `_legacy_cq_ex` and `cc` drop after `ibv_destroy_cq`: `ibv_destroy_comp_channel` fails
+        // with EBUSY if any CQ is still associated with it, so the CQ must be destroyed before the
+        // channel's Arc is released.
+    }
+}
+
+/// Software emulation of `ibv_cq_ex` over a classic `ibv_cq` (created by `ibv_create_cq`) for
+/// providers that decline `ibv_create_cq_ex` with `EOPNOTSUPP` (such as SoftiWARP `siw` or Gen-1
+/// Intel `irdma`, or when `IBV_WC_EX_WITH_DLID_PATH_BITS` is requested on `irdma`).
+///
+/// `cq_ex` is the first field (`#[repr(C)]`) so each `unsafe extern "C"` callback can recover the
+/// enclosing `LegacyCqEx` via `cq_ex.cast::<LegacyCqEx>()` without narrowing pointer provenance.
+/// Because `CompletionQueue` is `Sync` and `poll(&self)` takes `&self`, all callbacks operate
+/// through raw pointer projections (`*mut Self`) and acquire `poll_lock` before reading or writing
+/// `cq_ex` or `current_wc`, avoiding overlapping `&mut Self` references across threads.
+#[repr(C)]
+struct LegacyCqEx {
+    cq_ex: ffi::ibv_cq_ex,
+    cq: *mut ffi::ibv_cq,
+    poll_lock: UnsafeCell<nix::libc::pthread_mutex_t>,
+    current_wc: UnsafeCell<ffi::ibv_wc>,
+}
+
+impl Drop for LegacyCqEx {
+    fn drop(&mut self) {
+        unsafe {
+            nix::libc::pthread_mutex_destroy(self.poll_lock.get());
+        }
+    }
+}
+
+impl LegacyCqEx {
+    fn new(cq: *mut ffi::ibv_cq, wc_flags: u32) -> Box<Self> {
+        let base = unsafe { &*cq };
+        let has_slid = wc_flags & ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID.0 != 0;
+        let has_sl = wc_flags & ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL.0 != 0;
+        let has_dlid = wc_flags & ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_DLID_PATH_BITS.0 != 0;
+
+        Box::new(Self {
+            cq_ex: ffi::ibv_cq_ex {
+                context: base.context,
+                channel: base.channel,
+                cq_context: base.cq_context,
+                handle: base.handle,
+                cqe: base.cqe,
+                start_poll: Some(Self::start_poll),
+                next_poll: Some(Self::next_poll),
+                end_poll: Some(Self::end_poll),
+                read_opcode: Some(Self::read_opcode),
+                read_vendor_err: Some(Self::read_vendor_err),
+                read_byte_len: Some(Self::read_byte_len),
+                read_imm_data: Some(Self::read_imm_data),
+                read_qp_num: Some(Self::read_qp_num),
+                read_src_qp: Some(Self::read_src_qp),
+                read_wc_flags: Some(Self::read_wc_flags),
+                read_slid: has_slid.then_some(Self::read_slid),
+                read_sl: has_sl.then_some(Self::read_sl),
+                read_dlid_path_bits: has_dlid.then_some(Self::read_dlid_path_bits),
+                ..Default::default()
+            },
+            cq,
+            poll_lock: UnsafeCell::new(nix::libc::PTHREAD_MUTEX_INITIALIZER),
+            current_wc: UnsafeCell::new(ffi::ibv_wc::default()),
+        })
+    }
+
+    /// Polls one entry while the caller holds `(*this).poll_lock`.
+    #[inline]
+    unsafe fn poll_one(this: *mut Self) -> std::os::raw::c_int {
+        let wc_ptr = unsafe { (*this).current_wc.get() };
+        let cq = unsafe { (*this).cq };
+        let n = unsafe { ffi::ibv_poll_cq(cq, 1, wc_ptr) };
+        if n == 1 {
+            let wc = unsafe { &*wc_ptr };
+            let wr_id = wc.wr_id();
+            let status = wc
+                .error()
+                .map_or(ffi::ibv_wc_status::IBV_WC_SUCCESS, |(status, _)| status);
+            unsafe {
+                (*this).cq_ex.wr_id = wr_id;
+                (*this).cq_ex.status = status;
+            }
+            0
+        } else if n == 0 {
+            nix::libc::ENOENT
+        } else {
+            // `ibv_poll_cq` returns a negative value on failure without defining `errno`; some
+            // providers (such as `irdma_upoll_cq`) return a negative errno directly (e.g.
+            // `-EINVAL`), whereas others return `-1`. Never read thread-local `errno` (which may
+            // hold a stale `ENOENT` or `EOPNOTSUPP` from an earlier call), and never return
+            // `ENOENT` (treated as empty) or `EOPNOTSUPP`/`EPROTONOSUPPORT` (mapped to
+            // `Error::Unsupported`).
+            let candidate = n.saturating_neg();
+            if candidate > 1
+                && candidate != nix::libc::ENOENT
+                && candidate != nix::libc::EOPNOTSUPP
+                && candidate != nix::libc::EPROTONOSUPPORT
+            {
+                candidate
+            } else {
+                nix::libc::EIO
+            }
+        }
+    }
+
+    unsafe extern "C" fn start_poll(
+        cq_ex: *mut ffi::ibv_cq_ex,
+        _attr: *mut ffi::ibv_poll_cq_attr,
+    ) -> std::os::raw::c_int {
+        let this = cq_ex.cast::<Self>();
+        let lock_ptr = unsafe { (*this).poll_lock.get() };
+        unsafe { nix::libc::pthread_mutex_lock(lock_ptr) };
+        let rc = unsafe { Self::poll_one(this) };
+        if rc != 0 {
+            unsafe { nix::libc::pthread_mutex_unlock(lock_ptr) };
+        }
+        rc
+    }
+
+    unsafe extern "C" fn next_poll(cq_ex: *mut ffi::ibv_cq_ex) -> std::os::raw::c_int {
+        let this = cq_ex.cast::<Self>();
+        unsafe { Self::poll_one(this) }
+    }
+
+    unsafe extern "C" fn end_poll(cq_ex: *mut ffi::ibv_cq_ex) {
+        let this = cq_ex.cast::<Self>();
+        let lock_ptr = unsafe { (*this).poll_lock.get() };
+        unsafe { nix::libc::pthread_mutex_unlock(lock_ptr) };
+    }
+
+    unsafe extern "C" fn read_opcode(cq_ex: *mut ffi::ibv_cq_ex) -> ffi::ibv_wc_opcode {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).opcode() }
+    }
+
+    unsafe extern "C" fn read_vendor_err(cq_ex: *mut ffi::ibv_cq_ex) -> u32 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).error().map_or(0, |(_, v)| v) }
+    }
+
+    unsafe extern "C" fn read_byte_len(cq_ex: *mut ffi::ibv_cq_ex) -> u32 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).len() as u32 }
+    }
+
+    unsafe extern "C" fn read_imm_data(cq_ex: *mut ffi::ibv_cq_ex) -> u32 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).imm_data }
+    }
+
+    unsafe extern "C" fn read_qp_num(cq_ex: *mut ffi::ibv_cq_ex) -> u32 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).qp_num }
+    }
+
+    unsafe extern "C" fn read_src_qp(cq_ex: *mut ffi::ibv_cq_ex) -> u32 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).src_qp }
+    }
+
+    unsafe extern "C" fn read_wc_flags(cq_ex: *mut ffi::ibv_cq_ex) -> std::os::raw::c_uint {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).wc_flags.0 }
+    }
+
+    unsafe extern "C" fn read_slid(cq_ex: *mut ffi::ibv_cq_ex) -> u32 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).slid as u32 }
+    }
+
+    unsafe extern "C" fn read_sl(cq_ex: *mut ffi::ibv_cq_ex) -> u8 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).sl }
+    }
+
+    unsafe extern "C" fn read_dlid_path_bits(cq_ex: *mut ffi::ibv_cq_ex) -> u8 {
+        let this = cq_ex.cast::<Self>();
+        unsafe { (*(*this).current_wc.get()).dlid_path_bits }
     }
 }
 
@@ -1050,6 +1287,9 @@ impl Drop for Completions<'_> {
 #[derive(Clone)]
 pub struct CompletionQueue {
     inner: Arc<CompletionQueueInner>,
+    /// `inner.cq`, kept next to the `Arc` so `poll_into`, `req_notify`, and queue-pair creation
+    /// pass the genuine provider `ibv_cq` pointer without a dependent load.
+    cq: *mut ffi::ibv_cq,
     /// `inner.cq_ex`, kept next to the `Arc` for the data path: read through it, the pointer is a
     /// dependent load that every opaque provider call makes the compiler repeat.
     cq_ex: *mut ffi::ibv_cq_ex,
@@ -1158,8 +1398,8 @@ impl CompletionQueue {
     /// ```
     #[inline]
     pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
-        // An `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
-        // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
+        // `self.as_raw()` returns the provider's `ibv_cq` handle (`ibv_cq_ex_to_cq` on native
+        // extended queues, or the handle from `ibv_create_cq` when using `LegacyCqEx`).
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
         let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
         if n < 0 {
@@ -1212,25 +1452,28 @@ impl CompletionQueue {
     /// requests in flight across the queue pairs sharing this queue, or it overruns
     /// (`IBV_EVENT_CQ_ERR`) and stops working.
     pub fn capacity(&self) -> u32 {
-        unsafe { (*self.cq_ex).cqe }.max(0) as u32
+        unsafe { (*self.cq).cqe }.max(0) as u32
     }
 
-    /// Returns the underlying `ibv_cq` pointer.
+    /// Returns the underlying provider `ibv_cq` pointer.
     ///
-    /// This is an escape hatch for verbs this crate does not yet wrap. The completion queue is built
-    /// through the extended interface; an `ibv_cq_ex` shares its layout prefix with `ibv_cq`, so this
-    /// is the same handle viewed as a plain completion queue (see [`as_raw_ex`](Self::as_raw_ex)).
+    /// This is an escape hatch for verbs this crate does not yet wrap (such as `ibv_resize_cq`).
+    /// On providers that support `ibv_create_cq_ex`, this is `ibv_cq_ex_to_cq(self.as_raw_ex())`;
+    /// on providers using the legacy `ibv_create_cq` fallback, this is the genuine provider
+    /// `ibv_cq` handle, whereas [`as_raw_ex`](Self::as_raw_ex) points to the software adapter.
     /// The pointer stays valid only while this [`CompletionQueue`] is alive; do not destroy it.
     #[inline]
     pub fn as_raw(&self) -> *mut ffi::ibv_cq {
-        // An `ibv_cq_ex` starts with the `ibv_cq` it extends (`ibv_cq_ex_to_cq` in C).
-        self.cq_ex as *mut ffi::ibv_cq
+        self.cq
     }
 
-    /// Returns the underlying `ibv_cq_ex` pointer (the extended completion queue this is built on).
+    /// Returns the `ibv_cq_ex` pointer used for extended completion polling.
     ///
-    /// This is an escape hatch for verbs this crate does not yet wrap. The pointer stays valid only
-    /// while this [`CompletionQueue`] is alive; do not destroy it.
+    /// This is an escape hatch for driving the `ibv_start_poll` / `ibv_next_poll` / `ibv_end_poll`
+    /// function pointers directly. On providers using the legacy `ibv_create_cq` fallback, this
+    /// points to a software `ibv_cq_ex` adapter rather than a provider-allocated struct, so never
+    /// pass `ibv_cq_ex_to_cq(cq.as_raw_ex())` to C verbs (use [`as_raw`](Self::as_raw) instead).
+    /// The pointer stays valid only while this [`CompletionQueue`] is alive; do not destroy it.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_cq_ex {
         self.cq_ex
     }
@@ -1289,5 +1532,240 @@ mod test_conversions {
             assert_eq!(WcOpcode::from(raw), wrapper);
             assert_eq!(ffi::ibv_wc_opcode::from(wrapper), raw);
         }
+    }
+
+    #[repr(C)]
+    struct RawWcPrefix {
+        wr_id: u64,
+        status: ffi::ibv_wc_status,
+        opcode: ffi::ibv_wc_opcode,
+        vendor_err: u32,
+        byte_len: u32,
+    }
+
+    #[repr(C)]
+    struct FakeCq {
+        cq: ffi::ibv_cq,
+        entries: Vec<ffi::ibv_wc>,
+        cursor: usize,
+        fail_ret: i32,
+    }
+
+    unsafe extern "C" fn fake_poll_cq(
+        cq: *mut ffi::ibv_cq,
+        num_entries: i32,
+        wc: *mut ffi::ibv_wc,
+    ) -> i32 {
+        if num_entries != 1 {
+            return -nix::libc::EINVAL;
+        }
+        let fake = unsafe { &mut *cq.cast::<FakeCq>() };
+        if fake.fail_ret != 0 {
+            return fake.fail_ret;
+        }
+        if fake.cursor >= fake.entries.len() {
+            return 0;
+        }
+        unsafe { *wc = fake.entries[fake.cursor] };
+        fake.cursor += 1;
+        1
+    }
+
+    // Polling a `LegacyCqEx` through `Completions` yields all standard and UD addressing fields
+    // from `ibv_poll_cq`, surfaces completion status errors with their vendor syndrome, and
+    // releases `poll_lock` when `Completions` drops.
+    #[test]
+    fn legacy_cq_ex_polls_entries_and_releases_lock_on_drop() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.poll_cq = Some(fake_poll_cq);
+
+        let mut wc1 = ffi::ibv_wc::default();
+        // `ibv_wc::default()` initializes the private `status` field to `IBV_WC_GENERAL_ERR`.
+        assert_eq!(
+            wc1.error(),
+            Some((ffi::ibv_wc_status::IBV_WC_GENERAL_ERR, 0))
+        );
+        wc1.imm_data = 0x1234_5678u32.to_be();
+        wc1.qp_num = 42;
+        wc1.src_qp = 99;
+        wc1.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_IMM | ffi::ibv_wc_flags::IBV_WC_GRH;
+        wc1.slid = 7;
+        wc1.sl = 3;
+        wc1.dlid_path_bits = 5;
+        unsafe {
+            let p1 = (&raw mut wc1).cast::<RawWcPrefix>();
+            (*p1).wr_id = 101;
+            (*p1).status = ffi::ibv_wc_status::IBV_WC_SUCCESS;
+            (*p1).opcode = ffi::ibv_wc_opcode::IBV_WC_RECV;
+            (*p1).vendor_err = 0;
+            (*p1).byte_len = 64;
+        }
+
+        let mut wc2 = ffi::ibv_wc::default();
+        unsafe {
+            let p2 = (&raw mut wc2).cast::<RawWcPrefix>();
+            (*p2).wr_id = 202;
+            (*p2).status = ffi::ibv_wc_status::IBV_WC_REM_ACCESS_ERR;
+            (*p2).opcode = ffi::ibv_wc_opcode::IBV_WC_RDMA_WRITE;
+            (*p2).vendor_err = 0xdead;
+            (*p2).byte_len = 0;
+        }
+
+        let mut fake_cq = FakeCq {
+            cq: ffi::ibv_cq {
+                context: &raw mut ctx,
+                cqe: 32,
+                ..Default::default()
+            },
+            entries: vec![wc1, wc2],
+            cursor: 0,
+            fail_ret: 0,
+        };
+
+        let wc_flags = STANDARD_WC_FLAGS
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_DLID_PATH_BITS.0;
+        let legacy = OwnedLegacyCqEx::new((&raw mut fake_cq).cast::<ffi::ibv_cq>(), wc_flags);
+        let cq_ex = legacy.as_cq_ex_ptr();
+
+        let mut attr = ffi::ibv_poll_cq_attr::default();
+        assert_eq!(unsafe { (*cq_ex).start_poll.unwrap()(cq_ex, &mut attr) }, 0);
+        let mut iter = Completions {
+            cq: cq_ex,
+            open: true,
+            first: true,
+            done: false,
+            _cq: std::marker::PhantomData,
+        };
+
+        let first = iter.next().expect("expected first completion");
+        assert_eq!(first.wr_id(), 101);
+        assert!(first.ok().is_ok());
+        assert_eq!(first.opcode(), WcOpcode::Recv);
+        assert_eq!(first.len(), 64);
+        assert_eq!(first.imm_data(), Some(0x1234_5678));
+        assert_eq!(first.qp_num(), 42);
+        assert_eq!(first.src_qp(), 99);
+        assert!(first.has_grh());
+        assert_eq!(first.slid(), 7);
+        assert_eq!(first.sl(), 3);
+        assert_eq!(first.dlid_path_bits(), 5);
+
+        let second = iter.next().expect("expected second completion");
+        assert_eq!(second.wr_id(), 202);
+        assert_eq!(
+            second.ok(),
+            Err(WcError {
+                status: WcStatus::RemoteAccessError,
+                vendor_err: 0xdead,
+            })
+        );
+
+        assert!(iter.next().is_none());
+        drop(iter);
+
+        // Verify `poll_lock` was released on drop without blocking (`pthread_mutex_trylock == 0`).
+        let lock_ptr = unsafe { (*legacy.0.as_ptr()).poll_lock.get() };
+        assert_eq!(unsafe { nix::libc::pthread_mutex_trylock(lock_ptr) }, 0);
+        assert_eq!(unsafe { nix::libc::pthread_mutex_unlock(lock_ptr) }, 0);
+
+        // Once the queue is empty, `start_poll` returns `ENOENT` and leaves `poll_lock` unlocked.
+        assert_eq!(
+            unsafe { (*cq_ex).start_poll.unwrap()(cq_ex, &mut attr) },
+            nix::libc::ENOENT
+        );
+        assert_eq!(unsafe { nix::libc::pthread_mutex_trylock(lock_ptr) }, 0);
+        assert_eq!(unsafe { nix::libc::pthread_mutex_unlock(lock_ptr) }, 0);
+    }
+
+    // Building a `LegacyCqEx` with only the standard `WcFields` leaves optional UD reader
+    // callbacks (`read_slid`, `read_sl`, `read_dlid_path_bits`) unset while populating the
+    // standard field readers.
+    #[test]
+    fn legacy_cq_ex_omits_unrequested_optional_fields() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.poll_cq = Some(fake_poll_cq);
+        let mut fake_cq = FakeCq {
+            cq: ffi::ibv_cq {
+                context: &raw mut ctx,
+                cqe: 16,
+                ..Default::default()
+            },
+            entries: Vec::new(),
+            cursor: 0,
+            fail_ret: 0,
+        };
+
+        let legacy =
+            OwnedLegacyCqEx::new((&raw mut fake_cq).cast::<ffi::ibv_cq>(), STANDARD_WC_FLAGS);
+        let cq_ex = legacy.as_cq_ex_ptr();
+        unsafe {
+            assert!((*cq_ex).read_slid.is_none());
+            assert!((*cq_ex).read_sl.is_none());
+            assert!((*cq_ex).read_dlid_path_bits.is_none());
+            assert!((*cq_ex).read_byte_len.is_some());
+            assert!((*cq_ex).read_imm_data.is_some());
+            assert!((*cq_ex).read_qp_num.is_some());
+            assert!((*cq_ex).read_src_qp.is_some());
+        }
+    }
+
+    // `can_emulate_legacy_cq` accepts standard and UD addressing flags while rejecting
+    // extended-only hardware timestamp flags.
+    #[test]
+    fn can_emulate_legacy_cq_accepts_standard_and_ud_flags() {
+        assert!(can_emulate_legacy_cq(0));
+        assert!(can_emulate_legacy_cq(LEGACY_SUPPORTED_WC_FIELDS));
+        assert!(!can_emulate_legacy_cq(
+            ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_COMPLETION_TIMESTAMP.0
+        ));
+    }
+
+    // When `ibv_poll_cq` returns a negative value on `LegacyCqEx`, `start_poll` maps `-1` (and
+    // `-ENOENT` / `-EOPNOTSUPP`) to `EIO` and preserves negative errnos such as `-EINVAL` without
+    // reading stale thread-local `errno` values (`ENOENT` or `EOPNOTSUPP`).
+    #[test]
+    fn legacy_cq_ex_maps_negative_poll_return_without_reading_stale_errno() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.poll_cq = Some(fake_poll_cq);
+        let mut fake_cq = FakeCq {
+            cq: ffi::ibv_cq {
+                context: &raw mut ctx,
+                cqe: 16,
+                ..Default::default()
+            },
+            entries: Vec::new(),
+            cursor: 0,
+            fail_ret: -1,
+        };
+        let fake_cq_ptr = &raw mut fake_cq;
+
+        let legacy = OwnedLegacyCqEx::new(fake_cq_ptr.cast::<ffi::ibv_cq>(), STANDARD_WC_FLAGS);
+        let cq_ex = legacy.as_cq_ex_ptr();
+        let mut attr = ffi::ibv_poll_cq_attr::default();
+
+        // Seed thread-local `errno` with `ENOENT` and `EOPNOTSUPP` to verify `poll_one` ignores it.
+        nix::errno::Errno::set_raw(nix::libc::ENOENT);
+        assert_eq!(
+            unsafe { (*cq_ex).start_poll.unwrap()(cq_ex, &mut attr) },
+            nix::libc::EIO
+        );
+        nix::errno::Errno::set_raw(nix::libc::EOPNOTSUPP);
+        assert_eq!(
+            unsafe { (*cq_ex).start_poll.unwrap()(cq_ex, &mut attr) },
+            nix::libc::EIO
+        );
+
+        // Provider returning a negative errno directly (e.g. `irdma_upoll_cq` returning `-EINVAL`)
+        // surfaces that positive errno and releases `poll_lock`.
+        unsafe { (*fake_cq_ptr).fail_ret = -nix::libc::EINVAL };
+        assert_eq!(
+            unsafe { (*cq_ex).start_poll.unwrap()(cq_ex, &mut attr) },
+            nix::libc::EINVAL
+        );
+        let lock_ptr = unsafe { (*legacy.0.as_ptr()).poll_lock.get() };
+        assert_eq!(unsafe { nix::libc::pthread_mutex_trylock(lock_ptr) }, 0);
+        assert_eq!(unsafe { nix::libc::pthread_mutex_unlock(lock_ptr) }, 0);
     }
 }

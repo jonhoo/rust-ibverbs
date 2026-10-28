@@ -850,19 +850,64 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
-    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
+    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`), falling back to `ibv_create_qp`
+    /// plus a software `ibv_qp_ex` staging adapter when the provider does not support the
+    /// extended send-operations mask (`EOPNOTSUPP`) or does not install an `ibv_qp_ex` table.
     fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
         self.check_same_context()?;
+        let send_ops = self.send_ops();
         let mut attr = ffi::ibv_qp_init_attr_ex {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
             ..self.init_attr_ex()
         };
-        let qp = nonnull(
+
+        let (qp, qp_ex, _legacy_qp_ex) = match nonnull(
             unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
             Error::CreateQueuePair,
-        )?;
-        let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-        let prepared = PreparedQueuePair {
+        ) {
+            Ok(qp) => {
+                let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
+                if !qp_ex.is_null() {
+                    (qp, qp_ex, None)
+                } else if can_emulate_legacy_qp(send_ops) {
+                    let legacy = OwnedLegacyQpEx::new(qp, send_ops, attr.cap);
+                    let qp_ex = legacy.as_qp_ex_ptr();
+                    (qp, qp_ex, Some(legacy))
+                } else {
+                    destroyed("ibv_destroy_qp", unsafe { ffi::ibv_destroy_qp(qp) });
+                    return Err(Error::Unsupported {
+                        operation: &"ibv_qp_to_qp_ex",
+                    });
+                }
+            }
+            Err(Error::Unsupported { .. }) if can_emulate_legacy_qp(send_ops) => {
+                debug_assert_eq!(
+                    attr.comp_mask,
+                    ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0
+                        | ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_SEND_OPS_FLAGS.0,
+                );
+                let mut legacy_attr = ffi::ibv_qp_init_attr {
+                    qp_context: attr.qp_context,
+                    send_cq: attr.send_cq,
+                    recv_cq: attr.recv_cq,
+                    srq: attr.srq,
+                    cap: attr.cap,
+                    qp_type: attr.qp_type,
+                    sq_sig_all: attr.sq_sig_all,
+                };
+                let qp = nonnull(
+                    unsafe { ffi::ibv_create_qp(self.pd.as_raw(), &mut legacy_attr) },
+                    Error::CreateQueuePair,
+                )?;
+                attr.cap = legacy_attr.cap;
+                let legacy = OwnedLegacyQpEx::new(qp, send_ops, attr.cap);
+                let qp_ex = legacy.as_qp_ex_ptr();
+                (qp, qp_ex, Some(legacy))
+            }
+            Err(err) => return Err(err),
+        };
+
+        Ok(PreparedQueuePair {
             lid: self.lid,
             roce: self.roce,
             port_num: self.port_num,
@@ -873,6 +918,7 @@ impl<T: Transport> QueuePairBuilder<T> {
                 _recv_cq: self.recv.clone(),
                 qp,
                 qp_ex,
+                _legacy_qp_ex,
                 // Creation writes the granted capacities back into `attr.cap`.
                 max_inline_data: attr.cap.max_inline_data,
                 _transport: std::marker::PhantomData,
@@ -881,16 +927,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             traffic_class: self.traffic_class,
             service_level: self.service_level,
             bring_up: self.bring_up.clone(),
-        };
-        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
-        // work-request table; one that accepted the send-operations mask without doing so has
-        // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
-        if qp_ex.is_null() {
-            return Err(Error::Unsupported {
-                operation: &"ibv_qp_to_qp_ex",
-            });
-        }
-        Ok(prepared)
+        })
     }
 }
 
@@ -911,7 +948,8 @@ impl<T: Connected> QueuePairBuilder<T> {
         self
     }
 
-    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
+    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`, falling
+    /// back to `ibv_create_qp` when the provider declines `IBV_QP_INIT_ATTR_SEND_OPS_FLAGS`).
     ///
     /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
     ///
@@ -922,21 +960,24 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
     ///    queue belongs to another device context than the protection domain, or
-    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
+    ///    `ibv_create_qp_ex` (or the `ibv_create_qp` fallback) failed (`EINVAL` for an invalid
+    ///    `ProtectionDomain` or
     ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
     ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
     ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
     ///    with this Transport Service Type).
-    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
+    ///  - [`Unsupported`](Error::Unsupported): an extended-only send operation
+    ///    ([`SendOps::FLUSH`] or [`SendOps::ATOMIC_WRITE`]) was requested on a provider that does
+    ///    not support `ibv_create_qp_ex` / `ibv_qp_to_qp_ex`, or legacy `ibv_create_qp` itself
+    ///    returned `EOPNOTSUPP`.
     pub fn build(&self) -> Result<PreparedQueuePair<T>> {
         self.build_impl()
     }
 }
 
 impl QueuePairBuilder<Ud> {
-    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
+    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`, falling
+    /// back to `ibv_create_qp` when the provider declines `IBV_QP_INIT_ATTR_SEND_OPS_FLAGS`).
     ///
     /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
     ///
@@ -944,14 +985,15 @@ impl QueuePairBuilder<Ud> {
     ///
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
     ///    queue belongs to another device context than the protection domain, or
-    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
-    ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
-    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
-    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
-    ///    with this Transport Service Type).
-    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
+    ///    `ibv_create_qp_ex` (or the `ibv_create_qp` fallback) failed (`EINVAL` for an invalid
+    ///    `ProtectionDomain` or `CompletionQueue`, or an invalid value in `max_send_wr`,
+    ///    `max_recv_wr`, or `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the
+    ///    device does not support this Transport Service Type; `EPERM` without enough permissions
+    ///    to create a QP with this Transport Service Type).
+    ///  - [`Unsupported`](Error::Unsupported): an extended-only send operation
+    ///    ([`SendOps::FLUSH`] or [`SendOps::ATOMIC_WRITE`]) was requested on a provider that does
+    ///    not support `ibv_create_qp_ex` / `ibv_qp_to_qp_ex`, or legacy `ibv_create_qp` itself
+    ///    returned `EOPNOTSUPP`.
     pub fn build(&self) -> Result<PreparedQueuePair<Ud>> {
         self.build_impl()
     }
@@ -1040,8 +1082,9 @@ impl<T: Reliable> QueuePairBuilder<T> {
 
 /// An allocated but uninitialized `QueuePair`. Created by [`QueuePairBuilder::build`].
 ///
-/// Specifically, this `QueuePair` has been allocated with `ibv_create_qp_ex`, but has not yet been
-/// initialized with calls to `ibv_modify_qp`.
+/// Specifically, this `QueuePair` has been allocated with `ibv_create_qp_ex` (or `ibv_create_qp`
+/// when falling back on a legacy provider), but has not yet been initialized with calls to
+/// `ibv_modify_qp`.
 ///
 /// To complete the construction of the `QueuePair`, you will need to obtain the
 /// [`QueuePairEndpoint`] of the remote end (by using [`endpoint`](Self::endpoint)), and then call
@@ -1571,7 +1614,11 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     ///
     ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
     ///    value in one of the work requests, `ENOMEM` when the send queue is full or out of
-    ///    resources).
+    ///    resources). On providers that natively implement `ibv_qp_ex`, failure discards the
+    ///    entire batch; on legacy providers using the `ibv_post_send` fallback, batch-wide
+    ///    invariants (such as `num_sge <= max_send_sge`) are validated before posting, but a
+    ///    driver-level error mid-chain may leave work requests prior to the failing entry posted
+    ///    on the send queue.
     pub unsafe fn submit(self) -> Result<()> {
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
@@ -2406,12 +2453,437 @@ pub struct QueuePair<T: Transport = Rc> {
     pub(crate) _send_cq: CompletionQueue,
     pub(crate) _recv_cq: CompletionQueue,
     pub(crate) qp: *mut ffi::ibv_qp,
-    // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
-    // this aliases `qp` and lives exactly as long.
+    // The extended (doorbell) view of `qp`, used by the send path. Either `ibv_qp_to_qp_ex(qp)`
+    // when the provider supports the doorbell ABI, or a pointer to `_legacy_qp_ex`'s `qp_ex` when
+    // emulating the doorbell ABI over `ibv_post_send`.
     pub(crate) qp_ex: *mut ffi::ibv_qp_ex,
+    pub(crate) _legacy_qp_ex: Option<OwnedLegacyQpEx>,
     // The inline capacity the provider granted, which the send path enforces (`SendOp::build`).
     pub(crate) max_inline_data: u32,
     pub(crate) _transport: std::marker::PhantomData<T>,
+}
+
+#[inline]
+fn can_emulate_legacy_qp(send_ops: SendOps) -> bool {
+    let extended_only_ops = SendOps::FLUSH | SendOps::ATOMIC_WRITE;
+    (send_ops & extended_only_ops) == SendOps::empty()
+}
+
+pub(crate) struct OwnedLegacyQpEx(ptr::NonNull<LegacyQpEx>);
+
+impl OwnedLegacyQpEx {
+    pub(crate) fn new(qp: *mut ffi::ibv_qp, send_ops: SendOps, cap: ffi::ibv_qp_cap) -> Self {
+        let ptr = Box::into_raw(LegacyQpEx::new(qp, send_ops, cap));
+        Self(unsafe { ptr::NonNull::new_unchecked(ptr) })
+    }
+
+    #[inline]
+    pub(crate) fn as_qp_ex_ptr(&self) -> *mut ffi::ibv_qp_ex {
+        self.0.as_ptr().cast::<ffi::ibv_qp_ex>()
+    }
+}
+
+impl Drop for OwnedLegacyQpEx {
+    fn drop(&mut self) {
+        drop(unsafe { Box::from_raw(self.0.as_ptr()) });
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct StagedWrMeta {
+    sge_start: usize,
+    sge_count: usize,
+    inline_start: usize,
+    inline_len: usize,
+    is_inline: bool,
+}
+
+/// Software emulation of the `ibv_qp_ex` doorbell interface over `ibv_post_send` for providers
+/// (such as Intel `irdma` or SoftiWARP `siw`) that do not implement
+/// `IBV_QP_INIT_ATTR_SEND_OPS_FLAGS`.
+///
+/// `qp_ex` is the first field (`#[repr(C)]`) so each `unsafe extern "C"` callback can recover the
+/// enclosing `LegacyQpEx` via `qpx.cast::<LegacyQpEx>()` with whole-struct provenance. Staging
+/// buffers (`wrs`, `meta`, `sges`, `inline_buf`) are pre-allocated with bounded initial capacity
+/// and reused across batches so steady-state `start_send` .. `submit` performs amortized zero heap
+/// allocations on the datapath.
+#[repr(C)]
+pub(crate) struct LegacyQpEx {
+    pub(crate) qp_ex: ffi::ibv_qp_ex,
+    qp: *mut ffi::ibv_qp,
+    max_send_sge: usize,
+    max_inline_data: usize,
+    wrs: Vec<ffi::ibv_send_wr>,
+    meta: Vec<StagedWrMeta>,
+    sges: Vec<ffi::ibv_sge>,
+    inline_buf: Vec<u8>,
+}
+
+impl LegacyQpEx {
+    pub(crate) fn new(qp: *mut ffi::ibv_qp, send_ops: SendOps, cap: ffi::ibv_qp_cap) -> Box<Self> {
+        let init_wr = (cap.max_send_wr as usize).clamp(1, 64);
+        let max_sge = (cap.max_send_sge as usize).max(1);
+        let max_inline = cap.max_inline_data as usize;
+        let init_sge = init_wr.saturating_mul(max_sge).clamp(1, 256);
+        let init_inline = init_wr.saturating_mul(max_inline).min(4096);
+        let has = |flag: SendOps| send_ops.contains(flag);
+        let raw_qp = unsafe { &*qp };
+
+        Box::new(Self {
+            qp_ex: ffi::ibv_qp_ex {
+                // Copy plain scalar/pointer metadata (`qp_base.context` is checked by
+                // `SendBatch::<Ud>::to`) without bitwise-copying the live `pthread_mutex_t` or
+                // `pthread_cond_t` from `*qp`.
+                qp_base: ffi::ibv_qp {
+                    context: raw_qp.context,
+                    qp_context: raw_qp.qp_context,
+                    pd: raw_qp.pd,
+                    send_cq: raw_qp.send_cq,
+                    recv_cq: raw_qp.recv_cq,
+                    srq: raw_qp.srq,
+                    handle: raw_qp.handle,
+                    qp_num: raw_qp.qp_num,
+                    state: raw_qp.state,
+                    qp_type: raw_qp.qp_type,
+                    events_completed: 0,
+                    mutex: Default::default(),
+                    cond: Default::default(),
+                },
+                wr_start: Some(Self::wr_start),
+                wr_complete: Some(Self::wr_complete),
+                wr_abort: Some(Self::wr_abort),
+                wr_set_sge: Some(Self::wr_set_sge),
+                wr_set_sge_list: Some(Self::wr_set_sge_list),
+                wr_set_inline_data: Some(Self::wr_set_inline_data),
+                wr_set_inline_data_list: Some(Self::wr_set_inline_data_list),
+                wr_set_ud_addr: Some(Self::wr_set_ud_addr),
+                wr_send: has(SendOps::SEND).then_some(Self::wr_send),
+                wr_send_imm: has(SendOps::SEND_WITH_IMM).then_some(Self::wr_send_imm),
+                wr_send_inv: has(SendOps::SEND_WITH_INV).then_some(Self::wr_send_inv),
+                wr_rdma_write: has(SendOps::RDMA_WRITE).then_some(Self::wr_rdma_write),
+                wr_rdma_write_imm: has(SendOps::RDMA_WRITE_WITH_IMM)
+                    .then_some(Self::wr_rdma_write_imm),
+                wr_rdma_read: has(SendOps::RDMA_READ).then_some(Self::wr_rdma_read),
+                wr_atomic_cmp_swp: has(SendOps::ATOMIC_CMP_AND_SWP)
+                    .then_some(Self::wr_atomic_cmp_swp),
+                wr_atomic_fetch_add: has(SendOps::ATOMIC_FETCH_AND_ADD)
+                    .then_some(Self::wr_atomic_fetch_add),
+                wr_local_inv: has(SendOps::LOCAL_INV).then_some(Self::wr_local_inv),
+                wr_bind_mw: has(SendOps::BIND_MW).then_some(Self::wr_bind_mw),
+                wr_send_tso: has(SendOps::TSO).then_some(Self::wr_send_tso),
+                ..Default::default()
+            },
+            qp,
+            max_send_sge: max_sge,
+            max_inline_data: max_inline,
+            wrs: Vec::with_capacity(init_wr),
+            meta: Vec::with_capacity(init_wr),
+            sges: Vec::with_capacity(init_sge),
+            inline_buf: Vec::with_capacity(init_inline),
+        })
+    }
+
+    #[inline]
+    fn discard_staged_wrs(&mut self) {
+        self.wrs.clear();
+        self.meta.clear();
+        self.sges.clear();
+        self.inline_buf.clear();
+    }
+
+    #[inline]
+    fn push_wr(&mut self, opcode: ffi::ibv_wr_opcode) -> &mut ffi::ibv_send_wr {
+        self.wrs.push(ffi::ibv_send_wr {
+            wr_id: self.qp_ex.wr_id,
+            opcode,
+            send_flags: self.qp_ex.wr_flags,
+            ..Default::default()
+        });
+        self.meta.push(StagedWrMeta::default());
+        self.wrs.last_mut().unwrap()
+    }
+
+    unsafe extern "C" fn wr_start(qpx: *mut ffi::ibv_qp_ex) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        this.discard_staged_wrs();
+    }
+
+    unsafe extern "C" fn wr_abort(qpx: *mut ffi::ibv_qp_ex) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        this.discard_staged_wrs();
+    }
+
+    unsafe extern "C" fn wr_complete(qpx: *mut ffi::ibv_qp_ex) -> std::os::raw::c_int {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let n = this.wrs.len();
+        if n == 0 {
+            return 0;
+        }
+        // Pre-validate SGE counts and inline payload lengths across the entire batch before
+        // calling `post_send` so a single work request exceeding `max_send_sge` or
+        // `max_inline_data` rejects the whole batch upfront rather than partially posting earlier
+        // work requests in the chain.
+        for meta in &this.meta {
+            if (!meta.is_inline && meta.sge_count > this.max_send_sge)
+                || (meta.is_inline && meta.inline_len > this.max_inline_data)
+            {
+                this.discard_staged_wrs();
+                return nix::libc::EINVAL;
+            }
+        }
+        let sges_base = this.sges.as_mut_ptr();
+        let inline_base = this.inline_buf.as_ptr();
+        for i in 0..n {
+            let meta = this.meta[i];
+            if meta.is_inline {
+                this.wrs[i].send_flags |= ffi::ibv_send_flags::IBV_SEND_INLINE.0;
+                if meta.inline_len > 0 {
+                    let sge_ptr = unsafe { sges_base.add(meta.sge_start) };
+                    unsafe {
+                        *sge_ptr = ffi::ibv_sge {
+                            addr: inline_base.add(meta.inline_start) as u64,
+                            length: meta.inline_len as u32,
+                            lkey: 0,
+                        };
+                    }
+                    this.wrs[i].sg_list = sge_ptr;
+                    this.wrs[i].num_sge = 1;
+                } else {
+                    this.wrs[i].sg_list = ptr::null_mut();
+                    this.wrs[i].num_sge = 0;
+                }
+            } else if meta.sge_count > 0 {
+                this.wrs[i].sg_list = unsafe { sges_base.add(meta.sge_start) };
+                this.wrs[i].num_sge = meta.sge_count as i32;
+            } else {
+                this.wrs[i].sg_list = ptr::null_mut();
+                this.wrs[i].num_sge = 0;
+            }
+        }
+        let wr_base = this.wrs.as_mut_ptr();
+        unsafe {
+            for i in 1..n {
+                (*wr_base.add(i - 1)).next = wr_base.add(i);
+            }
+            (*wr_base.add(n - 1)).next = ptr::null_mut();
+        }
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
+        let ctx = unsafe { (*this.qp).context };
+        // Copy the `Option<unsafe extern "C" fn(...)>` function pointer by value rather than
+        // taking `.as_mut()` on the shared `ibv_context`.
+        let post_send = unsafe { (*ctx).ops.post_send }.unwrap();
+        let ret = unsafe { post_send(this.qp, wr_base, &mut bad_wr) };
+        this.discard_staged_wrs();
+        if ret < 0 { ret.saturating_neg() } else { ret }
+    }
+
+    unsafe extern "C" fn wr_send(qpx: *mut ffi::ibv_qp_ex) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let _ = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_SEND);
+    }
+
+    unsafe extern "C" fn wr_send_imm(qpx: *mut ffi::ibv_qp_ex, imm_data: u32) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM);
+        wr.__bindgen_anon_1.imm_data = imm_data;
+    }
+
+    unsafe extern "C" fn wr_send_inv(qpx: *mut ffi::ibv_qp_ex, invalidate_rkey: u32) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_INV);
+        wr.__bindgen_anon_1.invalidate_rkey = invalidate_rkey;
+    }
+
+    unsafe extern "C" fn wr_rdma_write(qpx: *mut ffi::ibv_qp_ex, rkey: u32, remote_addr: u64) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE);
+        wr.wr.rdma.rkey = rkey;
+        wr.wr.rdma.remote_addr = remote_addr;
+    }
+
+    unsafe extern "C" fn wr_rdma_write_imm(
+        qpx: *mut ffi::ibv_qp_ex,
+        rkey: u32,
+        remote_addr: u64,
+        imm_data: u32,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM);
+        wr.wr.rdma.rkey = rkey;
+        wr.wr.rdma.remote_addr = remote_addr;
+        wr.__bindgen_anon_1.imm_data = imm_data;
+    }
+
+    unsafe extern "C" fn wr_rdma_read(qpx: *mut ffi::ibv_qp_ex, rkey: u32, remote_addr: u64) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_RDMA_READ);
+        wr.wr.rdma.rkey = rkey;
+        wr.wr.rdma.remote_addr = remote_addr;
+    }
+
+    unsafe extern "C" fn wr_atomic_cmp_swp(
+        qpx: *mut ffi::ibv_qp_ex,
+        rkey: u32,
+        remote_addr: u64,
+        compare: u64,
+        swap: u64,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP);
+        wr.wr.atomic.rkey = rkey;
+        wr.wr.atomic.remote_addr = remote_addr;
+        wr.wr.atomic.compare_add = compare;
+        wr.wr.atomic.swap = swap;
+    }
+
+    unsafe extern "C" fn wr_atomic_fetch_add(
+        qpx: *mut ffi::ibv_qp_ex,
+        rkey: u32,
+        remote_addr: u64,
+        add: u64,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD);
+        wr.wr.atomic.rkey = rkey;
+        wr.wr.atomic.remote_addr = remote_addr;
+        wr.wr.atomic.compare_add = add;
+        wr.wr.atomic.swap = 0;
+    }
+
+    unsafe extern "C" fn wr_local_inv(qpx: *mut ffi::ibv_qp_ex, invalidate_rkey: u32) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_LOCAL_INV);
+        wr.__bindgen_anon_1.invalidate_rkey = invalidate_rkey;
+    }
+
+    unsafe extern "C" fn wr_bind_mw(
+        qpx: *mut ffi::ibv_qp_ex,
+        mw: *mut ffi::ibv_mw,
+        rkey: u32,
+        bind_info: *const ffi::ibv_mw_bind_info,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_BIND_MW);
+        wr.__bindgen_anon_2.bind_mw.mw = mw;
+        wr.__bindgen_anon_2.bind_mw.rkey = rkey;
+        if !bind_info.is_null() {
+            wr.__bindgen_anon_2.bind_mw.bind_info = unsafe { *bind_info };
+        }
+    }
+
+    unsafe extern "C" fn wr_send_tso(
+        qpx: *mut ffi::ibv_qp_ex,
+        hdr: *mut c_void,
+        hdr_sz: u16,
+        mss: u16,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        let wr = this.push_wr(ffi::ibv_wr_opcode::IBV_WR_TSO);
+        wr.__bindgen_anon_2.tso.hdr = hdr;
+        wr.__bindgen_anon_2.tso.hdr_sz = hdr_sz;
+        wr.__bindgen_anon_2.tso.mss = mss;
+    }
+
+    unsafe extern "C" fn wr_set_ud_addr(
+        qpx: *mut ffi::ibv_qp_ex,
+        ah: *mut ffi::ibv_ah,
+        remote_qpn: u32,
+        remote_qkey: u32,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        if let Some(wr) = this.wrs.last_mut() {
+            wr.wr.ud.ah = ah;
+            wr.wr.ud.remote_qpn = remote_qpn;
+            wr.wr.ud.remote_qkey = remote_qkey;
+        }
+    }
+
+    unsafe extern "C" fn wr_set_sge(qpx: *mut ffi::ibv_qp_ex, lkey: u32, addr: u64, length: u32) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        if let Some(meta) = this.meta.last_mut() {
+            meta.sge_start = this.sges.len();
+            meta.sge_count = 1;
+            meta.is_inline = false;
+            this.sges.push(ffi::ibv_sge { addr, length, lkey });
+        }
+    }
+
+    unsafe extern "C" fn wr_set_sge_list(
+        qpx: *mut ffi::ibv_qp_ex,
+        num_sge: usize,
+        sg_list: *const ffi::ibv_sge,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        if let Some(meta) = this.meta.last_mut() {
+            meta.sge_start = this.sges.len();
+            meta.is_inline = false;
+            if num_sge > 0 && !sg_list.is_null() {
+                meta.sge_count = num_sge;
+                this.sges
+                    .extend_from_slice(unsafe { std::slice::from_raw_parts(sg_list, num_sge) });
+            } else {
+                meta.sge_count = 0;
+            }
+        }
+    }
+
+    unsafe extern "C" fn wr_set_inline_data(
+        qpx: *mut ffi::ibv_qp_ex,
+        addr: *mut c_void,
+        length: usize,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        if let Some(meta) = this.meta.last_mut() {
+            meta.inline_start = this.inline_buf.len();
+            meta.is_inline = true;
+            if length > 0 && !addr.is_null() {
+                meta.inline_len = length;
+                this.inline_buf.extend_from_slice(unsafe {
+                    std::slice::from_raw_parts(addr.cast::<u8>(), length)
+                });
+                meta.sge_start = this.sges.len();
+                meta.sge_count = 1;
+                this.sges.push(ffi::ibv_sge::default());
+            } else {
+                meta.inline_len = 0;
+                meta.sge_start = 0;
+                meta.sge_count = 0;
+            }
+        }
+    }
+
+    unsafe extern "C" fn wr_set_inline_data_list(
+        qpx: *mut ffi::ibv_qp_ex,
+        num_buf: usize,
+        buf_list: *const ffi::ibv_data_buf,
+    ) {
+        let this = unsafe { &mut *qpx.cast::<Self>() };
+        if let Some(meta) = this.meta.last_mut() {
+            meta.inline_start = this.inline_buf.len();
+            meta.is_inline = true;
+            let mut total = 0usize;
+            if num_buf > 0 && !buf_list.is_null() {
+                let bufs = unsafe { std::slice::from_raw_parts(buf_list, num_buf) };
+                for buf in bufs {
+                    if buf.length > 0 && !buf.addr.is_null() {
+                        this.inline_buf.extend_from_slice(unsafe {
+                            std::slice::from_raw_parts(buf.addr.cast::<u8>(), buf.length)
+                        });
+                        total += buf.length;
+                    }
+                }
+            }
+            meta.inline_len = total;
+            if total > 0 {
+                meta.sge_start = this.sges.len();
+                meta.sge_count = 1;
+                this.sges.push(ffi::ibv_sge::default());
+            } else {
+                meta.sge_start = 0;
+                meta.sge_count = 0;
+            }
+        }
+    }
 }
 
 unsafe impl<T: Transport> Send for QueuePair<T> {}
@@ -2432,11 +2904,14 @@ impl<T: Transport> QueuePair<T> {
         self.qp
     }
 
-    /// Returns the underlying `ibv_qp_ex` pointer (the extended/doorbell view of this queue pair).
+    /// Returns the `ibv_qp_ex` pointer used for posting send work requests.
     ///
-    /// This is an escape hatch for verbs this crate does not yet wrap. `ibv_qp_to_qp_ex` is a cast,
-    /// so this aliases [`as_raw`](Self::as_raw) and lives exactly as long. The pointer stays valid
-    /// only while this [`QueuePair`] is alive; do not destroy it.
+    /// This is an escape hatch for driving the `ibv_wr_*` function pointers directly. On providers
+    /// that support `ibv_create_qp_ex`, this is `ibv_qp_to_qp_ex(self.as_raw())`; on providers
+    /// using the legacy `ibv_create_qp` fallback, this points to a software `ibv_qp_ex` adapter
+    /// rather than a provider-allocated struct, so never pass `&mut (*qp.as_raw_ex()).qp_base` to
+    /// C verbs (use [`as_raw`](Self::as_raw) instead). The pointer stays valid only while this
+    /// [`QueuePair`] is alive; do not destroy it.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_qp_ex {
         self.qp_ex
     }
@@ -3155,5 +3630,698 @@ mod test_qp_transitions {
             let (_, optional) = qp_transition_masks(qp_type, cur, cur).unwrap();
             assert_eq!(optional & port, 0, "{qp_type:?} in {cur:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod test_legacy_qp_ex {
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct CapturedWr {
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        send_flags: u32,
+        imm_data: u32,
+        rkey: u32,
+        remote_addr: u64,
+        compare_add: u64,
+        swap: u64,
+        ud_ah: *mut ffi::ibv_ah,
+        ud_remote_qpn: u32,
+        ud_remote_qkey: u32,
+        sges: Vec<(u64, u32, u32)>,
+        inline_bytes: Option<Vec<u8>>,
+    }
+
+    #[repr(C)]
+    struct FakeQp {
+        qp: ffi::ibv_qp,
+        posted_batches: Vec<Vec<CapturedWr>>,
+        fail_errno: i32,
+    }
+
+    unsafe extern "C" fn fake_post_send(
+        qp: *mut ffi::ibv_qp,
+        wr: *mut ffi::ibv_send_wr,
+        bad_wr: *mut *mut ffi::ibv_send_wr,
+    ) -> i32 {
+        let fake = unsafe { &mut *qp.cast::<FakeQp>() };
+        if fake.fail_errno != 0 {
+            unsafe { *bad_wr = wr };
+            return fake.fail_errno;
+        }
+        let mut batch = Vec::new();
+        let mut cur = wr;
+        while !cur.is_null() {
+            let item = unsafe { &*cur };
+            let sges_slice = if item.num_sge == 0 {
+                assert!(
+                    item.sg_list.is_null(),
+                    "expected null sg_list when num_sge is 0"
+                );
+                &[][..]
+            } else {
+                assert!(!item.sg_list.is_null());
+                unsafe { std::slice::from_raw_parts(item.sg_list, item.num_sge as usize) }
+            };
+            let sges: Vec<(u64, u32, u32)> = sges_slice
+                .iter()
+                .map(|s| (s.addr, s.length, s.lkey))
+                .collect();
+            let inline_bytes = if item.send_flags & ffi::ibv_send_flags::IBV_SEND_INLINE.0 != 0 {
+                let mut bytes = Vec::new();
+                for s in sges_slice {
+                    if s.length > 0 {
+                        let slice = unsafe {
+                            std::slice::from_raw_parts(s.addr as *const u8, s.length as usize)
+                        };
+                        bytes.extend_from_slice(slice);
+                    }
+                }
+                Some(bytes)
+            } else {
+                None
+            };
+            let (rkey, remote_addr, compare_add, swap) = match item.opcode {
+                ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE
+                | ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+                | ffi::ibv_wr_opcode::IBV_WR_RDMA_READ => unsafe {
+                    (item.wr.rdma.rkey, item.wr.rdma.remote_addr, 0, 0)
+                },
+                ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP
+                | ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD => unsafe {
+                    (
+                        item.wr.atomic.rkey,
+                        item.wr.atomic.remote_addr,
+                        item.wr.atomic.compare_add,
+                        item.wr.atomic.swap,
+                    )
+                },
+                _ => (0, 0, 0, 0),
+            };
+            let (ud_ah, ud_remote_qpn, ud_remote_qkey) =
+                unsafe { (item.wr.ud.ah, item.wr.ud.remote_qpn, item.wr.ud.remote_qkey) };
+            batch.push(CapturedWr {
+                wr_id: item.wr_id,
+                opcode: item.opcode,
+                send_flags: item.send_flags,
+                imm_data: unsafe { item.__bindgen_anon_1.imm_data },
+                rkey,
+                remote_addr,
+                compare_add,
+                swap,
+                ud_ah,
+                ud_remote_qpn,
+                ud_remote_qkey,
+                sges,
+                inline_bytes,
+            });
+            cur = item.next;
+        }
+        fake.posted_batches.push(batch);
+        0
+    }
+
+    // Submitting a multi-operation batch on `LegacyQpEx` chains the work requests in order and
+    // invokes `ibv_post_send` once with resolved SGE and inline pointers.
+    #[test]
+    fn legacy_qp_ex_batches_and_chains_work_requests_into_post_send() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 17,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: 0,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 8,
+            max_recv_wr: 8,
+            max_send_sge: 4,
+            max_recv_sge: 4,
+            max_inline_data: 64,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut batch = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+
+        let remote = RemoteMemorySlice {
+            addr: 0x9000,
+            len: 32,
+            rkey: 0xbeef,
+        };
+        let empty_sges: &[LocalMemorySlice] = &[];
+        let atomic_sge = LocalMemorySlice::from(ffi::ibv_sge {
+            addr: 0x2000,
+            length: 8,
+            lkey: 0x11,
+        });
+        batch.op().write(1, empty_sges, remote);
+        batch
+            .op()
+            .signaled()
+            .imm(0xabcd_0102)
+            .send(2, Payload::Inline(b"hello"));
+        let iov = [io::IoSlice::new(b"wor"), io::IoSlice::new(b"ld")];
+        batch
+            .op()
+            .fenced()
+            .write(3, Payload::InlineList(&iov), remote);
+        batch
+            .op()
+            .signaled()
+            .atomic_cmp_swap(4, &[atomic_sge], remote, 10, 20);
+        batch
+            .op()
+            .signaled()
+            .atomic_fetch_add(5, &[atomic_sge], remote, 5);
+
+        unsafe { batch.submit() }.expect("submit on LegacyQpEx failed");
+
+        assert_eq!(fake_qp.posted_batches.len(), 1);
+        let posted = &fake_qp.posted_batches[0];
+        assert_eq!(posted.len(), 5);
+
+        assert_eq!(posted[0].wr_id, 1);
+        assert_eq!(posted[0].opcode, ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE);
+        assert!(posted[0].sges.is_empty());
+        assert_eq!(posted[0].rkey, 0xbeef);
+        assert_eq!(posted[0].remote_addr, 0x9000);
+
+        assert_eq!(posted[1].wr_id, 2);
+        assert_eq!(posted[1].opcode, ffi::ibv_wr_opcode::IBV_WR_SEND_WITH_IMM);
+        assert_eq!(posted[1].imm_data, 0xabcd_0102u32.to_be());
+        assert_eq!(posted[1].inline_bytes.as_deref(), Some(&b"hello"[..]));
+
+        assert_eq!(posted[2].wr_id, 3);
+        assert_eq!(posted[2].opcode, ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE);
+        assert_eq!(posted[2].inline_bytes.as_deref(), Some(&b"world"[..]));
+
+        assert_eq!(posted[3].wr_id, 4);
+        assert_eq!(
+            posted[3].opcode,
+            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP
+        );
+        assert_eq!(posted[3].sges, vec![(0x2000, 8, 0x11)]);
+        assert_eq!(posted[3].compare_add, 10);
+        assert_eq!(posted[3].swap, 20);
+
+        assert_eq!(posted[4].wr_id, 5);
+        assert_eq!(
+            posted[4].opcode,
+            ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD
+        );
+        assert_eq!(posted[4].sges, vec![(0x2000, 8, 0x11)]);
+        assert_eq!(posted[4].compare_add, 5);
+        assert_eq!(posted[4].swap, 0);
+    }
+
+    // Posting single-SGE (`wr_set_sge`) and multi-SGE (`wr_set_sge_list`) payloads on `LegacyQpEx`
+    // stages and links the SGE arrays for `ibv_post_send`, and a null `sg_list` with non-zero
+    // `num_sge` safely degrades to zero SGEs.
+    #[test]
+    fn legacy_qp_ex_translates_single_and_multi_sge_payloads() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 21,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: 0,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 4,
+            max_recv_sge: 4,
+            max_inline_data: 64,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        let sge1 = LocalMemorySlice::from(ffi::ibv_sge {
+            addr: 0x1000,
+            length: 128,
+            lkey: 0xaa,
+        });
+        let sge2 = LocalMemorySlice::from(ffi::ibv_sge {
+            addr: 0x3000,
+            length: 256,
+            lkey: 0xbb,
+        });
+        let single = [sge1];
+        let multi = [sge1, sge2];
+
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut batch = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+        batch.op().signaled().send(10, &single);
+        batch.op().signaled().send(11, &multi);
+        // Also exercise raw `wr_set_sge_list` and `wr_set_inline_data` with null pointers and
+        // non-zero count/length.
+        unsafe {
+            (*qpx).wr_id = 12;
+            (*qpx).wr_flags = 0;
+            (*qpx).wr_send.unwrap()(qpx);
+            (*qpx).wr_set_sge_list.unwrap()(qpx, 2, ptr::null());
+
+            (*qpx).wr_id = 13;
+            (*qpx).wr_flags = 0;
+            (*qpx).wr_send.unwrap()(qpx);
+            (*qpx).wr_set_inline_data.unwrap()(qpx, ptr::null_mut(), 8);
+        }
+        unsafe { batch.submit() }.expect("submit failed");
+
+        let posted = &fake_qp.posted_batches[0];
+        assert_eq!(posted.len(), 4);
+        assert_eq!(posted[0].sges, vec![(0x1000, 128, 0xaa)]);
+        assert_eq!(
+            posted[1].sges,
+            vec![(0x1000, 128, 0xaa), (0x3000, 256, 0xbb)]
+        );
+        assert!(posted[2].sges.is_empty());
+        assert!(posted[3].sges.is_empty());
+        assert_eq!(posted[3].inline_bytes.as_deref(), Some(&b""[..]));
+    }
+
+    // Setting a UD destination via `wr_set_ud_addr` on `LegacyQpEx` populates `wr.ud.{ah,
+    // remote_qpn, remote_qkey}` on the staged `ibv_send_wr`.
+    #[test]
+    fn legacy_qp_ex_translates_ud_addressing() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 23,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: 0,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 2,
+            max_recv_sge: 2,
+            max_inline_data: 64,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_UD),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+        let mut fake_ah = ffi::ibv_ah {
+            context: &raw mut ctx,
+            ..Default::default()
+        };
+
+        unsafe {
+            (*qpx).wr_start.unwrap()(qpx);
+            (*qpx).wr_id = 55;
+            (*qpx).wr_flags = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+            (*qpx).wr_send.unwrap()(qpx);
+            (*qpx).wr_set_inline_data.unwrap()(qpx, b"ud".as_ptr() as *mut c_void, 2);
+            (*qpx).wr_set_ud_addr.unwrap()(qpx, &raw mut fake_ah, 0x4242, 0x1111_2222);
+            assert_eq!((*qpx).wr_complete.unwrap()(qpx), 0);
+        }
+
+        let posted = &fake_qp.posted_batches[0];
+        assert_eq!(posted.len(), 1);
+        assert_eq!(posted[0].wr_id, 55);
+        assert_eq!(posted[0].ud_ah, &raw mut fake_ah);
+        assert_eq!(posted[0].ud_remote_qpn, 0x4242);
+        assert_eq!(posted[0].ud_remote_qkey, 0x1111_2222);
+        assert_eq!(posted[0].inline_bytes.as_deref(), Some(&b"ud"[..]));
+    }
+
+    // `can_emulate_legacy_qp` accepts all classic `ibv_post_send` operations and rejects
+    // extended-only `FLUSH` and `ATOMIC_WRITE` flags.
+    #[test]
+    fn can_emulate_legacy_qp_rejects_extended_only_send_ops() {
+        assert!(can_emulate_legacy_qp(default_send_ops(
+            ffi::ibv_qp_type::IBV_QPT_RC
+        )));
+        assert!(!can_emulate_legacy_qp(SendOps::FLUSH));
+        assert!(!can_emulate_legacy_qp(SendOps::ATOMIC_WRITE));
+    }
+
+    // A positive errno from `post_send` surfaces as `Error::PostSend` and clears the staged work
+    // requests so a subsequent batch posts only its own operations.
+    #[test]
+    fn legacy_qp_ex_propagates_positive_post_send_errno_and_discards_staged_wrs() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 29,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: nix::libc::ENOMEM,
+        };
+        let fake_qp_ptr = &raw mut fake_qp;
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 32,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            fake_qp_ptr.cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut batch1 = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+        batch1.op().send(1, Payload::Inline(b"fail1"));
+        let err1 = unsafe { batch1.submit() }.expect_err("expected ENOMEM failure");
+        assert!(
+            matches!(err1, Error::PostSend(ref e) if e.raw_os_error() == Some(nix::libc::ENOMEM))
+        );
+
+        unsafe { (*fake_qp_ptr).fail_errno = 0 };
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut batch2 = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+        batch2.op().send(5, Payload::Inline(b"recovered"));
+        unsafe { batch2.submit() }.expect("recovery batch failed");
+        assert_eq!(fake_qp.posted_batches.len(), 1);
+        assert_eq!(fake_qp.posted_batches[0].len(), 1);
+        assert_eq!(fake_qp.posted_batches[0][0].wr_id, 5);
+    }
+
+    // A negative errno returned from `post_send` (such as `-EINVAL` from `siw_post_send`) is
+    // normalized to the corresponding positive OS error code.
+    #[test]
+    fn legacy_qp_ex_normalizes_negative_post_send_errno() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 30,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: -nix::libc::EINVAL,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 32,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut batch = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+        batch.op().send(2, Payload::Inline(b"fail2"));
+        let err = unsafe { batch.submit() }.expect_err("expected EINVAL failure");
+        assert!(
+            matches!(err, Error::PostSend(ref e) if e.raw_os_error() == Some(nix::libc::EINVAL))
+        );
+    }
+
+    // Exceeding `max_send_sge` on a work request rejects the entire batch with `EINVAL` before
+    // invoking `post_send`, preventing earlier work requests in the batch from being partially
+    // posted.
+    #[test]
+    fn legacy_qp_ex_rejects_sge_count_overflow_before_post_send() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 31,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: 0,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 32,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        let sge = LocalMemorySlice::from(ffi::ibv_sge {
+            addr: 0x4000,
+            length: 16,
+            lkey: 0x1,
+        });
+        let two_sges = [sge, sge];
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut batch = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+        batch.op().send(3, Payload::Inline(b"not-posted"));
+        batch.op().send(4, &two_sges);
+        let err = unsafe { batch.submit() }.expect_err("expected SGE overflow EINVAL");
+        assert!(
+            matches!(err, Error::PostSend(ref e) if e.raw_os_error() == Some(nix::libc::EINVAL))
+        );
+        assert!(fake_qp.posted_batches.is_empty());
+    }
+
+    // Exceeding `max_inline_data` on a work request rejects the entire batch with `EINVAL` before
+    // invoking `post_send`, preventing earlier work requests in the batch from being partially
+    // posted.
+    #[test]
+    fn legacy_qp_ex_rejects_inline_len_overflow_before_post_send() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 31,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: 0,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 4,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        unsafe {
+            (*qpx).wr_start.unwrap()(qpx);
+            (*qpx).wr_id = 1;
+            (*qpx).wr_send.unwrap()(qpx);
+            let ok = b"ok";
+            (*qpx).wr_set_inline_data.unwrap()(qpx, ok.as_ptr() as *mut c_void, ok.len());
+
+            (*qpx).wr_id = 2;
+            (*qpx).wr_send.unwrap()(qpx);
+            let too_long = b"12345";
+            (*qpx).wr_set_inline_data.unwrap()(
+                qpx,
+                too_long.as_ptr() as *mut c_void,
+                too_long.len(),
+            );
+            assert_eq!((*qpx).wr_complete.unwrap()(qpx), nix::libc::EINVAL);
+        }
+        assert!(fake_qp.posted_batches.is_empty());
+    }
+
+    // Posting more inline work requests than the initial pre-allocated capacity grows `wrs`,
+    // `sges`, and `inline_buf` on demand and resolves all SGE pointers after reallocation.
+    #[test]
+    fn legacy_qp_ex_grows_staging_buffers_across_reallocations() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 31,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: 0,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 1,
+            max_recv_wr: 1,
+            max_send_sge: 1,
+            max_recv_sge: 1,
+            max_inline_data: 16,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut batch = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: 64,
+            _qp: std::marker::PhantomData,
+        };
+        let payloads: [&[u8]; 4] = [
+            b"0123456789abcdef",
+            b"fedcba9876543210",
+            b"abcdefghijklmnop",
+            b"qrstuvwxyz012345",
+        ];
+        for (idx, payload) in payloads.iter().enumerate() {
+            batch
+                .op()
+                .signaled()
+                .send((idx + 1) as u64, Payload::Inline(payload));
+        }
+        unsafe { batch.submit() }.expect("submit after growth failed");
+
+        let posted = &fake_qp.posted_batches[0];
+        assert_eq!(posted.len(), 4);
+        for (idx, payload) in payloads.iter().enumerate() {
+            assert_eq!(posted[idx].wr_id, (idx + 1) as u64);
+            assert_eq!(posted[idx].inline_bytes.as_deref(), Some(*payload));
+        }
+    }
+
+    // Dropping a `SendBatch` on `LegacyQpEx` without submitting aborts the staged operations so a
+    // subsequent batch posts only its own work requests.
+    #[test]
+    fn legacy_qp_ex_abort_on_drop_discards_staged_requests() {
+        let mut ctx = ffi::ibv_context::default();
+        ctx.ops.post_send = Some(fake_post_send);
+
+        let mut fake_qp = FakeQp {
+            qp: ffi::ibv_qp {
+                context: &raw mut ctx,
+                qp_num: 19,
+                ..Default::default()
+            },
+            posted_batches: Vec::new(),
+            fail_errno: 0,
+        };
+
+        let cap = ffi::ibv_qp_cap {
+            max_send_wr: 4,
+            max_recv_wr: 4,
+            max_send_sge: 2,
+            max_recv_sge: 2,
+            max_inline_data: 32,
+        };
+        let legacy = OwnedLegacyQpEx::new(
+            (&raw mut fake_qp).cast::<ffi::ibv_qp>(),
+            default_send_ops(ffi::ibv_qp_type::IBV_QPT_RC),
+            cap,
+        );
+        let qpx = legacy.as_qp_ex_ptr();
+
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut aborted_batch = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+        aborted_batch.op().send(99, Payload::Inline(b"discarded"));
+        drop(aborted_batch);
+        assert!(fake_qp.posted_batches.is_empty());
+
+        unsafe { (*qpx).wr_start.unwrap()(qpx) };
+        let mut committed_batch = SendBatch::<Rc> {
+            qpx,
+            max_inline_data: cap.max_inline_data,
+            _qp: std::marker::PhantomData,
+        };
+        committed_batch
+            .op()
+            .signaled()
+            .send(100, Payload::Inline(b"kept"));
+        unsafe { committed_batch.submit() }.expect("submit failed");
+
+        assert_eq!(fake_qp.posted_batches.len(), 1);
+        assert_eq!(fake_qp.posted_batches[0].len(), 1);
+        assert_eq!(fake_qp.posted_batches[0][0].wr_id, 100);
+        assert_eq!(
+            fake_qp.posted_batches[0][0].inline_bytes.as_deref(),
+            Some(&b"kept"[..])
+        );
     }
 }

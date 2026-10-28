@@ -102,12 +102,14 @@
 //! bindings from installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR` and
 //! `RDMA_CORE_LIB_DIR`.
 //!
-//! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
-//! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
-//! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`, and
-//! `rxe` (SoftRoCE) implement both. A provider that lacks them fails cleanly at completion-queue
-//! or queue-pair creation (with [`Error::Unsupported`]) rather than degrading to the
-//! legacy verbs.
+//! The crate drives completion queues and queue pairs through rdma-core's extended verbs
+//! (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API) whenever the
+//! provider implements them (`mlx5`, `hns`, `efa`, and `rxe`). When a provider declines
+//! extended creation with `EOPNOTSUPP` (such as Intel `irdma` for `IBV_QP_INIT_ATTR_SEND_OPS_FLAGS`
+//! or SoftiWARP `siw` for both), the crate transparently falls back to `ibv_create_cq` /
+//! `ibv_create_qp` and emulates the extended polling and doorbell interfaces over `ibv_poll_cq`
+//! and `ibv_post_send`, returning [`Error::Unsupported`] only if extended-only features (such as
+//! hardware completion timestamps or RDMA flush/atomic-write operations) were explicitly requested.
 //!
 //! # Typed transports
 //!
