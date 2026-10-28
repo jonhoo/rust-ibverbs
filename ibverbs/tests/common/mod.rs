@@ -3,7 +3,10 @@
 
 use std::time::{Duration, Instant};
 
-use ibverbs::{CompletionQueue, Context, Device, DeviceList, WorkCompletion};
+use ibverbs::{
+    AccessFlags, CompletionQueue, Context, Device, DeviceList, MemoryRegion, ProtectionDomain,
+    WorkCompletion,
+};
 
 /// The device named by `IBVERBS_TEST_DEVICE`, or the first available one. Panics if absent; the
 /// device tests only run when explicitly requested, so a missing device is a real setup error.
@@ -50,4 +53,12 @@ pub fn poll_until(cq: &CompletionQueue, mut done: impl FnMut(&WorkCompletion<'_>
             return false;
         }
     }
+}
+
+/// Register a zeroed `len`-byte buffer on `pd` with [`AccessFlags::PERMISSIVE`], the access every
+/// test region needs.
+#[track_caller]
+pub fn mr(pd: &ProtectionDomain, len: usize) -> MemoryRegion<Box<[u8]>> {
+    pd.allocate(len, AccessFlags::PERMISSIVE)
+        .expect("failed to register a memory region")
 }
