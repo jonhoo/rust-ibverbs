@@ -5,7 +5,7 @@
 [![codecov](https://codecov.io/gh/jonhoo/rust-ibverbs/graph/badge.svg?token=3nylKSTA6R)](https://codecov.io/gh/jonhoo/rust-ibverbs)
 [![Dependency status](https://deps.rs/repo/github/jonhoo/rust-ibverbs/status.svg)](https://deps.rs/repo/github/jonhoo/rust-ibverbs)
 
-A safe Rust API for RDMA over InfiniBand, RoCE, and iWARP, wrapping `libibverbs`.
+A safe Rust API for RDMA over InfiniBand and RoCE, wrapping `libibverbs`.
 
 RDMA "verbs" let userspace talk to the network adapter directly: no system calls on the data
 path, no copies, single-digit-microsecond latencies. The C API leaves you to uphold a long list
