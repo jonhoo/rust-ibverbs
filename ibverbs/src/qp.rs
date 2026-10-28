@@ -1410,7 +1410,15 @@ impl<'a> RecvRequest<'a> {
             wr: ffi::ibv_recv_wr {
                 wr_id,
                 next: ptr::null_mut(),
-                sg_list: local.as_ptr() as *mut ffi::ibv_sge,
+                // An empty Rust slice's `.as_ptr()` is `NonNull::dangling()` (for example `0x8` for
+                // `LocalMemorySlice`), not `NULL`. C providers such as `irdma` (`irdma_set_fragment`
+                // in `providers/irdma/uk.c`) check `if (sge)` before checking `num_sge == 0` and
+                // dereference `sg_list`, so pass a genuine null pointer when the slice is empty.
+                sg_list: if local.is_empty() {
+                    ptr::null_mut()
+                } else {
+                    local.as_ptr() as *mut ffi::ibv_sge
+                },
                 num_sge: local.len() as i32,
             },
             _local: std::marker::PhantomData,
@@ -1690,16 +1698,27 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 Payload::Sges([one]) => {
                     (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
                 }
+                // An empty Rust slice's `.as_ptr()` is `NonNull::dangling()` rather than `NULL`;
+                // pass a genuine null pointer when the slice is empty so C providers never observe
+                // a dangling address alongside a zero count/length.
                 Payload::Sges(local) => (*qpx).wr_set_sge_list.unwrap()(
                     qpx,
                     local.len(),
-                    local.as_ptr() as *const ffi::ibv_sge,
+                    if local.is_empty() {
+                        ptr::null()
+                    } else {
+                        local.as_ptr() as *const ffi::ibv_sge
+                    },
                 ),
                 // The bytes are copied during this call, so the payload need not outlive the work
                 // completion.
                 Payload::Inline(data) => (*qpx).wr_set_inline_data.unwrap()(
                     qpx,
-                    data.as_ptr() as *mut c_void,
+                    if data.is_empty() {
+                        ptr::null_mut()
+                    } else {
+                        data.as_ptr() as *mut c_void
+                    },
                     data.len(),
                 ),
                 // `std::io::IoSlice` is guaranteed ABI-compatible with `struct iovec` on Unix (the
@@ -1709,7 +1728,11 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 Payload::InlineList(bufs) => (*qpx).wr_set_inline_data_list.unwrap()(
                     qpx,
                     bufs.len(),
-                    bufs.as_ptr() as *const ffi::ibv_data_buf,
+                    if bufs.is_empty() {
+                        ptr::null()
+                    } else {
+                        bufs.as_ptr() as *const ffi::ibv_data_buf
+                    },
                 ),
             }
         }
@@ -2721,6 +2744,142 @@ mod test_recv_link {
 
         let mut one = [RecvRequest::new(4, &sges)];
         assert_eq!(walk(RecvRequest::link(&mut one)), [4]);
+    }
+
+    #[repr(C)]
+    struct SpyQpEx {
+        qp_ex: ffi::ibv_qp_ex,
+        last_sge_ptr: *const ffi::ibv_sge,
+        last_sge_len: usize,
+        last_inline_ptr: *mut c_void,
+        last_inline_len: usize,
+        last_inline_list_ptr: *const ffi::ibv_data_buf,
+        last_inline_list_len: usize,
+    }
+
+    impl SpyQpEx {
+        fn new() -> Self {
+            unsafe extern "C" fn on_send(_qpx: *mut ffi::ibv_qp_ex) {}
+            unsafe extern "C" fn on_abort(_qpx: *mut ffi::ibv_qp_ex) {}
+            unsafe extern "C" fn on_sge_list(
+                qpx: *mut ffi::ibv_qp_ex,
+                num_sge: usize,
+                sg_list: *const ffi::ibv_sge,
+            ) {
+                let spy = unsafe { &mut *qpx.cast::<SpyQpEx>() };
+                spy.last_sge_len = num_sge;
+                spy.last_sge_ptr = sg_list;
+            }
+            unsafe extern "C" fn on_inline_data(
+                qpx: *mut ffi::ibv_qp_ex,
+                addr: *mut c_void,
+                length: usize,
+            ) {
+                let spy = unsafe { &mut *qpx.cast::<SpyQpEx>() };
+                spy.last_inline_ptr = addr;
+                spy.last_inline_len = length;
+            }
+            unsafe extern "C" fn on_inline_data_list(
+                qpx: *mut ffi::ibv_qp_ex,
+                num_buf: usize,
+                buf_list: *const ffi::ibv_data_buf,
+            ) {
+                let spy = unsafe { &mut *qpx.cast::<SpyQpEx>() };
+                spy.last_inline_list_len = num_buf;
+                spy.last_inline_list_ptr = buf_list;
+            }
+
+            Self {
+                qp_ex: ffi::ibv_qp_ex {
+                    wr_send: Some(on_send),
+                    wr_abort: Some(on_abort),
+                    wr_set_sge_list: Some(on_sge_list),
+                    wr_set_inline_data: Some(on_inline_data),
+                    wr_set_inline_data_list: Some(on_inline_data_list),
+                    ..Default::default()
+                },
+                last_sge_ptr: ptr::NonNull::dangling().as_ptr(),
+                last_sge_len: usize::MAX,
+                last_inline_ptr: ptr::NonNull::<u8>::dangling().as_ptr().cast(),
+                last_inline_len: usize::MAX,
+                last_inline_list_ptr: ptr::NonNull::dangling().as_ptr(),
+                last_inline_list_len: usize::MAX,
+            }
+        }
+    }
+
+    // Building a receive work request with an empty SGE slice sets `sg_list` to null rather than
+    // `NonNull::dangling()`.
+    #[test]
+    fn recv_request_with_empty_slice_sets_null_sg_list() {
+        let empty: &[LocalMemorySlice] = &[];
+        let recv = RecvRequest::new(7, empty);
+        assert!(recv.wr.sg_list.is_null());
+        assert_eq!(recv.wr.num_sge, 0);
+        assert_eq!(recv.wr.wr_id, 7);
+    }
+
+    // Building a receive work request with a non-empty SGE slice preserves the slice pointer and
+    // element count.
+    #[test]
+    fn recv_request_with_non_empty_slice_preserves_sge_pointer() {
+        let non_empty = [LocalMemorySlice::default()];
+        let recv_with_sge = RecvRequest::new(8, &non_empty);
+        assert_eq!(
+            recv_with_sge.wr.sg_list as *const ffi::ibv_sge,
+            non_empty.as_ptr() as *const ffi::ibv_sge
+        );
+        assert_eq!(recv_with_sge.wr.num_sge, 1);
+    }
+
+    // Posting a send operation with an empty SGE slice passes a null pointer and zero count to
+    // `wr_set_sge_list` rather than `NonNull::dangling()`.
+    #[test]
+    fn send_op_with_empty_sge_slice_passes_null_pointer_to_provider() {
+        let mut spy = SpyQpEx::new();
+        let mut batch = SendBatch::<Rc> {
+            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
+            max_inline_data: 64,
+            _qp: std::marker::PhantomData,
+        };
+
+        let empty_sges: &[LocalMemorySlice] = &[];
+        batch.op().send(1, empty_sges);
+        assert_eq!(spy.last_sge_len, 0);
+        assert!(spy.last_sge_ptr.is_null());
+    }
+
+    // Posting a send operation with an empty inline byte slice passes a null pointer and zero
+    // length to `wr_set_inline_data` rather than `NonNull::dangling()`.
+    #[test]
+    fn send_op_with_empty_inline_slice_passes_null_pointer_to_provider() {
+        let mut spy = SpyQpEx::new();
+        let mut batch = SendBatch::<Rc> {
+            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
+            max_inline_data: 64,
+            _qp: std::marker::PhantomData,
+        };
+
+        batch.op().send(2, Payload::Inline(&[]));
+        assert_eq!(spy.last_inline_len, 0);
+        assert!(spy.last_inline_ptr.is_null());
+    }
+
+    // Posting a send operation with an empty `IoSlice` list passes a null pointer and zero count
+    // to `wr_set_inline_data_list` rather than `NonNull::dangling()`.
+    #[test]
+    fn send_op_with_empty_inline_list_passes_null_pointer_to_provider() {
+        let mut spy = SpyQpEx::new();
+        let mut batch = SendBatch::<Rc> {
+            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
+            max_inline_data: 64,
+            _qp: std::marker::PhantomData,
+        };
+
+        let empty_iov: &[io::IoSlice<'_>] = &[];
+        batch.op().send(3, Payload::InlineList(empty_iov));
+        assert_eq!(spy.last_inline_list_len, 0);
+        assert!(spy.last_inline_list_ptr.is_null());
     }
 }
 

@@ -256,6 +256,56 @@ fn send_recv() {
     assert_eq!(&recv.bytes_mut()[..5], b"hello");
 }
 
+/// Zero-byte SEND, RECV, and RDMA WRITE with empty slices (`&[]`) pass null pointers to the
+/// provider and complete with zero transferred bytes.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn zero_length_ops_with_empty_slices() {
+    let mut lb = loopback();
+
+    let remote_mr = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register remote MR");
+    let remote = remote_mr.remote();
+
+    let empty_sges: &[ibverbs::LocalMemorySlice] = &[];
+    let empty_iov: &[std::io::IoSlice<'_>] = &[];
+    unsafe {
+        lb.qp.post_recv([
+            RecvRequest::new(1, empty_sges),
+            RecvRequest::new(2, empty_sges),
+            RecvRequest::new(3, empty_sges),
+        ])
+    }
+    .expect("post_recv with empty slice failed");
+
+    let mut batch = lb.qp.start_send();
+    batch.op().signaled().write(10, empty_sges, remote);
+    batch.op().signaled().send(11, empty_sges);
+    batch.op().signaled().send(12, Payload::Inline(&[]));
+    batch
+        .op()
+        .signaled()
+        .send(13, Payload::InlineList(empty_iov));
+    unsafe { batch.submit() }.expect("submit with empty payloads failed");
+
+    let comps = drain(&lb.cq, 7);
+    for id in [1, 2, 3] {
+        let wc = comps
+            .iter()
+            .find(|c| c.wr_id() == id)
+            .expect("missing recv completion");
+        assert_eq!(wc.len(), 0);
+    }
+    for id in [10, 11, 12, 13] {
+        assert!(
+            comps.iter().any(|c| c.wr_id() == id),
+            "missing send completion {id}"
+        );
+    }
+}
+
 /// The standard `ibv_poll_cq` batch path drains the same SEND / RECV completions as the extended
 /// interface, reporting matching `wr_id`s and byte lengths.
 #[test]
