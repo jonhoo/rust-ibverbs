@@ -176,6 +176,8 @@ impl Context {
             }
             return Err(Error::os(e, Error::AsyncEvent));
         }
+        // SAFETY: the event is not acknowledged yet, so the queue pair it names is still alive.
+        let qp_num = unsafe { event_qp_num(&event) };
         // Acknowledge it right away: what is left is plain data. libibverbs blocks the destruction
         // of the queue pair, completion queue, or shared receive queue an event names until the
         // event is acknowledged, so acknowledging only when the caller drops it would let a held
@@ -183,6 +185,7 @@ impl Context {
         unsafe { ffi::ibv_ack_async_event(&mut event) };
         Ok(Some(AsyncEvent {
             event,
+            qp_num,
             _ctx: PhantomData,
         }))
     }
@@ -484,6 +487,9 @@ pub(crate) fn rd_atomic_limits(ctx: *mut ffi::ibv_context) -> Result<(u8, u8)> {
 /// never delays the destruction of the object it names.
 pub struct AsyncEvent<'ctx> {
     event: ffi::ibv_async_event,
+    /// The number of the queue pair a queue-pair-scoped event names, read before the event was
+    /// acknowledged: after that, the queue pair may be destroyed at any time.
+    qp_num: Option<u32>,
     /// The [`Context`] the event was read from. The event is already acknowledged, so nothing
     /// needs the borrow any more; dropping the lifetime would make events `'static`.
     _ctx: PhantomData<&'ctx Context>,
@@ -493,6 +499,23 @@ impl AsyncEvent<'_> {
     /// The kind of event.
     pub fn event_type(&self) -> AsyncEventType {
         self.event.event_type.into()
+    }
+
+    /// The local queue-pair number (`qp_num`) of the queue pair the event refers to (matching
+    /// [`QueuePair::qp_num`](crate::QueuePair::qp_num)), for the queue-pair-scoped events
+    /// ([`QpFatal`](AsyncEventType::QpFatal),
+    /// [`QpRequestError`](AsyncEventType::QpRequestError),
+    /// [`QpAccessError`](AsyncEventType::QpAccessError),
+    /// [`CommEstablished`](AsyncEventType::CommEstablished),
+    /// [`SqDrained`](AsyncEventType::SqDrained),
+    /// [`PathMigrated`](AsyncEventType::PathMigrated),
+    /// [`PathMigrationError`](AsyncEventType::PathMigrationError), and
+    /// [`QpLastWqeReached`](AsyncEventType::QpLastWqeReached)); `None` for every other kind.
+    ///
+    /// The number is read as the event is, so it stays available after the queue pair is
+    /// destroyed.
+    pub fn qp_num(&self) -> Option<u32> {
+        self.qp_num
     }
 
     /// The port the event refers to, for the port-scoped events
@@ -520,9 +543,10 @@ impl AsyncEvent<'_> {
     /// The underlying `ibv_async_event`.
     ///
     /// This is the escape hatch for the `element` union: for CQ-, QP-, and SRQ-scoped events it
-    /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to. Those pointers
-    /// cannot be mapped back to this crate's safe wrappers; compare them against the `as_raw`
-    /// handles of the wrappers you own to identify the object. The event is already
+    /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to (queue-pair-scoped
+    /// events also expose their queue-pair number directly via [`AsyncEvent::qp_num`]). Those
+    /// pointers cannot be mapped back to this crate's safe wrappers; compare them against the
+    /// `as_raw` handles of the wrappers you own to identify the object. The event is already
     /// acknowledged, so the object may have been destroyed since, and its address reused by a new
     /// one: dereference the pointer only while you hold the wrapper it belongs to.
     pub fn as_raw(&self) -> &ffi::ibv_async_event {
@@ -537,15 +561,47 @@ impl fmt::Debug for AsyncEvent<'_> {
         if let Some(port_num) = self.port_num() {
             f.field("port_num", &port_num);
         }
+        if let Some(qp_num) = self.qp_num {
+            f.field("qp_num", &qp_num);
+        }
         f.finish_non_exhaustive()
+    }
+}
+
+/// The number of the queue pair `event` names, for the queue-pair-scoped events; `None` for every
+/// other kind.
+///
+/// # Safety
+///
+/// For a queue-pair-scoped event, `element.qp` must point to a live `ibv_qp`, as it does between
+/// `ibv_get_async_event` and `ibv_ack_async_event`.
+unsafe fn event_qp_num(event: &ffi::ibv_async_event) -> Option<u32> {
+    match AsyncEventType::from(event.event_type) {
+        AsyncEventType::QpFatal
+        | AsyncEventType::QpRequestError
+        | AsyncEventType::QpAccessError
+        | AsyncEventType::CommEstablished
+        | AsyncEventType::SqDrained
+        | AsyncEventType::PathMigrated
+        | AsyncEventType::PathMigrationError
+        | AsyncEventType::QpLastWqeReached => {
+            // SAFETY: for the queue-pair-scoped events the element union holds the `ibv_qp`
+            // pointer, which the caller guarantees is live. This is the same pointer
+            // `ibv_ack_async_event` dereferences, so the read is no riskier than the
+            // acknowledgement itself, even when `RDMAV_ALLOW_DISASSOC_DESTROY` or
+            // `MLX4_DEVICE_FATAL_CLEANUP` lets a destroy skip waiting for it.
+            Some(unsafe { (*event.element.qp).qp_num })
+        }
+        _ => None,
     }
 }
 
 /// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
 ///
 /// The events fall into three scopes: affiliated errors and state changes on a completion queue,
-/// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which),
-/// port-level changes (with [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
+/// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which
+/// object, and queue-pair events also expose [`AsyncEvent::qp_num`]), port-level changes (with
+/// [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AsyncEventType {
@@ -1387,5 +1443,111 @@ mod test_display {
         assert!(s.contains("DeviceAttrEx"), "{s}");
         assert!(s.contains("completion_timestamp_mask"), "{s}");
         assert!(s.contains("DeviceAttr {"), "{s}");
+    }
+
+    fn zeroed_qp_with_num(qp_num: u32) -> std::mem::MaybeUninit<ffi::ibv_qp> {
+        let mut raw_qp = std::mem::MaybeUninit::<ffi::ibv_qp>::zeroed();
+        unsafe { (*raw_qp.as_mut_ptr()).qp_num = qp_num };
+        raw_qp
+    }
+
+    /// An event of `event_type` whose element points at `qp`, built the way
+    /// [`Context::poll_async_event`] builds one.
+    fn synthetic_async_event(
+        event_type: ffi::ibv_event_type,
+        qp: *mut ffi::ibv_qp,
+    ) -> AsyncEvent<'static> {
+        let event = ffi::ibv_async_event {
+            event_type,
+            element: ffi::ibv_async_event__bindgen_ty_1 { qp },
+        };
+        AsyncEvent {
+            // SAFETY: `qp` points to a live `ibv_qp`.
+            qp_num: unsafe { event_qp_num(&event) },
+            event,
+            _ctx: PhantomData,
+        }
+    }
+
+    /// Queue-pair-scoped asynchronous events expose the queue-pair number they refer to.
+    #[test]
+    fn qp_scoped_async_events_expose_qp_num() {
+        let mut raw_qp = zeroed_qp_with_num(4242);
+
+        for event_type in [
+            ffi::ibv_event_type::IBV_EVENT_QP_FATAL,
+            ffi::ibv_event_type::IBV_EVENT_QP_REQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_QP_ACCESS_ERR,
+            ffi::ibv_event_type::IBV_EVENT_COMM_EST,
+            ffi::ibv_event_type::IBV_EVENT_SQ_DRAINED,
+            ffi::ibv_event_type::IBV_EVENT_PATH_MIG,
+            ffi::ibv_event_type::IBV_EVENT_PATH_MIG_ERR,
+            ffi::ibv_event_type::IBV_EVENT_QP_LAST_WQE_REACHED,
+        ] {
+            let event = synthetic_async_event(event_type, raw_qp.as_mut_ptr());
+            assert_eq!(
+                event.qp_num(),
+                Some(4242),
+                "{:?} must expose its queue-pair number",
+                event.event_type()
+            );
+        }
+    }
+
+    /// Asynchronous events that are not queue-pair-scoped return None for their queue-pair number.
+    #[test]
+    fn non_qp_scoped_async_events_have_no_qp_num() {
+        let mut raw_qp = zeroed_qp_with_num(4242);
+
+        for event_type in [
+            ffi::ibv_event_type::IBV_EVENT_PORT_ACTIVE,
+            ffi::ibv_event_type::IBV_EVENT_PORT_ERR,
+            ffi::ibv_event_type::IBV_EVENT_LID_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_PKEY_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_SM_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_CLIENT_REREGISTER,
+            ffi::ibv_event_type::IBV_EVENT_GID_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_CQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_SRQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_SRQ_LIMIT_REACHED,
+            ffi::ibv_event_type::IBV_EVENT_WQ_FATAL,
+            ffi::ibv_event_type::IBV_EVENT_DEVICE_FATAL,
+            ffi::ibv_event_type::IBV_EVENT_DEVICE_SPEED_CHANGE,
+            ffi::ibv_event_type(9999),
+        ] {
+            let event = synthetic_async_event(event_type, raw_qp.as_mut_ptr());
+            assert_eq!(
+                event.qp_num(),
+                None,
+                "{:?} must not have a queue-pair number",
+                event.event_type()
+            );
+        }
+    }
+
+    /// The Debug representation of a queue-pair-scoped asynchronous event includes its queue-pair
+    /// number.
+    #[test]
+    fn debug_renders_qp_num_for_qp_scoped_async_event() {
+        let mut raw_qp = zeroed_qp_with_num(4242);
+
+        let event =
+            synthetic_async_event(ffi::ibv_event_type::IBV_EVENT_QP_FATAL, raw_qp.as_mut_ptr());
+        let s = format!("{event:?}");
+        assert!(s.contains("qp_num: 4242"), "{s}");
+    }
+
+    /// The Debug representation of a non-queue-pair-scoped asynchronous event omits the queue-pair
+    /// number field.
+    #[test]
+    fn debug_omits_qp_num_for_non_qp_scoped_async_event() {
+        let mut raw_qp = zeroed_qp_with_num(4242);
+
+        let event = synthetic_async_event(
+            ffi::ibv_event_type::IBV_EVENT_DEVICE_FATAL,
+            raw_qp.as_mut_ptr(),
+        );
+        let s = format!("{event:?}");
+        assert!(!s.contains("qp_num"), "{s}");
     }
 }
