@@ -94,7 +94,7 @@ impl QueuePairBuilder<Srd> {
         };
         let qp = nonnull(qp, Error::CreateQueuePair)
             .map_err(|e| e.for_operation(&"efadv_create_qp_ex"))?;
-        self.prepared(qp, &attr)
+        self.prepared(qp, &attr, None)
     }
 }
 
