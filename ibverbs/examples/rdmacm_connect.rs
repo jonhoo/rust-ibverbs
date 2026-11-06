@@ -56,9 +56,10 @@ fn server(addr: SocketAddr) {
     // Wait for a client indefinitely, but bound the establishment of an arrived request.
     let incoming = acceptor.accept(None).unwrap();
     let ctx = incoming.context().unwrap();
+    let port = incoming.cm_id().port_num().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd.create_qp::<Rc>(&cq, &cq, 1).unwrap().build().unwrap();
+    let qp = pd.create_qp::<Rc>(&cq, &cq, port).unwrap().build().unwrap();
     let mut recv = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
 
     let mut conn = incoming
@@ -90,9 +91,10 @@ fn client(addr: SocketAddr) {
         .resolve(addr, Duration::from_secs(5))
         .unwrap();
     let ctx = resolved.context().unwrap();
+    let port = resolved.cm_id().port_num().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd.create_qp::<Rc>(&cq, &cq, 1).unwrap().build().unwrap();
+    let qp = pd.create_qp::<Rc>(&cq, &cq, port).unwrap().build().unwrap();
     let mut send = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
 

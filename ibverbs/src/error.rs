@@ -15,21 +15,28 @@ pub type Result<T> = std::result::Result<T, Error>;
 ///
 /// Most variants wrap the underlying operating-system error (an `errno` from a libibverbs or
 /// librdmacm call); the specific variant identifies which operation failed and carries any relevant
-/// context. A few variants — [`Unsupported`](Error::Unsupported),
+/// context. The others — [`Unsupported`](Error::Unsupported),
 /// [`PortNotActive`](Error::PortNotActive), [`GidMismatch`](Error::GidMismatch),
-/// [`MalformedWireFormat`](Error::MalformedWireFormat), and the two `InvalidQueuePair*` diagnoses
-/// — capture conditions that callers commonly branch on.
+/// [`GidRequired`](Error::GidRequired), [`DeviceIndexUnavailable`](Error::DeviceIndexUnavailable),
+/// [`MalformedWireFormat`](Error::MalformedWireFormat), the two `InvalidQueuePair*` diagnoses,
+/// and the connection manager's `TimedOut` and `ConnectionManager` — capture conditions that
+/// callers commonly branch on.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
     /// The device, provider, or kernel does not support the requested operation or
-    /// work-completion field (`EOPNOTSUPP`, or `EPROTONOSUPPORT` from a kernel older than the
-    /// request); `operation` names the verb that was declined.
+    /// work-completion field; `operation` names the verb that was declined, and `errno` who
+    /// declined it.
     #[error("{operation} is not supported by the device, provider, or kernel")]
     Unsupported {
         /// The verb (or the capability it asked for) the device, provider, or kernel declined. A
         /// reference to the name rather than the name itself, so that `Error` stays two words.
         operation: &'static &'static str,
+        /// The errno it was declined with: `EOPNOTSUPP` when the device or provider lacks the
+        /// operation, `EPROTONOSUPPORT` when the kernel is older than the request, `ENOSYS` for a
+        /// connection-manager option the kernel does not know, and `ENODEV` for an mlx5 device
+        /// without a Data Direct device.
+        errno: i32,
     },
 
     /// The device port is not in the `ACTIVE` or `ARMED` state, so its GID table and routing are
@@ -188,9 +195,17 @@ pub enum Error {
     #[error("failed to post a send work request")]
     PostSend(#[source] io::Error),
 
-    /// Posting a receive work request failed.
-    #[error("failed to post a receive work request")]
-    PostReceive(#[source] io::Error),
+    /// Posting a batch of receive work requests failed (`ibv_post_recv` / `ibv_post_srq_recv`)
+    /// at one of its requests; the ones ahead of it were posted.
+    #[error("failed to post a receive work request after posting {posted} of the batch")]
+    PostReceive {
+        /// How many requests at the front of the batch were posted before the one that failed:
+        /// they are on the queue like any other posted receive, so their buffers are in use.
+        posted: u32,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
 
     /// Polling a completion queue failed.
     #[error("failed to poll the completion queue")]
@@ -210,14 +225,15 @@ pub enum Error {
     /// or [`RemoteMemorySlice::from_bytes`](crate::RemoteMemorySlice::from_bytes)) failed: the
     /// bytes carry a flag or value this version does not understand. A length in a
     /// [`RemoteMemorySlice`](crate::RemoteMemorySlice) encoding that does not fit the platform's
-    /// `usize` also produces this error.
+    /// `usize` also produces this error, and so does a queue pair number or PSN wider than its 24
+    /// bits in a [`QueuePairEndpoint`](crate::QueuePairEndpoint) encoding.
     #[error("malformed wire-format encoding")]
     MalformedWireFormat,
 
     /// The connection manager reported a failure event while a blocking helper was waiting for
     /// the next setup step. Boxed, so that `Error` stays two words.
     #[cfg(feature = "rdmacm")]
-    #[error("the connection manager reported {} (status {})", .0.event, .0.status)]
+    #[error(transparent)]
     ConnectionManager(Box<CmFailure>),
 
     /// Binding a connection-manager identifier to a local address failed (`rdma_bind_addr`).
@@ -255,7 +271,14 @@ pub enum Error {
 impl Error {
     /// The operating-system error (`errno`) underlying this error, for the variants that wrap one:
     /// the uniform way to branch on `ENOMEM`, `EINVAL`, and friends without matching every
-    /// variant. `None` for the errors this crate diagnoses itself.
+    /// variant. `None` for the variants this crate diagnoses itself, and for
+    /// [`Unsupported`](Error::Unsupported), which carries its errno as a field instead. The
+    /// crate's checks of its own inputs (a queue from
+    /// another context, oversized private data, and the like) are reported in the operation's
+    /// variant as an [`io::ErrorKind::InvalidInput`] error with no errno, so for them this is
+    /// `Some` but [`raw_os_error`](io::Error::raw_os_error) is `None`. For the connection
+    /// manager's `ConnectionManager`, it is the errno a negative status stands for (an address,
+    /// route, or connection error), and `None` for a reject reason.
     pub fn os_error(&self) -> Option<&io::Error> {
         std::error::Error::source(self)?.downcast_ref::<io::Error>()
     }
@@ -263,7 +286,7 @@ impl Error {
     /// The verb (or step) this error came from, as [`Unsupported`](Self::Unsupported) names it.
     pub(crate) fn operation(&self) -> &'static &'static str {
         match self {
-            Error::Unsupported { operation } => operation,
+            Error::Unsupported { operation, .. } => operation,
             Error::PortNotActive(_) => &"port activation",
             Error::GidMismatch | Error::GidRequired => &"GID routing",
             Error::DeviceIndexUnavailable => &"the device index",
@@ -292,7 +315,7 @@ impl Error {
             Error::ModifySharedReceiveQueue(_) => &"ibv_modify_srq",
             Error::QuerySharedReceiveQueue(_) => &"ibv_query_srq",
             Error::PostSend(_) => &"ibv_wr_complete",
-            Error::PostReceive(_) => &"ibv_post_recv",
+            Error::PostReceive { .. } => &"ibv_post_recv",
             Error::PollCompletionQueue(_) => &"completion-queue polling",
             Error::AsyncEvent(_) => &"ibv_get_async_event",
             Error::MalformedWireFormat => &"wire-format decoding",
@@ -331,14 +354,24 @@ impl Error {
     /// (naming the operation `wrap` identifies) and otherwise tagging it with `wrap` (the variant
     /// identifying the operation that failed).
     pub(crate) fn os(err: io::Error, wrap: impl FnOnce(io::Error) -> Error) -> Error {
-        let unsupported = Error::is_unsupported(&err);
+        let unsupported = err.raw_os_error().filter(|_| Error::is_unsupported(&err));
         let wrapped = wrap(err);
-        if unsupported {
-            Error::Unsupported {
+        match unsupported {
+            Some(errno) => Error::Unsupported {
                 operation: wrapped.operation(),
-            }
-        } else {
-            wrapped
+                errno,
+            },
+            None => wrapped,
+        }
+    }
+
+    /// This error, naming `operation` as the declined verb if it is
+    /// [`Unsupported`](Error::Unsupported): for the verbs that report their failures through a
+    /// variant whose own [`operation`](Error::operation) names another verb.
+    pub(crate) fn for_operation(self, operation: &'static &'static str) -> Error {
+        match self {
+            Error::Unsupported { errno, .. } => Error::Unsupported { operation, errno },
+            other => other,
         }
     }
 
@@ -373,11 +406,22 @@ pub(crate) fn check(ret: i32, wrap: impl FnOnce(io::Error) -> Error) -> Result<(
 
 /// Panics with the error a destroy verb (`ibv_destroy_qp`, `ibv_dereg_mr`, ...) returned, if any:
 /// the `Drop` impls cannot report it, and must not carry on as if the object were gone.
+///
+/// The object still exists then, and so must the objects it was created on: `keep_parents` leaks
+/// the references it holds to them before the panic unwinds through its fields. Released, the last
+/// of them would destroy its object under this one, fail the same way, and panic again during the
+/// unwind, which aborts the process.
 #[track_caller]
-pub(crate) fn destroyed(verb: &str, errno: i32) {
+pub(crate) fn destroyed(verb: &str, errno: i32, keep_parents: impl FnOnce()) {
     if errno != 0 {
+        keep_parents();
         panic!("{verb} failed: {}", io::Error::from_raw_os_error(errno));
     }
+}
+
+/// Leaks one reference to `parent`, for [`destroyed`]'s `keep_parents`.
+pub(crate) fn keep<T: Clone>(parent: &T) {
+    std::mem::forget(parent.clone());
 }
 
 #[cfg(test)]
@@ -394,7 +438,8 @@ mod tests {
             matches!(
                 err,
                 Error::Unsupported {
-                    operation: &"ibv_create_qp_ex"
+                    operation: &"ibv_create_qp_ex",
+                    errno: nix::libc::EOPNOTSUPP,
                 }
             ),
             "{err:?}"
@@ -413,11 +458,31 @@ mod tests {
             matches!(
                 err,
                 Error::Unsupported {
-                    operation: &"ibv_reg_mr"
+                    operation: &"ibv_reg_mr",
+                    errno: nix::libc::EPROTONOSUPPORT,
                 }
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_shared_variant_names_the_verb_that_was_declined() {
+        let err = Error::errno(nix::libc::EOPNOTSUPP, Error::RegisterMemoryRegion)
+            .for_operation(&"ibv_reg_dmabuf_mr");
+        assert!(
+            matches!(
+                err,
+                Error::Unsupported {
+                    operation: &"ibv_reg_dmabuf_mr",
+                    errno: nix::libc::EOPNOTSUPP,
+                }
+            ),
+            "{err:?}"
+        );
+        let err = Error::errno(nix::libc::ENOMEM, Error::RegisterMemoryRegion)
+            .for_operation(&"ibv_reg_dmabuf_mr");
+        assert!(matches!(err, Error::RegisterMemoryRegion(_)), "{err:?}");
     }
 
     #[test]
@@ -429,6 +494,38 @@ mod tests {
             Some(nix::libc::ENOMEM)
         );
         assert!(Error::GidMismatch.os_error().is_none());
+    }
+
+    /// A failed destroy panics without releasing its parents: had the child held the last
+    /// reference, the parent's destroy would run during the unwind, fail too (the child still
+    /// exists), and its second panic would abort the process instead of unwinding to here.
+    #[test]
+    #[cfg_attr(miri, ignore = "leaks the parent on purpose, as a failed destroy does")]
+    fn a_failed_destroy_keeps_its_parents() {
+        use std::panic::catch_unwind;
+        use std::sync::Arc;
+
+        struct Parent;
+        impl Drop for Parent {
+            fn drop(&mut self) {
+                destroyed("ibv_dealloc_pd", nix::libc::EBUSY, || ());
+            }
+        }
+        struct Child {
+            parent: Arc<Parent>,
+        }
+        impl Drop for Child {
+            fn drop(&mut self) {
+                destroyed("ibv_dereg_mr", nix::libc::EBUSY, || keep(&self.parent));
+            }
+        }
+
+        let child = Child {
+            parent: Arc::new(Parent),
+        };
+        let parent = Arc::downgrade(&child.parent);
+        assert!(catch_unwind(move || drop(child)).is_err());
+        assert!(parent.upgrade().is_some(), "the parent was released");
     }
 
     #[test]

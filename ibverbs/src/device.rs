@@ -48,7 +48,7 @@ impl DeviceList {
 
     /// Returns an iterator over all found devices.
     pub fn iter(&self) -> DeviceListIter<'_> {
-        DeviceListIter { list: self, i: 0 }
+        DeviceListIter(self.as_slice().iter())
     }
 
     /// Returns the number of devices.
@@ -71,26 +71,25 @@ impl<'a> IntoIterator for &'a DeviceList {
     type Item = <DeviceListIter<'a> as Iterator>::Item;
     type IntoIter = DeviceListIter<'a>;
     fn into_iter(self) -> Self::IntoIter {
-        DeviceListIter { list: self, i: 0 }
+        self.iter()
     }
 }
 
 /// Iterator over a `DeviceList`.
-pub struct DeviceListIter<'iter> {
-    list: &'iter DeviceList,
-    i: usize,
-}
+pub struct DeviceListIter<'iter>(std::slice::Iter<'iter, *mut ffi::ibv_device>);
 
 impl<'iter> Iterator for DeviceListIter<'iter> {
     type Item = Device<'iter>;
     fn next(&mut self) -> Option<Self::Item> {
-        let e = self.list.as_slice().get(self.i);
-        if e.is_some() {
-            self.i += 1;
-        }
-        e.map(Device)
+        self.0.next().map(Device)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
     }
 }
+
+impl ExactSizeIterator for DeviceListIter<'_> {}
 
 /// An RDMA device. Returned by [`DeviceList::iter`] / [`DeviceList::get`].
 ///
@@ -317,19 +316,6 @@ impl From<ffi::ibv_transport_type> for TransportType {
     }
 }
 
-impl From<TransportType> for ffi::ibv_transport_type {
-    fn from(transport: TransportType) -> Self {
-        match transport {
-            TransportType::Unknown => ffi::ibv_transport_type::IBV_TRANSPORT_UNKNOWN,
-            TransportType::Ib => ffi::ibv_transport_type::IBV_TRANSPORT_IB,
-            TransportType::Iwarp => ffi::ibv_transport_type::IBV_TRANSPORT_IWARP,
-            TransportType::Usnic => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC,
-            TransportType::UsnicUdp => ffi::ibv_transport_type::IBV_TRANSPORT_USNIC_UDP,
-            TransportType::Unspecified => ffi::ibv_transport_type::IBV_TRANSPORT_UNSPECIFIED,
-        }
-    }
-}
-
 impl fmt::Display for TransportType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = match self {
@@ -383,7 +369,7 @@ mod test_display {
     }
 
     #[test]
-    fn transport_type_roundtrip() {
+    fn transport_type_from_raw() {
         for (wrapper, raw) in [
             (TransportType::Ib, ffi::ibv_transport_type::IBV_TRANSPORT_IB),
             (
@@ -396,7 +382,6 @@ mod test_display {
             ),
         ] {
             assert_eq!(TransportType::from(raw), wrapper);
-            assert_eq!(ffi::ibv_transport_type::from(wrapper), raw);
         }
         assert_eq!(TransportType::Ib.to_string(), "InfiniBand");
         assert_eq!(TransportType::Iwarp.to_string(), "iWARP");

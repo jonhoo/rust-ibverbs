@@ -20,11 +20,13 @@ categories = ["network-programming", "api-bindings"]
 
 license = "MIT OR Apache-2.0"
 
-# The crate itself and the vendored rdma-core headers `build.rs` generates the bindings from (its
-# `VENDORED_HEADERS`), with rdma-core's license files.
+# The crate itself and its license files, and the vendored rdma-core headers `build.rs` generates
+# the bindings from (its `VENDORED_HEADERS`), with rdma-core's license files.
 include = [
     "/build.rs",
     "/src/**",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
     "/vendor/rdma-core/COPYING*",
     "/vendor/rdma-core/libibverbs/verbs.h",
     "/vendor/rdma-core/libibverbs/verbs_api.h",
@@ -56,7 +58,7 @@ rdmacm = []
 
 # to make -Zminimal-versions work
 [target.'cfg(any())'.dependencies]
-proc-macro2 = { version = "1.0.80", optional = true }
+proc-macro2 = "1.0.80"
 
 [build-dependencies]
 bindgen = "0.72"

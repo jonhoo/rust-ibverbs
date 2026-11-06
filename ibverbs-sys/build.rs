@@ -1,5 +1,4 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::{env, fs};
 
 /// The public rdma-core headers the bindings are generated from, each at the path its `#include`s
@@ -31,35 +30,30 @@ const VENDORED_HEADERS: &[(&str, &str)] = &[
 ];
 
 /// Lay the vendored headers out the way an installed rdma-core does, and return that include
-/// directory.
+/// directory. The copies keep their sources' modification times, so the `rerun-if-changed` lines
+/// bindgen prints for them fire only when a vendored header itself changes.
 fn vendored_include_dir() -> PathBuf {
+    let vendor = Path::new("vendor/rdma-core");
+    assert!(
+        vendor.join("libibverbs/verbs.h").exists(),
+        "the vendored rdma-core headers are missing: run `git submodule update --init` (vendor/rdma-core \
+         is a git submodule), or set RDMA_CORE_INCLUDE_DIR to installed rdma-core headers"
+    );
     let include =
         PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is set by cargo")).join("include");
     for (to, from) in VENDORED_HEADERS {
+        let from = vendor.join(from);
         let to = include.join(to);
+        println!("cargo:rerun-if-changed={}", from.display());
         fs::create_dir_all(to.parent().expect("header paths have a directory"))
             .expect("failed to create the vendored include directory");
-        fs::copy(Path::new("vendor/rdma-core").join(from), &to)
-            .unwrap_or_else(|e| panic!("failed to copy vendor/rdma-core/{from}: {e}"));
+        fs::copy(&from, &to).unwrap_or_else(|e| panic!("failed to copy {}: {e}", from.display()));
+        let modified = fs::metadata(&from)
+            .and_then(|m| m.modified())
+            .and_then(|t| fs::File::options().write(true).open(&to)?.set_modified(t));
+        modified.unwrap_or_else(|e| panic!("failed to date {}: {e}", to.display()));
     }
     include
-}
-
-fn update_submodule() {
-    if Path::new("vendor/rdma-core/libibverbs/verbs.h").exists() {
-        // don't touch source dir if not necessary
-    } else if Path::new(".git").is_dir() {
-        // initialize and update submodules
-        Command::new("git")
-            .args(["submodule", "update", "--init"])
-            .status()
-            .expect("Failed to update submodules.");
-    } else {
-        assert!(
-            Path::new("vendor/rdma-core").is_dir(),
-            "vendor source not included"
-        );
-    }
 }
 
 fn main() {
@@ -82,34 +76,47 @@ fn main() {
         println!("cargo:rustc-link-lib=rdmacm");
     }
 
-    // Where `verbs.h`'s own includes (`<infiniband/verbs_api.h>` and friends) come from: either
-    // installed rdma-core headers named by the caller, or the vendored checkout's.
+    // What the bindings are generated from: installed rdma-core headers named by the caller, or the
+    // vendored checkout's. Since the script prints `rerun-if-*` lines, cargo reruns it only for
+    // these variables, the vendored headers, the headers bindgen reads (`CargoCallbacks`), and
+    // this file.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=RDMA_CORE_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=RDMA_CORE_LIB_DIR");
     if let Ok(rdma_core_lib_dir) = env::var("RDMA_CORE_LIB_DIR") {
         println!("cargo:rustc-link-search=native={rdma_core_lib_dir}");
     }
-    let rdma_core_include_dir = env::var("RDMA_CORE_INCLUDE_DIR").ok();
-    let ibverbs_header_dir = env::var("IBVERBS_HEADER_DIR").ok();
-    if rdma_core_include_dir.is_none() || ibverbs_header_dir.is_none() {
-        update_submodule();
-    }
-    let rdma_core_include_dir = if let Some(rdma_core_include_dir) = rdma_core_include_dir {
+    let rdma_core_include_dir = if let Some(dir) = env::var_os("RDMA_CORE_INCLUDE_DIR") {
         env::var("RDMA_CORE_LIB_DIR").expect(
             "When supplying RDMA_CORE_INCLUDE_DIR, you also need to supply RDMA_CORE_LIB_DIR",
         );
-        PathBuf::from(rdma_core_include_dir)
+        PathBuf::from(dir)
     } else {
         vendored_include_dir()
     };
     // exported to dependents as `DEP_IBVERBS_INCLUDE`
     println!("cargo:include={}", rdma_core_include_dir.display());
 
-    let ibverbs_header_dir =
-        ibverbs_header_dir.unwrap_or_else(|| "vendor/rdma-core/libibverbs".to_string());
+    // Every header is reached through the include directory from one translation unit, so `verbs.h`
+    // and the headers the features add come from the same rdma-core. Separate inputs would not do:
+    // bindgen hands clang every input but the first as an `-include`, which clang reads before the
+    // main file, so whichever `verbs.h` such an input pulls in would define the include guard first
+    // and shadow the main one.
+    let mut wrapper = String::from("#include <infiniband/verbs.h>\n");
+    if efa {
+        wrapper.push_str("#include <infiniband/efadv.h>\n");
+    }
+    if mlx5 {
+        wrapper.push_str("#include <infiniband/mlx5dv.h>\n");
+    }
+    if rdmacm {
+        wrapper.push_str("#include <rdma/rdma_cma.h>\n");
+    }
 
     // generate the bindings
-    eprintln!("run bindgen");
     let mut builder = bindgen::Builder::default()
-        .header(format!("{ibverbs_header_dir}/verbs.h"))
+        .header_contents("ibverbs_wrapper.h", &wrapper)
+        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
         // Generate for the crate's MSRV and edition rather than for whichever toolchain runs the
         // build (bindgen's default), so the output does not vary with it and matches the Bazel
         // build's. `wrap_unsafe_ops` has nothing to act on today (the bindings contain no `unsafe
@@ -161,10 +168,8 @@ fn main() {
         .size_t_is_usize(true);
 
     if efa {
-        // EFA SRD queue pairs are created through the provider's direct-verbs (`efadv`), reached
-        // via `<infiniband/efadv.h>` on the same include path as `verbs.h`.
+        // EFA SRD queue pairs are created through the provider's direct-verbs (`efadv`).
         builder = builder
-            .header_contents("efadv_wrapper.h", "#include <infiniband/efadv.h>")
             .allowlist_function("efadv_.*")
             .allowlist_type("efadv_.*")
             .allowlist_var("EFADV_QP_DRIVER_TYPE_.*");
@@ -172,7 +177,6 @@ fn main() {
 
     if mlx5 {
         builder = builder
-            .header_contents("mlx5dv_wrapper.h", "#include <infiniband/mlx5dv.h>")
             .allowlist_function("mlx5dv_reg_dmabuf_mr")
             .allowlist_function("mlx5dv_get_data_direct_sysfs_path")
             .allowlist_type("mlx5_ib_uapi_reg_dmabuf_flags")
@@ -180,10 +184,8 @@ fn main() {
     }
 
     if rdmacm {
-        // The RDMA connection manager lives in `<rdma/rdma_cma.h>`, which itself includes `verbs.h`
-        // (guarded, so the `ibv_*` types are still emitted only once) on the same include path.
+        // The RDMA connection manager lives in `<rdma/rdma_cma.h>`.
         builder = builder
-            .header_contents("rdmacm_wrapper.h", "#include <rdma/rdma_cma.h>")
             .allowlist_function("rdma_.*")
             .allowlist_type("rdma_.*")
             // the `rdma_set_option` levels and option names are anonymous enums

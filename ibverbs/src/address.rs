@@ -5,7 +5,7 @@ use std::io;
 
 use crate::completion::WorkCompletion;
 use crate::context::Context;
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 
 #[cfg(doc)]
@@ -236,16 +236,17 @@ mod test_wire {
 
     #[test]
     fn endpoint_bytes_roundtrip_without_gid() {
+        // The largest 24-bit queue pair number and PSN.
         let qpe = QueuePairEndpoint {
-            qp_num: u32::MAX,
+            qp_num: 0xff_ffff,
             lid: 0xbeef,
             gid: None,
-            psn: u32::MAX - 1,
+            psn: 0xff_fffe,
             max_dest_rd_atomic: 0xab,
         };
         let encoded = qpe.to_bytes();
         assert_eq!(encoded[0], 0);
-        assert_eq!(&encoded[23..27], &[0xff, 0xff, 0xff, 0xfe]);
+        assert_eq!(&encoded[23..27], &[0x00, 0xff, 0xff, 0xfe]);
         assert_eq!(encoded[27], 0xab);
         assert_eq!(QueuePairEndpoint::from_bytes(&encoded).unwrap(), qpe);
     }
@@ -265,6 +266,27 @@ mod test_wire {
             QueuePairEndpoint::from_bytes(&encoded),
             Err(crate::Error::MalformedWireFormat)
         ));
+    }
+
+    #[test]
+    fn endpoint_bytes_rejects_more_than_24_bits() {
+        let encoded = QueuePairEndpoint {
+            qp_num: 1,
+            lid: 1,
+            gid: None,
+            psn: 0,
+            max_dest_rd_atomic: 0,
+        }
+        .to_bytes();
+        // The top byte of the big-endian queue pair number, then of the PSN.
+        for top in [1, 23] {
+            let mut wide = encoded;
+            wide[top] = 1;
+            assert!(matches!(
+                QueuePairEndpoint::from_bytes(&wide),
+                Err(crate::Error::MalformedWireFormat)
+            ));
+        }
     }
 }
 
@@ -340,8 +362,14 @@ impl AddressHandleAttribute {
         self
     }
 
-    /// Set the service level.
+    /// Set the service level (0–15).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `service_level` is above 15: the field is 4 bits wide, and providers would
+    /// silently drop the extra bits.
     pub fn set_service_level(&mut self, service_level: u8) -> &mut Self {
+        assert!(service_level <= 15, "the service level is a 4-bit value");
         self.attr.sl = service_level;
         self
     }
@@ -643,7 +671,11 @@ impl AddressHandle {
 
 impl Drop for AddressHandle {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_ah", unsafe { ffi::ibv_destroy_ah(self.ah) });
+        destroyed(
+            "ibv_destroy_ah",
+            unsafe { ffi::ibv_destroy_ah(self.ah) },
+            || keep(&self._pd),
+        );
     }
 }
 

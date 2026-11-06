@@ -6,7 +6,7 @@ use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::address::{Gid, GidEntry, GidType};
 use crate::completion::{CompletionChannel, CompletionQueueBuilder};
@@ -23,9 +23,11 @@ struct ContextInner {
 
 impl Drop for ContextInner {
     fn drop(&mut self) {
-        destroyed("ibv_close_device", unsafe {
-            ffi::ibv_close_device(self.ctx)
-        });
+        destroyed(
+            "ibv_close_device",
+            unsafe { ffi::ibv_close_device(self.ctx) },
+            || (),
+        );
     }
 }
 
@@ -64,8 +66,9 @@ impl Context {
         let context = Context {
             inner: Arc::new(ContextInner { ctx }),
         };
-        // If this fails, `context` drops here and closes the half-opened device again.
-        context.set_async_fd_nonblocking()?;
+        // Non-blocking, so `poll_async_event` reports an empty event queue instead of blocking. If
+        // this fails, `context` drops here and closes the half-opened device again.
+        crate::completion::set_nonblocking(context.async_fd()).map_err(Error::OpenDevice)?;
         Ok(context)
     }
 
@@ -91,21 +94,6 @@ impl Context {
         let context = Context::with_device(dev)?;
         shared.push((dev as usize, Arc::downgrade(&context.inner)));
         Ok(context)
-    }
-
-    /// Set this context's asynchronous-event file descriptor to non-blocking, so
-    /// [`poll_async_event`](Self::poll_async_event) reports an empty event queue instead of
-    /// blocking.
-    fn set_async_fd_nonblocking(&self) -> Result<()> {
-        // SAFETY: the context owns this fd, and the borrow ends within this call.
-        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw((*self.inner.ctx).async_fd) };
-        let flags =
-            nix::fcntl::fcntl(fd, nix::fcntl::F_GETFL).map_err(|e| Error::OpenDevice(e.into()))?;
-        let arg = nix::fcntl::FcntlArg::F_SETFL(
-            nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK,
-        );
-        nix::fcntl::fcntl(fd, arg).map_err(|e| Error::OpenDevice(e.into()))?;
-        Ok(())
     }
 
     /// Begin building a completion queue (CQ) with room for at least `min_cq_entries` entries.
@@ -173,17 +161,14 @@ impl Context {
     /// [`async_fd`](Self::async_fd) from your own reactor and drain pending events here when it
     /// becomes readable.
     ///
-    /// The returned event is acknowledged when it drops; see [`AsyncEvent`] for why that should
-    /// happen promptly.
+    /// The event is acknowledged as it is read (see [`AsyncEvent`]).
     ///
     /// # Errors
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
     pub fn poll_async_event(&self) -> Result<Option<AsyncEvent<'_>>> {
-        // `ibv_async_event` embeds an enum with no zero variant inside a union, so let
-        // `ibv_get_async_event` initialize the storage before a Rust value is formed.
-        let mut event = std::mem::MaybeUninit::<ffi::ibv_async_event>::uninit();
-        let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, event.as_mut_ptr()) };
+        let mut event = ffi::ibv_async_event::default();
+        let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, &mut event) };
         if rc != 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::WouldBlock {
@@ -191,9 +176,16 @@ impl Context {
             }
             return Err(Error::os(e, Error::AsyncEvent));
         }
+        // SAFETY: the event is not acknowledged yet, so the queue pair it names is still alive.
+        let qp_num = unsafe { event_qp_num(&event) };
+        // Acknowledge it right away: what is left is plain data. libibverbs blocks the destruction
+        // of the queue pair, completion queue, or shared receive queue an event names until the
+        // event is acknowledged, so acknowledging only when the caller drops it would let a held
+        // (or leaked) event hang the drop of that object forever.
+        unsafe { ffi::ibv_ack_async_event(&mut event) };
         Ok(Some(AsyncEvent {
-            // SAFETY: `ibv_get_async_event` succeeded, so it filled in the event.
-            event: unsafe { event.assume_init() },
+            event,
+            qp_num,
             _ctx: PhantomData,
         }))
     }
@@ -209,36 +201,17 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
     pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
-        let deadline = timeout.map(|timeout| Instant::now() + timeout);
+        let deadline = crate::completion::deadline_after(timeout);
         loop {
-            let remaining = deadline.map(|deadline| {
-                crate::completion::ceil_to_millis(
-                    deadline.saturating_duration_since(Instant::now()),
-                )
-            });
-            let pollfd = nix::poll::PollFd::new(self.async_fd(), nix::poll::PollFlags::POLLIN);
-            let ret = nix::poll::poll(
-                &mut [pollfd],
-                remaining
-                    .map(nix::poll::PollTimeout::try_from)
-                    .transpose()
-                    .map_err(|_| {
-                        Error::AsyncEvent(io::Error::other(
-                            "failed to convert timeout to PollTimeout",
-                        ))
-                    })?,
-            )
-            .map_err(|e| Error::AsyncEvent(e.into()))?;
-            match ret {
-                0 => return Ok(None),
-                1 => {
-                    // The descriptor was readable, but another thread may have consumed the
-                    // event first; if so, go back to waiting for the next one.
-                    if let Some(event) = self.poll_async_event()? {
-                        return Ok(Some(event));
-                    }
-                }
-                _ => unreachable!("we passed 1 fd to poll, but it returned {ret}"),
+            if !crate::completion::wait_readable(self.async_fd(), deadline)
+                .map_err(Error::AsyncEvent)?
+            {
+                return Ok(None);
+            }
+            // The descriptor was readable, but another thread may have consumed the event
+            // first; if so, go back to waiting for the next one.
+            if let Some(event) = self.poll_async_event()? {
+                return Ok(Some(event));
             }
         }
     }
@@ -303,9 +276,11 @@ impl Context {
     ///
     /// Not every entry routes. On RoCE over plain Ethernet, peers answer on the RoCE v2 entry that
     /// holds the interface's IP address, and for an IPv4 network that is the IPv4-mapped one
-    /// (`::ffff:a.b.c.d`); this prefers such an entry and otherwise falls back to the port's first
-    /// entry (on InfiniBand, the port GID at index 0, where any entry routes). Pass the entry's
-    /// [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
+    /// (`::ffff:a.b.c.d`). This prefers such an entry, then any other RoCE v2 entry (an IPv6
+    /// address, or the link-local one), and otherwise falls back to the port's first entry: on
+    /// InfiniBand the port GID at index 0, where any entry routes, and on RoCE a RoCE v1 entry,
+    /// which reaches only peers on the same Ethernet segment that still speak RoCE v1. Pass the
+    /// entry's [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
     /// [`gid`](GidEntry::gid) to the peer or to [`AddressHandleAttribute::set_grh`]. Choose
     /// differently from [`gid_table`](Self::gid_table) when the network needs another entry.
     ///
@@ -315,35 +290,36 @@ impl Context {
     ///
     /// [`AddressHandleAttribute::set_grh`]: crate::AddressHandleAttribute::set_grh
     pub fn routable_gid(&self, port_num: u8) -> Result<Option<GidEntry>> {
-        let table = self.gid_table()?;
-        let on_port = |entry: &&GidEntry| entry.port_num == port_num;
-        let entry = table
-            .iter()
-            .filter(on_port)
-            .find(|entry| entry.gid_type == GidType::RoceV2 && entry.gid.is_ipv4_mapped())
-            .or_else(|| table.iter().find(on_port));
-        Ok(entry.cloned())
+        Ok(routable_entry(&self.gid_table()?, port_num).cloned())
     }
 
     /// Query a single entry of a port's GID table (`ibv_query_gid`).
     ///
     /// Ports are numbered from 1. For the full table at once (with the GID type and associated net
-    /// device of each entry), use [`gid_table`](Self::gid_table).
+    /// device of each entry), use [`gid_table`](Self::gid_table), which lists only the entries
+    /// that hold a GID.
     ///
     /// # Errors
     ///
     ///  - [`QueryGid`](Error::QueryGid): `ibv_query_gid` failed (`EINVAL` for an invalid
-    ///    `port_num` or `gid_index`).
+    ///    `port_num` or `gid_index`), or the entry is empty (`ENODATA`).
     pub fn query_gid(&self, port_num: u8, gid_index: u32) -> Result<Gid> {
         let mut gid = ffi::ibv_gid::default();
         let rc =
             unsafe { ffi::ibv_query_gid(self.inner.ctx, port_num, gid_index as i32, &mut gid) };
-        check(rc, |e| Error::QueryGid {
+        let error = |source| Error::QueryGid {
             port_num,
             gid_index,
-            source: e,
-        })?;
-        Ok(gid.into())
+            source,
+        };
+        check(rc, error)?;
+        let gid = Gid::from(gid);
+        // `ibv_query_gid` reports an empty entry as the all-zero GID `::`, which is not a GID any
+        // port holds; `ibv_query_gid_ex` reports it as `ENODATA`, and so does this.
+        if gid == Gid::default() {
+            return Err(error(io::Error::from_raw_os_error(nix::libc::ENODATA)));
+        }
+        Ok(gid)
     }
 
     /// The number of completion vectors the device supports: the exclusive upper bound for
@@ -369,21 +345,14 @@ impl Context {
     ///  - [`QueryDevice`](Error::QueryDevice): `ibv_query_device` failed (`EINVAL` for invalid
     ///    arguments).
     pub fn query_device(&self) -> Result<DeviceAttr> {
-        let mut device_attr = ffi::ibv_device_attr::default();
-        let errno = unsafe { ffi::ibv_query_device(self.inner.ctx, &mut device_attr as *mut _) };
-        if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
-        }
-        Ok(DeviceAttr(device_attr))
+        query_device(self.inner.ctx).map(DeviceAttr)
     }
 
     /// The most outstanding RDMA reads and atomics a queue pair on this device can issue as the
     /// initiator and service as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`),
     /// clamped to the `u8` the queue-pair attributes carry.
     pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
-        let attr = self.query_device()?;
-        let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
-        Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
+        rd_atomic_limits(self.inner.ctx)
     }
 
     /// Query the extended attributes and capabilities of this context's device
@@ -406,7 +375,9 @@ impl Context {
             ffi::ibv_query_device_ex(self.inner.ctx, std::ptr::null(), &mut device_attr as *mut _)
         };
         if errno != 0 {
-            return Err(Error::errno(errno, Error::QueryDevice));
+            return Err(
+                Error::errno(errno, Error::QueryDevice).for_operation(&"ibv_query_device_ex")
+            );
         }
         Ok(DeviceAttrEx(device_attr))
     }
@@ -482,18 +453,45 @@ impl Context {
     }
 }
 
+/// The entry of `table` that [`Context::routable_gid`] picks for `port_num`.
+fn routable_entry(table: &[GidEntry], port_num: u8) -> Option<&GidEntry> {
+    let on_port = || table.iter().filter(move |entry| entry.port_num == port_num);
+    let roce_v2 = |entry: &&GidEntry| entry.gid_type == GidType::RoceV2;
+    on_port()
+        .filter(roce_v2)
+        .find(|entry| entry.gid.is_ipv4_mapped())
+        .or_else(|| on_port().find(roce_v2))
+        .or_else(|| on_port().next())
+}
+
+/// [`Context::query_device`] for any open context.
+fn query_device(ctx: *mut ffi::ibv_context) -> Result<ffi::ibv_device_attr> {
+    let mut device_attr = ffi::ibv_device_attr::default();
+    let errno = unsafe { ffi::ibv_query_device(ctx, &mut device_attr) };
+    if errno != 0 {
+        return Err(Error::errno(errno, Error::QueryDevice));
+    }
+    Ok(device_attr)
+}
+
+/// [`Context::rd_atomic_limits`] for any open context on a device, such as the one librdmacm
+/// keeps for a connection-manager id.
+pub(crate) fn rd_atomic_limits(ctx: *mut ffi::ibv_context) -> Result<(u8, u8)> {
+    let attr = query_device(ctx)?;
+    let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
+    Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
+}
+
 /// An asynchronous event reported by the device, consumed with [`Context::poll_async_event`] /
-/// [`Context::wait_async_event`] and acknowledged automatically when dropped.
-///
-/// Drop events promptly: libibverbs blocks the destruction of the object an event refers to
-/// until the event is acknowledged (unless `RDMAV_ALLOW_DISASSOC_DESTROY` or
-/// `MLX4_DEVICE_FATAL_CLEANUP` is set in the environment and a disassociated device returns
-/// `EIO`), so holding an `AsyncEvent` while dropping the completion queue, queue pair, or
-/// shared receive queue it refers to deadlocks.
+/// [`Context::wait_async_event`], which acknowledge it as they read it: holding an `AsyncEvent`
+/// never delays the destruction of the object it names.
 pub struct AsyncEvent<'ctx> {
     event: ffi::ibv_async_event,
-    /// The event must be acknowledged before the device context closes, so it borrows the
-    /// [`Context`] it was read from.
+    /// The number of the queue pair a queue-pair-scoped event names, read before the event was
+    /// acknowledged: after that, the queue pair may be destroyed at any time.
+    qp_num: Option<u32>,
+    /// The [`Context`] the event was read from. The event is already acknowledged, so nothing
+    /// needs the borrow any more; dropping the lifetime would make events `'static`.
     _ctx: PhantomData<&'ctx Context>,
 }
 
@@ -513,29 +511,11 @@ impl AsyncEvent<'_> {
     /// [`PathMigrated`](AsyncEventType::PathMigrated),
     /// [`PathMigrationError`](AsyncEventType::PathMigrationError), and
     /// [`QpLastWqeReached`](AsyncEventType::QpLastWqeReached)); `None` for every other kind.
+    ///
+    /// The number is read as the event is, so it stays available after the queue pair is
+    /// destroyed.
     pub fn qp_num(&self) -> Option<u32> {
-        match self.event_type() {
-            AsyncEventType::QpFatal
-            | AsyncEventType::QpRequestError
-            | AsyncEventType::QpAccessError
-            | AsyncEventType::CommEstablished
-            | AsyncEventType::SqDrained
-            | AsyncEventType::PathMigrated
-            | AsyncEventType::PathMigrationError
-            | AsyncEventType::QpLastWqeReached => {
-                // SAFETY: for the queue-pair-scoped events, `ibv_get_async_event` populates
-                // `element.qp` with the non-null `ibv_qp` pointer stored as the kernel QP's
-                // `user_handle`. During `DESTROY_QP`, the kernel purges unread events for the QP
-                // and returns the count of already-read events in `events_reported`;
-                // `ibv_cmd_destroy_qp` then blocks until `events_completed == events_reported`
-                // before freeing `ibv_qp` (the same invariant `Drop` relies on, assuming
-                // `RDMAV_ALLOW_DISASSOC_DESTROY` / `MLX4_DEVICE_FATAL_CLEANUP` is not active on a
-                // disassociated device). Reading the immutable `u32` `qp_num` field via raw place
-                // projection avoids forming `&ffi::ibv_qp`.
-                Some(unsafe { (*self.event.element.qp).qp_num })
-            }
-            _ => None,
-        }
+        self.qp_num
     }
 
     /// The port the event refers to, for the port-scoped events
@@ -566,17 +546,11 @@ impl AsyncEvent<'_> {
     /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to (queue-pair-scoped
     /// events also expose their queue-pair number directly via [`AsyncEvent::qp_num`]). Those
     /// pointers cannot be mapped back to this crate's safe wrappers; compare them against the
-    /// `as_raw` handles of the wrappers you own to identify the object.
+    /// `as_raw` handles of the wrappers you own to identify the object. The event is already
+    /// acknowledged, so the object may have been destroyed since, and its address reused by a new
+    /// one: dereference the pointer only while you hold the wrapper it belongs to.
     pub fn as_raw(&self) -> &ffi::ibv_async_event {
         &self.event
-    }
-}
-
-impl Drop for AsyncEvent<'_> {
-    fn drop(&mut self) {
-        // Every event from `ibv_get_async_event` must be acknowledged exactly once; the object
-        // it refers to cannot be destroyed until then.
-        unsafe { ffi::ibv_ack_async_event(&mut self.event) };
     }
 }
 
@@ -587,10 +561,38 @@ impl fmt::Debug for AsyncEvent<'_> {
         if let Some(port_num) = self.port_num() {
             f.field("port_num", &port_num);
         }
-        if let Some(qp_num) = self.qp_num() {
+        if let Some(qp_num) = self.qp_num {
             f.field("qp_num", &qp_num);
         }
         f.finish_non_exhaustive()
+    }
+}
+
+/// The number of the queue pair `event` names, for the queue-pair-scoped events; `None` for every
+/// other kind.
+///
+/// # Safety
+///
+/// For a queue-pair-scoped event, `element.qp` must point to a live `ibv_qp`, as it does between
+/// `ibv_get_async_event` and `ibv_ack_async_event`.
+unsafe fn event_qp_num(event: &ffi::ibv_async_event) -> Option<u32> {
+    match AsyncEventType::from(event.event_type) {
+        AsyncEventType::QpFatal
+        | AsyncEventType::QpRequestError
+        | AsyncEventType::QpAccessError
+        | AsyncEventType::CommEstablished
+        | AsyncEventType::SqDrained
+        | AsyncEventType::PathMigrated
+        | AsyncEventType::PathMigrationError
+        | AsyncEventType::QpLastWqeReached => {
+            // SAFETY: for the queue-pair-scoped events the element union holds the `ibv_qp`
+            // pointer, which the caller guarantees is live. This is the same pointer
+            // `ibv_ack_async_event` dereferences, so the read is no riskier than the
+            // acknowledgement itself, even when `RDMAV_ALLOW_DISASSOC_DESTROY` or
+            // `MLX4_DEVICE_FATAL_CLEANUP` lets a destroy skip waiting for it.
+            Some(unsafe { (*event.element.qp).qp_num })
+        }
+        _ => None,
     }
 }
 
@@ -621,7 +623,10 @@ pub enum AsyncEventType {
     PathMigrated,
     /// The connection failed to migrate to its alternate path.
     PathMigrationError,
-    /// The device is in a fatal state; all of its resources are unusable.
+    /// The device is in a fatal state; all of its resources are unusable. This is the device's
+    /// last event: no other events follow it (a [`Context::wait_async_event`] without a timeout
+    /// then waits forever), and posting may keep succeeding without effect. Drop everything built
+    /// on the device and open it again.
     DeviceFatal,
     /// The port's logical state became active.
     PortActive,
@@ -683,36 +688,6 @@ impl From<ffi::ibv_event_type> for AsyncEventType {
     }
 }
 
-impl From<AsyncEventType> for ffi::ibv_event_type {
-    fn from(event: AsyncEventType) -> Self {
-        use ffi::ibv_event_type as E;
-        match event {
-            AsyncEventType::CqError => E::IBV_EVENT_CQ_ERR,
-            AsyncEventType::QpFatal => E::IBV_EVENT_QP_FATAL,
-            AsyncEventType::QpRequestError => E::IBV_EVENT_QP_REQ_ERR,
-            AsyncEventType::QpAccessError => E::IBV_EVENT_QP_ACCESS_ERR,
-            AsyncEventType::CommEstablished => E::IBV_EVENT_COMM_EST,
-            AsyncEventType::SqDrained => E::IBV_EVENT_SQ_DRAINED,
-            AsyncEventType::PathMigrated => E::IBV_EVENT_PATH_MIG,
-            AsyncEventType::PathMigrationError => E::IBV_EVENT_PATH_MIG_ERR,
-            AsyncEventType::DeviceFatal => E::IBV_EVENT_DEVICE_FATAL,
-            AsyncEventType::PortActive => E::IBV_EVENT_PORT_ACTIVE,
-            AsyncEventType::PortError => E::IBV_EVENT_PORT_ERR,
-            AsyncEventType::LidChange => E::IBV_EVENT_LID_CHANGE,
-            AsyncEventType::PkeyChange => E::IBV_EVENT_PKEY_CHANGE,
-            AsyncEventType::SmChange => E::IBV_EVENT_SM_CHANGE,
-            AsyncEventType::SrqError => E::IBV_EVENT_SRQ_ERR,
-            AsyncEventType::SrqLimitReached => E::IBV_EVENT_SRQ_LIMIT_REACHED,
-            AsyncEventType::QpLastWqeReached => E::IBV_EVENT_QP_LAST_WQE_REACHED,
-            AsyncEventType::ClientReregister => E::IBV_EVENT_CLIENT_REREGISTER,
-            AsyncEventType::GidChange => E::IBV_EVENT_GID_CHANGE,
-            AsyncEventType::WqFatal => E::IBV_EVENT_WQ_FATAL,
-            AsyncEventType::DeviceSpeedChange => E::IBV_EVENT_DEVICE_SPEED_CHANGE,
-            AsyncEventType::Unknown(raw) => ffi::ibv_event_type(raw),
-        }
-    }
-}
-
 impl std::fmt::Display for AsyncEventType {
     /// Formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
     /// [`SrqLimitReached`](Self::SrqLimitReached).
@@ -753,6 +728,13 @@ impl std::fmt::Display for AsyncEventType {
 /// [`ticks`](Self::ticks)) to time using the device's clock frequency,
 /// [`DeviceAttrEx::hca_core_clock_khz`].
 ///
+/// The clock wraps around: past `u64::MAX`, or on a device whose clock is narrower, past its
+/// [`DeviceAttrEx::completion_timestamp_mask`] (ionic's counts at most 48 bits). Subtraction
+/// wraps too, so a later reading minus an earlier one counts the ticks between them across a
+/// wrap; on a narrower clock, mask the difference with the device's mask:
+/// `(later - earlier) & mask`. Readings more than one wrap apart cannot be told apart, and a wrap
+/// between two readings reverses how they compare.
+///
 /// [`Sub`]: std::ops::Sub
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HcaClock(pub(crate) u64);
@@ -767,9 +749,10 @@ impl HcaClock {
 impl std::ops::Sub for HcaClock {
     type Output = u64;
 
-    /// The number of ticks from `rhs` to `self`.
+    /// The number of ticks from `rhs` to `self`, wrapping around as the clock does (see
+    /// [`HcaClock`]).
     fn sub(self, rhs: HcaClock) -> u64 {
-        self.0 - rhs.0
+        self.0.wrapping_sub(rhs.0)
     }
 }
 
@@ -870,20 +853,6 @@ impl From<ffi::ibv_port_state> for PortState {
             ffi::ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
             ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
             other => PortState::Unknown(other.0),
-        }
-    }
-}
-
-impl From<PortState> for ffi::ibv_port_state {
-    fn from(state: PortState) -> Self {
-        match state {
-            PortState::Nop => ffi::ibv_port_state::IBV_PORT_NOP,
-            PortState::Down => ffi::ibv_port_state::IBV_PORT_DOWN,
-            PortState::Init => ffi::ibv_port_state::IBV_PORT_INIT,
-            PortState::Armed => ffi::ibv_port_state::IBV_PORT_ARMED,
-            PortState::Active => ffi::ibv_port_state::IBV_PORT_ACTIVE,
-            PortState::ActiveDefer => ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER,
-            PortState::Unknown(raw) => ffi::ibv_port_state(raw),
         }
     }
 }
@@ -1215,7 +1184,8 @@ impl DeviceAttrEx {
     }
 
     /// The device's PCI atomic capabilities. Each field (`fetch_add`, `swap`, `compare_swap`) is a
-    /// bitmask of the operand sizes, in bytes, the device can operate on atomically across PCIe.
+    /// bitmask of the operand sizes the device can operate on atomically across PCIe, as
+    /// `IBV_PCI_ATOMIC_OPERATION_{4,8,16}_BYTE_SIZE_SUP` bits (1, 2, and 4), not byte counts.
     pub fn pci_atomic_caps(&self) -> ffi::ibv_pci_atomic_caps {
         self.0.pci_atomic_caps
     }
@@ -1381,7 +1351,7 @@ mod test_display {
     }
 
     #[test]
-    fn port_state_roundtrip() {
+    fn port_state_from_raw() {
         for (wrapper, raw) in [
             (PortState::Down, ffi::ibv_port_state::IBV_PORT_DOWN),
             (PortState::Active, ffi::ibv_port_state::IBV_PORT_ACTIVE),
@@ -1391,13 +1361,12 @@ mod test_display {
             ),
         ] {
             assert_eq!(PortState::from(raw), wrapper);
-            assert_eq!(ffi::ibv_port_state::from(wrapper), raw);
         }
         assert_eq!(PortState::Active.to_string(), "Active");
     }
 
     #[test]
-    fn async_event_type_roundtrip() {
+    fn async_event_type_from_raw() {
         for (wrapper, raw) in [
             (
                 AsyncEventType::CqError,
@@ -1421,8 +1390,48 @@ mod test_display {
             ),
         ] {
             assert_eq!(AsyncEventType::from(raw), wrapper);
-            assert_eq!(ffi::ibv_event_type::from(wrapper), raw);
         }
+    }
+
+    #[test]
+    fn routable_entry_prefers_roce_v2() {
+        let entry = |gid_index, port_num, gid: &str, gid_type| GidEntry {
+            gid: Gid::from(gid.parse::<std::net::Ipv6Addr>().unwrap()),
+            gid_index,
+            port_num,
+            gid_type,
+            ndev_ifindex: 0,
+        };
+        let routable = |table: &[GidEntry]| routable_entry(table, 1).map(|e| e.gid_index);
+        // What a RoCE port with an IPv4 and an IPv6 address lists, plus another port's entry.
+        let mut table = vec![
+            entry(0, 2, "::ffff:192.0.2.2", GidType::RoceV2),
+            entry(0, 1, "fe80::1", GidType::RoceV1),
+            entry(1, 1, "fe80::1", GidType::RoceV2),
+            entry(2, 1, "2001:db8::1", GidType::RoceV1),
+            entry(3, 1, "2001:db8::1", GidType::RoceV2),
+            entry(4, 1, "::ffff:192.0.2.1", GidType::RoceV1),
+            entry(5, 1, "::ffff:192.0.2.1", GidType::RoceV2),
+        ];
+        assert_eq!(routable(&table), Some(5));
+        // Without an IPv4 address, any RoCE v2 entry rather than the RoCE v1 one at index 0.
+        table.truncate(5);
+        assert_eq!(routable(&table), Some(1));
+        let ib = [
+            entry(0, 1, "fe80::2", GidType::Ib),
+            entry(1, 1, "fe80::3", GidType::Ib),
+        ];
+        assert_eq!(routable(&ib), Some(0));
+        assert_eq!(routable(&table[..1]), None);
+    }
+
+    #[test]
+    fn clock_differences_wrap() {
+        assert_eq!(HcaClock(10) - HcaClock(4), 6);
+        assert_eq!(HcaClock(2) - HcaClock(u64::MAX), 3);
+        // A 48-bit clock (ionic's widest) that wrapped between the two readings.
+        let mask = (1 << 48) - 1;
+        assert_eq!((HcaClock(1) - HcaClock(mask - 1)) & mask, 3);
     }
 
     #[test]
@@ -1442,18 +1451,22 @@ mod test_display {
         raw_qp
     }
 
+    /// An event of `event_type` whose element points at `qp`, built the way
+    /// [`Context::poll_async_event`] builds one.
     fn synthetic_async_event(
-        event_type: AsyncEventType,
-        element: ffi::ibv_async_event__bindgen_ty_1,
-    ) -> std::mem::ManuallyDrop<AsyncEvent<'static>> {
-        let raw_event = ffi::ibv_async_event {
-            event_type: ffi::ibv_event_type::from(event_type),
-            element,
+        event_type: ffi::ibv_event_type,
+        qp: *mut ffi::ibv_qp,
+    ) -> AsyncEvent<'static> {
+        let event = ffi::ibv_async_event {
+            event_type,
+            element: ffi::ibv_async_event__bindgen_ty_1 { qp },
         };
-        std::mem::ManuallyDrop::new(AsyncEvent {
-            event: raw_event,
+        AsyncEvent {
+            // SAFETY: `qp` points to a live `ibv_qp`.
+            qp_num: unsafe { event_qp_num(&event) },
+            event,
             _ctx: PhantomData,
-        })
+        }
     }
 
     /// Queue-pair-scoped asynchronous events expose the queue-pair number they refer to.
@@ -1462,25 +1475,21 @@ mod test_display {
         let mut raw_qp = zeroed_qp_with_num(4242);
 
         for event_type in [
-            AsyncEventType::QpFatal,
-            AsyncEventType::QpRequestError,
-            AsyncEventType::QpAccessError,
-            AsyncEventType::CommEstablished,
-            AsyncEventType::SqDrained,
-            AsyncEventType::PathMigrated,
-            AsyncEventType::PathMigrationError,
-            AsyncEventType::QpLastWqeReached,
+            ffi::ibv_event_type::IBV_EVENT_QP_FATAL,
+            ffi::ibv_event_type::IBV_EVENT_QP_REQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_QP_ACCESS_ERR,
+            ffi::ibv_event_type::IBV_EVENT_COMM_EST,
+            ffi::ibv_event_type::IBV_EVENT_SQ_DRAINED,
+            ffi::ibv_event_type::IBV_EVENT_PATH_MIG,
+            ffi::ibv_event_type::IBV_EVENT_PATH_MIG_ERR,
+            ffi::ibv_event_type::IBV_EVENT_QP_LAST_WQE_REACHED,
         ] {
-            let event = synthetic_async_event(
-                event_type,
-                ffi::ibv_async_event__bindgen_ty_1 {
-                    qp: raw_qp.as_mut_ptr(),
-                },
-            );
+            let event = synthetic_async_event(event_type, raw_qp.as_mut_ptr());
             assert_eq!(
                 event.qp_num(),
                 Some(4242),
-                "{event_type:?} must expose its queue-pair number"
+                "{:?} must expose its queue-pair number",
+                event.event_type()
             );
         }
     }
@@ -1491,31 +1500,27 @@ mod test_display {
         let mut raw_qp = zeroed_qp_with_num(4242);
 
         for event_type in [
-            AsyncEventType::PortActive,
-            AsyncEventType::PortError,
-            AsyncEventType::LidChange,
-            AsyncEventType::PkeyChange,
-            AsyncEventType::SmChange,
-            AsyncEventType::ClientReregister,
-            AsyncEventType::GidChange,
-            AsyncEventType::CqError,
-            AsyncEventType::SrqError,
-            AsyncEventType::SrqLimitReached,
-            AsyncEventType::WqFatal,
-            AsyncEventType::DeviceFatal,
-            AsyncEventType::DeviceSpeedChange,
-            AsyncEventType::Unknown(9999),
+            ffi::ibv_event_type::IBV_EVENT_PORT_ACTIVE,
+            ffi::ibv_event_type::IBV_EVENT_PORT_ERR,
+            ffi::ibv_event_type::IBV_EVENT_LID_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_PKEY_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_SM_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_CLIENT_REREGISTER,
+            ffi::ibv_event_type::IBV_EVENT_GID_CHANGE,
+            ffi::ibv_event_type::IBV_EVENT_CQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_SRQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_SRQ_LIMIT_REACHED,
+            ffi::ibv_event_type::IBV_EVENT_WQ_FATAL,
+            ffi::ibv_event_type::IBV_EVENT_DEVICE_FATAL,
+            ffi::ibv_event_type::IBV_EVENT_DEVICE_SPEED_CHANGE,
+            ffi::ibv_event_type(9999),
         ] {
-            let event = synthetic_async_event(
-                event_type,
-                ffi::ibv_async_event__bindgen_ty_1 {
-                    qp: raw_qp.as_mut_ptr(),
-                },
-            );
+            let event = synthetic_async_event(event_type, raw_qp.as_mut_ptr());
             assert_eq!(
                 event.qp_num(),
                 None,
-                "{event_type:?} must not have a queue-pair number"
+                "{:?} must not have a queue-pair number",
+                event.event_type()
             );
         }
     }
@@ -1526,12 +1531,8 @@ mod test_display {
     fn debug_renders_qp_num_for_qp_scoped_async_event() {
         let mut raw_qp = zeroed_qp_with_num(4242);
 
-        let event = synthetic_async_event(
-            AsyncEventType::QpFatal,
-            ffi::ibv_async_event__bindgen_ty_1 {
-                qp: raw_qp.as_mut_ptr(),
-            },
-        );
+        let event =
+            synthetic_async_event(ffi::ibv_event_type::IBV_EVENT_QP_FATAL, raw_qp.as_mut_ptr());
         let s = format!("{event:?}");
         assert!(s.contains("qp_num: 4242"), "{s}");
     }
@@ -1543,10 +1544,8 @@ mod test_display {
         let mut raw_qp = zeroed_qp_with_num(4242);
 
         let event = synthetic_async_event(
-            AsyncEventType::DeviceFatal,
-            ffi::ibv_async_event__bindgen_ty_1 {
-                qp: raw_qp.as_mut_ptr(),
-            },
+            ffi::ibv_event_type::IBV_EVENT_DEVICE_FATAL,
+            raw_qp.as_mut_ptr(),
         );
         let s = format!("{event:?}");
         assert!(!s.contains("qp_num"), "{s}");

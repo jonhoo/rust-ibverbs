@@ -1,9 +1,9 @@
 use std::ptr;
 use std::sync::Arc;
 
-use crate::error::{Error, Result, destroyed};
+use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
-use crate::qp::RecvRequest;
+use crate::qp::{RecvRequest, post_recv_error};
 
 struct SharedReceiveQueueInner {
     _pd: ProtectionDomain,
@@ -15,7 +15,11 @@ unsafe impl Send for SharedReceiveQueueInner {}
 
 impl Drop for SharedReceiveQueueInner {
     fn drop(&mut self) {
-        destroyed("ibv_destroy_srq", unsafe { ffi::ibv_destroy_srq(self.srq) });
+        destroyed(
+            "ibv_destroy_srq",
+            unsafe { ffi::ibv_destroy_srq(self.srq) },
+            || keep(&self._pd),
+        );
     }
 }
 
@@ -149,13 +153,17 @@ impl SharedReceiveQueue {
     ///
     /// Each referenced memory region must stay valid until a work completion has been polled for
     /// the corresponding `wr_id` (i.e., until `CompletionQueue::poll` returns a completion for
-    /// that receive).
+    /// that receive), or until the shared receive queue is destroyed. After an `Err`, the requests
+    /// ahead of the one that failed were posted (the error's `posted` counts them), so the same
+    /// holds for theirs.
     ///
     /// # Errors
     ///
     ///  - [`PostReceive`](Error::PostReceive): `ibv_post_srq_recv` failed (`EINVAL` for an invalid
     ///    value in one of the work requests, `ENOMEM` when the SRQ is full or out of resources,
-    ///    `EFAULT` for an invalid `SharedReceiveQueue`).
+    ///    `EFAULT` for an invalid `SharedReceiveQueue`). Its `posted` counts the requests at the
+    ///    front of `recvs` that were posted before the one that failed, so the rest can be posted
+    ///    again once there is room.
     ///
     /// [1]: https://www.rdmamojo.com/2013/02/08/ibv_post_srq_recv/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_post_srq_recv.3.html
@@ -167,12 +175,9 @@ impl SharedReceiveQueue {
         let head = RecvRequest::link(recvs);
 
         let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let ctx = unsafe { *self.srq }.context;
-        let ops = &mut unsafe { *ctx }.ops;
-        let errno =
-            unsafe { ops.post_srq_recv.as_mut().unwrap()(self.srq, head, &mut bad_wr as *mut _) };
+        let errno = unsafe { ffi::ibv_post_srq_recv(self.srq, head, &mut bad_wr) };
         if errno != 0 {
-            Err(Error::errno(errno, Error::PostReceive))
+            Err(post_recv_error(errno, recvs, bad_wr, false))
         } else {
             Ok(())
         }
