@@ -1714,6 +1714,7 @@ fn legacy_zero_length_ops() {
     let remote = remote_mr.remote();
     let empty_sges: &[ibverbs::LocalMemorySlice] = &[];
     let empty_inline: &[InlineSlice<'_>] = &[];
+    let one_empty_inline = [InlineSlice::new(&[])];
     unsafe {
         lb.qp.post_recv([
             RecvRequest::new(1, empty_sges),
@@ -1726,10 +1727,11 @@ fn legacy_zero_length_ops() {
         SendRequest::write(10, empty_sges, remote).signaled(),
         SendRequest::send(11, empty_sges).signaled(),
         SendRequest::send_inline(12, empty_inline).signaled(),
+        SendRequest::write_inline(13, &one_empty_inline, remote).signaled(),
     ];
     unsafe { lb.qp.post_send(chain) }.expect("post_send with empty payloads failed");
 
-    let comps = drain(&lb.cq, 5);
+    let comps = drain(&lb.cq, 6);
     for id in [1, 2] {
         let wc = comps
             .iter()
@@ -1737,7 +1739,7 @@ fn legacy_zero_length_ops() {
             .expect("missing recv completion");
         assert_eq!(wc.len(), 0);
     }
-    for id in [10, 11, 12] {
+    for id in [10, 11, 12, 13] {
         assert!(
             comps.iter().any(|c| c.wr_id() == id),
             "missing send completion {id}"

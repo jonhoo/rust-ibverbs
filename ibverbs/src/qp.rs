@@ -1524,6 +1524,11 @@ impl<'a> RecvRequest<'a> {
     }
 }
 
+/// A real, readable byte for an empty [`InlineSlice`] to point at: C providers (`mlx5`, `mlx4`,
+/// `rxe`, `efa`, `hns`, `ionic`, `bnxt_re`) pass `sg_list[i].addr` straight to `memcpy` even when
+/// `length` is 0, where a null or dangling pointer is undefined behavior in C.
+static EMPTY_INLINE: u8 = 0;
+
 /// Bytes that [`QueuePair::post_send`] copies into a send work request, instead of the device
 /// reading them from registered memory.
 ///
@@ -1550,9 +1555,10 @@ impl<'a> InlineSlice<'a> {
             u32::try_from(data.len()).expect("an inline slice holds at most u32::MAX bytes");
         InlineSlice {
             sge: ffi::ibv_sge {
-                // A genuine null for an empty slice, as `RecvRequest::new` passes for an empty list.
+                // Point an empty slice at a static byte instead of null, so C providers'
+                // `memcpy(dst, addr, 0)` calls never see a null source pointer.
                 addr: if data.is_empty() {
-                    0
+                    (&raw const EMPTY_INLINE) as u64
                 } else {
                     data.as_ptr() as u64
                 },
@@ -1565,7 +1571,7 @@ impl<'a> InlineSlice<'a> {
 }
 
 /// A send work request for [`QueuePair::post_send`], binding the lifetime of the buffers and the
-/// address handle it points at.
+/// [`AddressHandle`] it points at.
 ///
 /// Build one with the constructor for its operation (`send`, `write`, `read`, the atomics, and
 /// `send_to` on UD; which exist depends on the transport `T`), chain the modifiers
@@ -1596,8 +1602,8 @@ impl<'a> InlineSlice<'a> {
 /// # }
 /// ```
 ///
-/// A datagram request keeps its [`AddressHandle`] borrowed until it is posted, since the provider
-/// reads the handle inside `ibv_post_send`:
+/// A datagram request keeps its [`AddressHandle`] borrowed until `post_send` returns;
+/// [`QueuePair::post_send`]'s safety contract requires keeping it alive until completion:
 ///
 /// ```compile_fail,E0505
 /// # fn f(
@@ -1887,10 +1893,12 @@ impl<'a, T: Reliable> SendRequest<'a, T> {
 impl<'a> SendRequest<'a, Ud> {
     /// A SEND of the registered memory in `local` to `remote_qpn` / `remote_qkey` through `ah`.
     ///
-    /// `ah` stays borrowed until the request is posted, since the provider reads the handle inside
-    /// `ibv_post_send`. Keep it alive until the request completes too: some providers (rxe, for
-    /// one) only resolve the handle when the request executes. `post_send` panics if `ah` was
-    /// created on another protection domain than the queue pair's, as [`SendBatch::to`] does.
+    /// `ah` stays borrowed until `post_send` returns, since the provider reads `ah`
+    /// inside `ibv_post_send`. Keep `ah` alive until the request completes too (see
+    /// [`QueuePair::post_send`] `# Safety`): `irdma`, `efa`, `bnxt_re`, and `rxe` store
+    /// its index in the work request and resolve that index when the request executes.
+    /// `post_send` panics if `ah` comes from another protection domain than the queue
+    /// pair's, as [`SendBatch::to`] does.
     #[inline]
     pub fn send_to(
         ah: &'a AddressHandle,
@@ -3275,11 +3283,19 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// # Safety
     ///
-    /// Every memory region a request references must stay valid until the device is done with
-    /// it, as for [`SendBatch::submit`]: until a work completion has been polled for its request,
-    /// or for a later signaled request on the same send queue, or until the queue pair has been
-    /// reset or destroyed. After an `Err`, the requests ahead of the one that failed were posted
-    /// (the error's `posted` counts them), so the same holds for theirs.
+    /// Every memory region and [`AddressHandle`] a request references must stay valid
+    /// until the device is done with it, as for [`SendBatch::submit`]: until a work
+    /// completion has been polled for its request, or for a later signaled request on
+    /// the same send queue, or until the queue pair has been reset or destroyed
+    /// (`ibv_post_send(3)` forbids destroying an [`AddressHandle`] earlier, and `irdma`,
+    /// `efa`, `bnxt_re`, and `rxe` store its index in the work request and resolve that
+    /// index when the request executes).
+    ///
+    /// After an `Err`, the requests ahead of the one that failed were posted (the
+    /// error's `posted` counts them), so the same holds for theirs. On `rxe`, a failed
+    /// doorbell write after every request was queued reports `posted` as `0`, so on
+    /// `rxe` every request in `sends` is already on the queue and its memory regions and
+    /// [`AddressHandle`]s stay in use too.
     ///
     /// # Panics
     ///
@@ -3621,7 +3637,27 @@ mod test_send_request {
         assert_eq!(inline.wr.num_sge, 0);
         assert_eq!(inline.wr.send_flags, ffi::ibv_send_flags::IBV_SEND_INLINE.0);
 
-        assert_eq!(InlineSlice::new(&[]).sge.addr, 0);
+        assert_eq!(
+            InlineSlice::new(&[]).sge.addr,
+            (&raw const EMPTY_INLINE) as u64
+        );
+    }
+
+    #[test]
+    fn empty_inline_slice_points_at_a_readable_byte() {
+        let slices = [InlineSlice::new(&[])];
+        let req = SendRequest::<Rc>::send_inline(1, &slices);
+        assert!(!req.wr.sg_list.is_null());
+        assert_eq!(req.wr.num_sge, 1);
+        // SAFETY: `req.wr.sg_list` points to `slices[0]`, and an empty `InlineSlice` must carry a
+        // non-null, 1-byte-readable C object address so providers' `memcpy(dst, addr, 0)` calls
+        // never see a null source pointer.
+        let sge = unsafe { *req.wr.sg_list };
+        assert_ne!(sge.addr, 0);
+        assert_eq!(sge.addr, (&raw const EMPTY_INLINE) as u64);
+        assert_eq!((sge.length, sge.lkey), (0, 0));
+        // SAFETY: `sge.addr` is `&raw const EMPTY_INLINE`, a static initialized `u8`.
+        assert_eq!(unsafe { *(sge.addr as *const u8) }, 0);
     }
 
     #[test]

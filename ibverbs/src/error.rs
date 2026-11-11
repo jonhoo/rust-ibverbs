@@ -202,9 +202,13 @@ pub enum Error {
     /// [`PostSend`](Self::PostSend).
     #[error("failed to post a send work request after posting {posted} of the batch")]
     PostSendBatch {
-        /// How many requests at the front of the batch were posted before the one that failed:
-        /// they are on the queue like any other posted send, so their buffers are in use and their
-        /// signaled completions will arrive.
+        /// How many requests at the front of the batch were posted before the one that
+        /// failed: they are on the queue like any other posted send, so their memory
+        /// regions and [`AddressHandle`](crate::AddressHandle)s stay in use and their
+        /// signaled completions will arrive. On `rxe`, a failed doorbell write after
+        /// queueing every request reports `0`, even though every request in `sends` is
+        /// on the queue (see [`QueuePair::post_send`](crate::QueuePair::post_send)
+        /// `# Safety`).
         posted: u32,
         /// The underlying error.
         #[source]
