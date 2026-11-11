@@ -671,8 +671,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// Value can be `[0..dev_cap.max_sge]`. Some devices support fewer
     /// scatter/gather elements for specific transport types than the
     /// maximum reported value. Posting a work request with more entries than requested here
-    /// panics, even where the device granted more; with 0, the queue pair sends only inline or
-    /// empty payloads.
+    /// panics, even where the device granted more. With 0, a send batch sends only inline or empty
+    /// payloads; [`QueuePair::post_send`] counts each [`InlineSlice`] as an entry, as
+    /// `ibv_post_send` does.
     ///
     /// Defaults to 1.
     pub fn set_max_send_sge(&mut self, max_send_sge: u32) -> &mut Self {
@@ -704,7 +705,7 @@ impl<T: Transport> QueuePairBuilder<T> {
 
     /// Set the maximum size, in bytes, of inline data that may be posted on the send queue.
     ///
-    /// Inline sends (see [`Payload::Inline`]) copy their payload directly into the work request
+    /// Inline sends (see [`Payload::Inline`] and [`InlineSlice`]) copy their payload directly into the work request
     /// rather than referencing a registered memory region, which lowers latency for small messages.
     /// A send queue must reserve this capacity up front. The device may grant more than requested
     /// (reported by [`QueuePair::query`], see [`QueuePairInitAttribute::max_inline_data`]), but
@@ -934,9 +935,10 @@ impl<T: Connected> QueuePairBuilder<T> {
     /// Create a new [`PreparedQueuePair`] from this builder template with the legacy
     /// `ibv_create_qp`, for providers without the extended queue-pair verbs (`irdma`).
     ///
-    /// The queue pair has no extended work-request interface:
-    /// [`as_raw_ex`](QueuePair::as_raw_ex) returns null and [`start_send`](QueuePair::start_send)
-    /// panics. The send operations of [`set_send_ops`](Self::set_send_ops) are ignored.
+    /// Send on it with [`post_send`](QueuePair::post_send). It has no extended work-request
+    /// interface: [`as_raw_ex`](QueuePair::as_raw_ex) returns null and
+    /// [`start_send`](QueuePair::start_send) panics. The send operations of
+    /// [`set_send_ops`](Self::set_send_ops) are ignored.
     ///
     /// # Errors
     ///
@@ -975,9 +977,10 @@ impl QueuePairBuilder<Ud> {
     /// Create a new [`PreparedQueuePair`] from this builder template with the legacy
     /// `ibv_create_qp`, for providers without the extended queue-pair verbs (`irdma`).
     ///
-    /// The queue pair has no extended work-request interface:
-    /// [`as_raw_ex`](QueuePair::as_raw_ex) returns null and [`start_send`](QueuePair::start_send)
-    /// panics. The send operations of [`set_send_ops`](Self::set_send_ops) are ignored.
+    /// Send on it with [`post_send`](QueuePair::post_send). It has no extended work-request
+    /// interface: [`as_raw_ex`](QueuePair::as_raw_ex) returns null and
+    /// [`start_send`](QueuePair::start_send) panics. The send operations of
+    /// [`set_send_ops`](Self::set_send_ops) are ignored.
     ///
     /// # Errors
     ///
@@ -1521,6 +1524,418 @@ impl<'a> RecvRequest<'a> {
     }
 }
 
+/// Bytes that [`QueuePair::post_send`] copies into a send work request, instead of the device
+/// reading them from registered memory.
+///
+/// `ibv_post_send` reads inline bytes through the request's scatter/gather list, so each slice is
+/// an `ibv_sge` that points at the caller's bytes (with no memory key). The bytes are copied during
+/// the call, so they may be reused or dropped as soon as `post_send` returns. Post them with
+/// [`SendRequest::send_inline`], [`SendRequest::write_inline`] or [`SendRequest::send_inline_to`].
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct InlineSlice<'a> {
+    sge: ffi::ibv_sge,
+    _data: std::marker::PhantomData<&'a [u8]>,
+}
+
+impl<'a> InlineSlice<'a> {
+    /// An inline slice of `data`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `data` is longer than `u32::MAX` bytes, the most an `ibv_sge` describes.
+    #[inline]
+    pub fn new(data: &'a [u8]) -> Self {
+        let length =
+            u32::try_from(data.len()).expect("an inline slice holds at most u32::MAX bytes");
+        InlineSlice {
+            sge: ffi::ibv_sge {
+                // A genuine null for an empty slice, as `RecvRequest::new` passes for an empty list.
+                addr: if data.is_empty() {
+                    0
+                } else {
+                    data.as_ptr() as u64
+                },
+                length,
+                lkey: 0,
+            },
+            _data: std::marker::PhantomData,
+        }
+    }
+}
+
+/// A send work request for [`QueuePair::post_send`], binding the lifetime of the buffers and the
+/// address handle it points at.
+///
+/// Build one with the constructor for its operation (`send`, `write`, `read`, the atomics, and
+/// `send_to` on UD; which exist depends on the transport `T`), chain the modifiers
+/// ([`signaled`](Self::signaled), [`imm`](Self::imm), `solicited`, and on RC `fenced`), and post a
+/// slice of them with [`QueuePair::post_send`]. Like [`RecvRequest`], requests are posted from a
+/// caller-owned slice and linked in place, so posting allocates nothing.
+///
+/// # Borrow-checked guarantees
+///
+/// `post_send` takes `&mut QueuePair`, so it cannot run while a send batch is open:
+///
+/// ```compile_fail,E0499
+/// # fn f(qp: &mut ibverbs::QueuePair, note: &[ibverbs::LocalMemorySlice]) {
+/// let batch = qp.start_send();
+/// // error: `*qp` is already mutably borrowed by `batch`
+/// let _ = unsafe { qp.post_send([ibverbs::SendRequest::send(1, note)]) };
+/// drop(batch);
+/// # }
+/// ```
+///
+/// The receive side of a [`split`](QueuePair::split) queue pair cannot post sends:
+///
+/// ```compile_fail,E0596
+/// # fn f(qp: &mut ibverbs::QueuePair, note: &[ibverbs::LocalMemorySlice]) {
+/// let (_sends, recvs) = qp.split();
+/// // error: `*recvs` is a `&` reference
+/// let _ = unsafe { recvs.post_send([ibverbs::SendRequest::send(1, note)]) };
+/// # }
+/// ```
+///
+/// A datagram request keeps its [`AddressHandle`] borrowed until it is posted, since the provider
+/// reads the handle inside `ibv_post_send`:
+///
+/// ```compile_fail,E0505
+/// # fn f(
+/// #     qp: &mut ibverbs::QueuePair<ibverbs::Ud>,
+/// #     ah: ibverbs::AddressHandle,
+/// #     sges: &[ibverbs::LocalMemorySlice],
+/// # ) {
+/// let request = ibverbs::SendRequest::send_to(&ah, 1, 2, 3, sges);
+/// drop(ah); // error: cannot move out of `ah` because it is borrowed
+/// let _ = unsafe { qp.post_send([request]) };
+/// # }
+/// ```
+///
+/// Operations exist only on the transports that support them:
+///
+/// ```compile_fail,E0599
+/// // A connected transport addresses no individual sends: `send_to` exists only on UD.
+/// fn f(ah: &ibverbs::AddressHandle, sges: &[ibverbs::LocalMemorySlice]) {
+///     let _ = ibverbs::SendRequest::<ibverbs::Rc>::send_to(ah, 1, 2, 3, sges);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// // Only RC has RDMA reads: `read` requires `T: Reliable`.
+/// fn f(local: &[ibverbs::LocalMemorySlice], remote: ibverbs::RemoteMemorySlice) {
+///     let _ = ibverbs::SendRequest::<ibverbs::Uc>::read(1, local, remote);
+/// }
+/// ```
+#[repr(transparent)]
+pub struct SendRequest<'a, T: Transport> {
+    wr: ffi::ibv_send_wr,
+    _borrows: std::marker::PhantomData<(&'a (), T)>,
+}
+
+impl<'a, T: Transport> SendRequest<'a, T> {
+    /// A request for `opcode` over the `len` scatter/gather entries at `sges`, tagged with `wr_id`.
+    #[inline]
+    fn new(
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        sges: *const ffi::ibv_sge,
+        len: usize,
+        flags: u32,
+    ) -> Self {
+        SendRequest {
+            wr: ffi::ibv_send_wr {
+                wr_id,
+                next: ptr::null_mut(),
+                // An empty Rust slice's `.as_ptr()` is dangling, not null, and irdma tests the
+                // pointer before the count (see `RecvRequest::new`), so pass a genuine null.
+                sg_list: if len == 0 {
+                    ptr::null_mut()
+                } else {
+                    sges as *mut ffi::ibv_sge
+                },
+                // A count above `i32::MAX` saturates, so the capacity check in `link` refuses it.
+                num_sge: i32::try_from(len).unwrap_or(i32::MAX),
+                opcode,
+                send_flags: flags,
+                ..Default::default()
+            },
+            _borrows: std::marker::PhantomData,
+        }
+    }
+
+    /// A request over registered memory.
+    #[inline]
+    fn local(wr_id: u64, opcode: ffi::ibv_wr_opcode, local: &'a [LocalMemorySlice]) -> Self {
+        // `LocalMemorySlice` is `repr(transparent)` over `ibv_sge`.
+        Self::new(wr_id, opcode, local.as_ptr().cast(), local.len(), 0)
+    }
+
+    /// A request whose payload is copied into it (`IBV_SEND_INLINE`).
+    #[inline]
+    fn inline(wr_id: u64, opcode: ffi::ibv_wr_opcode, data: &'a [InlineSlice<'a>]) -> Self {
+        // `InlineSlice` is `repr(transparent)` over `ibv_sge`.
+        let flags = ffi::ibv_send_flags::IBV_SEND_INLINE.0;
+        Self::new(wr_id, opcode, data.as_ptr().cast(), data.len(), flags)
+    }
+
+    /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
+    #[inline]
+    pub fn signaled(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_SIGNALED.0;
+        self
+    }
+
+    /// Attach a 32-bit immediate (host byte order) to the SEND or RDMA WRITE this request posts,
+    /// as [`SendOp::imm`] does. Ignored by the operations that cannot carry one (RDMA READ and the
+    /// atomics).
+    #[inline]
+    pub fn imm(mut self, imm: u32) -> Self {
+        use ffi::ibv_wr_opcode as O;
+        self.wr.opcode = match self.wr.opcode {
+            O::IBV_WR_SEND | O::IBV_WR_SEND_WITH_IMM => O::IBV_WR_SEND_WITH_IMM,
+            O::IBV_WR_RDMA_WRITE | O::IBV_WR_RDMA_WRITE_WITH_IMM => O::IBV_WR_RDMA_WRITE_WITH_IMM,
+            _ => return self,
+        };
+        // Network byte order, as `ibv_post_send(3)` documents.
+        self.wr.__bindgen_anon_1.imm_data = imm.to_be();
+        self
+    }
+
+    /// Set the solicited flag; the transports that allow it expose this as `solicited`.
+    #[inline]
+    fn solicit(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_SOLICITED.0;
+        self
+    }
+
+    /// Links the non-empty `sends` into the list `ibv_post_send` walks and returns its head,
+    /// refusing a request that does not fit the queue pair, as [`SendOp::build`] and
+    /// [`SendBatch::to`] do: more entries than `max_send_sge`, more inline bytes than
+    /// `max_inline_data`, or (UD) an address handle from another protection domain than `pd`.
+    /// Not every provider checks these: irdma and mlx5 sum inline lengths in 32-bit integers that
+    /// can wrap. Every link comes from one pointer to the slice, as in [`RecvRequest::link`].
+    fn link(
+        sends: &mut [SendRequest<'_, T>],
+        max_send_sge: u32,
+        max_inline_data: u32,
+        pd: *mut ffi::ibv_pd,
+    ) -> *mut ffi::ibv_send_wr {
+        let n = sends.len();
+        let base = sends.as_mut_ptr();
+        unsafe {
+            for i in 0..n {
+                let wr = &raw mut (*base.add(i)).wr;
+                // `new` never stores a negative count.
+                let num_sge = (*wr).num_sge as u32;
+                if num_sge > max_send_sge {
+                    too_many_sges(num_sge as usize, max_send_sge);
+                }
+                if (*wr).send_flags & ffi::ibv_send_flags::IBV_SEND_INLINE.0 != 0 {
+                    let len = (0..num_sge as usize).fold(0usize, |len, k| {
+                        len.saturating_add((*(*wr).sg_list.add(k)).length as usize)
+                    });
+                    if len > max_inline_data as usize {
+                        inline_too_long(len, max_inline_data);
+                    }
+                }
+                // Only the UD constructors write `wr.ud`, and every one of them does.
+                if T::TYPE == ffi::ibv_qp_type::IBV_QPT_UD && (*(*wr).wr.ud.ah).pd != pd {
+                    foreign_address_handle();
+                }
+                (*wr).next = if i + 1 < n {
+                    &raw mut (*base.add(i + 1)).wr
+                } else {
+                    ptr::null_mut()
+                };
+            }
+            &raw mut (*base).wr
+        }
+    }
+}
+
+impl<'a, T: Connected> SendRequest<'a, T> {
+    /// A SEND of the registered memory in `local`.
+    #[inline]
+    pub fn send(wr_id: u64, local: &'a [LocalMemorySlice]) -> Self {
+        Self::local(wr_id, ffi::ibv_wr_opcode::IBV_WR_SEND, local)
+    }
+
+    /// A SEND of the bytes in `data`, copied into the request (see [`InlineSlice`]). The queue pair
+    /// needs inline capacity for their combined length
+    /// ([`QueuePairBuilder::set_max_inline_data`]), and each slice counts as a scatter/gather entry
+    /// ([`QueuePairBuilder::set_max_send_sge`]).
+    #[inline]
+    pub fn send_inline(wr_id: u64, data: &'a [InlineSlice<'a>]) -> Self {
+        Self::inline(wr_id, ffi::ibv_wr_opcode::IBV_WR_SEND, data)
+    }
+
+    /// An RDMA WRITE of the registered memory in `local` into `remote`.
+    #[inline]
+    pub fn write(wr_id: u64, local: &'a [LocalMemorySlice], remote: RemoteMemorySlice) -> Self {
+        let mut request = Self::local(wr_id, ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE, local);
+        request.set_rdma(remote);
+        request
+    }
+
+    /// An RDMA WRITE of the bytes in `data` into `remote`, copied into the request (see
+    /// [`send_inline`](Self::send_inline) for the capacity it needs).
+    #[inline]
+    pub fn write_inline(
+        wr_id: u64,
+        data: &'a [InlineSlice<'a>],
+        remote: RemoteMemorySlice,
+    ) -> Self {
+        let mut request = Self::inline(wr_id, ffi::ibv_wr_opcode::IBV_WR_RDMA_WRITE, data);
+        request.set_rdma(remote);
+        request
+    }
+
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`), as [`SendOp::solicited`] does. The
+    /// flag is valid only on a SEND or an RDMA WRITE with an immediate.
+    #[inline]
+    pub fn solicited(self) -> Self {
+        self.solicit()
+    }
+
+    /// Address the RDMA operation at `remote`.
+    #[inline]
+    fn set_rdma(&mut self, remote: RemoteMemorySlice) {
+        self.wr.wr.rdma = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_1 {
+            remote_addr: remote.addr,
+            rkey: remote.rkey,
+        };
+    }
+}
+
+impl<'a, T: Reliable> SendRequest<'a, T> {
+    /// An RDMA READ from `remote` into the registered memory in `local`.
+    #[inline]
+    pub fn read(wr_id: u64, local: &'a [LocalMemorySlice], remote: RemoteMemorySlice) -> Self {
+        let mut request = Self::local(wr_id, ffi::ibv_wr_opcode::IBV_WR_RDMA_READ, local);
+        request.set_rdma(remote);
+        request
+    }
+
+    /// An atomic compare-and-swap on the 8-byte value at `remote`, as
+    /// [`SendOp::atomic_cmp_swap`] describes. The value it held before is written to `local`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` is not 8 bytes long.
+    #[inline]
+    pub fn atomic_cmp_swap(
+        wr_id: u64,
+        local: &'a LocalMemorySlice,
+        remote: RemoteMemorySlice,
+        compare: u64,
+        swap: u64,
+    ) -> Self {
+        let opcode = ffi::ibv_wr_opcode::IBV_WR_ATOMIC_CMP_AND_SWP;
+        Self::atomic(wr_id, opcode, local, remote, compare, swap)
+    }
+
+    /// An atomic fetch-and-add on the 8-byte value at `remote`, as
+    /// [`SendOp::atomic_fetch_add`] describes. The value it held before is written to `local`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `local` is not 8 bytes long.
+    #[inline]
+    pub fn atomic_fetch_add(
+        wr_id: u64,
+        local: &'a LocalMemorySlice,
+        remote: RemoteMemorySlice,
+        add: u64,
+    ) -> Self {
+        let opcode = ffi::ibv_wr_opcode::IBV_WR_ATOMIC_FETCH_AND_ADD;
+        Self::atomic(wr_id, opcode, local, remote, add, 0)
+    }
+
+    /// Mark this work request fenced (`IBV_SEND_FENCE`), as [`SendOp::fenced`] does.
+    #[inline]
+    pub fn fenced(mut self) -> Self {
+        self.wr.send_flags |= ffi::ibv_send_flags::IBV_SEND_FENCE.0;
+        self
+    }
+
+    /// An atomic `opcode` whose original value lands in `local`. irdma reads the first entry of
+    /// an atomic without checking the count, and rxe fails a shorter buffer only after applying
+    /// the atomic, so refuse anything but one 8-byte entry, as [`SendOp`] does.
+    #[inline]
+    fn atomic(
+        wr_id: u64,
+        opcode: ffi::ibv_wr_opcode,
+        local: &'a LocalMemorySlice,
+        remote: RemoteMemorySlice,
+        compare_add: u64,
+        swap: u64,
+    ) -> Self {
+        if local.len() != 8 {
+            atomic_local_not_8_bytes(local.len());
+        }
+        let mut request = Self::local(wr_id, opcode, std::slice::from_ref(local));
+        request.wr.wr.atomic = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_2 {
+            remote_addr: remote.addr,
+            compare_add,
+            swap,
+            rkey: remote.rkey,
+        };
+        request
+    }
+}
+
+impl<'a> SendRequest<'a, Ud> {
+    /// A SEND of the registered memory in `local` to `remote_qpn` / `remote_qkey` through `ah`.
+    ///
+    /// `ah` stays borrowed until the request is posted, since the provider reads the handle inside
+    /// `ibv_post_send`. Keep it alive until the request completes too: some providers (rxe, for
+    /// one) only resolve the handle when the request executes. `post_send` panics if `ah` was
+    /// created on another protection domain than the queue pair's, as [`SendBatch::to`] does.
+    #[inline]
+    pub fn send_to(
+        ah: &'a AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+        wr_id: u64,
+        local: &'a [LocalMemorySlice],
+    ) -> Self {
+        let mut request = Self::local(wr_id, ffi::ibv_wr_opcode::IBV_WR_SEND, local);
+        request.set_ud(ah, remote_qpn, remote_qkey);
+        request
+    }
+
+    /// A SEND of the bytes in `data`, copied into the request, to `remote_qpn` / `remote_qkey`
+    /// through `ah` (see [`send_to`](Self::send_to) and [`InlineSlice`]).
+    #[inline]
+    pub fn send_inline_to(
+        ah: &'a AddressHandle,
+        remote_qpn: u32,
+        remote_qkey: u32,
+        wr_id: u64,
+        data: &'a [InlineSlice<'a>],
+    ) -> Self {
+        let mut request = Self::inline(wr_id, ffi::ibv_wr_opcode::IBV_WR_SEND, data);
+        request.set_ud(ah, remote_qpn, remote_qkey);
+        request
+    }
+
+    /// Mark this work request solicited (`IBV_SEND_SOLICITED`), as [`SendOp::solicited`] does.
+    #[inline]
+    pub fn solicited(self) -> Self {
+        self.solicit()
+    }
+
+    /// Address the datagram.
+    #[inline]
+    fn set_ud(&mut self, ah: &'a AddressHandle, remote_qpn: u32, remote_qkey: u32) {
+        self.wr.wr.ud = ffi::ibv_send_wr__bindgen_ty_2__bindgen_ty_3 {
+            ah: ah.as_raw(),
+            remote_qpn,
+            remote_qkey,
+        };
+    }
+}
+
 /// A batch of send work requests being built on a [`QueuePair`]'s send queue.
 ///
 /// Created by [`QueuePair::start_send`]. Each work request starts at [`op`](Self::op) (on a
@@ -2052,6 +2467,40 @@ pub(crate) fn post_recv_error(
         io::Error::from_raw_os_error(errno.abs())
     };
     Error::PostReceive { posted, source }
+}
+
+/// The error for a failed `ibv_post_send` of `sends`, kept out of line like [`post_recv_error`]:
+/// `bad_wr` is the first request the provider refused, so its index in `sends` counts the ones it
+/// posted, and a null or foreign `bad_wr` counts none. rxe returns a failed doorbell write with a
+/// null `bad_wr` after queueing every request, so there 0 can undercount. The errno is not
+/// promoted to [`Unsupported`](Error::Unsupported), which would lose the count.
+#[cold]
+#[inline(never)]
+fn post_send_error<T: Transport>(
+    errno: i32,
+    sends: &[SendRequest<'_, T>],
+    bad_wr: *const ffi::ibv_send_wr,
+) -> Error {
+    // Plain address arithmetic, as in `post_recv_error`.
+    let index = (bad_wr as usize).wrapping_sub(sends.as_ptr() as usize)
+        / std::mem::size_of::<SendRequest<'_, T>>();
+    let posted = if index < sends.len() {
+        u32::try_from(index).unwrap_or(u32::MAX)
+    } else {
+        0
+    };
+    Error::PostSendBatch {
+        posted,
+        source: io::Error::from_raw_os_error(errno.abs()),
+    }
+}
+
+/// The panic for a datagram request whose address handle is from another protection domain than
+/// the queue pair's, kept out of line like `inline_too_long`. Same message as `SendBatch::to`.
+#[cold]
+#[inline(never)]
+fn foreign_address_handle() -> ! {
+    panic!("the address handle must come from the queue pair's protection domain")
 }
 
 /// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
@@ -2797,6 +3246,80 @@ impl<T: Transport> QueuePair<T> {
         }
     }
 
+    /// Posts a batch of send work requests to this queue pair's send queue with a single
+    /// `ibv_post_send`.
+    ///
+    /// `sends` is the caller's storage — a stack array or a reusable `Vec` — linked in place rather
+    /// than copied, so posting allocates nothing; the provider reads the requests, their
+    /// scatter/gather lists, inline bytes and address handles during the call. This works on every
+    /// queue pair: one from [`build_legacy`](QueuePairBuilder::build_legacy), which has no send
+    /// batch, and one from `build`, where rdma-core allows `ibv_post_send` outside an open batch
+    /// (`ibv_wr_post(3)`).
+    ///
+    /// Takes `&mut self`, so it cannot run while a send batch is open, and at most one thread posts
+    /// sends at a time. To post sends while other threads post receives,
+    /// [`split`](Self::split) the queue pair and use [`SendQueue::post_send`].
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice, SendRequest};
+    /// # unsafe fn f(qp: &mut QueuePair, payload: &[LocalMemorySlice], dest: RemoteMemorySlice, note: &[LocalMemorySlice]) -> ibverbs::Result<()> {
+    /// let chain = [
+    ///     SendRequest::write(1, payload, dest),
+    ///     SendRequest::send(2, note).signaled(),
+    /// ];
+    /// unsafe { qp.post_send(chain) }
+    /// # }
+    /// ```
+    ///
+    /// # Safety
+    ///
+    /// Every memory region a request references must stay valid until the device is done with
+    /// it, as for [`SendBatch::submit`]: until a work completion has been polled for its request,
+    /// or for a later signaled request on the same send queue, or until the queue pair has been
+    /// reset or destroyed. After an `Err`, the requests ahead of the one that failed were posted
+    /// (the error's `posted` counts them), so the same holds for theirs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a request has more scatter/gather entries than the queue pair was built for
+    /// ([`QueuePairBuilder::set_max_send_sge`]; each [`InlineSlice`] counts as one), more inline
+    /// bytes than its inline capacity ([`QueuePairBuilder::set_max_inline_data`]), or (UD) an
+    /// address handle from another protection domain than the queue pair's.
+    ///
+    /// # Errors
+    ///
+    ///  - [`PostSendBatch`](Error::PostSendBatch): `ibv_post_send` failed (`EINVAL` for an invalid
+    ///    value in one of the work requests or an operation the provider does not support,
+    ///    `ENOMEM` when the send queue is full or out of resources). Its `posted` counts the
+    ///    requests at the front of `sends` that were posted before the one that failed. On rxe, a
+    ///    failed doorbell write after every request was queued reports `posted` as 0.
+    pub unsafe fn post_send<'a>(
+        &mut self,
+        mut sends: impl AsMut<[SendRequest<'a, T>]>,
+    ) -> Result<()> {
+        unsafe { self.post_send_list(sends.as_mut()) }
+    }
+
+    /// Posts `sends` with one `ibv_post_send`. Every caller holds the send queue exclusively (a
+    /// `&mut` to the queue pair or to its [`SendQueue`]), which keeps it out of an open send batch.
+    unsafe fn post_send_list(&self, sends: &mut [SendRequest<'_, T>]) -> Result<()> {
+        if sends.is_empty() {
+            return Ok(());
+        }
+        let pd = unsafe { (*self.qp).pd };
+        let head = SendRequest::link(sends, self.max_send_sge, self.max_inline_data, pd);
+
+        let mut bad_wr: *mut ffi::ibv_send_wr = ptr::null_mut();
+        let errno = unsafe { ffi::ibv_post_send(self.qp, head, &mut bad_wr) };
+        if errno != 0 {
+            Err(post_send_error(errno, sends, bad_wr))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Begin a batch of send work requests on this queue pair's send queue.
     ///
     /// Each [`op`](SendBatch::op) on the returned [`SendBatch`] appends one request (a datagram
@@ -2908,6 +3431,26 @@ impl<T: Transport> SendQueue<'_, T> {
     pub fn start_send(&mut self) -> SendBatch<'_, T> {
         self.qp.open_batch()
     }
+
+    /// Posts a batch of send work requests, as [`QueuePair::post_send`] does.
+    ///
+    /// # Safety
+    ///
+    /// As for [`QueuePair::post_send`].
+    ///
+    /// # Panics
+    ///
+    /// As [`QueuePair::post_send`] does.
+    ///
+    /// # Errors
+    ///
+    /// As [`QueuePair::post_send`].
+    pub unsafe fn post_send<'a>(
+        &mut self,
+        mut sends: impl AsMut<[SendRequest<'a, T>]>,
+    ) -> Result<()> {
+        unsafe { self.qp.post_send_list(sends.as_mut()) }
+    }
 }
 
 /// The panic for a send batch on a queue pair from `build_legacy`, kept out of line so opening a
@@ -2917,7 +3460,7 @@ impl<T: Transport> SendQueue<'_, T> {
 fn no_extended_send_interface() -> ! {
     panic!(
         "this queue pair was created by build_legacy and has no extended work-request interface, \
-         so it cannot start a send batch"
+         so it cannot start a send batch; post with post_send"
     )
 }
 
@@ -2934,6 +3477,228 @@ impl<T: Transport> Drop for QueuePair<T> {
                 keep(&self._recv_cq);
             },
         );
+    }
+}
+
+#[cfg(test)]
+mod test_send_request {
+    use super::*;
+    use ffi::ibv_wr_opcode as O;
+
+    /// Follow the list the way a provider does, from the head through each `next`.
+    fn walk(mut wr: *mut ffi::ibv_send_wr) -> Vec<u64> {
+        let mut ids = Vec::new();
+        while !wr.is_null() {
+            unsafe {
+                ids.push((*wr).wr_id);
+                wr = (*wr).next;
+            }
+        }
+        ids
+    }
+
+    fn sges(lens: &[u32]) -> Vec<LocalMemorySlice> {
+        lens.iter()
+            .map(|&length| {
+                LocalMemorySlice::from(ffi::ibv_sge {
+                    addr: 0x1000,
+                    length,
+                    lkey: 7,
+                })
+            })
+            .collect()
+    }
+
+    const REMOTE: RemoteMemorySlice = RemoteMemorySlice {
+        addr: 0x2000,
+        len: 8,
+        rkey: 9,
+    };
+
+    #[test]
+    fn link_chains_the_requests_in_order() {
+        let local = sges(&[4]);
+        let mut sends = [
+            SendRequest::<Rc>::send(1, &local),
+            SendRequest::write(2, &local, REMOTE),
+            SendRequest::read(3, &local, REMOTE),
+        ];
+        let head = SendRequest::link(&mut sends, 1, 0, ptr::null_mut());
+        assert_eq!(walk(head), [1, 2, 3]);
+
+        let mut one = [SendRequest::<Rc>::send(4, &local)];
+        assert_eq!(
+            walk(SendRequest::link(&mut one, 1, 0, ptr::null_mut())),
+            [4]
+        );
+    }
+
+    #[test]
+    fn each_opcode_is_encoded() {
+        let local = sges(&[8]);
+        let send = SendRequest::<Rc>::send(1, &local);
+        assert_eq!(send.wr.opcode, O::IBV_WR_SEND);
+        assert_eq!(send.wr.num_sge, 1);
+        assert_eq!(send.wr.sg_list.cast_const(), local.as_ptr().cast());
+        assert_eq!(send.wr.send_flags, 0);
+
+        let write = SendRequest::<Rc>::write(2, &local, REMOTE);
+        assert_eq!(write.wr.opcode, O::IBV_WR_RDMA_WRITE);
+        let rdma = unsafe { write.wr.wr.rdma };
+        assert_eq!((rdma.remote_addr, rdma.rkey), (0x2000, 9));
+
+        let read = SendRequest::<Rc>::read(3, &local, REMOTE);
+        assert_eq!(read.wr.opcode, O::IBV_WR_RDMA_READ);
+        let rdma = unsafe { read.wr.wr.rdma };
+        assert_eq!((rdma.remote_addr, rdma.rkey), (0x2000, 9));
+
+        let cas = SendRequest::<Rc>::atomic_cmp_swap(4, &local[0], REMOTE, 5, 6);
+        assert_eq!(cas.wr.opcode, O::IBV_WR_ATOMIC_CMP_AND_SWP);
+        let atomic = unsafe { cas.wr.wr.atomic };
+        assert_eq!(
+            (
+                atomic.remote_addr,
+                atomic.compare_add,
+                atomic.swap,
+                atomic.rkey
+            ),
+            (0x2000, 5, 6, 9)
+        );
+        assert_eq!(cas.wr.num_sge, 1);
+
+        let faa = SendRequest::<Rc>::atomic_fetch_add(5, &local[0], REMOTE, 10);
+        assert_eq!(faa.wr.opcode, O::IBV_WR_ATOMIC_FETCH_AND_ADD);
+        let atomic = unsafe { faa.wr.wr.atomic };
+        assert_eq!((atomic.compare_add, atomic.swap), (10, 0));
+    }
+
+    #[test]
+    fn modifiers_set_their_flags() {
+        let local = sges(&[4]);
+        let flags = SendRequest::<Rc>::send(1, &local)
+            .signaled()
+            .solicited()
+            .fenced()
+            .wr
+            .send_flags;
+        let expected = ffi::ibv_send_flags::IBV_SEND_SIGNALED.0
+            | ffi::ibv_send_flags::IBV_SEND_SOLICITED.0
+            | ffi::ibv_send_flags::IBV_SEND_FENCE.0;
+        assert_eq!(flags, expected);
+    }
+
+    #[test]
+    fn imm_switches_send_and_write_and_is_big_endian() {
+        let local = sges(&[4]);
+        let send = SendRequest::<Rc>::send(1, &local).imm(0x0102_0304);
+        assert_eq!(send.wr.opcode, O::IBV_WR_SEND_WITH_IMM);
+        assert_eq!(
+            unsafe { send.wr.__bindgen_anon_1.imm_data },
+            0x0102_0304u32.to_be()
+        );
+        let write = SendRequest::<Rc>::write(2, &local, REMOTE).imm(7);
+        assert_eq!(write.wr.opcode, O::IBV_WR_RDMA_WRITE_WITH_IMM);
+        // A second `imm` replaces the value and keeps the opcode.
+        let again = write.imm(8);
+        assert_eq!(again.wr.opcode, O::IBV_WR_RDMA_WRITE_WITH_IMM);
+        assert_eq!(unsafe { again.wr.__bindgen_anon_1.imm_data }, 8u32.to_be());
+        // Ignored where the operation cannot carry one.
+        let read = SendRequest::<Rc>::read(3, &local, REMOTE).imm(9);
+        assert_eq!(read.wr.opcode, O::IBV_WR_RDMA_READ);
+        assert_eq!(unsafe { read.wr.__bindgen_anon_1.imm_data }, 0);
+    }
+
+    #[test]
+    fn empty_slices_pass_a_null_sg_list() {
+        let none: &[LocalMemorySlice] = &[];
+        let send = SendRequest::<Rc>::send(1, none);
+        assert!(send.wr.sg_list.is_null());
+        assert_eq!(send.wr.num_sge, 0);
+
+        let no_bytes: &[InlineSlice<'_>] = &[];
+        let inline = SendRequest::<Rc>::send_inline(2, no_bytes);
+        assert!(inline.wr.sg_list.is_null());
+        assert_eq!(inline.wr.num_sge, 0);
+        assert_eq!(inline.wr.send_flags, ffi::ibv_send_flags::IBV_SEND_INLINE.0);
+
+        assert_eq!(InlineSlice::new(&[]).sge.addr, 0);
+    }
+
+    #[test]
+    fn inline_slices_point_at_the_callers_bytes() {
+        let bytes = *b"ping";
+        let data = [InlineSlice::new(&bytes)];
+        assert_eq!(data[0].sge.addr, bytes.as_ptr() as u64);
+        assert_eq!((data[0].sge.length, data[0].sge.lkey), (4, 0));
+        let write = SendRequest::<Rc>::write_inline(1, &data, REMOTE);
+        assert_eq!(write.wr.opcode, O::IBV_WR_RDMA_WRITE);
+        assert_eq!(write.wr.sg_list.cast_const(), data.as_ptr().cast());
+        assert_eq!(write.wr.send_flags, ffi::ibv_send_flags::IBV_SEND_INLINE.0);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "an atomic writes 8 bytes to its local buffer, which is 4 bytes long"
+    )]
+    fn atomic_local_buffer_must_be_8_bytes() {
+        let local = sges(&[4]);
+        let _ = SendRequest::<Rc>::atomic_fetch_add(1, &local[0], REMOTE, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "2 scatter/gather entries exceed the queue pair's capacity of 1")]
+    fn link_refuses_more_entries_than_the_capacity() {
+        let local = sges(&[4, 4]);
+        let mut sends = [SendRequest::<Rc>::send(1, &local)];
+        SendRequest::link(&mut sends, 1, 0, ptr::null_mut());
+    }
+
+    #[test]
+    #[should_panic(expected = "1 scatter/gather entries exceed the queue pair's capacity of 0")]
+    fn link_counts_inline_slices_as_entries() {
+        let data = [InlineSlice::new(b"ab")];
+        let mut sends = [SendRequest::<Rc>::send_inline(1, &data)];
+        SendRequest::link(&mut sends, 0, 64, ptr::null_mut());
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "5 bytes of inline data exceed the queue pair's inline capacity of 4"
+    )]
+    fn link_refuses_more_inline_bytes_than_the_capacity() {
+        let (a, b) = (*b"abc", *b"de");
+        let data = [InlineSlice::new(&a), InlineSlice::new(&b)];
+        let mut sends = [SendRequest::<Rc>::send_inline(1, &data)];
+        SendRequest::link(&mut sends, 2, 4, ptr::null_mut());
+    }
+
+    #[test]
+    fn a_failed_post_counts_the_requests_ahead_of_bad_wr() {
+        let local = sges(&[4]);
+        let mut sends = [
+            SendRequest::<Rc>::send(1, &local),
+            SendRequest::send(2, &local),
+            SendRequest::send(3, &local),
+        ];
+        let head = SendRequest::link(&mut sends, 1, 0, ptr::null_mut());
+        let posted = |bad_wr| match post_send_error(nix::libc::ENOMEM, &sends, bad_wr) {
+            Error::PostSendBatch { posted, source } => {
+                assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM));
+                posted
+            }
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(posted(head), 0);
+        assert_eq!(posted(unsafe { (*head).next }), 1);
+        assert_eq!(posted(unsafe { (*(*head).next).next }), 2);
+        // A provider that refuses the batch without naming a request (or rxe after a failed
+        // doorbell) posted none that the count can show.
+        assert_eq!(posted(ptr::null()), 0);
+        // Not even an unsupported errno loses the count.
+        assert!(matches!(
+            post_send_error(nix::libc::EOPNOTSUPP, &sends, head),
+            Error::PostSendBatch { posted: 0, .. }
+        ));
     }
 }
 

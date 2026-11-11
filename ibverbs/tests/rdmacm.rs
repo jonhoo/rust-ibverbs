@@ -24,7 +24,7 @@ use ibverbs::rdmacm::{
 use ibverbs::{
     AccessFlags, AckTimeout, CompletionQueue, Context, Error, PreparedQueuePair, ProtectionDomain,
     QueuePairAttribute, QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest,
-    RemoteMemorySlice, WcStatus,
+    RemoteMemorySlice, SendRequest, WcStatus,
 };
 
 /// The device's IPv4 address, from its routable GID on port 1 (the IPv4-mapped RoCEv2 entry of the
@@ -213,6 +213,79 @@ fn connect_and_send() {
             wait_for(cq, 2);
         },
     );
+}
+
+/// The connection manager connects queue pairs from `build_legacy` like any other, and they send
+/// with `post_send`.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn legacy_connect_and_send() {
+    fn legacy_resources(
+        ctx: &Context,
+        port: u8,
+    ) -> (ProtectionDomain, CompletionQueue, PreparedQueuePair<Rc>) {
+        let pd = ctx
+            .alloc_pd()
+            .expect("failed to allocate a protection domain");
+        let cq = ctx
+            .create_cq(16)
+            .build()
+            .expect("failed to create a completion queue");
+        let qp = pd
+            .create_qp::<Rc>(&cq, &cq, port)
+            .expect("failed to create a queue pair builder")
+            .build_legacy()
+            .expect("failed to build a legacy queue pair");
+        (pd, cq, qp)
+    }
+
+    let ip = device_ip(&open_test_device());
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let acceptor = bind_acceptor(ip, 1);
+        ready_tx
+            .send(acceptor.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let ctx = incoming.context().expect("server device context");
+        let port = incoming.cm_id().port_num().expect("server port");
+        let (pd, cq, qp) = legacy_resources(&ctx, port);
+        let mut recv = mr(&pd, 64);
+        let mut conn = incoming
+            .accept_with(
+                qp,
+                ConnectionParameter::default(),
+                SETUP_TIMEOUT,
+                |qp| unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) },
+            )
+            .expect("accept");
+        assert!(conn.queue_pair().as_raw_ex().is_null());
+        wait_for(&cq, 1);
+        assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (pd, cq, qp) = legacy_resources(&ctx, port);
+    let mut conn = resolved
+        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .expect("connect");
+    assert!(conn.queue_pair().as_raw_ex().is_null());
+    let mut send = mr(&pd, 64);
+    send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
+    let sges = [send.slice(..MESSAGE.len())];
+    unsafe {
+        conn.queue_pair()
+            .post_send([SendRequest::send(2, &sges).signaled()])
+    }
+    .expect("post_send");
+    wait_for(&cq, 2);
+    join(server);
 }
 
 #[test]
