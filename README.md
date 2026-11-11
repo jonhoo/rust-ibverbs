@@ -162,11 +162,19 @@ The minimum supported Rust version is 1.85.
 
 ### Provider requirements
 
-The crate drives completion queues and queue pairs exclusively through the extended verbs
-(`ibv_create_cq_ex`, `ibv_create_qp_ex`, and the `ibv_wr_*` send API). Providers that implement
-them include `mlx5`, `hns`, `efa`, and `rxe`; on providers that do not (for example
-`mlx4`-generation hardware), creation fails cleanly (with `Error::Unsupported`) rather than
-degrading to the legacy verbs.
+The crate creates every completion queue with the extended `ibv_create_cq_ex`. Queue pairs are
+created one of two ways:
+
+- `QueuePairBuilder::build` uses `ibv_create_qp_ex` with the `ibv_wr_*` send API
+  (`QueuePair::start_send`). Providers that implement both include `mlx5`, `hns`, `efa`, and
+  `rxe`.
+- `QueuePairBuilder::build_legacy` uses the legacy `ibv_create_qp`, for providers without the
+  extended queue-pair verbs, such as `irdma` (second hardware generation and later, which have
+  `ibv_create_cq_ex`). Such a queue pair sends with `QueuePair::post_send`, which works on a queue
+  pair from either method.
+
+Neither method falls back to the other. On a provider that lacks what a call needs (for example
+`build` on `irdma`), creation fails cleanly with `Error::Unsupported`.
 
 ## Documentation
 
