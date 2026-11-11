@@ -726,6 +726,9 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// install only the requested operations, so the method panics; mlx5 posts it anyway).
     /// Operations beyond the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`,
     /// `FLUSH`, `ATOMIC_WRITE`) are reachable through [`as_raw_ex`](QueuePair::as_raw_ex).
+    ///
+    /// [`build_legacy`](Self::build_legacy) ignores this set: `ibv_create_qp` takes no send
+    /// operations, and the provider accepts or refuses each opcode when it is posted.
     pub fn set_send_ops(&mut self, ops: SendOps) -> &mut Self {
         self.send_ops = Some(ops);
         self
@@ -808,6 +811,27 @@ impl<T: Transport> QueuePairBuilder<T> {
         self.prepared(qp, &attr)
     }
 
+    /// The `ibv_create_qp` creation shared by the `build_legacy` of every transport it serves.
+    /// Asking for nothing beyond the protection domain makes the `ibv_create_qp_ex` shim create
+    /// the queue pair with `ibv_create_qp`, as the C inline does.
+    fn build_legacy_impl(&self) -> Result<PreparedQueuePair<T>> {
+        self.check_same_context()?;
+        let mut attr = ffi::ibv_qp_init_attr_ex {
+            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
+            comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0,
+            send_ops_flags: 0,
+            ..self.init_attr_ex()
+        };
+        let qp = nonnull(
+            unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
+            Error::CreateQueuePair,
+        )
+        .map_err(|e| e.for_operation(&"ibv_create_qp"))?;
+        // No `ibv_qp_to_qp_ex` here: it reads the `verbs_qp` fields that follow the `ibv_qp`, and
+        // a provider without the extended verbs (irdma) allocates its own fields there instead.
+        Ok(self.wrap(qp, &attr, ptr::null_mut()))
+    }
+
     /// Wraps `qp`, just created from `attr`, as the prepared queue pair this builder describes:
     /// the end of every transport's `build`. Creation wrote the granted capacities back into
     /// `attr`, and the queue pair holds the shared receive queue `attr` attached it to, if any.
@@ -817,7 +841,28 @@ impl<T: Transport> QueuePairBuilder<T> {
         attr: &ffi::ibv_qp_init_attr_ex,
     ) -> Result<PreparedQueuePair<T>> {
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-        let prepared = PreparedQueuePair {
+        let prepared = self.wrap(qp, attr, qp_ex);
+        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
+        // work-request table; one that accepted the send-operations mask without doing so has
+        // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
+        if qp_ex.is_null() {
+            return Err(Error::Unsupported {
+                operation: &"ibv_qp_to_qp_ex",
+                errno: nix::libc::EOPNOTSUPP,
+            });
+        }
+        Ok(prepared)
+    }
+
+    /// Wraps `qp`, created from `attr`, with `qp_ex` as its extended view: null for a queue pair
+    /// from `build_legacy`, which has none.
+    fn wrap(
+        &self,
+        qp: *mut ffi::ibv_qp,
+        attr: &ffi::ibv_qp_init_attr_ex,
+        qp_ex: *mut ffi::ibv_qp_ex,
+    ) -> PreparedQueuePair<T> {
+        PreparedQueuePair {
             lid: self.lid,
             roce: self.roce,
             port_num: self.port_num,
@@ -842,17 +887,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             traffic_class: self.traffic_class,
             service_level: self.service_level,
             bring_up: self.bring_up.clone(),
-        };
-        // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
-        // work-request table; one that accepted the send-operations mask without doing so has
-        // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
-        if qp_ex.is_null() {
-            return Err(Error::Unsupported {
-                operation: &"ibv_qp_to_qp_ex",
-                errno: nix::libc::EOPNOTSUPP,
-            });
         }
-        Ok(prepared)
     }
 }
 
@@ -895,6 +930,25 @@ impl<T: Connected> QueuePairBuilder<T> {
     pub fn build(&self) -> Result<PreparedQueuePair<T>> {
         self.build_impl()
     }
+
+    /// Create a new [`PreparedQueuePair`] from this builder template with the legacy
+    /// `ibv_create_qp`, for providers without the extended queue-pair verbs (`irdma`).
+    ///
+    /// The queue pair has no extended work-request interface:
+    /// [`as_raw_ex`](QueuePair::as_raw_ex) returns null and [`start_send`](QueuePair::start_send)
+    /// panics. The send operations of [`set_send_ops`](Self::set_send_ops) are ignored.
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
+    ///    queue belongs to another device context than the protection domain, or `ibv_create_qp`
+    ///    failed (`EINVAL` for an invalid value in the queue pair attributes, `ENOMEM` when out of
+    ///    resources).
+    ///  - [`Unsupported`](Error::Unsupported): the provider does not create this transport
+    ///    (`EOPNOTSUPP`; irdma refuses UC).
+    pub fn build_legacy(&self) -> Result<PreparedQueuePair<T>> {
+        self.build_legacy_impl()
+    }
 }
 
 impl QueuePairBuilder<Ud> {
@@ -916,6 +970,25 @@ impl QueuePairBuilder<Ud> {
     ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
     pub fn build(&self) -> Result<PreparedQueuePair<Ud>> {
         self.build_impl()
+    }
+
+    /// Create a new [`PreparedQueuePair`] from this builder template with the legacy
+    /// `ibv_create_qp`, for providers without the extended queue-pair verbs (`irdma`).
+    ///
+    /// The queue pair has no extended work-request interface:
+    /// [`as_raw_ex`](QueuePair::as_raw_ex) returns null and [`start_send`](QueuePair::start_send)
+    /// panics. The send operations of [`set_send_ops`](Self::set_send_ops) are ignored.
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
+    ///    queue belongs to another device context than the protection domain, or `ibv_create_qp`
+    ///    failed (`EINVAL` for an invalid value in the queue pair attributes, `ENOMEM` when out of
+    ///    resources).
+    ///  - [`Unsupported`](Error::Unsupported): the provider does not create UD queue pairs
+    ///    (`EOPNOTSUPP`).
+    pub fn build_legacy(&self) -> Result<PreparedQueuePair<Ud>> {
+        self.build_legacy_impl()
     }
 }
 
@@ -2520,7 +2593,7 @@ pub struct QueuePair<T: Transport = Rc> {
     _recv_cq: CompletionQueue,
     qp: *mut ffi::ibv_qp,
     // The extended (doorbell) view of `qp`, used by the send path. `ibv_qp_to_qp_ex` is a cast, so
-    // this aliases `qp` and lives exactly as long.
+    // this aliases `qp` and lives exactly as long. Null on a queue pair from `build_legacy`.
     qp_ex: *mut ffi::ibv_qp_ex,
     // The inline capacity the builder asked for (capped at what the provider granted), which the
     // send path enforces (`SendOp::build`).
@@ -2559,7 +2632,8 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// This is an escape hatch for verbs this crate does not yet wrap. `ibv_qp_to_qp_ex` is a cast,
     /// so this aliases [`as_raw`](Self::as_raw) and lives exactly as long. The pointer stays valid
-    /// only while this [`QueuePair`] is alive; do not destroy it.
+    /// only while this [`QueuePair`] is alive; do not destroy it. It is null on a queue pair from
+    /// [`build_legacy`](QueuePairBuilder::build_legacy), which has no extended view.
     pub fn as_raw_ex(&self) -> *mut ffi::ibv_qp_ex {
         self.qp_ex
     }
@@ -2736,6 +2810,11 @@ impl<T: Transport> QueuePair<T> {
     /// As with any send, the memory backing each scatter/gather slice must stay valid until the
     /// device is done with the request (see [`submit`](SendBatch::submit)).
     ///
+    /// # Panics
+    ///
+    /// Panics on a queue pair from [`build_legacy`](QueuePairBuilder::build_legacy), which has no
+    /// extended work-request interface.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -2788,6 +2867,9 @@ impl<T: Transport> QueuePair<T> {
     #[inline]
     fn open_batch(&self) -> SendBatch<'_, T> {
         let qpx = self.qp_ex;
+        if qpx.is_null() {
+            no_extended_send_interface();
+        }
         unsafe { (*qpx).wr_start.unwrap()(qpx) };
         SendBatch {
             qpx,
@@ -2817,10 +2899,26 @@ pub struct SendQueue<'qp, T: Transport> {
 
 impl<T: Transport> SendQueue<'_, T> {
     /// Begin a batch of send work requests, as [`QueuePair::start_send`] does.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a queue pair from [`build_legacy`](QueuePairBuilder::build_legacy), as
+    /// [`QueuePair::start_send`] does.
     #[inline]
     pub fn start_send(&mut self) -> SendBatch<'_, T> {
         self.qp.open_batch()
     }
+}
+
+/// The panic for a send batch on a queue pair from `build_legacy`, kept out of line so opening a
+/// batch carries only the null test.
+#[cold]
+#[inline(never)]
+fn no_extended_send_interface() -> ! {
+    panic!(
+        "this queue pair was created by build_legacy and has no extended work-request interface, \
+         so it cannot start a send batch"
+    )
 }
 
 impl<T: Transport> Drop for QueuePair<T> {

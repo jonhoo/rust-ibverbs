@@ -131,7 +131,7 @@ pub enum Error {
     #[error("failed to create a completion queue")]
     CreateCompletionQueue(#[source] io::Error),
 
-    /// Creating a queue pair failed (`ibv_create_qp_ex` / `efadv_create_qp_ex`).
+    /// Creating a queue pair failed (`ibv_create_qp_ex`, `ibv_create_qp` or `efadv_create_qp_ex`).
     #[error("failed to create a queue pair")]
     CreateQueuePair(#[source] io::Error),
 

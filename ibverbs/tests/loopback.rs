@@ -1471,6 +1471,72 @@ fn create_qp_ex_with_only_a_protection_domain() {
     }
 }
 
+/// `build_legacy` creates RC and UD queue pairs without the extended view, and they come up like
+/// any other: handshake or activate, query, and receives through a shared receive queue.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_queue_pair_bring_up() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let gid_index = gid_index(&ctx);
+
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair")
+        .set_gid_index(gid_index)
+        .set_srq(&srq)
+        .build_legacy()
+        .expect("failed to build legacy RC queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let mut qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition legacy queue pair to RTS");
+    assert!(!qp.as_raw().is_null());
+    assert!(qp.as_raw_ex().is_null());
+    let (attr, _) = qp
+        .query(QueuePairAttributeMask::STATE)
+        .expect("failed to query legacy queue pair");
+    assert_eq!(attr.state(), QueuePairState::ReadyToSend);
+
+    let recv = mr(&pd, 64);
+    unsafe { srq.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
+        .expect("SRQ post_recv failed");
+
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build_legacy()
+        .expect("failed to build legacy UD queue pair");
+    let ud = prepared
+        .activate(0x1234_5678)
+        .expect("failed to activate legacy UD queue pair");
+    assert!(ud.as_raw_ex().is_null());
+}
+
+/// A send batch needs the extended view, which a queue pair from `build_legacy` lacks.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "created by build_legacy and has no extended work-request interface")]
+fn start_send_on_legacy_queue_pair_panics() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair")
+        .set_gid_index(gid_index(&ctx))
+        .build_legacy()
+        .expect("failed to build legacy RC queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let mut qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition legacy queue pair to RTS");
+    let _batch = qp.start_send();
+}
+
 /// The raw-handle escape hatches return the live, non-null FFI pointers for each resource.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
