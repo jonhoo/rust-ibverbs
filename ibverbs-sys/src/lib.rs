@@ -504,12 +504,12 @@ pub unsafe fn ibv_query_device_ex(
     }
 }
 
-// `ibv_poll_cq`, `ibv_req_notify_cq`, `ibv_post_recv`, and `ibv_post_srq_recv` are `static inline`
-// as well, but dispatch through the legacy op table in `ibv_context` itself, which libibverbs fills
-// completely (a stub returning `EOPNOTSUPP` stands in for any op the provider leaves out; every
-// provider that creates completion queues implements `poll_cq`, for which that would read as a
-// count), so they need no availability check. They read only the op pointer: other threads write
-// other fields of the queue pair, the queue, and the context.
+// `ibv_poll_cq`, `ibv_req_notify_cq`, `ibv_post_send`, `ibv_post_recv`, and `ibv_post_srq_recv` are
+// `static inline` as well, but dispatch through the legacy op table in `ibv_context` itself, which
+// libibverbs fills completely (a stub returning `EOPNOTSUPP` stands in for any op the provider
+// leaves out; every provider that creates completion queues implements `poll_cq`, for which that
+// would read as a count), so they need no availability check. They read only the op pointer: other
+// threads write other fields of the queue pair, the queue, and the context.
 
 /// Poll a completion queue for up to `num_entries` work completions, copying them into `wc`
 /// (`ibv_poll_cq`).
@@ -544,6 +544,24 @@ pub unsafe fn ibv_req_notify_cq(
     solicited_only: ::std::os::raw::c_int,
 ) -> ::std::os::raw::c_int {
     unsafe { (*(*cq).context).ops.req_notify_cq.unwrap()(cq, solicited_only) }
+}
+
+/// Post a linked list of send work requests to a queue pair's send queue (`ibv_post_send`).
+///
+/// Returns 0 on success, or the `errno` value on failure, with `bad_wr` set to the first request
+/// that was not posted (the ones ahead of it were).
+///
+/// # Safety
+///
+/// `qp` must be a valid queue pair, `wr` a valid list of send work requests whose buffers stay
+/// valid until they complete, and `bad_wr` valid for writes.
+#[inline]
+pub unsafe fn ibv_post_send(
+    qp: *mut ibv_qp,
+    wr: *mut ibv_send_wr,
+    bad_wr: *mut *mut ibv_send_wr,
+) -> ::std::os::raw::c_int {
+    unsafe { (*(*qp).context).ops.post_send.unwrap()(qp, wr, bad_wr) }
 }
 
 /// Post a linked list of receive work requests to a queue pair's receive queue (`ibv_post_recv`).
