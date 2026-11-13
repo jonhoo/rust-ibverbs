@@ -691,10 +691,10 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The maximum number of scatter/gather elements in any Work Request
     /// that can be posted to the Receive Queue in that Queue Pair.
     ///
-    /// Value can be `[0..dev_cap.max_sge]`. Some devices support fewer
-    /// scatter/gather elements for specific transport types than the
-    /// maximum reported value. This value is ignored if the
-    /// Queue Pair is associated with an SRQ.
+    /// Value can be `[1..dev_cap.max_sge]` (0 is requested as 1: mlx5 rounds it up to 1 anyway,
+    /// and EFA divides by it). Some devices support fewer scatter/gather elements for specific
+    /// transport types than the maximum reported value. This value is ignored if the Queue Pair
+    /// is associated with an SRQ.
     ///
     /// Defaults to 1.
     pub fn set_max_recv_sge(&mut self, max_recv_sge: u32) -> &mut Self {
@@ -779,7 +779,9 @@ impl<T: Transport> QueuePairBuilder<T> {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
                 max_send_sge: self.max_send_sge,
-                max_recv_sge: self.max_recv_sge,
+                // libefa divides its receive-queue depth by this before checking it, so 0 kills
+                // the process with SIGFPE (`efa_check_qp_limits`); mlx5 rounds 0 up to 1 anyway.
+                max_recv_sge: self.max_recv_sge.max(1),
                 max_inline_data: self.max_inline_data,
             },
             qp_type: T::TYPE,
