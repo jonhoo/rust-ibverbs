@@ -987,6 +987,12 @@ pub struct TagMatchingInfo {
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
 /// call (which is why it cannot implement [`Iterator`]); consume it with a `while let` loop.
 ///
+/// Every completion the poll positions on leaves the queue when the `Completions` drops, including
+/// the first, which [`CompletionQueue::poll`] already took: a `Completions` dropped before its
+/// first `next` (by a `?` on another call between the poll and the loop, say) discards that
+/// completion unseen. Polls stopped early otherwise lose nothing: the completions after the last
+/// one yielded stay queued for the next poll.
+///
 /// # Deadlocks
 ///
 /// The provider holds the queue's poll lock from the poll's start until [`next`](Self::next) has
@@ -1120,7 +1126,9 @@ impl CompletionQueue {
     /// Poll for the work completions that are ready, through the extended interface.
     ///
     /// The returned [`Completions`] is a lending iterator whose [`WorkCompletion`]s read their
-    /// fields lazily, so you only pay for the fields you read; it is empty when the queue is.
+    /// fields lazily, so you only pay for the fields you read; it is empty when the queue is. The
+    /// poll already takes the first completion off the queue, so iterate the result right away:
+    /// dropped unread, it discards that completion (see [`Completions`]).
     ///
     /// Callers must ensure the CQ does not overrun (exceed its [`capacity`](Self::capacity)), as
     /// this triggers an `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do
