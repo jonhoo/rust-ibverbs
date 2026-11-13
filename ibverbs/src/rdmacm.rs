@@ -6,6 +6,10 @@
 //! out of band the way [`PreparedQueuePair::handshake`](crate::PreparedQueuePair::handshake)
 //! requires. It picks the device, resolves the route, and negotiates the queue pair parameters.
 //!
+//! This module is for InfiniBand and RoCE. No iWARP provider can create this crate's queue pairs,
+//! and the blocking helpers follow the InfiniBand connection manager's event sequence, which
+//! iWARP's differs from.
+//!
 //! Connection setup is blocking and has two roles, with distinct types so they cannot be mixed up:
 //! the active side uses a [`Connector`], the passive side an [`Acceptor`]. Each owns its event
 //! channel and drives the whole exchange internally, handing back a connected [`Connection`].
@@ -32,8 +36,8 @@
 //! let qp = pd
 //!     .create_qp::<ibverbs::Rc>(&cq, &cq, port)?
 //!     .build()?;
-//! let mut conn = resolved.connect(qp, ConnectionParameter::default(), None)?;
-//! // `conn.queue_pair()` is ready to post on; poll completions on `cq`.
+//! let mut conn = resolved.connect(qp, &ConnectionParameter::default(), None)?;
+//! // `conn.queue_pair_mut()` is ready to post on; poll completions on `cq`.
 //! # let _ = &mut conn;
 //! # Ok(())
 //! # }
@@ -81,7 +85,7 @@ use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage};
@@ -95,17 +99,21 @@ use crate::{
 /// The port space a connection-manager identifier lives in: which namespace its port numbers are
 /// allocated from, and which transport its connections use. Passed to [`Connector::new`],
 /// [`Acceptor::bind`], and [`CmId::create`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortSpace {
-    /// IP over InfiniBand.
+    /// The IP-over-InfiniBand port space: unreliable datagrams (UD) that share IPoIB's multicast
+    /// groups and Q_Key. Not the port space for connecting over an IPoIB address: that is
+    /// [`Tcp`](Self::Tcp), as on any other interface.
     Ipoib,
     /// TCP port space: reliable connections (RC). The usual choice.
     Tcp,
     /// UDP port space: unreliable datagrams (UD).
     Udp,
-    /// The InfiniBand port space, open to every queue-pair type (`rdma_create_id(3)`); the
-    /// blocking helpers use it for reliable connections, like [`Tcp`](Self::Tcp).
+    /// The InfiniBand port space: reliable connections like [`Tcp`](Self::Tcp), in a range of
+    /// service IDs of its own, so the two do not reach each other's listeners. (The other
+    /// queue-pair types `rdma_create_id(3)` lists for it need `rdma_create_ep`, which this module
+    /// does not use: an id created here is a reliable-connection one.)
     Ib,
 }
 
@@ -123,7 +131,7 @@ impl From<PortSpace> for ffi::rdma_port_space {
 
 /// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
 /// the sequence in which the events arrive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CmEventType {
     /// The destination address resolved to an RDMA device.
@@ -195,10 +203,12 @@ impl From<ffi::rdma_cm_event_type> for CmEventType {
             E::RDMA_CM_EVENT_MULTICAST_ERROR => CmEventType::MulticastError,
             E::RDMA_CM_EVENT_ADDR_CHANGE => CmEventType::AddressChange,
             E::RDMA_CM_EVENT_TIMEWAIT_EXIT => CmEventType::TimewaitExit,
-            E::RDMA_CM_EVENT_ADDRINFO_RESOLVED => CmEventType::AddressInfoResolved,
-            E::RDMA_CM_EVENT_ADDRINFO_ERROR => CmEventType::AddressInfoError,
-            E::RDMA_CM_EVENT_USER => CmEventType::User,
-            E::RDMA_CM_EVENT_INTERNAL => CmEventType::Internal,
+            // `RDMA_CM_EVENT_ADDRINFO_RESOLVED`, `_ADDRINFO_ERROR`, `_USER`, and `_INTERNAL`,
+            // spelled by value: installed headers from rdma-core before 60 lack the names.
+            E(16) => CmEventType::AddressInfoResolved,
+            E(17) => CmEventType::AddressInfoError,
+            E(18) => CmEventType::User,
+            E(19) => CmEventType::Internal,
             other => CmEventType::Unknown(other.0),
         }
     }
@@ -263,6 +273,21 @@ unsafe fn socket_addr_of(sa: *const ffi::sockaddr) -> Option<SocketAddr> {
     unsafe { SockaddrIn::from_raw(sa, None) }
         .map(SocketAddr::from)
         .or_else(|| unsafe { SockaddrIn6::from_raw(sa, None) }.map(SocketAddr::from))
+}
+
+/// `addr` as the kernel's connection manager needs it: an IPv4-mapped IPv6 address (the form a
+/// dual-stack TCP socket reports its IPv4 peers in) becomes the IPv4 address it stands for. The
+/// connection manager has no dual-stack addressing: it looks the mapped form up as an IPv6
+/// address, which no interface has (a bind fails with `EADDRNOTAVAIL`) and which routes like any
+/// other IPv6 destination.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
 }
 
 /// `timeout` in the whole milliseconds librdmacm takes, rounded up like every other wait in the
@@ -407,9 +432,9 @@ impl EventChannel {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_create_event_channel` failed
-    ///    (`ENODEV` when there is no RDMA device, `EPERM` when the kernel's connection manager,
-    ///    the `rdma_ucm` module, is not loaded), or making its file descriptor non-blocking
-    ///    failed.
+    ///    (`ENODEV` when there is no RDMA device, `ENOENT` when the kernel's connection manager,
+    ///    the `rdma_ucm` module, is not loaded and could not be loaded on demand), or making its
+    ///    file descriptor non-blocking failed.
     pub fn new() -> Result<EventChannel> {
         EventChannel::open(true)
     }
@@ -454,45 +479,63 @@ impl EventChannel {
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): reading the event (`rdma_get_cm_event`)
     ///    failed.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
-        // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so an
-        // empty one reports `EAGAIN`.
-        let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
-        nix::errno::Errno::clear();
-        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.chan, &mut event) };
-        if ret != 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
+        loop {
+            // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so
+            // an empty one reports `EAGAIN`.
+            let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
+            nix::errno::Errno::clear();
+            let ret = unsafe { ffi::rdma_get_cm_event(self.inner.chan, &mut event) };
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(Error::os(e, Error::ConnectionSetup));
             }
-            return Err(Error::os(e, Error::ConnectionSetup));
+            // The kernel reports a failure as a negative errno, but when librdmacm itself fails
+            // to finish an address or route resolution while reading the event (querying the
+            // device, address, or path), it sets the status to -1 and leaves the reason in
+            // `errno`, which is only readable now. `errno` was cleared above, so a -1 from the
+            // kernel (`-EPERM`) stays.
+            let mut status = unsafe { (*event).status };
+            if status == -1 {
+                let errno = nix::errno::Errno::last_raw();
+                if errno != 0 {
+                    status = -errno;
+                }
+            }
+            // A connection request is about the listener it arrived at: the event's own id is the
+            // request's new one, which `connection_request` takes over.
+            let about = unsafe {
+                if (*event).event == ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
+                    (*event).listen_id
+                } else {
+                    (*event).id
+                }
+            };
+            let event = CmEvent {
+                event,
+                status,
+                id: None,
+                channel: self.clone(),
+                taken: false,
+            };
+            let routed = self.ids().get(&(about as usize)).map(Weak::upgrade);
+            match routed {
+                Some(Some(inner)) => {
+                    let mut event = event;
+                    event.id = Some(CmId { inner });
+                    return Ok(Some(event));
+                }
+                // The id's last handle is gone and it is being destroyed, which waits for this
+                // event to be acknowledged: acknowledge it now (declining a connection request to
+                // a listener that is going away) and read on, rather than hand out an event
+                // nobody can act on and make the destroy wait for whoever holds it.
+                Some(None) => drop(event),
+                // Not an id of this crate's.
+                None => return Ok(Some(event)),
+            }
         }
-        // The kernel reports a failure as a negative errno, but when librdmacm itself fails to
-        // finish an address or route resolution while reading the event (querying the device,
-        // address, or path), it sets the status to -1 and leaves the reason in `errno`, which is
-        // only readable now. `errno` was cleared above, so a -1 from the kernel (`-EPERM`) stays.
-        let mut status = unsafe { (*event).status };
-        if status == -1 {
-            let errno = nix::errno::Errno::last_raw();
-            if errno != 0 {
-                status = -errno;
-            }
-        }
-        // A connection request is about the listener it arrived at: the event's own id is the
-        // request's new one, which `connection_request` takes over.
-        let about = unsafe {
-            if (*event).event == ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
-                (*event).listen_id
-            } else {
-                (*event).id
-            }
-        };
-        Ok(Some(CmEvent {
-            event,
-            status,
-            id: self.id(about),
-            channel: self.clone(),
-            taken: false,
-        }))
     }
 
     /// Blocks until the next event arrives (up to `deadline`, indefinitely with `None`) and returns
@@ -500,19 +543,12 @@ impl EventChannel {
     /// `poll(2)`ed with the remaining time and the event then read without blocking, so the wait
     /// never runs past the deadline.
     fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<CmEvent> {
-        loop {
-            if !crate::completion::wait_readable(self.as_fd(), deadline)
-                .map_err(Error::ConnectionSetup)?
-            {
-                return Err(Error::TimedOut);
-            }
-            // The descriptor was readable, but another thread may have taken the event first, or
-            // librdmacm consumed it internally; if so, go back to waiting for the next one with
-            // whatever time is left.
-            if let Some(event) = self.poll_cm_event()? {
-                return Ok(event);
-            }
-        }
+        // A readable descriptor whose event librdmacm consumed internally is waited past like one
+        // that another thread took first.
+        crate::completion::wait_and_take(self.as_fd(), deadline, Error::ConnectionSetup, || {
+            self.poll_cm_event()
+        })?
+        .ok_or(Error::TimedOut)
     }
 
     /// The ids on the channel, by address.
@@ -522,12 +558,6 @@ impl EventChannel {
             .ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The live [`CmId`] for `id` on this channel, if there is one.
-    fn id(&self, id: *mut ffi::rdma_cm_id) -> Option<CmId> {
-        let inner = self.ids().get(&(id as usize))?.upgrade()?;
-        Some(CmId { inner })
     }
 
     /// Returns the underlying `rdma_event_channel` pointer.
@@ -545,7 +575,7 @@ impl AsRawFd for EventChannel {
     /// blocking. It is non-blocking and becomes readable when an event is pending, to be consumed
     /// with [`poll_cm_event`](EventChannel::poll_cm_event).
     fn as_raw_fd(&self) -> RawFd {
-        unsafe { (*self.inner.chan).fd }
+        self.as_fd().as_raw_fd()
     }
 }
 
@@ -562,6 +592,9 @@ impl AsFd for EventChannel {
 struct CmIdInner {
     channel: EventChannel,
     id: *mut ffi::rdma_cm_id,
+    /// The read and atomic limits of the id's device, which [`CmId::init_qp_attr`] caps to: queried
+    /// once, since they are device capabilities and the id stays on its device once bound to it.
+    rd_atomic_limits: OnceLock<(u8, u8)>,
 }
 
 // Ownership of an `rdma_cm_id` can be moved (and shared) between threads.
@@ -570,12 +603,17 @@ unsafe impl Sync for CmIdInner {}
 
 impl Drop for CmIdInner {
     fn drop(&mut self) {
-        // Stop routing events to the id first, while its address is still its own: any of its
-        // events read from here on, which `rdma_destroy_id` waits to see acknowledged, come
-        // without one.
-        self.channel.ids().remove(&(self.id as usize));
-        // Destroy the id before its channel (the `channel` field drops right after this).
+        // Destroy the id before its channel (the `channel` field drops right after this). Until
+        // the destroy returns, the id's entry stays in the channel's map, dead, so that a reader
+        // that takes one of its events acknowledges it at once instead of handing it out: the
+        // destroy waits for every event read for the id to be acknowledged.
         unsafe { ffi::rdma_destroy_id(self.id) };
+        // Then stop routing the address to the id, unless an id created since has taken it over.
+        let mut ids = self.channel.ids();
+        let key = self.id as usize;
+        if ids.get(&key).is_some_and(|id| ptr::eq(id.as_ptr(), self)) {
+            ids.remove(&key);
+        }
     }
 }
 
@@ -615,8 +653,8 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): opening the event channel
     ///    (`rdma_create_event_channel`) or creating the id (`rdma_create_id`) failed: `ENODEV`
-    ///    when there is no RDMA device, `EPERM` when the kernel's connection manager (the
-    ///    `rdma_ucm` module) is not loaded.
+    ///    when there is no RDMA device, `ENOENT` when the kernel's connection manager (the
+    ///    `rdma_ucm` module) is not loaded and could not be loaded on demand.
     pub fn create(port_space: PortSpace) -> Result<CmId> {
         CmId::create_in(EventChannel::open(false)?, port_space)
     }
@@ -650,7 +688,11 @@ impl CmId {
 
     /// Takes ownership of `id`, which delivers its events on `channel`, and routes those to it.
     fn on(channel: EventChannel, id: *mut ffi::rdma_cm_id) -> CmId {
-        let inner = Arc::new(CmIdInner { channel, id });
+        let inner = Arc::new(CmIdInner {
+            channel,
+            id,
+            rd_atomic_limits: OnceLock::new(),
+        });
         inner
             .channel
             .ids()
@@ -670,7 +712,7 @@ impl CmId {
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the channel's file descriptor
     ///    (`poll`) or reading the event (`rdma_get_cm_event`) failed.
     pub fn get_cm_event(&self) -> Result<CmEvent> {
-        self.get_cm_event_deadline(None)
+        self.inner.channel.get_cm_event()
     }
 
     /// Returns the next event on this id's channel, or `None` if none is currently pending. This
@@ -696,9 +738,17 @@ impl CmId {
     ///
     /// The context is this crate's own, independent of the id: one per device, shared by every id
     /// on that device while any of them uses it, so its asynchronous events
-    /// ([`Context::poll_async_event`]) are those of all of them. It does not keep this id alive:
+    /// ([`Context::poll_async_event`]) are those of all of them. Any other context on the same
+    /// device serves as well: a server can build every connection's queue pair on a protection
+    /// domain it created at startup, with its registered memory, and never call this. It does not
+    /// keep this id alive:
     /// dropping the id's last handle declines its request or disconnects its connection right
     /// away, however long the queue pair and its resources live on.
+    ///
+    /// The device is closed once nothing built on the context is left, and opened again by the
+    /// next call, which on mlx5 allocates the context's doorbell pages in firmware anew. A
+    /// program that sets up one connection at a time should keep a clone of the context (or its
+    /// protection domain and memory regions) across connections.
     ///
     /// # Errors
     ///
@@ -706,6 +756,17 @@ impl CmId {
     ///  - [`OpenDevice`](Error::OpenDevice): opening the device failed (`ibv_open_device`).
     pub fn context(&self) -> Result<Context> {
         Context::shared(unsafe { (*self.verbs()?).device })
+    }
+
+    /// The read and atomic limits of the id's device, for [`init_qp_attr`](Self::init_qp_attr) to
+    /// cap to: queried on first use, so a connection's `ReadyToReceive` and `ReadyToSend`
+    /// attributes share one `ibv_query_device`.
+    fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
+        if let Some(&limits) = self.inner.rd_atomic_limits.get() {
+            return Ok(limits);
+        }
+        let limits = crate::context::rd_atomic_limits(self.verbs()?)?;
+        Ok(*self.inner.rd_atomic_limits.get_or_init(|| limits))
     }
 
     /// Computes the queue-pair attributes the connection manager derives for transitioning to
@@ -751,18 +812,11 @@ impl CmId {
         check(ret, Error::ModifyQueuePair)?;
         let mask = M(mask as u32);
         if mask.0 & (M::IBV_QP_MAX_DEST_RD_ATOMIC.0 | M::IBV_QP_MAX_QP_RD_ATOMIC.0) != 0 {
-            let (max_initiator_depth, max_responder_resources) =
-                crate::context::rd_atomic_limits(self.verbs()?)?;
+            let (max_initiator_depth, max_responder_resources) = self.rd_atomic_limits()?;
             attr.max_dest_rd_atomic = attr.max_dest_rd_atomic.min(max_responder_resources);
             attr.max_rd_atomic = attr.max_rd_atomic.min(max_initiator_depth);
         }
         Ok(QueuePairAttribute::from_raw(attr, mask))
-    }
-
-    /// Blocks until the next event on this id's channel arrives (up to `deadline`, indefinitely
-    /// with `None`) and returns it, or [`TimedOut`](Error::TimedOut) once the deadline passes.
-    fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<CmEvent> {
-        self.inner.channel.get_cm_event_deadline(deadline)
     }
 
     /// Blocks until an `expected` event arrives (up to `deadline`) and returns it, acknowledging
@@ -773,7 +827,7 @@ impl CmId {
             // This blocks on the channel's fd until an event arrives — it does not spin. The loop
             // only goes around to skip a non-matching event, re-blocking on the next read. Each
             // skipped event is acknowledged when it drops at the iteration end.
-            let event = self.get_cm_event_deadline(deadline)?;
+            let event = self.inner.channel.get_cm_event_deadline(deadline)?;
             let kind = event.event_type();
             if kind == expected {
                 return Ok(event);
@@ -787,12 +841,23 @@ impl CmId {
     /// Binds to a local `addr` (passive side). Bind to an unspecified address such as
     /// `0.0.0.0:port` to accept connections on any device. Follow with [`listen`](Self::listen).
     ///
+    /// A loopback address is not local-only here, as it is with TCP: the kernel treats it like the
+    /// unspecified address, so the id listens on every device and takes requests for any of the
+    /// host's addresses, from any peer.
+    ///
+    /// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is bound as the IPv4 address it stands for.
+    ///
     /// # Errors
     ///
-    ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed (`ENODEV` when no RDMA
-    ///    device answers to `addr`, `EADDRINUSE` when its port is taken).
+    ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed: `ENODEV` when no RDMA
+    ///    device answers to `addr`; `EADDRNOTAVAIL` when the address is not this host's, or when
+    ///    its port is taken and either holder is bound to an unspecified address (a second
+    ///    `0.0.0.0:port` listener gets this, not `EADDRINUSE`); `EADDRINUSE` when the same
+    ///    specific address and port is taken; `EACCES` for a port below 1024 without
+    ///    `CAP_NET_BIND_SERVICE`; `EINVAL` for an id that is already bound, or a link-local
+    ///    address without a scope id.
     pub fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
-        let addr = SockaddrStorage::from(addr);
+        let addr = SockaddrStorage::from(canonical(addr));
         let ret =
             unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr() as *mut ffi::sockaddr) };
         check(ret, Error::BindAddress)
@@ -820,12 +885,24 @@ impl CmId {
     /// [`context`](Self::context) is available and [`resolve_route`](Self::resolve_route) is the
     /// next step.
     ///
+    /// The connection comes from whichever local address routes to `dst`; to choose it (or the
+    /// source port), [`bind_addr`](Self::bind_addr) the id first. A `timeout` of zero asks only
+    /// for an answer the kernel has at hand (a local address, a cached neighbor).
+    ///
+    /// An IPv4-mapped IPv6 destination (`::ffff:a.b.c.d`) is resolved as the IPv4 address it stands
+    /// for.
+    ///
+    /// A link-local IPv6 destination needs its scope id (the index of the interface to reach it
+    /// through). Without one the kernel resolves it over whichever interface its routing table
+    /// lists first, and typically reports the failure only when `timeout` runs out.
+    ///
     /// # Errors
     ///
     ///  - [`ResolveAddress`](Error::ResolveAddress): `rdma_resolve_addr` could not start the
     ///    resolution (`EINVAL` on an id past that step). A resolution that fails or times out
     ///    later is reported by an [`AddressError`](CmEventType::AddressError) event instead.
     pub fn resolve_addr(&self, dst: SocketAddr, timeout: Duration) -> Result<()> {
+        let dst = canonical(dst);
         let dst = SockaddrStorage::from(dst);
         let ret = unsafe {
             ffi::rdma_resolve_addr(
@@ -842,13 +919,21 @@ impl CmId {
     /// success a [`CmEventType::RouteResolved`] event is delivered, after which the queue pair can
     /// be built and [`connect`](Self::connect) called.
     ///
+    /// `timeout` bounds the subnet administrator's path query on InfiniBand; RoCE has no query to
+    /// wait for. A zero `timeout` is raised to a millisecond: the kernel refuses zero here. On a
+    /// host that runs the `ibacm` address-resolution daemon, librdmacm first asks it for the path
+    /// and waits for its answer, however long that takes: there this call can block, on RoCE
+    /// devices too.
+    ///
     /// # Errors
     ///
     ///  - [`ResolveRoute`](Error::ResolveRoute): `rdma_resolve_route` failed, or the address has
     ///    not resolved yet (the [`CmEventType::AddressResolved`] event has not been read).
     pub fn resolve_route(&self, timeout: Duration) -> Result<()> {
         self.device_or(Error::ResolveRoute)?;
-        let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout)) };
+        // The kernel refuses a timeout of 0 (`EINVAL`), unlike `rdma_resolve_addr`, for which 0
+        // means "only if the answer is at hand": ask for the shortest wait it takes instead.
+        let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout).max(1)) };
         check(ret, Error::ResolveRoute)
     }
 
@@ -953,7 +1038,12 @@ impl CmId {
     }
 
     /// Disconnects an established connection, delivering [`CmEventType::Disconnected`] to both
-    /// sides.
+    /// sides: to the peer when the request arrives, and to this id when the peer has answered
+    /// (or, with status `-ETIMEDOUT`, when the kernel has given up retrying).
+    ///
+    /// The kernel retransmits the request only while the id lives. Dropping the id's last handle
+    /// before its own `Disconnected` has arrived leaves the peer with the one transmission: if
+    /// that is lost, the peer keeps believing the connection is up until its next send fails.
     ///
     /// The queue pair is not touched: it is not attached to the id, so `rdma_disconnect` does not
     /// move it to the error state the way it would a connection-manager-created one. Do that
@@ -1003,6 +1093,11 @@ impl CmId {
     /// accepts take their traffic class and service level from the peer's request, so set it on
     /// the connecting side.
     ///
+    /// The description above is RoCE's. On InfiniBand the value instead selects the QoS class of
+    /// the path the subnet administrator is asked for, and only for IPv4 addresses: with IPv6
+    /// ones it is ignored, and the traffic class comes from the flow information of the address
+    /// the id is bound to.
+    ///
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
@@ -1012,7 +1107,9 @@ impl CmId {
     }
 
     /// Allow the local address to be shared, like `SO_REUSEADDR`: another id with the same
-    /// setting may bind the same address and port. Set it before binding.
+    /// setting may bind the same address and port. Only one of them can listen there, though:
+    /// [`listen`](Self::listen) fails (`EADDRNOTAVAIL`, or `EADDRINUSE` between two binds of one
+    /// specific address) while another id is bound to the port. Set it before binding.
     ///
     /// # Errors
     ///
@@ -1075,8 +1172,11 @@ impl CmId {
         check(ret, Error::ConnectionSetup)
     }
 
-    /// The IP address and port of the remote end of this id, or `None` while the destination has
-    /// not been resolved yet (or its address family is neither IPv4 nor IPv6).
+    /// The IP address and port of the remote end of this id: the destination from the moment
+    /// [`resolve_addr`](Self::resolve_addr) is called (whether or not it then resolves), or a
+    /// request's sender. `None` before that, or if the address family is neither IPv4 nor IPv6.
+    /// A link-local IPv6 peer of a request comes without its scope id, which the request does not
+    /// carry.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         // SAFETY: the id is valid, and its address storage is sockaddr_storage-sized.
         unsafe { socket_addr_of(ffi::rdma_get_peer_addr(self.inner.id)) }
@@ -1175,7 +1275,8 @@ impl CmId {
         if unsafe { (*(*qp.as_raw()).context).device } != device {
             return Err(Error::ModifyQueuePair(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the queue pair must come from the connection's device (the one `context` returns)",
+                "the queue pair must come from the connection's device (`context` returns a \
+                 context on it)",
             )));
         }
         self.transition(&mut qp, QueuePairState::Init)?;
@@ -1214,6 +1315,24 @@ impl CmId {
     }
 }
 
+/// Two handles are equal when they are clones of one id. That makes a `CmId` a key for the state
+/// an event loop keeps per id: look an event's [`CmEvent::id`] up in a `HashMap<CmId, _>`.
+/// (Clippy's `mutable_key_type` lint objects to such a map because an id holds its channel's
+/// lock; the hash does not depend on it.)
+impl PartialEq for CmId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for CmId {}
+
+impl std::hash::Hash for CmId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.inner).hash(state);
+    }
+}
+
 impl AsRawFd for CmId {
     /// The raw file descriptor of this id's event channel (shared with the other ids on it, if
     /// any), for a reactor to drive connection setup without blocking. It is non-blocking and
@@ -1238,6 +1357,9 @@ impl AsFd for CmId {
 /// outstanding event. A [`ConnectRequest`](CmEventType::ConnectRequest) whose new id is never
 /// taken with [`connection_request`](Self::connection_request) is rejected on drop, so the peer
 /// learns right away rather than after its retries time out.
+///
+/// Both happen in the drop alone: a leaked event ([`std::mem::forget`]) is never acknowledged, so
+/// its id is never destroyed (the event holds it), and an untaken request in it is never answered.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
     /// The event's status, with librdmacm's own failures turned into a negative errno (see
@@ -1318,7 +1440,7 @@ impl CmEvent {
         Error::ConnectionManager(Box::new(CmFailure::new(
             self.event_type(),
             self.status(),
-            self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
+            self.private_data().unwrap_or_default().to_vec(),
         )))
     }
 
@@ -1328,9 +1450,8 @@ impl CmEvent {
     /// it reports on. On an [`EventChannel`] shared by several ids, this is how their events are
     /// told apart.
     ///
-    /// `None` when that id was not created through this crate, or is going away: its last handle
-    /// was dropped after the event was queued, and destroying it waits for this event to be
-    /// acknowledged (dropped).
+    /// `None` when that id was not created through this crate. (The events of an id whose last
+    /// handle is gone are acknowledged as they are read, and never handed out.)
     pub fn id(&self) -> Option<&CmId> {
         self.id.as_ref()
     }
@@ -1406,16 +1527,15 @@ impl CmEvent {
             )));
         }
         let id = unsafe { (*self.event).id };
-        if self.channel.inner.shared {
-            // From here on the id is ours to release: `Drop` must no longer reject and destroy it.
-            self.taken = true;
-            return Ok(CmId::on(self.channel.clone(), id));
-        }
-        let channel = EventChannel::open(false)?;
+        let shared = self.channel.inner.shared;
+        let channel = if shared {
+            self.channel.clone()
+        } else {
+            EventChannel::open(false)?
+        };
         // From here on the id is ours to release: `Drop` must no longer reject and destroy it.
         self.taken = true;
-        let ret = unsafe { ffi::rdma_migrate_id(id, channel.as_raw()) };
-        if ret != 0 {
+        if !shared && unsafe { ffi::rdma_migrate_id(id, channel.as_raw()) } != 0 {
             let err = io::Error::last_os_error();
             // The request id is ours to destroy once we abandon it; `channel` drops after.
             unsafe { ffi::rdma_destroy_id(id) };
@@ -1452,11 +1572,12 @@ const MAX_PRIVATE_DATA: usize = 196;
 
 /// Parameters for connecting and accepting.
 ///
-/// [`Default`] gives sane reliable-connection defaults, and the setters consume and return the
-/// value, so a parameter is built up in one expression:
-/// `ConnectionParameter::default().set_qp_num(qpn).set_private_data(b"hello")`. The local queue
-/// pair's number, and whether it uses a shared receive queue, are set automatically by
-/// [`Resolved::connect`] / [`Incoming::accept`].
+/// [`Default`] gives sane reliable-connection defaults. The setters change the value in place and
+/// return it for chaining, like the other setters of this crate, so a parameter can be built
+/// where it is passed: `&ConnectionParameter::default()`, or
+/// `ConnectionParameter::default().set_private_data(b"hello")`. The local queue pair's number,
+/// and whether it uses a shared receive queue, are set automatically by [`Resolved::connect`] /
+/// [`Incoming::accept`].
 #[derive(Clone, Copy)]
 pub struct ConnectionParameter {
     param: ffi::rdma_conn_param,
@@ -1466,10 +1587,16 @@ pub struct ConnectionParameter {
     private_data: [u8; MAX_PRIVATE_DATA],
 }
 
+// SAFETY: `param.private_data` is the only pointer, and it is null in every stored value:
+// `as_raw` aims a copy of it at the inline bytes for the duration of a call.
+unsafe impl Send for ConnectionParameter {}
+unsafe impl Sync for ConnectionParameter {}
+
 impl Default for ConnectionParameter {
     /// Reliable-connection defaults: as many outstanding RDMA reads and atomics in each direction
     /// as both devices support (librdmacm's `RDMA_MAX_RESP_RES` / `RDMA_MAX_INIT_DEPTH`), the
-    /// maximum retry counts, and no private data.
+    /// maximum retry counts (7, which for receiver-not-ready errors means retrying indefinitely),
+    /// and no private data.
     fn default() -> Self {
         ConnectionParameter {
             param: ffi::rdma_conn_param {
@@ -1487,7 +1614,7 @@ impl Default for ConnectionParameter {
 impl ConnectionParameter {
     /// Sets the number of outstanding RDMA read/atomic operations the local side can service as a
     /// responder. Defaults to the device's limit, negotiated down to what the peer issues.
-    pub fn set_responder_resources(mut self, responder_resources: u8) -> Self {
+    pub fn set_responder_resources(&mut self, responder_resources: u8) -> &mut Self {
         self.param.responder_resources = responder_resources;
         self
     }
@@ -1499,7 +1626,7 @@ impl ConnectionParameter {
     /// (`rdma_accept(3)`); the default does. Nothing checks this: a peer that cannot raise its
     /// responder resources to match fails the connection, or answers the excess reads with an
     /// invalid-request error.
-    pub fn set_initiator_depth(mut self, initiator_depth: u8) -> Self {
+    pub fn set_initiator_depth(&mut self, initiator_depth: u8) -> &mut Self {
         self.param.initiator_depth = initiator_depth;
         self
     }
@@ -1509,13 +1636,31 @@ impl ConnectionParameter {
     ///
     /// Only the connecting side's value counts: accepting ignores it (`rdma_accept(3)`), and the
     /// accepting queue pair retries as often as the connection request asked.
-    pub fn set_retry_count(mut self, retry_count: u8) -> Self {
+    ///
+    /// # Panics
+    ///
+    /// Panics if `retry_count > 7` (the field is 3 bits, and the kernel would send 7 instead).
+    pub fn set_retry_count(&mut self, retry_count: u8) -> &mut Self {
+        assert!(
+            retry_count <= 7,
+            "the retry count is 3 bits, got {retry_count}"
+        );
         self.param.retry_count = retry_count;
         self
     }
 
-    /// Sets how many times to retry sending after a receiver-not-ready error (0-7).
-    pub fn set_rnr_retry_count(mut self, rnr_retry_count: u8) -> Self {
+    /// Sets how many times to retry sending after a receiver-not-ready error (0-7), where 7
+    /// retries indefinitely.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rnr_retry_count > 7` (the field is 3 bits, and the kernel would send 7 instead,
+    /// which retries indefinitely).
+    pub fn set_rnr_retry_count(&mut self, rnr_retry_count: u8) -> &mut Self {
+        assert!(
+            rnr_retry_count <= 7,
+            "the RNR retry count is 3 bits, got {rnr_retry_count}"
+        );
         self.param.rnr_retry_count = rnr_retry_count;
         self
     }
@@ -1528,7 +1673,7 @@ impl ConnectionParameter {
     /// # Panics
     ///
     /// Panics if `qp_num > 0xFF_FFFF` (queue pair numbers are 24 bits).
-    pub fn set_qp_num(mut self, qp_num: u32) -> Self {
+    pub fn set_qp_num(&mut self, qp_num: u32) -> &mut Self {
         assert!(
             qp_num <= crate::qp::MAX_24_BITS,
             "a queue pair number is 24 bits, got {qp_num:#x}"
@@ -1543,7 +1688,7 @@ impl ConnectionParameter {
     /// yourself when driving [`CmId::connect`] or [`CmId::accept`] directly.
     ///
     /// Defaults to `false`.
-    pub fn set_srq(mut self, srq: bool) -> Self {
+    pub fn set_srq(&mut self, srq: bool) -> &mut Self {
         self.param.srq = srq.into();
         self
     }
@@ -1554,7 +1699,7 @@ impl ConnectionParameter {
     /// The connection manager only passes it on.
     ///
     /// Defaults to `false`.
-    pub fn set_flow_control(mut self, flow_control: bool) -> Self {
+    pub fn set_flow_control(&mut self, flow_control: bool) -> &mut Self {
         self.param.flow_control = flow_control.into();
         self
     }
@@ -1573,7 +1718,7 @@ impl ConnectionParameter {
     /// # Panics
     ///
     /// Panics if `data` is longer than 196 bytes, more than any call accepts.
-    pub fn set_private_data(mut self, data: &[u8]) -> Self {
+    pub fn set_private_data(&mut self, data: &[u8]) -> &mut Self {
         assert!(
             data.len() <= MAX_PRIVATE_DATA,
             "connection private data is limited to {MAX_PRIVATE_DATA} bytes, got {}",
@@ -1621,7 +1766,8 @@ impl Connector {
     }
 
     /// The underlying id, for options that must be set before resolving ([`CmId::set_tos`],
-    /// [`CmId::set_ack_timeout`]).
+    /// [`CmId::set_ack_timeout`]), and to choose the local address or port the connection comes
+    /// from ([`CmId::bind_addr`]) on a host with several.
     pub fn cm_id(&self) -> &CmId {
         &self.id
     }
@@ -1694,13 +1840,16 @@ impl Resolved {
     ///    is touched.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
     ///    is not on the device of [`context`](Self::context).
+    ///  - [`QueryDevice`](Error::QueryDevice): reading the device's read and atomic limits failed
+    ///    (see [`CmId::init_qp_attr`]).
     ///  - [`TimedOut`](Error::TimedOut): the response did not arrive in time.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading an event failed.
     ///
     /// Any error, a refused `param` included, consumes `self` and `qp`: resolve again to retry.
     pub fn connect(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
         self.connect_with(qp, param, timeout, |_| Ok(()))
@@ -1719,19 +1868,18 @@ impl Resolved {
     pub fn connect_with(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
         prepare: impl FnOnce(&QueuePair<Rc>) -> Result<()>,
     ) -> Result<Connection> {
         let deadline = crate::completion::deadline_after(timeout);
-        self.id.check_connect_private_data(&param)?;
+        self.id.check_connect_private_data(param)?;
         let mut qp = self.id.init_qp(qp)?;
-        let param = param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
+        let mut param = *param;
+        param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
         self.id.connect(&param)?;
         let response = self.id.wait_for(CmEventType::ConnectResponse, deadline)?;
-        let private_data = response
-            .private_data()
-            .map_or_else(Vec::new, <[u8]>::to_vec);
+        let private_data = response.private_data().unwrap_or_default().to_vec();
         drop(response);
         // The `INIT` attributes applied before connecting carried no remote-access flags (there
         // was no connection to derive them from); now there is one, so apply `INIT` again — as
@@ -1759,7 +1907,8 @@ impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
     /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
     /// listening, queueing up to `backlog` requests not yet taken by [`accept`](Self::accept) (0
-    /// means the kernel's limit, see [`CmId::listen`]).
+    /// means the kernel's limit, see [`CmId::listen`]). A loopback address listens on every
+    /// device too, for peers anywhere (see [`CmId::bind_addr`]).
     ///
     /// # Errors
     ///
@@ -1767,7 +1916,8 @@ impl Acceptor {
     ///    `port_space` is a datagram port space ([`Udp`](PortSpace::Udp) /
     ///    [`Ipoib`](PortSpace::Ipoib)): the blocking helpers set up reliable connections only.
     ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed, for example because no
-    ///    RDMA device answers to `addr`.
+    ///    RDMA device answers to `addr` (`ENODEV`) or another listener holds the port
+    ///    (`EADDRNOTAVAIL` for a bind to an unspecified address; see [`CmId::bind_addr`]).
     pub fn bind(addr: SocketAddr, port_space: PortSpace, backlog: u32) -> Result<Self> {
         Self::bind_with(addr, port_space, backlog, |_| Ok(()))
     }
@@ -1822,12 +1972,16 @@ impl Acceptor {
     ///    acceptor, and with several waiters give each a timeout and stop them all once one sees
     ///    the failure.
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading an event failed, or
+    ///    a request arrived but could not get an event channel of its own (`EMFILE` once the
+    ///    process is out of file descriptors, one per accepted connection): the request is then
+    ///    declined, and the acceptor stays usable.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = crate::completion::deadline_after(timeout);
         let request = self
             .listener
             .wait_for(CmEventType::ConnectRequest, deadline)?;
-        let private_data = request.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
+        let private_data = request.private_data().unwrap_or_default().to_vec();
         Ok(Incoming {
             id: request.connection_request()?,
             private_data,
@@ -1892,7 +2046,10 @@ impl Incoming {
     ///    it established (its ready-to-use message was lost).
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
     ///    is not on the device of [`context`](Self::context).
+    ///  - [`QueryDevice`](Error::QueryDevice): reading the device's read and atomic limits failed
+    ///    (see [`CmId::init_qp_attr`]).
     ///  - [`TimedOut`](Error::TimedOut): the connection was not established in time.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading an event failed.
     ///
     /// A peer that withdrew its request before this side replied (for example by dropping its id
     /// after its connect timed out) shows up as `EINVAL` instead: in
@@ -1902,7 +2059,7 @@ impl Incoming {
     pub fn accept(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
         self.accept_with(qp, param, timeout, |_| Ok(()))
@@ -1921,7 +2078,7 @@ impl Incoming {
     pub fn accept_with(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
         prepare: impl FnOnce(&QueuePair<Rc>) -> Result<()>,
     ) -> Result<Connection> {
@@ -1934,7 +2091,8 @@ impl Incoming {
         self.id
             .ready(&mut qp, responder_resources, initiator_depth)?;
         prepare(&qp)?;
-        let param = param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
+        let mut param = *param;
+        param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
         self.id.accept(&param)?;
         self.id.wait_for(CmEventType::Established, deadline)?;
         Ok(Connection {
@@ -1963,6 +2121,10 @@ impl Incoming {
 /// Dropping it disconnects (the peer sees [`CmEventType::Disconnected`]) and destroys the queue
 /// pair; [`disconnect`](Self::disconnect) does the same while keeping the queue pair around to
 /// reap the flushed completions.
+///
+/// The disconnect request goes out once when the connection is dropped: the kernel retransmits
+/// it only while the id lives. To be sure the peer hears of it, [`close`](Self::close) the
+/// connection instead, which waits for the peer's answer.
 #[must_use = "dropping a connection disconnects it"]
 pub struct Connection {
     id: CmId,
@@ -1972,15 +2134,26 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// The connected queue pair, for posting work requests. Poll completions on the completion queue
-    /// you built it with.
-    pub fn queue_pair(&mut self) -> &mut QueuePair<Rc> {
+    /// The connected queue pair, for what a shared reference can do: posting receives
+    /// ([`QueuePair::post_recv`]), which several threads may do at once. Poll completions on the
+    /// completion queue you built it with.
+    pub fn queue_pair(&self) -> &QueuePair<Rc> {
+        &self.qp
+    }
+
+    /// The connected queue pair, for sending ([`QueuePair::start_send`]) and everything else
+    /// that takes it exclusively.
+    pub fn queue_pair_mut(&mut self) -> &mut QueuePair<Rc> {
         &mut self.qp
     }
 
     /// The connection's id, to watch what happens to it after establishment — the peer
     /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
-    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. Its
+    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. A connection can
+    /// also end with [`Unreachable`](CmEventType::Unreachable) (on RoCE, when the peer's link
+    /// address changes under an id that connected) or [`Rejected`](CmEventType::Rejected) (the
+    /// peer answering a connection it no longer knows), so treat those as the end too, not
+    /// `Disconnected` alone. Its
     /// [`peer_addr`](CmId::peer_addr) and [`local_addr`](CmId::local_addr) are the connection's two
     /// ends.
     pub fn cm_id(&self) -> &CmId {
@@ -2012,6 +2185,38 @@ impl Connection {
         let mut error = QueuePairAttribute::new();
         error.set_state(QueuePairState::Error);
         self.qp.modify(&error)
+    }
+
+    /// Disconnects like [`disconnect`](Self::disconnect), then keeps the connection until the
+    /// peer has answered (this side's own [`CmEventType::Disconnected`] event), so that the
+    /// kernel goes on retransmitting the request meanwhile: the way to be sure the peer hears of
+    /// the disconnect. `timeout` bounds the wait; `None` waits until the kernel gives up, which
+    /// with a dead peer takes over a minute.
+    ///
+    /// Do not read this connection's events elsewhere (through a clone of
+    /// [`cm_id`](Self::cm_id)) meanwhile: the answer would go to that reader. If the peer
+    /// disconnected first there is no answer to wait for, and [`disconnect`](Self::disconnect)
+    /// is enough.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`disconnect`](Self::disconnect), and
+    ///
+    ///  - [`TimedOut`](Error::TimedOut): the peer did not answer in time. The connection is
+    ///    dropped all the same.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading the event failed.
+    pub fn close(mut self, timeout: Option<Duration>) -> Result<()> {
+        let deadline = crate::completion::deadline_after(timeout);
+        self.disconnect()?;
+        loop {
+            let event = self.id.inner.channel.get_cm_event_deadline(deadline)?;
+            if matches!(
+                event.event_type(),
+                CmEventType::Disconnected | CmEventType::TimewaitExit | CmEventType::DeviceRemoval
+            ) {
+                return Ok(());
+            }
+        }
     }
 }
 
@@ -2067,6 +2272,24 @@ mod test_conversions {
     }
 
     #[test]
+    fn mapped_addresses_become_ipv4() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:18515".parse().unwrap();
+        assert_eq!(canonical(mapped), "192.0.2.1:18515".parse().unwrap());
+        // Everything else passes through untouched, scope id and flow label included.
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            18515,
+            7,
+            3,
+        ));
+        assert_eq!(canonical(scoped), scoped);
+        let v4: SocketAddr = "192.0.2.1:18515".parse().unwrap();
+        assert_eq!(canonical(v4), v4);
+        let wildcard: SocketAddr = "[::]:0".parse().unwrap();
+        assert_eq!(canonical(wildcard), wildcard);
+    }
+
+    #[test]
     fn timeouts_round_up_to_whole_milliseconds() {
         assert_eq!(timeout_ms(Duration::ZERO), 0);
         assert_eq!(timeout_ms(Duration::from_micros(900)), 1);
@@ -2085,6 +2308,26 @@ mod test_conversions {
             .set_qp_num(0x12_3456)
             .as_raw();
         assert_eq!((raw.srq, raw.flow_control, raw.qp_num), (1, 1, 0x12_3456));
+    }
+
+    #[test]
+    fn retry_counts_are_three_bits() {
+        let raw = ConnectionParameter::default()
+            .set_retry_count(0)
+            .set_rnr_retry_count(7)
+            .as_raw();
+        assert_eq!((raw.retry_count, raw.rnr_retry_count), (0, 7));
+        type Setter = fn(&mut ConnectionParameter, u8) -> &mut ConnectionParameter;
+        let setters: [Setter; 2] = [
+            ConnectionParameter::set_retry_count,
+            ConnectionParameter::set_rnr_retry_count,
+        ];
+        for set in setters {
+            let wide = std::panic::catch_unwind(|| {
+                set(&mut ConnectionParameter::default(), 8);
+            });
+            assert!(wide.is_err());
+        }
     }
 
     #[test]

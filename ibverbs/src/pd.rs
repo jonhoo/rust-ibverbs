@@ -13,7 +13,7 @@ use crate::qp::{QueuePairBuilder, Transport};
 use crate::srq::SharedReceiveQueue;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MrAdvice {
     /// Prefetch the pages for read access (a best-effort hint; the ranges must allow local read).
@@ -100,14 +100,25 @@ impl ProtectionDomain {
     /// # Errors
     ///
     ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): `ibv_create_ah` failed (`EINVAL`
-    ///    for an invalid value in `attr`, `ENOMEM` when out of resources).
+    ///    for an invalid value in `attr`, `ENOMEM` when out of resources), or the provider
+    ///    refused `attr` without naming a reason ([`io::ErrorKind::InvalidInput`]; mlx5 for a
+    ///    port number the device does not have). On RoCE the kernel resolves the destination GID
+    ///    to a MAC address during the call, which can take up to a second and fail with
+    ///    `ETIMEDOUT` or `ENETUNREACH` when the GID does not answer.
     ///  - [`Unsupported`](Error::Unsupported): the provider has no address handles (`EOPNOTSUPP`).
     pub fn create_address_handle(&self, attr: &AddressHandleAttribute) -> Result<AddressHandle> {
         let mut ah_attr = attr.attr;
-        let ah = nonnull(
-            unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) },
-            Error::CreateAddressHandle,
-        )?;
+        // libmlx5 returns null for a port number the device does not have without setting
+        // `errno`, which would then name whatever failed last on this thread. Clear it to tell.
+        nix::errno::Errno::clear();
+        let ah = unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) };
+        if ah.is_null() && nix::errno::Errno::last_raw() == 0 {
+            return Err(Error::CreateAddressHandle(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the provider refused the address handle's attributes",
+            )));
+        }
+        let ah = nonnull(ah, Error::CreateAddressHandle)?;
         Ok(AddressHandle::new(self.clone(), ah))
     }
 
@@ -125,7 +136,9 @@ impl ProtectionDomain {
     ///  - [`Unsupported`](Error::Unsupported): the device does not support `ibv_advise_mr`
     ///    (`EOPNOTSUPP`).
     ///  - [`AdviseMemoryRegion`](Error::AdviseMemoryRegion): `ibv_advise_mr` failed (`EINVAL` for
-    ///    an invalid value in the arguments, `ENOMEM` when out of resources).
+    ///    an invalid value in the arguments, `ENOMEM` when out of resources; on mlx5 also `ENOENT`
+    ///    for a region that is not registered [`ON_DEMAND`](AccessFlags::ON_DEMAND), and `EPERM`
+    ///    for a write prefetch of a region without local write access).
     pub fn advise_mr(
         &self,
         advice: MrAdvice,
@@ -181,9 +194,9 @@ impl ProtectionDomain {
         // when each builder is created; `PreparedQueuePair::endpoint` documents the stale-LID case.
         let port_attr = self.context().query_port(port_num)?;
         require_active(port_num, &port_attr)?;
-        // Only reliable connections carry RDMA read and atomic limits.
-        let rd_atomic_limits = if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
-            Some(self.context().rd_atomic_limits()?)
+        // Only reliable connections carry RDMA read and atomic limits, and default to the atomics.
+        let rc_limits = if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
+            Some(self.context().rc_limits()?)
         } else {
             None
         };
@@ -193,7 +206,7 @@ impl ProtectionDomain {
             port_num,
             send.clone(),
             recv.clone(),
-            rd_atomic_limits,
+            rc_limits,
         ))
     }
 
@@ -275,11 +288,16 @@ impl ProtectionDomain {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that, for the entire lifetime of the returned `MemoryRegion`:
+    /// The caller must ensure that, for as long as the memory is registered:
     ///
     ///  - `ptr` is valid for reads and writes of `len` bytes,
     ///  - the memory is not moved, freed, or unmapped, and
     ///  - the memory is not accessed in a way that races with the device reading or writing it.
+    ///
+    /// The memory is registered until the returned `MemoryRegion` has been dropped (or consumed
+    /// by [`into_inner`](MemoryRegion::into_inner)) *without panicking*. A drop that panics could
+    /// not deregister the region: the device can still reach the memory, which must then never be
+    /// freed or reused.
     ///
     /// # Panics
     ///
@@ -315,6 +333,19 @@ impl ProtectionDomain {
     /// descriptor may be closed afterwards. The region starts at `offset` bytes into the DMA-BUF
     /// and covers `len` bytes. `iova` is the virtual base address of the region when accessed
     /// through an `lkey` or `rkey`; it must have the same page offset as `offset`.
+    ///
+    /// # Receiving small messages on mlx5
+    ///
+    /// mlx5 hands a message of up to 32 bytes (64 with 128-byte completion entries,
+    /// `MLX5_CQE_SIZE=128`) that arrives on an RC or UC queue pair to its library inside the
+    /// completion entry, and the library copies it to the receive's buffer with the CPU while the
+    /// completion is polled ("scatter to CQE", on by default). It copies to the address the receive
+    /// request carries, which for a slice of this region is `iova`-based: the bytes land in
+    /// whatever this process has mapped at that address, not in the DMA-BUF, and the poll crashes
+    /// if nothing is mapped there. Before posting receives that point into such a region (on a
+    /// queue pair or a shared receive queue), set `MLX5_SCATTER_TO_CQE=0` in the environment
+    /// (libmlx5 reads it whenever a queue pair is created), or choose an `iova` at which this
+    /// process maps the same memory. Sends, and RDMA reads and writes, are not affected.
     ///
     /// # Errors
     ///
@@ -356,14 +387,11 @@ impl ProtectionDomain {
     /// each queue pair separately.
     ///
     /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
-    /// `max_sge` is the maximum number of scatter/gather elements per work request.
-    /// `srq_limit` is recorded at creation and, on providers that honor it there (Soft-RoCE's rxe
-    /// does; this crate's test suite relies on that), arms the low-watermark event: once fewer
-    /// receives than the limit remain posted, the device raises
-    /// [`AsyncEventType::SrqLimitReached`](crate::AsyncEventType::SrqLimitReached) once. The
-    /// `ibv_create_srq` man page considers the field irrelevant at creation, so arm it portably
-    /// (and re-arm it after it fires) with [`SharedReceiveQueue::set_limit`]. Pass 0 for no
-    /// limit.
+    /// `max_sge` is the maximum number of scatter/gather elements per work request. Providers
+    /// round both up; [`SharedReceiveQueue::capacity`] and
+    /// [`max_sge`](SharedReceiveQueue::max_sge) report what was granted. The queue is created
+    /// without a low-watermark limit; arm one (and re-arm it after it fires) with
+    /// [`SharedReceiveQueue::set_limit`].
     ///
     /// # Errors
     ///
@@ -376,25 +404,27 @@ impl ProtectionDomain {
     ///
     /// [1]: https://www.rdmamojo.com/2012/11/24/ibv_create_srq/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_create_srq.3.html
-    pub fn create_srq(
-        &self,
-        max_wr: u32,
-        max_sge: u32,
-        srq_limit: u32,
-    ) -> Result<SharedReceiveQueue> {
+    pub fn create_srq(&self, max_wr: u32, max_sge: u32) -> Result<SharedReceiveQueue> {
+        // No `srq_limit`: `ibv_create_srq(3)` calls it irrelevant at creation, and only rxe arms
+        // it there (mlx5 arms it only when modified, and hns zeroes it).
         let mut srq_init_attr = ffi::ibv_srq_init_attr {
             srq_context: ptr::null_mut(),
             attr: ffi::ibv_srq_attr {
                 max_wr,
                 max_sge,
-                srq_limit,
+                srq_limit: 0,
             },
         };
         let srq = nonnull(
             unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) },
             Error::CreateSharedReceiveQueue,
         )?;
-        Ok(SharedReceiveQueue::new(self.clone(), srq))
+        // Creation wrote the granted capacities back into the attributes.
+        Ok(SharedReceiveQueue::new(
+            self.clone(),
+            srq,
+            &srq_init_attr.attr,
+        ))
     }
 }
 

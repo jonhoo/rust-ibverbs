@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::ffi::CStr;
 use std::fmt;
 use std::io;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
@@ -166,7 +165,7 @@ impl Context {
     /// # Errors
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
-    pub fn poll_async_event(&self) -> Result<Option<AsyncEvent<'_>>> {
+    pub fn poll_async_event(&self) -> Result<Option<AsyncEvent>> {
         let mut event = ffi::ibv_async_event::default();
         let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, &mut event) };
         if rc != 0 {
@@ -183,11 +182,7 @@ impl Context {
         // event is acknowledged, so acknowledging only when the caller drops it would let a held
         // (or leaked) event hang the drop of that object forever.
         unsafe { ffi::ibv_ack_async_event(&mut event) };
-        Ok(Some(AsyncEvent {
-            event,
-            qp_num,
-            _ctx: PhantomData,
-        }))
+        Ok(Some(AsyncEvent { event, qp_num }))
     }
 
     /// Block until an asynchronous event is available (up to `timeout`), then consume it.
@@ -200,20 +195,13 @@ impl Context {
     /// # Errors
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
-    pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
-        let deadline = crate::completion::deadline_after(timeout);
-        loop {
-            if !crate::completion::wait_readable(self.async_fd(), deadline)
-                .map_err(Error::AsyncEvent)?
-            {
-                return Ok(None);
-            }
-            // The descriptor was readable, but another thread may have consumed the event
-            // first; if so, go back to waiting for the next one.
-            if let Some(event) = self.poll_async_event()? {
-                return Ok(Some(event));
-            }
-        }
+    pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent>> {
+        crate::completion::wait_and_take(
+            self.async_fd(),
+            crate::completion::deadline_after(timeout),
+            Error::AsyncEvent,
+            || self.poll_async_event(),
+        )
     }
 
     /// Allocate a protection domain (PD) for the device's context.
@@ -267,7 +255,12 @@ impl Context {
             return Err(Error::errno(-num_entries as i32, Error::QueryGidTable));
         }
         gid_table.truncate(num_entries as usize);
-        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
+        let gid_table = gid_table
+            .into_iter()
+            .map(GidEntry::from)
+            // An entry of a port above 255 is of no use: nothing here can name its port.
+            .filter(|entry| entry.port_num != 0)
+            .collect();
         Ok(gid_table)
     }
 
@@ -276,13 +269,16 @@ impl Context {
     ///
     /// Not every entry routes. On RoCE over plain Ethernet, peers answer on the RoCE v2 entry that
     /// holds the interface's IP address, and for an IPv4 network that is the IPv4-mapped one
-    /// (`::ffff:a.b.c.d`). This prefers such an entry, then any other RoCE v2 entry (an IPv6
-    /// address, or the link-local one), and otherwise falls back to the port's first entry: on
-    /// InfiniBand the port GID at index 0, where any entry routes, and on RoCE a RoCE v1 entry,
-    /// which reaches only peers on the same Ethernet segment that still speak RoCE v1. Pass the
-    /// entry's [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
-    /// [`gid`](GidEntry::gid) to the peer or to [`AddressHandleAttribute::set_grh`]. Choose
-    /// differently from [`gid_table`](Self::gid_table) when the network needs another entry.
+    /// (`::ffff:a.b.c.d`). This prefers such an entry, then a RoCE v2 entry holding a routable
+    /// IPv6 address, then the link-local RoCE v2 entry (the kernel's default GID, at the start of
+    /// the table, which reaches only peers on the same link), and otherwise falls back to the
+    /// port's first entry: on InfiniBand the port GID at index 0, where any entry routes, and on
+    /// RoCE a RoCE v1 entry, which reaches only peers on the same Ethernet segment that still
+    /// speak RoCE v1. Entries above index 255 are passed over: an address vector cannot route from
+    /// them. Pass the entry's [`gid_index`](GidEntry::gid_index) to
+    /// [`QueuePairBuilder::set_gid_index`], and its [`gid`](GidEntry::gid) to the peer or to
+    /// [`AddressHandleAttribute::set_grh`]. Choose differently from
+    /// [`gid_table`](Self::gid_table) when the network needs another entry.
     ///
     /// # Errors
     ///
@@ -348,11 +344,17 @@ impl Context {
         query_device(self.inner.ctx).map(DeviceAttr)
     }
 
-    /// The most outstanding RDMA reads and atomics a queue pair on this device can issue as the
-    /// initiator and service as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`),
-    /// clamped to the `u8` the queue-pair attributes carry.
-    pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
-        rd_atomic_limits(self.inner.ctx)
+    /// What a reliable connection's defaults take from the device (one `ibv_query_device`): the
+    /// most outstanding RDMA reads and atomics a queue pair can issue as the initiator and service
+    /// as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`), clamped to the `u8` the
+    /// queue-pair attributes carry, and whether the device executes RDMA atomics at all
+    /// (`atomic_cap` is not `IBV_ATOMIC_NONE`).
+    pub(crate) fn rc_limits(&self) -> Result<RcLimits> {
+        let attr = query_device(self.inner.ctx)?;
+        Ok(RcLimits {
+            rd_atomic: rd_atomic_depths(&attr),
+            atomics: attr.atomic_cap != ffi::ibv_atomic_cap::IBV_ATOMIC_NONE,
+        })
     }
 
     /// Query the extended attributes and capabilities of this context's device
@@ -455,11 +457,19 @@ impl Context {
 
 /// The entry of `table` that [`Context::routable_gid`] picks for `port_num`.
 fn routable_entry(table: &[GidEntry], port_num: u8) -> Option<&GidEntry> {
-    let on_port = || table.iter().filter(move |entry| entry.port_num == port_num);
+    // An address vector holds the source GID index in 8 bits.
+    let on_port = || {
+        table
+            .iter()
+            .filter(move |entry| entry.port_num == port_num && entry.gid_index <= 255)
+    };
     let roce_v2 = |entry: &&GidEntry| entry.gid_type == GidType::RoceV2;
+    let link_local =
+        |entry: &&GidEntry| std::net::Ipv6Addr::from(entry.gid).is_unicast_link_local();
     on_port()
         .filter(roce_v2)
         .find(|entry| entry.gid.is_ipv4_mapped())
+        .or_else(|| on_port().filter(roce_v2).find(|entry| !link_local(entry)))
         .or_else(|| on_port().find(roce_v2))
         .or_else(|| on_port().next())
 }
@@ -474,28 +484,45 @@ fn query_device(ctx: *mut ffi::ibv_context) -> Result<ffi::ibv_device_attr> {
     Ok(device_attr)
 }
 
-/// [`Context::rd_atomic_limits`] for any open context on a device, such as the one librdmacm
-/// keeps for a connection-manager id.
+/// The device limits a reliable connection's defaults follow (see [`Context::rc_limits`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RcLimits {
+    /// The `(initiator, responder)` RDMA read and atomic depths.
+    pub(crate) rd_atomic: (u8, u8),
+    /// Whether the device executes RDMA atomics.
+    pub(crate) atomics: bool,
+}
+
+/// The `(initiator, responder)` RDMA read and atomic depths of [`Context::rc_limits`] for any open
+/// context on a device, such as the one librdmacm keeps for a connection-manager id.
+#[cfg(feature = "rdmacm")]
 pub(crate) fn rd_atomic_limits(ctx: *mut ffi::ibv_context) -> Result<(u8, u8)> {
-    let attr = query_device(ctx)?;
+    Ok(rd_atomic_depths(&query_device(ctx)?))
+}
+
+/// The `(initiator, responder)` RDMA read and atomic depths `attr` reports, clamped to the `u8`
+/// the queue-pair attributes carry.
+fn rd_atomic_depths(attr: &ffi::ibv_device_attr) -> (u8, u8) {
     let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
-    Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
+    (clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom))
 }
 
 /// An asynchronous event reported by the device, consumed with [`Context::poll_async_event`] /
 /// [`Context::wait_async_event`], which acknowledge it as they read it: holding an `AsyncEvent`
 /// never delays the destruction of the object it names.
-pub struct AsyncEvent<'ctx> {
+pub struct AsyncEvent {
     event: ffi::ibv_async_event,
     /// The number of the queue pair a queue-pair-scoped event names, read before the event was
     /// acknowledged: after that, the queue pair may be destroyed at any time.
     qp_num: Option<u32>,
-    /// The [`Context`] the event was read from. The event is already acknowledged, so nothing
-    /// needs the borrow any more; dropping the lifetime would make events `'static`.
-    _ctx: PhantomData<&'ctx Context>,
 }
 
-impl AsyncEvent<'_> {
+// SAFETY: an acknowledged event is plain data. The pointer in its element is handed out for
+// comparison, and nothing here dereferences it.
+unsafe impl Send for AsyncEvent {}
+unsafe impl Sync for AsyncEvent {}
+
+impl AsyncEvent {
     /// The kind of event.
     pub fn event_type(&self) -> AsyncEventType {
         self.event.event_type.into()
@@ -513,9 +540,45 @@ impl AsyncEvent<'_> {
     /// [`QpLastWqeReached`](AsyncEventType::QpLastWqeReached)); `None` for every other kind.
     ///
     /// The number is read as the event is, so it stays available after the queue pair is
-    /// destroyed.
+    /// destroyed. Nothing holds the queue pair once the event is read, though: by the time the
+    /// event is handled, the number may name no queue pair any more, or (once the device has
+    /// handed it out again) a newer one. Handle events and drop queue pairs under one lock, or
+    /// tolerate an event about a queue pair that is gone.
     pub fn qp_num(&self) -> Option<u32> {
         self.qp_num
+    }
+
+    /// The completion queue the event refers to, for [`CqError`](AsyncEventType::CqError);
+    /// `None` for every other kind. It equals the [`CompletionQueue::as_raw`] of that queue.
+    ///
+    /// The pointer is for comparison only. The event is already acknowledged, so the queue may
+    /// have been destroyed since, and its address may belong to a newer one.
+    ///
+    /// [`CompletionQueue::as_raw`]: crate::CompletionQueue::as_raw
+    pub fn cq(&self) -> Option<*mut ffi::ibv_cq> {
+        match self.event_type() {
+            // SAFETY: for the completion-queue-scoped event, the element union holds the queue.
+            AsyncEventType::CqError => Some(unsafe { self.event.element.cq }),
+            _ => None,
+        }
+    }
+
+    /// The shared receive queue the event refers to, for [`SrqError`](AsyncEventType::SrqError)
+    /// and [`SrqLimitReached`](AsyncEventType::SrqLimitReached); `None` for every other kind. It
+    /// equals the [`SharedReceiveQueue::as_raw`] of that queue.
+    ///
+    /// The pointer is for comparison only. The event is already acknowledged, so the queue may
+    /// have been destroyed since, and its address may belong to a newer one.
+    ///
+    /// [`SharedReceiveQueue::as_raw`]: crate::SharedReceiveQueue::as_raw
+    pub fn srq(&self) -> Option<*mut ffi::ibv_srq> {
+        match self.event_type() {
+            AsyncEventType::SrqError | AsyncEventType::SrqLimitReached => {
+                // SAFETY: for the SRQ-scoped events, the element union holds the queue.
+                Some(unsafe { self.event.element.srq })
+            }
+            _ => None,
+        }
     }
 
     /// The port the event refers to, for the port-scoped events
@@ -523,7 +586,8 @@ impl AsyncEvent<'_> {
     /// [`LidChange`](AsyncEventType::LidChange), [`PkeyChange`](AsyncEventType::PkeyChange),
     /// [`SmChange`](AsyncEventType::SmChange),
     /// [`ClientReregister`](AsyncEventType::ClientReregister), and
-    /// [`GidChange`](AsyncEventType::GidChange)); `None` for every other kind.
+    /// [`GidChange`](AsyncEventType::GidChange)); `None` for every other kind, and for a port
+    /// above 255, which this crate cannot name.
     pub fn port_num(&self) -> Option<u8> {
         match self.event_type() {
             AsyncEventType::PortActive
@@ -534,7 +598,7 @@ impl AsyncEvent<'_> {
             | AsyncEventType::ClientReregister
             | AsyncEventType::GidChange => {
                 // SAFETY: for the port-scoped events, the element union holds the port number.
-                Some(unsafe { self.event.element.port_num } as u8)
+                u8::try_from(unsafe { self.event.element.port_num }).ok()
             }
             _ => None,
         }
@@ -543,18 +607,19 @@ impl AsyncEvent<'_> {
     /// The underlying `ibv_async_event`.
     ///
     /// This is the escape hatch for the `element` union: for CQ-, QP-, and SRQ-scoped events it
-    /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to (queue-pair-scoped
-    /// events also expose their queue-pair number directly via [`AsyncEvent::qp_num`]). Those
-    /// pointers cannot be mapped back to this crate's safe wrappers; compare them against the
-    /// `as_raw` handles of the wrappers you own to identify the object. The event is already
-    /// acknowledged, so the object may have been destroyed since, and its address reused by a new
-    /// one: dereference the pointer only while you hold the wrapper it belongs to.
+    /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to, which
+    /// [`cq`](Self::cq), [`srq`](Self::srq), and (as the queue pair's number)
+    /// [`qp_num`](Self::qp_num) read for you. Those pointers cannot be mapped back to this
+    /// crate's safe wrappers; compare them against the `as_raw` handles of the wrappers you own
+    /// to identify the object. The event is already acknowledged, so the object may have been
+    /// destroyed since, and its address reused by a new one: dereference the pointer only while
+    /// you hold the wrapper it belongs to.
     pub fn as_raw(&self) -> &ffi::ibv_async_event {
         &self.event
     }
 }
 
-impl fmt::Debug for AsyncEvent<'_> {
+impl fmt::Debug for AsyncEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut f = f.debug_struct("AsyncEvent");
         f.field("event_type", &self.event_type());
@@ -602,7 +667,7 @@ unsafe fn event_qp_num(event: &ffi::ibv_async_event) -> Option<u32> {
 /// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which
 /// object, and queue-pair events also expose [`AsyncEvent::qp_num`]), port-level changes (with
 /// [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AsyncEventType {
     /// An error occurred on a completion queue (overrun or protection fault); the queue and the
@@ -641,7 +706,7 @@ pub enum AsyncEventType {
     /// An error occurred on a shared receive queue.
     SrqError,
     /// The number of receives posted to a shared receive queue dropped below its low watermark
-    /// (the `srq_limit` of [`ProtectionDomain::create_srq`]).
+    /// (armed with [`SharedReceiveQueue::set_limit`](crate::SharedReceiveQueue::set_limit)).
     SrqLimitReached,
     /// The last work request reached a queue pair, attached to a shared receive queue, that is in
     /// the error state: no more receives will be consumed from the SRQ by this queue pair.
@@ -682,7 +747,9 @@ impl From<ffi::ibv_event_type> for AsyncEventType {
             E::IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
             E::IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
             E::IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
-            E::IBV_EVENT_DEVICE_SPEED_CHANGE => AsyncEventType::DeviceSpeedChange,
+            // `IBV_EVENT_DEVICE_SPEED_CHANGE`, spelled by value: rdma-core 62 added it, and
+            // installed headers from an older rdma-core lack the name.
+            E(20) => AsyncEventType::DeviceSpeedChange,
             other => AsyncEventType::Unknown(other.0),
         }
     }
@@ -736,7 +803,7 @@ impl std::fmt::Display for AsyncEventType {
 /// between two readings reverses how they compare.
 ///
 /// [`Sub`]: std::ops::Sub
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HcaClock(pub(crate) u64);
 
 impl HcaClock {
@@ -760,7 +827,7 @@ impl std::ops::Sub for HcaClock {
 ///
 /// Returned by [`PortAttr::active_mtu`] / [`PortAttr::max_mtu`], and set on a queue pair with
 /// [`QueuePairBuilder::set_path_mtu`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Mtu {
     /// 256 bytes.
@@ -824,7 +891,7 @@ impl fmt::Display for Mtu {
 }
 
 /// The logical state of a port. Returned by [`PortAttr::state`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortState {
     /// Reserved value (no state change).
@@ -875,7 +942,7 @@ impl fmt::Display for PortState {
 /// The signaling rate of a port's active link, decoded from `ibv_port_attr::active_speed` (or
 /// `active_speed_ex`, where the provider reports the speeds the legacy 8-bit field cannot, such
 /// as XDR).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortSpeed {
     /// Single data rate (2.5 Gb/s signaling per lane).
@@ -918,6 +985,10 @@ impl PortSpeed {
 
     /// The effective data rate of a single (1x) lane in gigabits per second, accounting for the
     /// link's encoding overhead. Returns `None` for an unrecognized speed.
+    ///
+    /// That is the rate of an InfiniBand link. On an Ethernet (RoCE) port the kernel reports the
+    /// InfiniBand speed and width that come nearest the interface's rate, which need not multiply
+    /// out to it: 1 GbE reads as SDR 1x.
     pub fn lane_gbps(self) -> Option<f64> {
         Some(match self {
             PortSpeed::Sdr => 2.0,
@@ -953,7 +1024,7 @@ impl fmt::Display for PortSpeed {
 }
 
 /// The width (number of lanes) of a port's active link, decoded from `ibv_port_attr::active_width`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortWidth {
     /// A single lane.
@@ -1009,7 +1080,7 @@ impl fmt::Display for PortWidth {
 }
 
 /// The link layer of a port, decoded from `ibv_port_attr::link_layer`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LinkLayer {
     /// The link layer is unspecified.
@@ -1047,7 +1118,7 @@ impl fmt::Display for LinkLayer {
 }
 
 /// The physical state of a port, decoded from `ibv_port_attr::phys_state`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PhysicalState {
     /// The port is sleeping.
@@ -1414,8 +1485,15 @@ mod test_display {
             entry(5, 1, "::ffff:192.0.2.1", GidType::RoceV2),
         ];
         assert_eq!(routable(&table), Some(5));
-        // Without an IPv4 address, any RoCE v2 entry rather than the RoCE v1 one at index 0.
+        // Without an IPv4 address, the RoCE v2 entry of the routable IPv6 address rather than the
+        // link-local default one at index 1, or the RoCE v1 one at index 0.
         table.truncate(5);
+        assert_eq!(routable(&table), Some(3));
+        // With only the default GIDs, the link-local RoCE v2 one.
+        table.truncate(3);
+        assert_eq!(routable(&table), Some(1));
+        // An IPv4 address past index 255 cannot route; the link-local entry can.
+        table.push(entry(300, 1, "::ffff:192.0.2.3", GidType::RoceV2));
         assert_eq!(routable(&table), Some(1));
         let ib = [
             entry(0, 1, "fe80::2", GidType::Ib),
@@ -1453,10 +1531,7 @@ mod test_display {
 
     /// An event of `event_type` whose element points at `qp`, built the way
     /// [`Context::poll_async_event`] builds one.
-    fn synthetic_async_event(
-        event_type: ffi::ibv_event_type,
-        qp: *mut ffi::ibv_qp,
-    ) -> AsyncEvent<'static> {
+    fn synthetic_async_event(event_type: ffi::ibv_event_type, qp: *mut ffi::ibv_qp) -> AsyncEvent {
         let event = ffi::ibv_async_event {
             event_type,
             element: ffi::ibv_async_event__bindgen_ty_1 { qp },
@@ -1465,7 +1540,6 @@ mod test_display {
             // SAFETY: `qp` points to a live `ibv_qp`.
             qp_num: unsafe { event_qp_num(&event) },
             event,
-            _ctx: PhantomData,
         }
     }
 
@@ -1523,6 +1597,27 @@ mod test_display {
                 event.event_type()
             );
         }
+    }
+
+    /// The completion-queue and SRQ-scoped events name their queue; no other event names one.
+    #[test]
+    fn cq_and_srq_scoped_async_events_expose_their_queue() {
+        let mut raw_qp = zeroed_qp_with_num(4242);
+        // The element is a union of pointers: the queue is whatever object the event points at.
+        let element = raw_qp.as_mut_ptr();
+        let cq = synthetic_async_event(ffi::ibv_event_type::IBV_EVENT_CQ_ERR, element);
+        assert_eq!(cq.cq(), Some(element.cast()));
+        assert_eq!(cq.srq(), None);
+        for event_type in [
+            ffi::ibv_event_type::IBV_EVENT_SRQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_SRQ_LIMIT_REACHED,
+        ] {
+            let srq = synthetic_async_event(event_type, element);
+            assert_eq!(srq.srq(), Some(element.cast()));
+            assert_eq!(srq.cq(), None);
+        }
+        let other = synthetic_async_event(ffi::ibv_event_type::IBV_EVENT_QP_FATAL, element);
+        assert_eq!((other.cq(), other.srq()), (None, None));
     }
 
     /// The Debug representation of a queue-pair-scoped asynchronous event includes its queue-pair

@@ -28,6 +28,7 @@ pub enum Error {
     /// work-completion field; `operation` names the verb that was declined, and `errno` who
     /// declined it.
     #[error("{operation} is not supported by the device, provider, or kernel")]
+    #[non_exhaustive]
     Unsupported {
         /// The verb (or the capability it asked for) the device, provider, or kernel declined. A
         /// reference to the name rather than the name itself, so that `Error` stays two words.
@@ -78,6 +79,7 @@ pub enum Error {
 
     /// Querying port attributes failed (`ibv_query_port`).
     #[error("failed to query attributes of port {port_num}")]
+    #[non_exhaustive]
     QueryPort {
         /// The port that was queried.
         port_num: u8,
@@ -88,6 +90,7 @@ pub enum Error {
 
     /// Querying a GID failed (`ibv_query_gid`).
     #[error("failed to query GID index {gid_index} on port {port_num}")]
+    #[non_exhaustive]
     QueryGid {
         /// The port that was queried.
         port_num: u8,
@@ -145,6 +148,7 @@ pub enum Error {
     /// Surfaced by [`QueuePair::modify`] when the device rejects the transition and the crate's
     /// state-table check confirms that `current -> next` is not allowed.
     #[error("invalid queue pair state transition from {current} to {next}")]
+    #[non_exhaustive]
     InvalidQueuePairTransition {
         /// The queue pair's current state.
         current: QueuePairState,
@@ -160,6 +164,7 @@ pub enum Error {
         "invalid attribute mask for queue pair transition from {current} to {next}: \
          disallowed bits {invalid:?}, missing required bits {needed:?}"
     )]
+    #[non_exhaustive]
     InvalidQueuePairAttributeMask {
         /// The queue pair's current state.
         current: QueuePairState,
@@ -198,6 +203,7 @@ pub enum Error {
     /// Posting a batch of receive work requests failed (`ibv_post_recv` / `ibv_post_srq_recv`)
     /// at one of its requests; the ones ahead of it were posted.
     #[error("failed to post a receive work request after posting {posted} of the batch")]
+    #[non_exhaustive]
     PostReceive {
         /// How many requests at the front of the batch were posted before the one that failed:
         /// they are on the queue like any other posted receive, so their buffers are in use.
@@ -284,7 +290,7 @@ impl Error {
     }
 
     /// The verb (or step) this error came from, as [`Unsupported`](Self::Unsupported) names it.
-    pub(crate) fn operation(&self) -> &'static &'static str {
+    fn operation(&self) -> &'static &'static str {
         match self {
             Error::Unsupported { operation, .. } => operation,
             Error::PortNotActive(_) => &"port activation",
@@ -338,30 +344,23 @@ impl Error {
         }
     }
 
-    /// Whether `err` says the operation is unsupported: `EOPNOTSUPP` from the provider or kernel,
-    /// or `EPROTONOSUPPORT`, which the kernel's ioctl dispatch returns for a method or attribute
-    /// it does not know (a kernel older than the request) and reserves for exactly that: a
-    /// driver's own `EPROTONOSUPPORT` reaches userspace as `EINVAL` (`uverbs_ioctl.c`).
-    pub(crate) fn is_unsupported(err: &io::Error) -> bool {
-        matches!(
-            err.raw_os_error(),
-            Some(nix::libc::EOPNOTSUPP | nix::libc::EPROTONOSUPPORT)
-        )
-    }
-
-    /// Build an [`Error`] from an OS error, promoting an unsupported one (see
-    /// [`is_unsupported`](Error::is_unsupported)) to [`Error::Unsupported`]
+    /// Build an [`Error`] from an OS error, promoting an unsupported one to [`Error::Unsupported`]
     /// (naming the operation `wrap` identifies) and otherwise tagging it with `wrap` (the variant
     /// identifying the operation that failed).
+    ///
+    /// Unsupported means `EOPNOTSUPP` from the provider or kernel, or `EPROTONOSUPPORT`, which the
+    /// kernel's ioctl dispatch returns for a method or attribute it does not know (a kernel older
+    /// than the request) and reserves for exactly that: a driver's own `EPROTONOSUPPORT` reaches
+    /// userspace as `EINVAL` (`uverbs_ioctl.c`).
     pub(crate) fn os(err: io::Error, wrap: impl FnOnce(io::Error) -> Error) -> Error {
-        let unsupported = err.raw_os_error().filter(|_| Error::is_unsupported(&err));
-        let wrapped = wrap(err);
-        match unsupported {
-            Some(errno) => Error::Unsupported {
-                operation: wrapped.operation(),
-                errno,
-            },
-            None => wrapped,
+        match err.raw_os_error() {
+            Some(errno @ (nix::libc::EOPNOTSUPP | nix::libc::EPROTONOSUPPORT)) => {
+                Error::Unsupported {
+                    operation: wrap(err).operation(),
+                    errno,
+                }
+            }
+            _ => wrap(err),
         }
     }
 
@@ -411,12 +410,27 @@ pub(crate) fn check(ret: i32, wrap: impl FnOnce(io::Error) -> Error) -> Result<(
 /// the references it holds to them before the panic unwinds through its fields. Released, the last
 /// of them would destroy its object under this one, fail the same way, and panic again during the
 /// unwind, which aborts the process.
+///
+/// For the same reason this does not panic on a thread that is already unwinding: there the
+/// failure is reported on standard error, the object (with its parents) is leaked, and `false`
+/// comes back for the callers that own more than the object (a memory region's buffer). That is
+/// the case when one cause fails several destroys at once (a forked child that destroyed the
+/// objects first, a device that went away under a kernel that refuses destroys afterwards): the
+/// first failed drop panics, and the drops the unwind then runs fail the same way.
+///
+/// Returns whether the object is gone.
 #[track_caller]
-pub(crate) fn destroyed(verb: &str, errno: i32, keep_parents: impl FnOnce()) {
-    if errno != 0 {
-        keep_parents();
-        panic!("{verb} failed: {}", io::Error::from_raw_os_error(errno));
+pub(crate) fn destroyed(verb: &str, errno: i32, keep_parents: impl FnOnce()) -> bool {
+    if errno == 0 {
+        return true;
     }
+    keep_parents();
+    let error = io::Error::from_raw_os_error(errno);
+    if std::thread::panicking() {
+        eprintln!("{verb} failed while unwinding from a panic: {error}; the object is leaked");
+        return false;
+    }
+    panic!("{verb} failed: {error}");
 }
 
 /// Leaks one reference to `parent`, for [`destroyed`]'s `keep_parents`.
@@ -528,6 +542,36 @@ mod tests {
         assert!(parent.upgrade().is_some(), "the parent was released");
     }
 
+    /// A destroy that fails while the thread already unwinds (here: from the failed destroy of
+    /// the object dropped just before it) must not panic again, which would abort the process. It
+    /// reports that the object is still there instead.
+    #[test]
+    fn a_failed_destroy_during_an_unwind_does_not_abort() {
+        use std::panic::catch_unwind;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static STILL_THERE: AtomicU32 = AtomicU32::new(0);
+        struct Failing;
+        impl Drop for Failing {
+            fn drop(&mut self) {
+                // Returns only when it did not panic, so only for the second drop.
+                if !destroyed("ibv_destroy_qp", nix::libc::EIO, || ()) {
+                    STILL_THERE.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let unwound = catch_unwind(|| {
+            let _first = Failing;
+            let _second = Failing;
+        });
+        assert!(unwound.is_err(), "the first failed destroy still panics");
+        assert_eq!(STILL_THERE.load(Ordering::Relaxed), 1);
+        assert!(destroyed("ibv_destroy_qp", 0, || ()));
+    }
+
+    // On 32-bit targets an `io::Error` alone takes two words, and `Error` is 16 bytes there too.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn error_fits_in_two_words() {
         // Returned in registers rather than through memory, on every data-path call.

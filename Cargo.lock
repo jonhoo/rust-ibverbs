@@ -101,7 +101,6 @@ name = "ibverbs-sys"
 version = "0.3.2+65.0"
 dependencies = [
  "bindgen",
- "proc-macro2",
 ]
 
 [[package]]

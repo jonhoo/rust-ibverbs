@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
-use crate::context::Mtu;
+use crate::context::{Mtu, RcLimits};
 use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
@@ -14,10 +14,30 @@ use crate::srq::SharedReceiveQueue;
 
 /// Seals the transport traits: only the markers defined by this crate implement them.
 pub(crate) mod sealed {
+    use super::{PreparedQueuePair, QueuePairBuilder, Transport};
+    use crate::error::Result;
+
     /// Implemented by every transport marker.
     pub trait Sealed {
         /// The queue-pair type (`IBV_QPT_*`) the marker stands for.
         const TYPE: ffi::ibv_qp_type;
+
+        /// The send operations a queue pair of this transport on `ctx` is created with unless
+        /// the builder says otherwise: SEND on every transport, RDMA WRITE on the connected
+        /// ones, and RDMA READ and the atomics on RC, the atomics only if the device executes
+        /// them (`atomics`). SRD asks the device (see `efa.rs`).
+        fn default_send_ops(_ctx: &crate::Context, atomics: bool) -> super::SendOps {
+            super::default_send_ops(Self::TYPE, atomics)
+        }
+
+        /// Creates the queue pair `builder` describes, with `ibv_create_qp_ex` unless the
+        /// transport's queue pairs come from a provider's own verb (SRD's, in `efa.rs`).
+        fn create(builder: &QueuePairBuilder<Self>) -> Result<PreparedQueuePair<Self>>
+        where
+            Self: Transport + Sized,
+        {
+            builder.create_qp_ex()
+        }
     }
 }
 
@@ -129,7 +149,7 @@ impl Datagram for Ud {}
 /// Set through [`QueuePairAttribute::set_state`] + [`QueuePair::modify`] and read back by
 /// [`QueuePair::query`]. [`PreparedQueuePair::handshake`] and friends drive the
 /// `Reset -> Init -> ReadyToReceive -> ReadyToSend` bring-up for you.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum QueuePairState {
     /// The newly created queue pair: posting work requests is an error.
@@ -267,7 +287,7 @@ flags_newtype! {
 /// [`INFINITE`](Self::INFINITE) (never time out). Construct a timeout from a [`Duration`] with
 /// [`at_least`](Self::at_least), which rounds up to the next representable step, or from a raw
 /// encoding with [`from_exponent`](Self::from_exponent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AckTimeout(u8);
 
 impl AckTimeout {
@@ -346,7 +366,7 @@ impl std::fmt::Display for AckTimeout {
 /// increasing order from 0.01 ms to 491.52 ms. Construct a delay from a [`Duration`] with
 /// [`at_least`](Self::at_least), which rounds up to the next representable delay, or from a raw
 /// encoding with [`from_encoding`](Self::from_encoding).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RnrTimer(u8);
 
 impl RnrTimer {
@@ -449,19 +469,21 @@ flags_newtype! {
 }
 
 /// The send operations a queue pair of `qp_type` is created with unless the builder says
-/// otherwise: SEND on every transport, RDMA WRITE on the connected transports and SRD, RDMA READ
-/// on RC and SRD, and the atomics on RC only.
-fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
+/// otherwise, on the transports this crate knows the set of: SEND on every transport, RDMA WRITE
+/// on the connected transports, and RDMA READ and the atomics on RC only, the atomics only when
+/// the device executes them (`atomics`): mlx5 refuses to create a queue pair that requests
+/// atomics on a device without. SRD asks its device instead (see `efa.rs`).
+fn default_send_ops(qp_type: ffi::ibv_qp_type, atomics: bool) -> SendOps {
     use ffi::ibv_qp_type as T;
     let mut ops = SendOps::SEND | SendOps::SEND_WITH_IMM;
-    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_UC | T::IBV_QPT_DRIVER) {
+    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_UC) {
         ops |= SendOps::RDMA_WRITE | SendOps::RDMA_WRITE_WITH_IMM;
     }
-    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_DRIVER) {
-        ops |= SendOps::RDMA_READ;
-    }
     if qp_type == T::IBV_QPT_RC {
-        ops |= SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
+        ops |= SendOps::RDMA_READ;
+        if atomics {
+            ops |= SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
+        }
     }
     ops
 }
@@ -495,6 +517,8 @@ pub struct QueuePairBuilder<T: Transport> {
     max_inline_data: u32,
     /// the send operations to request at creation, or the transport's default set
     send_ops: Option<SendOps>,
+    /// the transport's default set of send operations on this device
+    default_send_ops: SendOps,
 
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
@@ -512,15 +536,15 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// Prepare a new `QueuePair` builder on port `port_num`, whose attributes are `port_attr`, with
     /// the defaults the setters document.
     ///
-    /// `rd_atomic_limits` is the device's `(initiator, responder)` RDMA read and atomic limit, the
-    /// default for a reliable connection; it is `None` for the other transports.
+    /// `rc_limits` is what a reliable connection's defaults take from the device (its RDMA read
+    /// and atomic depths, and whether it executes atomics); it is `None` for the other transports.
     pub(crate) fn new(
         pd: ProtectionDomain,
         port_attr: &ffi::ibv_port_attr,
         port_num: u8,
         send: CompletionQueue,
         recv: CompletionQueue,
-        rd_atomic_limits: Option<(u8, u8)>,
+        rc_limits: Option<RcLimits>,
     ) -> QueuePairBuilder<T> {
         let reliable = T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC;
         let connected = reliable || T::TYPE == ffi::ibv_qp_type::IBV_QPT_UC;
@@ -538,14 +562,22 @@ impl<T: Transport> QueuePairBuilder<T> {
         }
         if reliable {
             rtr.set_min_rnr_timer(RnrTimer::from_encoding(16));
-            rts.set_timeout(AckTimeout::from_exponent(4))
-                .set_retry_count(6)
-                .set_rnr_retry(6);
+            // The values of rdma-core's examples (`rc_pingpong`), and the retry counts of a
+            // connection made through the connection manager.
+            rts.set_timeout(AckTimeout::from_exponent(14))
+                .set_retry_count(7)
+                .set_rnr_retry(7);
         }
-        if let Some((initiator, responder)) = rd_atomic_limits {
+        if let Some(RcLimits {
+            rd_atomic: (initiator, responder),
+            ..
+        }) = rc_limits
+        {
             rtr.set_max_dest_rd_atomic(responder);
             rts.set_max_rd_atomic(initiator);
         }
+        let default_send_ops =
+            T::default_send_ops(pd.context(), rc_limits.is_some_and(|limits| limits.atomics));
         QueuePairBuilder {
             ctx: 0,
             pd,
@@ -564,6 +596,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             max_recv_sge: 1,
             max_inline_data: 0,
             send_ops: None,
+            default_send_ops,
 
             service_level: 0,
             bring_up: BringUp { init, rtr, rts },
@@ -614,6 +647,10 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// Set the Shared Receive Queue (SRQ) associated with this QP.
+    ///
+    /// The shared receive queue must come from the builder's protection domain, or
+    /// [`build`](Self::build) fails: rxe checks the buffers of the receives it takes from the
+    /// queue against the queue pair's protection domain, so with another one every receive fails.
     pub fn set_srq(&mut self, srq: &SharedReceiveQueue) -> &mut Self {
         self.srq = Some(srq.clone());
         self
@@ -691,10 +728,10 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The maximum number of scatter/gather elements in any Work Request
     /// that can be posted to the Receive Queue in that Queue Pair.
     ///
-    /// Value can be `[0..dev_cap.max_sge]`. Some devices support fewer
-    /// scatter/gather elements for specific transport types than the
-    /// maximum reported value. This value is ignored if the
-    /// Queue Pair is associated with an SRQ.
+    /// Value can be `[1..dev_cap.max_sge]` (0 is requested as 1: mlx5 rounds it up to 1 anyway,
+    /// and EFA divides by it). Some devices support fewer scatter/gather elements for specific
+    /// transport types than the maximum reported value. This value is ignored if the Queue Pair
+    /// is associated with an SRQ.
     ///
     /// Defaults to 1.
     pub fn set_max_recv_sge(&mut self, max_recv_sge: u32) -> &mut Self {
@@ -708,7 +745,8 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// rather than referencing a registered memory region, which lowers latency for small messages.
     /// A send queue must reserve this capacity up front. The device may grant more than requested
     /// (reported by [`QueuePair::query`], see [`QueuePairInitAttribute::max_inline_data`]), but
-    /// posting more inline bytes than requested here panics.
+    /// posting more inline bytes than requested here panics. hns instead grants at most its
+    /// device's limit without failing, and the send path then holds payloads to that.
     ///
     /// Defaults to 0 (inline sends disabled).
     pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
@@ -720,8 +758,8 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// set (see [`send_ops`](Self::send_ops)).
     ///
     /// The device must support every operation requested, or [`build`](Self::build) fails with
-    /// [`Unsupported`](Error::Unsupported): a device without extended atomics, for example, can
-    /// still create a send-only RC queue pair this way. Conversely, do not call an opcode method
+    /// [`Unsupported`](Error::Unsupported): mlx5, for example, refuses the atomics on a device
+    /// that reports no atomic capability. Conversely, do not call an opcode method
     /// whose operation was not requested: what happens depends on the provider (rxe and EFA
     /// install only the requested operations, so the method panics; mlx5 posts it anyway).
     /// Operations beyond the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`,
@@ -733,34 +771,39 @@ impl<T: Transport> QueuePairBuilder<T> {
 
     /// The send operations the queue pair will be created with: the set given to
     /// [`set_send_ops`](Self::set_send_ops), or else the transport's default — SEND (with and
-    /// without an immediate) everywhere, plus RDMA WRITE on RC, UC, and SRD, RDMA READ on RC and
-    /// SRD, and the atomics on RC. Start from it to add an operation:
+    /// without an immediate) everywhere, plus RDMA WRITE on RC and UC, RDMA READ on RC, and the
+    /// atomics on RC where the device executes them (its `atomic_cap` is not `IBV_ATOMIC_NONE`).
+    /// On SRD, RDMA WRITE and RDMA READ are part of the default exactly when the EFA device has
+    /// them. Start from it to add an operation:
     /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
     pub fn send_ops(&self) -> SendOps {
-        self.send_ops.unwrap_or_else(|| default_send_ops(T::TYPE))
+        self.send_ops.unwrap_or(self.default_send_ops)
     }
 
-    /// Refuses completion queues or a shared receive queue from another device context than the
-    /// protection domain's. libibverbs hands the kernel only their handle numbers, which each
-    /// context numbers independently and the kernel looks up in the protection domain's context:
-    /// a foreign object either fails to resolve or silently names a different object there, while
-    /// the provider keeps operating on the foreign one (misrouted completions, and type confusion
-    /// across providers).
+    /// Refuses completion queues from another device context than the protection domain's, and a
+    /// shared receive queue from another protection domain. libibverbs hands the kernel only their
+    /// handle numbers, which each context numbers independently and the kernel looks up in the
+    /// protection domain's context: a foreign object either fails to resolve or silently names a
+    /// different object there, while the provider keeps operating on the foreign one (misrouted
+    /// completions, and type confusion across providers). A shared receive queue from another
+    /// protection domain of the same context is accepted by the kernel, but rxe then checks every
+    /// receive it takes from it against the queue pair's protection domain and fails it.
     pub(crate) fn check_same_context(&self) -> Result<()> {
         let ctx = self.pd.context().as_raw();
+        // One protection domain implies one device context.
         let foreign = unsafe {
             (*self.send.as_raw()).context != ctx
                 || (*self.recv.as_raw()).context != ctx
                 || self
                     .srq
                     .as_ref()
-                    .is_some_and(|s| (*s.as_raw()).context != ctx)
+                    .is_some_and(|s| (*s.as_raw()).pd != self.pd.as_raw())
         };
         if foreign {
             return Err(Error::CreateQueuePair(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the completion queues and the shared receive queue must come from the protection \
-                 domain's device context",
+                "the completion queues must come from the protection domain's device context, and \
+                 the shared receive queue from the protection domain",
             )));
         }
         Ok(())
@@ -779,7 +822,9 @@ impl<T: Transport> QueuePairBuilder<T> {
                 max_send_wr: self.max_send_wr,
                 max_recv_wr: self.max_recv_wr,
                 max_send_sge: self.max_send_sge,
-                max_recv_sge: self.max_recv_sge,
+                // libefa divides its receive-queue depth by this before checking it, so 0 kills
+                // the process with SIGFPE (`efa_check_qp_limits`); mlx5 rounds 0 up to 1 anyway.
+                max_recv_sge: self.max_recv_sge.max(1),
                 max_inline_data: self.max_inline_data,
             },
             qp_type: T::TYPE,
@@ -793,9 +838,33 @@ impl<T: Transport> QueuePairBuilder<T> {
         }
     }
 
-    /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
-    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
-    fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
+    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`, or
+    /// `efadv_create_qp_ex` for SRD).
+    ///
+    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
+    ///
+    /// This method will fail if an unreliable-connection (UC) queue pair is associated with an
+    /// SRQ (devices support SRQs on RC and UD queue pairs).
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
+    ///    device context than the protection domain, or the shared receive queue to another
+    ///    protection domain, or the creation failed (`EINVAL` for an invalid `ProtectionDomain`
+    ///    or `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
+    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
+    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
+    ///    with this Transport Service Type).
+    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
+    ///    operations (`EOPNOTSUPP`; on EFA, RDMA READ or WRITE on a device without them), or
+    ///    created the queue pair without the extended work-request interface this crate posts
+    ///    through (`ibv_qp_to_qp_ex` returned no handle).
+    pub fn build(&self) -> Result<PreparedQueuePair<T>> {
+        T::create(self)
+    }
+
+    /// The `ibv_create_qp_ex` creation of every transport but SRD.
+    fn create_qp_ex(&self) -> Result<PreparedQueuePair<T>> {
         self.check_same_context()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
@@ -872,51 +941,6 @@ impl<T: Connected> QueuePairBuilder<T> {
         self.bring_up.rtr.set_path_mtu(path_mtu);
         self
     }
-
-    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
-    ///
-    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
-    ///
-    /// This method will fail if an unreliable-connection (UC) queue pair is associated with an
-    /// SRQ (devices support SRQs on RC and UD queue pairs).
-    ///
-    /// # Errors
-    ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
-    ///    queue belongs to another device context than the protection domain, or
-    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
-    ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
-    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
-    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
-    ///    with this Transport Service Type).
-    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
-    pub fn build(&self) -> Result<PreparedQueuePair<T>> {
-        self.build_impl()
-    }
-}
-
-impl QueuePairBuilder<Ud> {
-    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
-    ///
-    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
-    ///
-    /// # Errors
-    ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
-    ///    queue belongs to another device context than the protection domain, or
-    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
-    ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
-    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
-    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
-    ///    with this Transport Service Type).
-    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
-    pub fn build(&self) -> Result<PreparedQueuePair<Ud>> {
-        self.build_impl()
-    }
 }
 
 impl<T: Reliable> QueuePairBuilder<T> {
@@ -941,7 +965,15 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// [`AckTimeout::INFINITE`] waits forever (useful for debugging): if a packet is lost and no
     /// ACK or NACK arrives, no retry ever occurs and the QP just stops sending data.
     ///
-    /// Defaults to 65.536 µs.
+    /// A device waits between one and four times the timeout before each retransmission, so the
+    /// timeout and the [retry count](Self::set_retry_count) together bound how long a peer may
+    /// stay silent before the request fails with
+    /// [`RetryExceeded`](crate::WcStatus::RetryExceeded) and the queue pair enters the error
+    /// state. A network that pauses traffic (priority flow control on RoCE, a failover) is silent
+    /// for milliseconds, which timeouts in the microseconds do not survive.
+    ///
+    /// Defaults to 67.1 ms (`n` = 14), which with the default retry count gives a peer between
+    /// half a second and two seconds.
     pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
         self.bring_up.rts.set_timeout(timeout);
         self
@@ -950,7 +982,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// Sets the total number of times that the new `QueuePair` will try to resend the packets
     /// before reporting an error because the remote side doesn't answer in the primary path.
     ///
-    /// This 3-bit value defaults to 6.
+    /// This 3-bit value defaults to 7.
     ///
     /// # Panics
     ///
@@ -963,8 +995,12 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// Sets the total number of times that the new `QueuePair` will try to resend the packets when
     /// an RNR NACK was sent by the remote QP before reporting an error.
     ///
-    /// This 3-bit value defaults to 6. The value 7 is special: it retries indefinitely when the
-    /// remote side answers with an RNR NAK.
+    /// This 3-bit value defaults to 7, which is special: it retries indefinitely while the remote
+    /// side answers with an RNR NAK, so a send to a peer that never posts a receive never
+    /// completes. With a lower value, a peer that is late with its receives by a few
+    /// [RNR timers](Self::set_min_rnr_timer) fails the request with
+    /// [`RnrRetryExceeded`](crate::WcStatus::RnrRetryExceeded) and the queue pair enters the error
+    /// state.
     ///
     /// # Panics
     ///
@@ -1010,20 +1046,27 @@ impl<T: Reliable> QueuePairBuilder<T> {
 /// [`handshake`](Self::handshake) on both sides with the other side's endpoint:
 ///
 /// ```text
-/// // on host 1
+/// // on host 1, which connects
 /// let pqp: PreparedQueuePair = ...;
-/// let host1end = pqp.endpoint()?;
-/// host2.send(host1end);
+/// host2.send(pqp.endpoint()?);
 /// let host2end = host2.recv();
 /// let qp = pqp.handshake(host2end)?;
+/// // host 2 is ready by now: send
 ///
-/// // on host 2
+/// // on host 2, which answers
 /// let pqp: PreparedQueuePair = ...;
-/// let host2end = pqp.endpoint()?;
-/// host1.send(host2end);
 /// let host1end = host1.recv();
+/// let host2end = pqp.endpoint()?;
 /// let qp = pqp.handshake(host1end)?;
+/// host1.send(host2end);
+/// // host 1 may still be in its handshake: let it send first
 /// ```
+///
+/// The answering side finishes its `handshake` before it replies, so it is ready for whatever the
+/// connecting side sends once that side's own `handshake` returns. A queue pair drops what
+/// arrives before its `handshake` is done, and the sender retransmits only after its
+/// [ACK timeout](QueuePairBuilder::set_timeout): a message in the other direction, sent while the
+/// connecting side is still in its `handshake`, arrives late by at least that long.
 ///
 /// For a runnable version of this exchange (self-connected, so it fits one process), see
 /// `examples/loopback.rs`; `examples/rdmacm_connect.rs` shows the same bring-up driven by the
@@ -1072,7 +1115,7 @@ pub(crate) const MAX_24_BITS: u32 = 0xFF_FFFF;
 /// Internally, this contains the `QueuePair`'s `qp_num`, its port's `lid` and `gid`, the
 /// packet sequence number the queue pair's send queue starts at, and how many RDMA reads and
 /// atomics it services at once.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num` (24 bits)
     pub qp_num: u32,
@@ -1118,10 +1161,12 @@ impl QueuePairEndpoint {
     /// # Errors
     ///
     ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the flags byte carries bits this
-    ///    version does not know, or the queue pair number or PSN is wider than its 24 bits.
+    ///    version does not know, the GID bytes are not zero although no GID is flagged, or the
+    ///    queue pair number or PSN is wider than its 24 bits.
     pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
         let gid = match bytes[0] {
-            0 => None,
+            // Zero when absent, so that a later version can give those bytes a meaning.
+            0 if bytes[7..23] == [0; 16] => None,
             1 => {
                 let raw: [u8; 16] = bytes[7..23].try_into().expect("slice length is fixed");
                 Some(Gid::from(raw))
@@ -1173,14 +1218,13 @@ impl<T: Transport> PreparedQueuePair<T> {
     ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
     ///    (`ibv_query_gid`), or that entry of the GID table is empty (`ENODATA`).
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
-        let qp_num = unsafe { (*self.qp.qp).qp_num };
         let gid = if let Some(gid_index) = self.gid_index {
             Some(self.qp.pd.context().query_gid(self.port_num, gid_index)?)
         } else {
             None
         };
         Ok(QueuePairEndpoint {
-            qp_num,
+            qp_num: self.qp.qp_num(),
             lid: self.lid,
             gid,
             psn: self.bring_up.rts.sq_psn(),
@@ -1223,11 +1267,28 @@ impl<T: Datagram> PreparedQueuePair<T> {
     ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
     ///    privileged `qkey` without the privilege).
     pub fn activate(self, qkey: u32) -> Result<QueuePair<T>> {
-        let attributes = self.activate_attributes(qkey);
+        self.activate_with(qkey, |_| Ok(()))
+    }
+
+    /// As [`activate`](Self::activate), running `prepare` on the queue pair while it is in
+    /// `INIT`, before it can receive: the place to post the first receives, so that no datagram
+    /// arrives before them (one that does is dropped).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`activate`](Self::activate), plus whatever `prepare` returns, which abandons the
+    /// bring-up (the queue pair is destroyed, discarding what was posted to it).
+    pub fn activate_with(
+        self,
+        qkey: u32,
+        prepare: impl FnOnce(&QueuePair<T>) -> Result<()>,
+    ) -> Result<QueuePair<T>> {
+        let [init, rtr, rts] = self.activate_attributes(qkey);
         let mut qp = self.qp;
-        for attr in &attributes {
-            qp.modify(attr)?;
-        }
+        qp.modify(&init)?;
+        prepare(&qp)?;
+        qp.modify(&rtr)?;
+        qp.modify(&rts)?;
         Ok(qp)
     }
 }
@@ -1362,11 +1423,30 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
     pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair<T>> {
+        self.handshake_with(remote, |_| Ok(()))
+    }
+
+    /// As [`handshake`](Self::handshake), running `prepare` on the queue pair while it is in
+    /// `INIT`, before it can receive: the place to post the receives the peer's first messages
+    /// need. Posted after `handshake` returns instead, they race the peer's first send, which on
+    /// missing them is retried after a receiver-not-ready back-off (RC; it fails once the peer's
+    /// [`set_rnr_retry`](QueuePairBuilder::set_rnr_retry) budget is spent) or dropped (UC).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`handshake`](Self::handshake), plus whatever `prepare` returns, which abandons
+    /// the handshake (the queue pair is destroyed, discarding what was posted to it).
+    pub fn handshake_with(
+        self,
+        remote: QueuePairEndpoint,
+        prepare: impl FnOnce(&QueuePair<T>) -> Result<()>,
+    ) -> Result<QueuePair<T>> {
         let init = self.init_attributes();
         let rtr = self.rtr_attributes(&remote)?;
         let rts = self.rts_attributes(&remote);
         let mut qp = self.qp;
         qp.modify(&init)?;
+        prepare(&qp)?;
         if let Err(err) = qp.modify(&rtr) {
             // On RoCE, the provider resolves the route to the remote GID during this transition,
             // and reports a GID that does not answer as a timeout or unreachable network. Spell
@@ -1403,11 +1483,21 @@ impl<T: Connected> PreparedQueuePair<T> {
 /// Build one with [`RecvRequest::new`] and post a batch of them with [`QueuePair::post_recv`] or
 /// [`SharedReceiveQueue::post_recv`]. Unlike the send doorbell, receives are posted from a
 /// caller-owned slice, so batching allocates nothing.
+///
+/// A request is plain data until it is posted (posting links the requests of a batch afresh every
+/// time), so it can be copied: `vec![RecvRequest::new(id, &sges); n]` posts `n` identical
+/// receives.
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct RecvRequest<'a> {
-    pub(crate) wr: ffi::ibv_recv_wr,
+    wr: ffi::ibv_recv_wr,
     _local: std::marker::PhantomData<&'a [LocalMemorySlice]>,
 }
+
+// The pointers are the borrowed scatter list (shared, immutable data) and the link to the next
+// request, which every post rewrites before the provider reads it.
+unsafe impl Send for RecvRequest<'_> {}
+unsafe impl Sync for RecvRequest<'_> {}
 
 impl<'a> RecvRequest<'a> {
     /// A receive that scatters an incoming message into `local`, tagged with `wr_id`.
@@ -1417,26 +1507,38 @@ impl<'a> RecvRequest<'a> {
             wr: ffi::ibv_recv_wr {
                 wr_id,
                 next: ptr::null_mut(),
-                // An empty Rust slice's `.as_ptr()` is `NonNull::dangling()` (for example `0x8` for
-                // `LocalMemorySlice`), not `NULL`. C providers such as `irdma` (`irdma_set_fragment`
-                // in `providers/irdma/uk.c`) check `if (sge)` before checking `num_sge == 0` and
-                // dereference `sg_list`, so pass a genuine null pointer when the slice is empty.
-                sg_list: if local.is_empty() {
-                    ptr::null_mut()
-                } else {
-                    local.as_ptr() as *mut ffi::ibv_sge
-                },
+                sg_list: ptr_or_null(local).cast::<ffi::ibv_sge>().cast_mut(),
                 num_sge: local.len() as i32,
             },
             _local: std::marker::PhantomData,
         }
     }
 
+    /// Posts `recvs` as one linked list with `post` (`ibv_post_recv` or `ibv_post_srq_recv`, handed
+    /// the list's head and `bad_wr`); an empty batch posts nothing. `srq_attached` is for the
+    /// error ([`post_recv_error`]).
+    #[inline(always)]
+    pub(crate) fn post(
+        recvs: &mut [RecvRequest<'_>],
+        srq_attached: bool,
+        post: impl FnOnce(*mut ffi::ibv_recv_wr, *mut *mut ffi::ibv_recv_wr) -> i32,
+    ) -> Result<()> {
+        if recvs.is_empty() {
+            return Ok(());
+        }
+        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
+        let errno = post(Self::link(recvs), &mut bad_wr);
+        if errno != 0 {
+            return Err(post_recv_error(errno, recvs, bad_wr, srq_attached));
+        }
+        Ok(())
+    }
+
     /// Links the non-empty `recvs` into the list `ibv_post_recv` and `ibv_post_srq_recv` walk, and
     /// returns its head. Every link comes from one pointer to the slice: indexing the slice again
     /// for each request would invalidate the links stored before it, which the provider then
     /// follows.
-    pub(crate) fn link(recvs: &mut [RecvRequest<'_>]) -> *mut ffi::ibv_recv_wr {
+    fn link(recvs: &mut [RecvRequest<'_>]) -> *mut ffi::ibv_recv_wr {
         let base = recvs.as_mut_ptr();
         unsafe {
             for i in 1..recvs.len() {
@@ -1511,8 +1613,15 @@ impl<'a> RecvRequest<'a> {
 /// a receive to a queue pair whose receive completion queue is the same one. So on ionic, while a
 /// batch is open, the thread holding it must not poll or arm its send completion queue or post
 /// receives through it, and other threads doing so wait until the batch ends. On hns, polling a
-/// failed completion takes the send queue's lock, so do not poll this queue pair's completion
-/// queues while holding an open batch either (see [`Completions`](crate::Completions)).
+/// failed completion takes the send queue's lock, and so does posting a receive once the queue
+/// pair is in the error state: do not poll this queue pair's completion queues or post receives
+/// to it while holding an open batch either (see [`Completions`](crate::Completions)).
+/// On EFA, polling any of this queue pair's send completions takes the send queue's lock to
+/// retire it, so on EFA the thread holding the batch must not poll the send completion queue at
+/// all, and other threads' polls that reach such a completion wait until the batch ends.
+///
+/// The lock is released by `submit` or the drop alone: a leaked batch ([`std::mem::forget`]) is
+/// never aborted, and the next batch on its queue pair then blocks forever.
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
@@ -1589,7 +1698,11 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     /// Every memory region the batch references must stay valid until the device is done with it:
     /// until a work completion has been polled for its request, or for a later signaled request on
     /// the same send queue (an unsignaled request produces no completion of its own), or until the
-    /// queue pair has been reset or destroyed.
+    /// queue pair has been reset or destroyed. EFA is the exception to the middle rule: its send
+    /// queues complete requests out of order (SRD delivers over several paths), so there a
+    /// request's memory is free only once its own completion has been polled (every request is
+    /// signaled there anyway: SRD queue pairs signal them all, and EFA refuses unsignaled UD
+    /// sends; see [`SendOp::signaled`]).
     ///
     /// That holds even when this returns `Err`, and for requests of a batch that was dropped:
     ///
@@ -1598,6 +1711,12 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     ///   before it, so never have more requests outstanding than the queue's capacity;
     /// - hns devices in owner-doorbell mode may execute each request as soon as its opcode method
     ///   returns, before `submit` and even if the batch is dropped.
+    ///
+    /// On hns, a reset releases the requests posted before it only if no batch is started while
+    /// the queue pair is below `RTS` afterwards: such a batch fails, and rolls hns' send queue back
+    /// to where the last batch before the reset began, so the next doorbell in `RTS` makes the
+    /// device execute those earlier requests again. Bring a reset queue pair back to `RTS` before
+    /// starting a batch on it.
     ///
     /// # Errors
     ///
@@ -1647,6 +1766,13 @@ pub struct SendOp<'b, 'qp, T: Transport> {
 impl<T: Transport> SendOp<'_, '_, T> {
     /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
     ///
+    /// An unsignaled request keeps its slot in the send queue until the completion of a later
+    /// signaled request on the same queue has been polled (on mlx5; Soft-RoCE frees the slot as
+    /// soon as the request is done, so a test there does not show this). Signal at least one
+    /// request in every [`max_send_wr`](QueuePairBuilder::set_max_send_wr) and poll its
+    /// completion, or the queue fills up for good: with the default capacity of 1, that is every
+    /// request.
+    ///
     /// On SRD every work request generates a completion, so this is implied there. EFA refuses
     /// unsignaled work requests on UD too, so on EFA mark every UD send signaled.
     #[inline]
@@ -1659,7 +1785,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
     ///
     /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
     /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
-    /// requirements of each.
+    /// requirements of each. A message of no bytes is the empty list (`send(id, &[])`).
     ///
     /// # Panics
     ///
@@ -1746,27 +1872,14 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 Payload::Sges([one]) => {
                     (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
                 }
-                // An empty Rust slice's `.as_ptr()` is `NonNull::dangling()` rather than `NULL`;
-                // pass a genuine null pointer when the slice is empty so C providers never observe
-                // a dangling address alongside a zero count/length.
-                Payload::Sges(local) => (*qpx).wr_set_sge_list.unwrap()(
-                    qpx,
-                    local.len(),
-                    if local.is_empty() {
-                        ptr::null()
-                    } else {
-                        local.as_ptr() as *const ffi::ibv_sge
-                    },
-                ),
+                Payload::Sges(local) => {
+                    (*qpx).wr_set_sge_list.unwrap()(qpx, local.len(), ptr_or_null(local).cast())
+                }
                 // The bytes are copied during this call, so the payload need not outlive the work
                 // completion.
                 Payload::Inline(data) => (*qpx).wr_set_inline_data.unwrap()(
                     qpx,
-                    if data.is_empty() {
-                        ptr::null_mut()
-                    } else {
-                        data.as_ptr() as *mut c_void
-                    },
+                    ptr_or_null(data).cast_mut().cast(),
                     data.len(),
                 ),
                 // `std::io::IoSlice` is guaranteed ABI-compatible with `struct iovec` on Unix (the
@@ -1776,11 +1889,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 Payload::InlineList(bufs) => (*qpx).wr_set_inline_data_list.unwrap()(
                     qpx,
                     bufs.len(),
-                    if bufs.is_empty() {
-                        ptr::null()
-                    } else {
-                        bufs.as_ptr() as *const ffi::ibv_data_buf
-                    },
+                    ptr_or_null(bufs).cast(),
                 ),
             }
         }
@@ -1877,6 +1986,11 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
     /// request, which moves the queue pairs on both sides to the error state.
     ///
+    /// The operands are numbers; which byte order spells one in the 8 bytes at `remote`, and in
+    /// the 8 written to `local`, is the device's choice. It is each host's native order on rxe
+    /// and on mlx5 (whose kernel driver offers atomics only when the device answers in host
+    /// order), so read both with `u64::from_ne_bytes` there.
+    ///
     /// # Panics
     ///
     /// Panics if `local` is not 8 bytes long, or the queue pair was built without room for a
@@ -1896,7 +2010,8 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     }
 
     /// Post an atomic fetch-and-add on the 8-byte value at `remote`: `add` is added to it. The
-    /// value it held before is written to `local`.
+    /// value it held before is written to `local`, in the byte order
+    /// [`atomic_cmp_swap`](Self::atomic_cmp_swap) describes.
     ///
     /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
     /// request, which moves the queue pairs on both sides to the error state.
@@ -1955,21 +2070,17 @@ impl SendOp<'_, '_, Ud> {
 /// others return them as they are.
 #[cold]
 #[inline(never)]
-pub(crate) fn post_recv_error(
+fn post_recv_error(
     errno: i32,
     recvs: &[RecvRequest<'_>],
     bad_wr: *const ffi::ibv_recv_wr,
     srq_attached: bool,
 ) -> Error {
-    // A null `bad_wr` lands past the end. Plain address arithmetic, since a provider's pointer is
-    // only compared, never followed.
-    let index = (bad_wr as usize).wrapping_sub(recvs.as_ptr() as usize)
-        / std::mem::size_of::<RecvRequest<'_>>();
-    let posted = if index < recvs.len() {
-        u32::try_from(index).unwrap_or(u32::MAX)
-    } else {
-        0
-    };
+    // The provider's pointer is only compared, never followed; a null one matches no request.
+    let posted = recvs
+        .iter()
+        .position(|recv| ptr::eq(&recv.wr, bad_wr))
+        .map_or(0, |index| u32::try_from(index).unwrap_or(u32::MAX));
     let source = if srq_attached {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -1979,6 +2090,18 @@ pub(crate) fn post_recv_error(
         io::Error::from_raw_os_error(errno.abs())
     };
     Error::PostReceive { posted, source }
+}
+
+/// `s`'s address, or null if `s` is empty: an empty slice's address is dangling (`0x8` for a
+/// `LocalMemorySlice`), and C providers such as irdma follow a non-null list even when its count
+/// is 0 (`irdma_set_fragment` in `providers/irdma/uk.c`), so they get a genuine null instead.
+#[inline(always)]
+fn ptr_or_null<T>(s: &[T]) -> *const T {
+    if s.is_empty() {
+        ptr::null()
+    } else {
+        s.as_ptr()
+    }
 }
 
 /// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
@@ -2011,6 +2134,18 @@ fn atomic_local_not_8_bytes(len: usize) -> ! {
     panic!("an atomic writes 8 bytes to its local buffer, which is {len} bytes long")
 }
 
+// `Payload::InlineList` hands its `IoSlice`s to the provider as `ibv_data_buf`s. std lays an
+// `IoSlice` out as an `iovec`, and an `iovec` is an `ibv_data_buf` under other names.
+const _: () = {
+    use nix::libc::iovec;
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<ffi::ibv_data_buf>() == size_of::<iovec>());
+    assert!(align_of::<ffi::ibv_data_buf>() == align_of::<iovec>());
+    assert!(offset_of!(ffi::ibv_data_buf, addr) == offset_of!(iovec, iov_base));
+    assert!(offset_of!(ffi::ibv_data_buf, length) == offset_of!(iovec, iov_len));
+    assert!(size_of::<io::IoSlice<'static>>() == size_of::<iovec>());
+};
+
 /// The data a SEND or RDMA WRITE carries: registered memory the device reads after the request is
 /// posted, or bytes copied into the work request as it is posted.
 ///
@@ -2025,6 +2160,14 @@ fn atomic_local_not_8_bytes(len: usize) -> ! {
 ///
 /// A scatter/gather list converts implicitly, so `batch.op().send(id, &[mr.slice(..)])` reads
 /// naturally; inline payloads are spelled out: `batch.op().send(id, Payload::Inline(b"ping"))`.
+///
+/// One work request carries at most the port's `max_msg_sz` bytes
+/// ([`Context::query_port`](crate::Context::query_port); typically 1 GiB on mlx5, and never more
+/// than the 2 GiB the transport allows), counting every entry of the list, and nothing here
+/// checks that. Past it the providers go wrong each in its own way: mlx5 reads the top bit of an
+/// entry's length as its inline-data marker, and rxe and hns add the lengths up in 32 bits, so a
+/// list of 4 GiB or more is posted as its length modulo 4 GiB. Split a larger transfer across
+/// requests.
 #[derive(Clone, Copy)]
 pub enum Payload<'a> {
     /// Registered memory, as scatter/gather entries.
@@ -2040,6 +2183,14 @@ pub enum Payload<'a> {
 impl<'a> From<&'a [LocalMemorySlice]> for Payload<'a> {
     fn from(local: &'a [LocalMemorySlice]) -> Self {
         Payload::Sges(local)
+    }
+}
+
+/// A single slice is a scatter/gather list of one entry: `send(id, &mr.slice(..))`.
+impl<'a> From<&'a LocalMemorySlice> for Payload<'a> {
+    #[inline]
+    fn from(local: &'a LocalMemorySlice) -> Self {
+        Payload::Sges(std::slice::from_ref(local))
     }
 }
 
@@ -2572,6 +2723,12 @@ impl<T: Transport> QueuePair<T> {
     /// for teardown, setting a custom partition-key index or packet sequence number, and so on.
     /// Only the attributes whose mask bits are set in `attr` are applied.
     ///
+    /// On EFA, do not use a queue pair again after moving it to `RESET`; destroy it and create
+    /// another. libefa neither rebuilds its table of free work-request slots nor removes the
+    /// queue pair's entries from its completion queues on a reset, so completions polled
+    /// afterwards can report the `wr_id` of another request, and one generated before the reset
+    /// corrupts that table.
+    ///
     /// # Errors
     ///
     /// If the device rejects the transition with `EINVAL`, the crate consults its queue-pair state
@@ -2597,8 +2754,8 @@ impl<T: Transport> QueuePair<T> {
     /// configured capacities.
     ///
     /// Takes `&mut self`: libibverbs stores the queried state in the queue pair's cached `state`
-    /// without a lock, and rxe, EFA, and hns read that cache on every receive post, so a query must
-    /// not overlap any other use of the queue pair.
+    /// without a lock, and rxe, EFA, hns, and ionic read that cache on every receive post, so a
+    /// query must not overlap any other use of the queue pair.
     ///
     /// # Errors
     ///
@@ -2687,7 +2844,9 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// On a UD queue pair the 40-byte GRH of an incoming message is placed at the front of the
     /// scatter buffers, so the payload starts at offset 40. If the queue pair uses a shared receive
-    /// queue, post to the [`SharedReceiveQueue`] instead; its own receive queue is unused.
+    /// queue, post to the [`SharedReceiveQueue`] instead; its own receive queue is unused. On EFA,
+    /// give every receive at least one scatter/gather entry: one without is accepted but lost,
+    /// and keeps its slot in the receive queue.
     ///
     /// Takes `&self`: the provider serializes posts to the receive queue, so several threads may
     /// post at once. To post receives while a send batch is open, [`split`](Self::split) the
@@ -2700,27 +2859,22 @@ impl<T: Transport> QueuePair<T> {
     /// its outstanding receives). After an `Err`, the requests ahead of the one that failed were
     /// posted (the error's `posted` counts them), so the same holds for theirs.
     ///
+    /// A slice of a DMA-BUF region must also meet what "Receiving small messages on mlx5" asks
+    /// for in [`register_dmabuf`](crate::ProtectionDomain::register_dmabuf): there the provider
+    /// writes a small message to the slice's address with the CPU.
+    ///
     /// # Errors
     ///
     ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
     ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
-    ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
-    ///    of resources). Its `posted` counts the requests at the front of `recvs` that were posted
-    ///    before the one that failed, so the rest can be posted again once there is room.
+    ///    invalid value in one of the work requests or a queue pair in `RESET`, and on EFA in
+    ///    `ERR`; `ENOMEM` when the receive queue is full or out of resources). Its `posted` counts
+    ///    the requests at the front of `recvs` that were posted before the one that failed, so
+    ///    the rest can be posted again once there is room.
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
-        let recvs = recvs.as_mut();
-        if recvs.is_empty() {
-            return Ok(());
-        }
-        let head = RecvRequest::link(recvs);
-
-        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let errno = unsafe { ffi::ibv_post_recv(self.qp, head, &mut bad_wr) };
-        if errno != 0 {
-            Err(post_recv_error(errno, recvs, bad_wr, self._srq.is_some()))
-        } else {
-            Ok(())
-        }
+        RecvRequest::post(recvs.as_mut(), self._srq.is_some(), |head, bad_wr| unsafe {
+            ffi::ibv_post_recv(self.qp, head, bad_wr)
+        })
     }
 
     /// Begin a batch of send work requests on this queue pair's send queue.
@@ -2735,6 +2889,10 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// As with any send, the memory backing each scatter/gather slice must stay valid until the
     /// device is done with the request (see [`submit`](SendBatch::submit)).
+    ///
+    /// Start batches only once the queue pair is in `RTS`: providers handle a batch below it
+    /// differently (most fail it at `submit`), and after a reset hns also loses track of its send
+    /// queue (see the safety section of [`submit`](SendBatch::submit)).
     ///
     /// # Examples
     ///
@@ -2755,10 +2913,12 @@ impl<T: Transport> QueuePair<T> {
     /// Splits the queue pair into its send half and a shared reference for the receive side, so
     /// that one thread can build and submit send batches while others post receives
     /// ([`post_recv`](Self::post_recv) takes `&self`). mlx5, rxe, EFA, and hns lock the two
-    /// queues separately, so neither side waits for the other. ionic is the exception: an open
-    /// send batch also holds its send completion queue's lock, so when one completion queue serves
-    /// both queues, receives posted meanwhile wait for the batch to end, and the thread holding the
-    /// batch must not post receives itself (see [`SendBatch`]).
+    /// queues separately, so neither side waits for the other, except that hns, once the queue
+    /// pair is in the error state, takes the send queue's lock to post a receive. ionic is the
+    /// other exception: an open send batch also holds its send completion queue's lock, so when
+    /// one completion queue serves both queues, receives posted meanwhile wait for the batch to
+    /// end. On either, the thread holding a batch must not post receives itself (see
+    /// [`SendBatch`]).
     ///
     /// Both borrow the queue pair, which is usable again once they are dropped.
     ///
@@ -2897,6 +3057,28 @@ mod test_recv_link {
         ));
     }
 
+    #[test]
+    fn a_failed_post_takes_ionics_negated_errno_and_names_an_srq_attachment() {
+        let sges = [LocalMemorySlice::default()];
+        let mut recvs = [RecvRequest::new(1, &sges)];
+        let head = RecvRequest::link(&mut recvs);
+        // ionic returns its errnos negated (6173038).
+        match post_recv_error(-nix::libc::EAGAIN, &recvs, head, false) {
+            Error::PostReceive { posted: 0, source } => {
+                assert_eq!(source.raw_os_error(), Some(nix::libc::EAGAIN));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A queue pair on a shared receive queue is named, whatever its provider reports (67d61aa).
+        match post_recv_error(nix::libc::ENOMEM, &recvs, head, true) {
+            Error::PostReceive { posted: 0, source } => {
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(source.raw_os_error(), None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[repr(C)]
     struct SpyQpEx {
         qp_ex: ffi::ibv_qp_ex,
@@ -2959,6 +3141,17 @@ mod test_recv_link {
         }
     }
 
+    /// A batch open on `spy`, as `start_send` hands one out, posting through its readers. Built
+    /// from a raw pointer, so the test can read the spy while the batch is open.
+    fn spy_batch(spy: *mut SpyQpEx) -> SendBatch<'static, Rc> {
+        SendBatch {
+            qpx: spy.cast::<ffi::ibv_qp_ex>(),
+            max_inline_data: 64,
+            max_send_sge: 1,
+            _qp: std::marker::PhantomData,
+        }
+    }
+
     // Building a receive work request with an empty SGE slice sets `sg_list` to null rather than
     // `NonNull::dangling()`.
     #[test]
@@ -2988,12 +3181,7 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_sge_slice_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&raw mut spy);
 
         let empty_sges: &[LocalMemorySlice] = &[];
         batch.op().send(1, empty_sges);
@@ -3006,12 +3194,7 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_inline_slice_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&raw mut spy);
 
         batch.op().send(2, Payload::Inline(&[]));
         assert_eq!(spy.last_inline_len, 0);
@@ -3023,17 +3206,38 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_inline_list_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&raw mut spy);
 
         let empty_iov: &[io::IoSlice<'_>] = &[];
         batch.op().send(3, Payload::InlineList(empty_iov));
         assert_eq!(spy.last_inline_list_len, 0);
         assert!(spy.last_inline_list_ptr.is_null());
+    }
+}
+
+#[cfg(test)]
+mod test_default_send_ops {
+    use super::*;
+    use ffi::ibv_qp_type as T;
+
+    /// A reliable connection defaults to the atomics only where the device executes them; the
+    /// other operations, and the other transports, do not depend on it.
+    #[test]
+    fn atomics_follow_the_device() {
+        let atomics = SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
+        let with = default_send_ops(T::IBV_QPT_RC, true);
+        let without = default_send_ops(T::IBV_QPT_RC, false);
+        assert!(with.contains(atomics));
+        assert_eq!(without & atomics, SendOps::empty());
+        assert_eq!(without | atomics, with);
+        assert!(without.contains(SendOps::RDMA_READ | SendOps::RDMA_WRITE | SendOps::SEND));
+        for qp_type in [T::IBV_QPT_UC, T::IBV_QPT_UD] {
+            assert_eq!(
+                default_send_ops(qp_type, true),
+                default_send_ops(qp_type, false)
+            );
+            assert_eq!(default_send_ops(qp_type, true) & atomics, SendOps::empty());
+        }
     }
 }
 
@@ -3107,7 +3311,7 @@ mod test_timers {
 
     #[test]
     fn ack_timeout_exact_step_is_itself() {
-        // 4.096 µs × 2^4 = 65.536 µs, the default.
+        // 4.096 µs × 2^4 = 65.536 µs.
         let d = Duration::from_nanos(4096 << 4);
         assert_eq!(AckTimeout::at_least(d), AckTimeout::from_exponent(4));
         assert_eq!(AckTimeout::at_least(d).duration(), Some(d));
@@ -3237,77 +3441,29 @@ mod test_timers {
         assert_eq!(RnrTimer::from_encoding(16).to_string(), "2.56ms");
     }
 
+    /// The 32 delays without the table: in units of 10 µs, the encodings from 2 on alternate
+    /// between 2 and 3 times a power of two, 1 is the unit, and 0 continues the series past 31
+    /// (the names of Linux's `enum ib_rnr_timeout` spell out the same values).
+    #[test]
+    fn rnr_timer_delays_follow_the_specification() {
+        for v in 0..=31u8 {
+            let units = match v {
+                0 => 2 << 15,
+                1 => 1,
+                v => (2 + u64::from(v & 1)) << (v / 2 - 1),
+            };
+            assert_eq!(
+                RnrTimer::from_encoding(v).duration(),
+                Duration::from_micros(10 * units),
+                "encoding {v}"
+            );
+        }
+    }
+
     #[test]
     #[should_panic(expected = "5 bits")]
     fn rnr_timer_encoding_out_of_range_panics() {
         let _ = RnrTimer::from_encoding(32);
-    }
-}
-
-#[cfg(test)]
-mod test_qp_transitions {
-    use super::*;
-    use ffi::ibv_qp_state as S;
-    const IBV_QPT_RC: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_RC;
-
-    fn bit(m: ffi::ibv_qp_attr_mask) -> u32 {
-        m.0
-    }
-
-    #[test]
-    fn reset_to_init_requires_pkey_port_access() {
-        let (required, _optional) =
-            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_RESET, S::IBV_QPS_INIT).unwrap();
-        let expected = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE)
-            | bit(ffi::ibv_qp_attr_mask::IBV_QP_PKEY_INDEX)
-            | bit(ffi::ibv_qp_attr_mask::IBV_QP_PORT)
-            | bit(ffi::ibv_qp_attr_mask::IBV_QP_ACCESS_FLAGS);
-        assert_eq!(required, expected);
-    }
-
-    #[test]
-    fn init_to_rts_is_not_a_valid_transition() {
-        assert!(qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_INIT, S::IBV_QPS_RTS).is_none());
-    }
-
-    #[test]
-    fn any_state_to_reset_or_err_needs_only_state() {
-        let state = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE);
-        let accepted = state | bit(ffi::ibv_qp_attr_mask::IBV_QP_RATE_LIMIT);
-        assert_eq!(
-            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_RTS, S::IBV_QPS_ERR),
-            Some((state, accepted))
-        );
-        assert_eq!(
-            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_INIT, S::IBV_QPS_RESET),
-            Some((state, accepted))
-        );
-        // The kernel lets RESET go only to RESET or INIT.
-        assert!(qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_RESET, S::IBV_QPS_ERR).is_none());
-    }
-
-    #[test]
-    fn rows_match_the_kernel_table() {
-        use ffi::ibv_qp_type as T;
-        let state = bit(ffi::ibv_qp_attr_mask::IBV_QP_STATE);
-        let port = bit(ffi::ibv_qp_attr_mask::IBV_QP_PORT);
-
-        // The state is accepted on a transition that keeps it.
-        let (_, optional) =
-            qp_transition_masks(IBV_QPT_RC, S::IBV_QPS_INIT, S::IBV_QPS_INIT).unwrap();
-        assert_eq!(optional & state, state);
-        // UC may leave SQE for RTS.
-        assert!(qp_transition_masks(T::IBV_QPT_UC, S::IBV_QPS_SQE, S::IBV_QPS_RTS).is_some());
-        // Neither UC nor UD may change its port in SQD, nor a raw-packet queue pair after RESET.
-        for (qp_type, cur) in [
-            (T::IBV_QPT_UC, S::IBV_QPS_SQD),
-            (T::IBV_QPT_UD, S::IBV_QPS_SQD),
-            (T::IBV_QPT_RAW_PACKET, S::IBV_QPS_INIT),
-            (T::IBV_QPT_RAW_PACKET, S::IBV_QPS_SQD),
-        ] {
-            let (_, optional) = qp_transition_masks(qp_type, cur, cur).unwrap();
-            assert_eq!(optional & port, 0, "{qp_type:?} in {cur:?}");
-        }
     }
 }
 

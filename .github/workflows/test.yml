@@ -5,6 +5,7 @@
 #   requirements of this crate, and its dependencies
 # - vendored: builds with the vendored rdma-core headers, the way a crates.io consumer does
 # - integration: runs the ignored data-path tests against a Soft-RoCE (rxe) device
+# - miri: runs the unit tests and the sys shims' Miri tests under Miri
 # - coverage: runs the test suite and collects coverage information
 # See check.yml for information about how the concurrency cancellation and workflow triggering works
 permissions:
@@ -178,6 +179,25 @@ jobs:
           lsmod | grep -E '^(rdma|ib_|rxe)' || true
           "$GITHUB_WORKSPACE"/rdma-core-build/bin/ibv_devinfo -v || true
           sudo dmesg | tail -n 60 || true
+  miri:
+    # The sys shims' tests in ibverbs-sys/tests/miri_verbs_get_ctx.rs pin out-of-bounds reads and
+    # pointer arithmetic that a native run cannot see: with those bugs back, the tests still pass
+    # natively and fail only under Miri. Run them, and the unit tests, under Miri (no device
+    # needed: the device tests stay ignored).
+    runs-on: ubuntu-latest
+    name: ubuntu / nightly / miri
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - name: Configure CI host
+        run: ./configure-ci.sh
+      - name: Install nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri, rust-src
+      - name: cargo miri test
+        run: cargo miri test --locked --workspace --all-features --lib --tests
   minimal:
     # This action chooses the oldest version of the dependencies permitted by Cargo.toml to ensure
     # that this crate is compatible with the minimal version that this crate and its dependencies

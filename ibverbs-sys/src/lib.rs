@@ -15,7 +15,8 @@ pub struct ibv_wc {
     byte_len: u32,
 
     /// Immediate data OR the local RKey that was invalidated depending on `wc_flags`.
-    /// See `man ibv_poll_cq` for details.
+    /// See `man ibv_poll_cq` for details. As in C, the immediate is in network byte order here
+    /// ([`imm_data()`](Self::imm_data) converts it) and the invalidated RKey in host order.
     pub imm_data: u32,
     /// Local QP number of completed WR.
     ///

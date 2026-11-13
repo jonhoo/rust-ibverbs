@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -15,13 +15,23 @@ pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
     timeout.and_then(|timeout| Instant::now().checked_add(timeout))
 }
 
-/// Block until `fd` is readable (`true`) or `deadline` passes (`false`); with no deadline, wait
-/// indefinitely.
+/// Wait until `fd` is readable and `take` (which returns `None` while nothing is pending) takes an
+/// item, or until `deadline` passes (`None`); with no deadline, wait indefinitely. A readable `fd`
+/// whose item another thread took first sends the wait back to waiting for the next one, and a
+/// failed wait on `fd` becomes the error `wrap` makes of it.
 ///
 /// `poll(2)` waits at most `i32::MAX` milliseconds (about 24.8 days) per call, so a later deadline
 /// is waited out in slices; each is rounded up to whole milliseconds so the wait never ends
-/// fractionally early. A signal interrupting `poll(2)` (`EINTR`) resumes the wait.
-pub(crate) fn wait_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<bool> {
+/// fractionally early. A signal interrupting `poll(2)` (`EINTR`) resumes the wait. Out of line:
+/// it blocks anyway, and inlined it would weigh on [`CompletionChannel::wait`]'s path for a
+/// notification that is already pending.
+#[inline(never)]
+pub(crate) fn wait_and_take<T>(
+    fd: BorrowedFd<'_>,
+    deadline: Option<Instant>,
+    wrap: fn(io::Error) -> Error,
+    mut take: impl FnMut() -> Result<Option<T>>,
+) -> Result<Option<T>> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     loop {
         let timeout = match deadline {
@@ -36,12 +46,16 @@ pub(crate) fn wait_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io
             // A slice ran out: the wait is over only once the deadline itself has passed.
             Ok(0) => {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
-            Ok(_) => return Ok(true),
+            Ok(_) => {
+                if let Some(item) = take()? {
+                    return Ok(Some(item));
+                }
+            }
             Err(nix::errno::Errno::EINTR) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(wrap(e.into())),
         }
     }
 }
@@ -74,7 +88,7 @@ fn provider_poll_failure(verb: &str, code: i32) -> Error {
 /// and build the queue on it with [`CompletionQueueBuilder::set_comp_channel`]; then arm the queue
 /// with [`CompletionQueue::req_notify`], drain it with [`poll`](CompletionQueue::poll), and block
 /// on the channel ([`wait`](Self::wait)), or watch its descriptor
-/// ([`AsFd`]/[`AsRawFd`](std::os::fd::AsRawFd)) from your own reactor and consume notifications
+/// ([`AsFd`]/[`AsRawFd`]) from your own reactor and consume notifications
 /// with [`get_event`](Self::get_event). After each notification, re-arm the queue and then drain
 /// it again, in that order (see [`req_notify`](CompletionQueue::req_notify)).
 ///
@@ -186,17 +200,12 @@ impl CompletionChannel {
         if let Some(context) = self.get_event()? {
             return Ok(Some(context));
         }
-        let deadline = deadline_after(timeout);
-        loop {
-            if !wait_readable(self.as_fd(), deadline).map_err(Error::PollCompletionQueue)? {
-                return Ok(None);
-            }
-            // The descriptor was readable, but another thread may have consumed the notification
-            // first; if so, go back to waiting for the next one.
-            if let Some(context) = self.get_event()? {
-                return Ok(Some(context));
-            }
-        }
+        wait_and_take(
+            self.as_fd(),
+            deadline_after(timeout),
+            Error::PollCompletionQueue,
+            || self.get_event(),
+        )
     }
 
     /// Returns the underlying `ibv_comp_channel` pointer.
@@ -209,12 +218,12 @@ impl CompletionChannel {
     }
 }
 
-impl std::os::fd::AsRawFd for CompletionChannel {
+impl AsRawFd for CompletionChannel {
     /// The raw file descriptor of this completion channel. It is non-blocking and becomes readable
     /// when a notification arrives for any queue built on it after
     /// [`req_notify`](CompletionQueue::req_notify).
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        unsafe { (*self.inner.cc).fd }
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_fd().as_raw_fd()
     }
 }
 
@@ -276,9 +285,9 @@ impl CompletionQueueBuilder {
 
     /// Request additional work-completion fields beyond the standard set.
     ///
-    /// The standard fields (byte length, immediate data, QP number, and source QP) are always
-    /// available, so their [`WorkCompletion`] accessors work on every queue without a flag; the
-    /// fields given here are requested *in addition*. For example, pass
+    /// The standard fields (byte length, immediate data, QP number, source QP, source LID, and
+    /// service level) are always available, so their [`WorkCompletion`] accessors work on every
+    /// queue without a flag; the fields given here are requested *in addition*. For example, pass
     /// [`WcFields::COMPLETION_TIMESTAMP`] to make [`WorkCompletion::completion_timestamp`]
     /// available.
     ///
@@ -313,18 +322,19 @@ impl CompletionQueueBuilder {
     ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
     ///    work-completion field, or a completion channel (EFA devices without completion
     ///    notifications) (`EOPNOTSUPP`).
-    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `min_cq_entries` is 0 or above
-    ///    `i32::MAX`, or the completion channel comes from another device context (both
+    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `min_cq_entries` is 0 or 2^30
+    ///    or more, or the completion channel comes from another device context (both
     ///    [`io::ErrorKind::InvalidInput`]), or `ibv_create_cq_ex` failed (`EINVAL` for an invalid
     ///    `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`, or an invalid completion
     ///    vector, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<CompletionQueue> {
-        // The legacy verbs take the size as an `int`, and providers do unsigned arithmetic on it
-        // that wraps near `u32::MAX` (mlx5 then accepts `u32::MAX` as a one-entry queue).
-        if self.min_cq_entries == 0 || self.min_cq_entries > i32::MAX as u32 {
+        // mlx5 rounds the size plus one up to a power of two in an `int`: from 2^30 on that
+        // overflows (and near `u32::MAX` it wraps to a one-entry queue it accepts). No device holds
+        // that many entries: mlx5 itself refuses more than 2^24.
+        if self.min_cq_entries == 0 || self.min_cq_entries >= 1 << 30 {
             return Err(Error::CreateCompletionQueue(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "min_cq_entries must be between 1 and i32::MAX",
+                "min_cq_entries must be between 1 and 2^30 - 1",
             )));
         }
         // The kernel looks a completion channel up in the creating context's own file table, so a
@@ -343,10 +353,16 @@ impl CompletionQueueBuilder {
 
         // Always request the standard work-completion fields so the lazy readers in `WorkCompletion`
         // can serve them, then add any caller-requested extras (such as the completion timestamp).
+        // These are C's `IBV_WC_STANDARD_FLAGS` without the DLID path bits, which irdma refuses:
+        // every provider with extended completion queues takes the rest, and none sizes its
+        // entries by them. The source LID and service level are among them because the route back
+        // to a datagram's sender needs them on InfiniBand (`from_completion`).
         let wc_flags = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL.0
             | self.wc_flags;
         let mut cq_attr = ffi::ibv_cq_init_attr_ex {
             cqe: self.min_cq_entries,
@@ -406,16 +422,12 @@ flags_newtype! {
     /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
     ///
     /// The byte length ([`WorkCompletion::len`]), immediate data ([`WorkCompletion::imm_data`]),
-    /// QP number ([`WorkCompletion::qp_num`]), and source QP ([`WorkCompletion::src_qp`]) are
-    /// always available and need no flag; these flags add fields on top, at the cost of a larger
-    /// completion entry. Fields with an accessor on [`WorkCompletion`] panic when read if they
-    /// were not requested.
+    /// QP number ([`WorkCompletion::qp_num`]), source QP ([`WorkCompletion::src_qp`]), source LID
+    /// ([`WorkCompletion::slid`]), and service level ([`WorkCompletion::sl`]) are always available
+    /// and need no flag; these flags add fields on top, at the cost of a larger completion entry.
+    /// Fields with an accessor on [`WorkCompletion`] panic when read if they were not requested.
     pub struct WcFields(ffi::ibv_create_cq_wc_flags) {
-        /// The source LID ([`WorkCompletion::slid`]).
-        SLID = IBV_WC_EX_WITH_SLID;
-        /// The service level ([`WorkCompletion::sl`]).
-        SL = IBV_WC_EX_WITH_SL;
-        /// The destination LID path bits ([`WorkCompletion::dlid_path_bits`]).
+        /// The destination LID path bits ([`WorkCompletion::dlid_path_bits`]). irdma has none.
         DLID_PATH_BITS = IBV_WC_EX_WITH_DLID_PATH_BITS;
         /// The hardware completion timestamp ([`WorkCompletion::completion_timestamp`]).
         COMPLETION_TIMESTAMP = IBV_WC_EX_WITH_COMPLETION_TIMESTAMP;
@@ -426,6 +438,12 @@ flags_newtype! {
         /// The tag-matching information.
         TM_INFO = IBV_WC_EX_WITH_TM_INFO;
         /// The wallclock completion timestamp ([`WorkCompletion::completion_wallclock_ns`]).
+        ///
+        /// On mlx5 this needs rdma-core 65.0 or newer: a poll of such a queue that finds a
+        /// completion re-reads the clock parameters the kernel publishes, and reports `EBUSY` when
+        /// it catches the kernel updating them, which [`CompletionQueue::poll`] retries. Before
+        /// 65.0, libmlx5 had already consumed the completion when it reported that, so the retry
+        /// loses it.
         COMPLETION_TIMESTAMP_WALLCLOCK = IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK;
     }
 }
@@ -459,7 +477,7 @@ flags_newtype! {
 /// connected queue pair, that the queue pair has moved to the error state); once one work request
 /// fails, the ones behind it complete as [`WorkRequestFlushed`](Self::WorkRequestFlushed).
 /// `Display` gives the human-readable message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WcStatus {
     /// The work request completed successfully.
@@ -493,9 +511,11 @@ pub enum WcStatus {
     RnrRetryExceeded,
     /// A local RD domain violation (RD only).
     LocalRddViolation,
-    /// The remote side rejected an RD read request as invalid (RD only).
+    /// The remote side rejected an RD read request as invalid (RD only). EFA reports a
+    /// destination queue pair that does not exist, or is in the error state, this way.
     RemoteInvalidRdRequest,
-    /// The remote side aborted the operation (RD only).
+    /// The remote side aborted the operation (UD or UC queue pairs on a shared receive queue; on
+    /// EFA, the remote side was reset).
     RemoteAborted,
     /// An invalid EE context number was detected (RD only).
     InvalidEecn,
@@ -503,7 +523,8 @@ pub enum WcStatus {
     InvalidEecState,
     /// A fatal transport error occurred; further use of the device is undefined.
     Fatal,
-    /// The response timer expired before a response arrived.
+    /// The response timer expired before a response arrived (on EFA, the remote address is
+    /// unreachable or stopped responding).
     ResponseTimeout,
     /// An error not covered by the other statuses.
     GeneralError,
@@ -583,7 +604,7 @@ impl fmt::Display for WcStatus {
 
 /// The failure of a work request, reported by [`WorkCompletion::ok`]: the completion status and
 /// the provider-specific vendor error syndrome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WcError {
     /// The completion status (anything other than [`WcStatus::Success`]).
     pub status: WcStatus,
@@ -604,7 +625,7 @@ impl fmt::Display for WcError {
 impl std::error::Error for WcError {}
 
 /// The kind of operation a work completion reports on. Returned by [`WorkCompletion::opcode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WcOpcode {
     /// A SEND completed.
@@ -762,12 +783,17 @@ impl WorkCompletion<'_> {
     /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
     /// [`wr_id`](Self::wr_id), the status and vendor error ([`WcError`]), and
     /// [`qp_num`](Self::qp_num) are defined.
+    ///
+    /// EFA reports a completed RDMA READ as [`Send`](WcOpcode::Send), with a length of 0: tell
+    /// its reads from its sends by `wr_id`.
     #[inline]
     pub fn opcode(&self) -> WcOpcode {
         unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }.into()
     }
 
-    /// The number of bytes transferred, for a successful completion.
+    /// The number of bytes transferred, for a successful completion. A message can have none:
+    /// slicing a region by a length of 0 panics (see
+    /// [`MemoryRegion::slice`](crate::MemoryRegion::slice)).
     #[inline]
     pub fn len(&self) -> usize {
         unsafe { (*self.cq).read_byte_len.unwrap()(self.cq) as usize }
@@ -848,24 +874,18 @@ impl WorkCompletion<'_> {
 
     /// The source LID this message was sent from (relevant for datagram receive completions).
     ///
-    /// # Panics
-    ///
-    /// Panics if the completion queue did not request [`WcFields::SLID`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// EFA has no LIDs and reports here the number of the address handle the receiving side holds
+    /// for the sender's GID (`AddressHandle::efa_ah_number`, with the `efa` feature), or `0xffff`
+    /// when it holds none.
     #[inline]
     pub fn slid(&self) -> u32 {
-        wc_reader!(self.cq, read_slid, "the source LID")
+        unsafe { (*self.cq).read_slid.unwrap()(self.cq) }
     }
 
     /// The service level this message was sent with (relevant for datagram receive completions).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the completion queue did not request [`WcFields::SL`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn sl(&self) -> u8 {
-        wc_reader!(self.cq, read_sl, "the service level")
+        unsafe { (*self.cq).read_sl.unwrap()(self.cq) }
     }
 
     /// The destination LID path bits (relevant for datagram receive completions).
@@ -942,32 +962,171 @@ impl WorkCompletion<'_> {
         self.cq
     }
 
-    /// The addressing fields of this completion as a classic `ibv_wc`, for deriving the route
-    /// back to a datagram's sender: the flags, the source and local queue pair numbers, and — when
-    /// the queue requested them — the source LID, service level, and path bits (zero otherwise).
-    pub(crate) fn addressing(&self) -> ffi::ibv_wc {
+    /// The addressing fields of this completion in the batch form, for deriving the route back
+    /// to a datagram's sender: the flags, the source and local queue pair numbers, the source LID,
+    /// the service level, and — when the queue requested them — the path bits (zero otherwise).
+    pub(crate) fn addressing(&self) -> Completion {
         let mut wc = ffi::ibv_wc::default();
         wc.wc_flags = self.wc_flags().into();
         wc.src_qp = self.src_qp();
         wc.qp_num = self.qp_num();
-        unsafe {
-            if let Some(read_slid) = (*self.cq).read_slid {
-                wc.slid = read_slid(self.cq) as u16;
-            }
-            if let Some(read_sl) = (*self.cq).read_sl {
-                wc.sl = read_sl(self.cq);
-            }
-            if let Some(read_dlid_path_bits) = (*self.cq).read_dlid_path_bits {
-                wc.dlid_path_bits = read_dlid_path_bits(self.cq);
-            }
+        wc.slid = self.slid() as u16;
+        wc.sl = self.sl();
+        if let Some(read_dlid_path_bits) = unsafe { (*self.cq).read_dlid_path_bits } {
+            wc.dlid_path_bits = unsafe { read_dlid_path_bits(self.cq) };
         }
-        wc
+        Completion(wc)
+    }
+}
+
+/// A work completion as [`CompletionQueue::poll_into`] fills it in: the fields of C's `ibv_wc`,
+/// read through the accessors a [`WorkCompletion`] has.
+///
+/// Unlike a `WorkCompletion` it is plain data. It borrows nothing, so it can be kept past the
+/// poll, copied, and sent to another thread, and every field is there on every queue, whichever
+/// [`WcFields`] the queue was built with. [`Default`] gives an entry for `poll_into` to fill,
+/// which reads as a failed work request until it has been.
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+pub struct Completion(ffi::ibv_wc);
+
+#[allow(clippy::len_without_is_empty)]
+impl Completion {
+    /// The 64-bit id that was associated with the corresponding work request when it was posted.
+    #[inline]
+    pub fn wr_id(&self) -> u64 {
+        self.0.wr_id()
+    }
+
+    /// `Ok(())` if the work request completed successfully (`IBV_WC_SUCCESS`), otherwise the
+    /// [`WcError`] carrying the status and vendor error syndrome.
+    #[inline]
+    pub fn ok(&self) -> std::result::Result<(), WcError> {
+        match self.0.error() {
+            None => Ok(()),
+            Some((status, vendor_err)) => Err(WcError {
+                status: status.into(),
+                vendor_err,
+            }),
+        }
+    }
+
+    /// The opcode of the completed work request.
+    ///
+    /// Like `len` and the other detail fields, this is only meaningful when the completion
+    /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
+    /// [`wr_id`](Self::wr_id), the status and vendor error ([`WcError`]), and
+    /// [`qp_num`](Self::qp_num) are defined.
+    #[inline]
+    pub fn opcode(&self) -> WcOpcode {
+        self.0.opcode().into()
+    }
+
+    /// The number of bytes transferred, for a successful completion (see
+    /// [`WorkCompletion::len`]).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The 32-bit immediate value (host byte order) if one was carried ([`WcFlags::WITH_IMM`]).
+    #[inline]
+    pub fn imm_data(&self) -> Option<u32> {
+        self.0.imm_data()
+    }
+
+    /// The remote key a SEND-with-invalidate invalidated, if this completion reports one
+    /// ([`WcFlags::WITH_INV`]). It shares its field with the immediate data, so a completion
+    /// carries one or the other.
+    #[inline]
+    pub fn invalidated_rkey(&self) -> Option<u32> {
+        if self.0.is_valid() && self.wc_flags().contains(WcFlags::WITH_INV) {
+            Some(self.0.imm_data)
+        } else {
+            None
+        }
+    }
+
+    /// The local QP number of the completed work request (relevant for shared-receive-queue
+    /// completions, to tell which queue pair a receive arrived on).
+    #[inline]
+    pub fn qp_num(&self) -> u32 {
+        self.0.qp_num
+    }
+
+    /// The source (remote) QP number, relevant for datagram receive completions.
+    #[inline]
+    pub fn src_qp(&self) -> u32 {
+        self.0.src_qp
+    }
+
+    /// The flags describing this completion.
+    #[inline]
+    pub fn wc_flags(&self) -> WcFlags {
+        self.0.wc_flags.into()
+    }
+
+    /// Whether the receive completion carries a 40-byte Global Routing Header (GRH) at the front of
+    /// the scatter buffers (set for unreliable-datagram receives with a GRH).
+    #[inline]
+    pub fn has_grh(&self) -> bool {
+        self.wc_flags().contains(WcFlags::GRH)
+    }
+
+    /// The source LID this message was sent from (relevant for datagram receive completions; see
+    /// [`WorkCompletion::slid`] for what EFA reports here).
+    #[inline]
+    pub fn slid(&self) -> u32 {
+        self.0.slid.into()
+    }
+
+    /// The service level this message was sent with (relevant for datagram receive completions).
+    #[inline]
+    pub fn sl(&self) -> u8 {
+        self.0.sl
+    }
+
+    /// The destination LID path bits (relevant for datagram receive completions).
+    #[inline]
+    pub fn dlid_path_bits(&self) -> u8 {
+        self.0.dlid_path_bits
+    }
+
+    /// The underlying `ibv_wc`, for the fields without an accessor here (the P_Key index of a
+    /// completion on a GSI queue pair).
+    #[inline]
+    pub fn as_raw(&self) -> &ffi::ibv_wc {
+        &self.0
+    }
+}
+
+impl From<ffi::ibv_wc> for Completion {
+    /// Wraps a completion that `ibv_poll_cq` filled in elsewhere.
+    fn from(wc: ffi::ibv_wc) -> Self {
+        Completion(wc)
+    }
+}
+
+impl fmt::Debug for Completion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut f = f.debug_struct("Completion");
+        f.field("wr_id", &self.wr_id());
+        match self.ok() {
+            Ok(()) => f
+                .field("opcode", &self.opcode())
+                .field("len", &self.len())
+                .field("wc_flags", &self.wc_flags()),
+            Err(error) => f
+                .field("status", &error.status)
+                .field("vendor_err", &error.vendor_err),
+        };
+        f.field("qp_num", &self.qp_num()).finish_non_exhaustive()
     }
 }
 
 /// The tag-matching information of a receive on a tag-matching queue, read with
 /// [`WorkCompletion::tag_matching`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TagMatchingInfo {
     /// The tag from the tag-matching header.
     pub tag: u64,
@@ -984,12 +1143,21 @@ pub struct TagMatchingInfo {
 /// borrows the `Completions`, so it must be dropped before the next [`next`](Completions::next)
 /// call (which is why it cannot implement [`Iterator`]); consume it with a `while let` loop.
 ///
+/// Every completion the poll positions on leaves the queue when the `Completions` drops, including
+/// the first, which [`CompletionQueue::poll`] already took: a `Completions` dropped before its
+/// first `next` (by a `?` on another call between the poll and the loop, say) discards that
+/// completion unseen. Polls stopped early otherwise lose nothing: the completions after the last
+/// one yielded stay queued for the next poll.
+///
 /// # Deadlocks
 ///
-/// The provider holds the queue's poll lock from the poll's start until the `Completions` is
-/// dropped (`ibv_end_poll`), so keep it short-lived; a poll of an empty queue holds nothing. The
-/// lock is not reentrant, and other calls take it too (on mlx5, for one), so while a
-/// `Completions` of a queue is alive, the same thread must not:
+/// The provider holds the queue's poll lock from the poll's start until [`next`](Self::next) has
+/// returned `None` or the `Completions` is dropped, whichever comes first (`ibv_end_poll`); a poll
+/// of an empty queue holds nothing. (ionic is the exception: it holds the lock only inside each
+/// step, so on ionic only one thread may poll a queue at a time; see
+/// [Thread safety](crate#thread-safety).) The lock is not reentrant, and other calls take it too
+/// (on mlx5, for one), so while a `Completions` of a queue is alive and not yet drained, the same
+/// thread must not:
 ///
 /// - poll that queue again ([`poll`](CompletionQueue::poll) or
 ///   [`poll_into`](CompletionQueue::poll_into));
@@ -999,23 +1167,32 @@ pub struct TagMatchingInfo {
 /// - post to such a queue pair while its send or receive queue is full or nearly so: the
 ///   provider then re-checks how full it is under the lock before accepting the post.
 ///
-/// Made from another thread, those calls wait until the `Completions` drops instead, so a poll
-/// loop must not wait for a thread that might be making one of them.
+/// Made from another thread, those calls wait until the poll ends instead, so a poll loop must
+/// not wait for a thread that might be making one of them.
 ///
 /// Posting a reply or reposting a receive from inside the loop is fine while the work queue has
-/// room; when it may be full, drop the `Completions` first.
+/// room; when it may be full, drain or drop the `Completions` first.
 ///
 /// Some providers take the locks the other way around, so polling can wait for a posting thread
 /// too. hns moves a queue pair to `ERR` from inside the poll when it reads one of the pair's error
 /// completions, taking the pair's send and receive queue locks under the poll lock; so do not poll
 /// on a thread that has a [`SendBatch`](crate::SendBatch) open on a queue pair this queue serves.
+/// EFA takes a queue pair's send queue lock under the poll lock to retire each of its send
+/// completions, failed or not, so the same rule applies there to every completion. Across
+/// threads, hns's order is the reverse of a post's to a nearly full queue (queue lock, then the
+/// poll lock to re-check how full it is), so on hns such a poll and post can deadlock each other:
+/// keep the pair's work queues from filling, or post to and poll it from one thread.
 /// ionic holds the send completion queue's poll lock for as long as a send batch is open (see
 /// [`SendBatch`](crate::SendBatch)).
+///
+/// Nothing else releases the lock: a `Completions` that is leaked while it holds it
+/// ([`std::mem::forget`], a reference cycle) keeps it for good, and every later poll of the queue,
+/// and the drop or reset of every queue pair on it, then blocks forever.
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
-    /// Whether `start_poll` handed out an entry, and so `end_poll` is owed on drop; `false` for
-    /// a poll of an empty queue.
+    /// Whether `start_poll` handed out an entry and `end_poll` is still owed (by `next` once the
+    /// entries run out, or by the drop); `false` for a poll of an empty queue.
     open: bool,
     /// Whether the next entry is the one `start_poll` positioned on (not yet yielded).
     first: bool,
@@ -1033,7 +1210,8 @@ impl Completions<'_> {
     /// `None` also ends the poll if the provider reports an error mid-poll (a rare provider-level
     /// failure, distinct from a completion *status* error, which is reported per work completion
     /// through [`WorkCompletion::ok`]); resources are still released correctly in that case, and
-    /// later calls keep returning `None`.
+    /// later calls keep returning `None`. EFA reports one for each completion of a queue pair
+    /// that no longer exists, so more completions can be waiting behind such a `None`.
     #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> Option<WorkCompletion<'_>> {
@@ -1042,15 +1220,39 @@ impl Completions<'_> {
         }
         if self.first {
             self.first = false;
-        } else if unsafe { (*self.cq).next_poll.unwrap()(self.cq) } != 0 {
-            // ENOENT (no more) or an error: either way the poll is finished.
-            self.done = true;
-            return None;
+        } else {
+            let ret = unsafe { (*self.cq).next_poll.unwrap()(self.cq) };
+            // ENOENT (no more) or an error: either way the poll is finished. End it here rather
+            // than in `Drop`, so that a drained `Completions` holds the poll lock no longer.
+            // ionic's `next_poll` is its `start_poll`, so on a queue with wallclock timestamps it
+            // too reports a concurrent clock update as EBUSY, keeping the completion it took off
+            // the queue pending: retry that, as `poll` does.
+            if ret != 0 && (ret != nix::libc::EBUSY || !next_poll_after_busy(self.cq)) {
+                self.done = true;
+                self.open = false;
+                unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+                return None;
+            }
         }
         Some(WorkCompletion {
             cq: self.cq,
             _iter: std::marker::PhantomData,
         })
+    }
+}
+
+/// Retry a `next_poll` on `cq` that reported EBUSY until it no longer does; whether it then
+/// positioned on a completion. Out of line, so the data path keeps one test of `next_poll`'s
+/// result.
+#[cold]
+#[inline(never)]
+fn next_poll_after_busy(cq: *mut ffi::ibv_cq_ex) -> bool {
+    loop {
+        std::hint::spin_loop();
+        match unsafe { (*cq).next_poll.unwrap()(cq) } {
+            e if e == nix::libc::EBUSY => {}
+            ret => return ret == 0,
+        }
     }
 }
 
@@ -1084,7 +1286,9 @@ impl CompletionQueue {
     /// Poll for the work completions that are ready, through the extended interface.
     ///
     /// The returned [`Completions`] is a lending iterator whose [`WorkCompletion`]s read their
-    /// fields lazily, so you only pay for the fields you read; it is empty when the queue is.
+    /// fields lazily, so you only pay for the fields you read; it is empty when the queue is. The
+    /// poll already takes the first completion off the queue, so iterate the result right away:
+    /// dropped unread, it discards that completion (see [`Completions`]).
     ///
     /// Callers must ensure the CQ does not overrun (exceed its [`capacity`](Self::capacity)), as
     /// this triggers an `IBV_EVENT_CQ_ERR` async event, rendering the CQ unusable. You can do
@@ -1097,7 +1301,9 @@ impl CompletionQueue {
     /// # Errors
     ///
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): starting the poll failed
-    ///    (`ibv_start_poll`).
+    ///    (`ibv_start_poll`). On EFA, `EINVAL` means the next completion belonged to a queue pair
+    ///    that has been destroyed since (the device completes a destroyed queue pair's
+    ///    outstanding requests as flushed): the entry is consumed, so poll again.
     ///
     /// # Examples
     ///
@@ -1120,7 +1326,9 @@ impl CompletionQueue {
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
         // paired with `end_poll`) when the queue is empty. On a queue with wallclock timestamps it
         // can also fail transiently with EBUSY while the kernel updates the clock information (mlx5,
-        // ionic); the queue is left unchanged and ibv_create_cq_ex(3) says to retry.
+        // ionic); ibv_create_cq_ex(3) says to retry, and the queue is left unchanged (by libmlx5
+        // only since rdma-core 65.0: before that it had consumed a completion, which the retry
+        // cannot recover).
         loop {
             match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
                 0 => {
@@ -1155,12 +1363,14 @@ impl CompletionQueue {
     ///
     /// This is the batch counterpart to [`poll`](Self::poll). Where `poll` reads each field lazily
     /// through the extended interface — an indirect provider call per field — this copies whole
-    /// completions into caller-owned [`ibv_wc`](ffi::ibv_wc) entries in one call, then lets you read
-    /// their fields as plain struct accesses. For high-throughput draining where you consume many
-    /// completions and touch several fields of each, avoiding the per-field indirection makes this
-    /// the faster path; when you poll a completion at a time and read only a field or two,
-    /// [`poll`](Self::poll) is cheaper. It is also a compatibility fallback for the fields the
-    /// standard `ibv_wc` carries, independent of which extended fields the queue was built with.
+    /// completions into caller-owned [`Completion`] entries in one call, then lets you read
+    /// their fields as plain struct accesses, under the names [`WorkCompletion`] gives them. For
+    /// high-throughput draining where you consume many completions and touch several fields of
+    /// each, avoiding the per-field indirection makes this the faster path; when you poll a
+    /// completion at a time and read only a field or two, [`poll`](Self::poll) is cheaper. The
+    /// entries borrow nothing, so they also suit an event loop that keeps completions past the
+    /// poll, and they carry the fields of the standard `ibv_wc` whichever extended fields the
+    /// queue was built with.
     ///
     /// The returned slice is empty when no completions are ready. Like [`poll`](Self::poll), this
     /// neither blocks nor causes a context switch; to wait for completions, build the queue on a
@@ -1178,23 +1388,25 @@ impl CompletionQueue {
     /// # Examples
     ///
     /// ```no_run
-    /// # use ibverbs::{ffi, CompletionQueue};
+    /// # use ibverbs::{Completion, CompletionQueue};
     /// # fn drain(cq: &CompletionQueue) -> ibverbs::Result<()> {
-    /// let mut wc = [ffi::ibv_wc::default(); 16];
+    /// let mut wc = [Completion::default(); 16];
     /// for completion in cq.poll_into(&mut wc)? {
-    ///     if let Some((status, vendor_err)) = completion.error() {
-    ///         eprintln!("work request {}: {status:?} (vendor {vendor_err})", completion.wr_id());
+    ///     if let Err(e) = completion.ok() {
+    ///         eprintln!("work request {}: {e}", completion.wr_id());
     ///     }
     /// }
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
+    pub fn poll_into<'w>(&self, wc: &'w mut [Completion]) -> Result<&'w mut [Completion]> {
         // An `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
-        // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
+        // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path). A `Completion`
+        // is an `ibv_wc` under another name (`repr(transparent)`).
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
-        let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
+        let entries = wc.as_mut_ptr().cast::<ffi::ibv_wc>();
+        let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, entries) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and leaves `errno` alone, so
             // whatever is there is stale (in an event loop, typically the `EAGAIN` of the `get_event`
@@ -1343,5 +1555,143 @@ mod test_conversions {
         ] {
             assert_eq!(WcOpcode::from(raw), wrapper);
         }
+    }
+
+    /// A batch completion reads its fields as the lending one does: the immediate in host order,
+    /// only when the completion says it carries one, and nothing but the failure for a failed
+    /// request.
+    #[test]
+    fn a_batch_completion_reads_like_a_lending_one() {
+        // All zeroes is a successful SEND.
+        let mut raw: ffi::ibv_wc = unsafe { std::mem::zeroed() };
+        raw.qp_num = 7;
+        raw.src_qp = 9;
+        raw.slid = 3;
+        raw.sl = 2;
+        raw.dlid_path_bits = 1;
+        raw.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_IMM | ffi::ibv_wc_flags::IBV_WC_GRH;
+        raw.imm_data = 0x0102_0304_u32.to_be();
+        let wc = Completion::from(raw);
+        assert!(wc.ok().is_ok());
+        assert_eq!(wc.opcode(), WcOpcode::Send);
+        assert_eq!((wc.qp_num(), wc.src_qp(), wc.slid(), wc.sl()), (7, 9, 3, 2));
+        assert_eq!(wc.dlid_path_bits(), 1);
+        assert_eq!(wc.imm_data(), Some(0x0102_0304));
+        assert_eq!(wc.invalidated_rkey(), None);
+        assert!(wc.has_grh());
+
+        // With the invalidate flag the same field is a remote key, in host order.
+        raw.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_INV;
+        raw.imm_data = 0x1234;
+        let wc = Completion::from(raw);
+        assert_eq!((wc.imm_data(), wc.invalidated_rkey()), (None, Some(0x1234)));
+        assert!(!wc.has_grh());
+
+        // An entry that `poll_into` has not filled reads as a failed request.
+        let unfilled = Completion::default();
+        assert_eq!(
+            unfilled.ok().map_err(|e| e.status),
+            Err(WcStatus::GeneralError)
+        );
+        assert_eq!(unfilled.imm_data(), None);
+        assert!(format!("{unfilled:?}").contains("GeneralError"));
+    }
+
+    /// A provider's poll table over `left` more entries, counting its `end_poll` calls. Its
+    /// `next_poll` first reports EBUSY `busy` times.
+    #[repr(C)]
+    struct SpyCqEx {
+        cq_ex: ffi::ibv_cq_ex,
+        left: u32,
+        busy: u32,
+        ends: u32,
+    }
+
+    impl SpyCqEx {
+        /// A queue on whose first entry `start_poll` has just positioned, with `more` behind it.
+        fn started(more: u32) -> Self {
+            unsafe extern "C" fn next_poll(cq: *mut ffi::ibv_cq_ex) -> std::os::raw::c_int {
+                let spy = unsafe { &mut *cq.cast::<SpyCqEx>() };
+                if spy.busy > 0 {
+                    spy.busy -= 1;
+                    return nix::libc::EBUSY;
+                }
+                if spy.left == 0 {
+                    return nix::libc::ENOENT;
+                }
+                spy.left -= 1;
+                0
+            }
+            unsafe extern "C" fn end_poll(cq: *mut ffi::ibv_cq_ex) {
+                unsafe { (*cq.cast::<SpyCqEx>()).ends += 1 };
+            }
+            SpyCqEx {
+                cq_ex: ffi::ibv_cq_ex {
+                    next_poll: Some(next_poll),
+                    end_poll: Some(end_poll),
+                    ..Default::default()
+                },
+                left: more,
+                busy: 0,
+                ends: 0,
+            }
+        }
+    }
+
+    fn open_poll<'a>(spy: *mut SpyCqEx) -> Completions<'a> {
+        Completions {
+            cq: spy.cast(),
+            open: true,
+            first: true,
+            done: false,
+            _cq: std::marker::PhantomData,
+        }
+    }
+
+    /// The poll (and with it the provider's poll lock) ends as soon as the entries run out, not
+    /// only when the `Completions` is dropped: code that follows a drain in the same scope may
+    /// poll again or drop a queue pair.
+    #[test]
+    fn a_drained_poll_ends_before_it_is_dropped() {
+        let mut spy = SpyCqEx::started(1);
+        let spy = &raw mut spy;
+        let mut completions = open_poll(spy);
+        assert!(completions.next().is_some());
+        assert!(completions.next().is_some());
+        assert_eq!(unsafe { (*spy).ends }, 0);
+        assert!(completions.next().is_none());
+        assert_eq!(unsafe { (*spy).ends }, 1);
+        assert!(completions.next().is_none());
+        drop(completions);
+        assert_eq!(unsafe { (*spy).ends }, 1, "ended twice");
+    }
+
+    /// A `next_poll` that reports EBUSY has kept the completion it took off the queue pending, so
+    /// it is asked again instead of ending the poll.
+    #[test]
+    fn a_busy_next_poll_is_retried() {
+        let mut spy = SpyCqEx::started(1);
+        spy.busy = 2;
+        let spy = &raw mut spy;
+        let mut completions = open_poll(spy);
+        assert!(completions.next().is_some());
+        assert!(completions.next().is_some(), "lost the entry behind EBUSY");
+        assert_eq!(unsafe { (*spy).busy }, 0);
+        assert_eq!(unsafe { (*spy).ends }, 0);
+        // EBUSY and then the end of the queue.
+        unsafe { (*spy).busy = 1 };
+        assert!(completions.next().is_none());
+        assert_eq!(unsafe { (*spy).ends }, 1);
+    }
+
+    #[test]
+    fn a_poll_dropped_early_ends_in_the_drop() {
+        let mut spy = SpyCqEx::started(1);
+        let spy = &raw mut spy;
+        let mut completions = open_poll(spy);
+        assert!(completions.next().is_some());
+        assert_eq!(unsafe { (*spy).ends }, 0);
+        drop(completions);
+        assert_eq!(unsafe { (*spy).ends }, 1);
     }
 }

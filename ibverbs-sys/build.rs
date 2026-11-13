@@ -31,7 +31,9 @@ const VENDORED_HEADERS: &[(&str, &str)] = &[
 
 /// Lay the vendored headers out the way an installed rdma-core does, and return that include
 /// directory. The copies keep their sources' modification times, so the `rerun-if-changed` lines
-/// bindgen prints for them fire only when a vendored header itself changes.
+/// bindgen prints for them fire only when a vendored header itself changes. They are written
+/// rather than `fs::copy`'d, which would also copy a read-only source's permissions (Nix store
+/// paths, a read-only vendor directory) and then refuse the dating and any rerun's overwrite.
 fn vendored_include_dir() -> PathBuf {
     let vendor = Path::new("vendor/rdma-core");
     assert!(
@@ -47,7 +49,9 @@ fn vendored_include_dir() -> PathBuf {
         println!("cargo:rerun-if-changed={}", from.display());
         fs::create_dir_all(to.parent().expect("header paths have a directory"))
             .expect("failed to create the vendored include directory");
-        fs::copy(&from, &to).unwrap_or_else(|e| panic!("failed to copy {}: {e}", from.display()));
+        let header =
+            fs::read(&from).unwrap_or_else(|e| panic!("failed to read {}: {e}", from.display()));
+        fs::write(&to, header).unwrap_or_else(|e| panic!("failed to write {}: {e}", to.display()));
         let modified = fs::metadata(&from)
             .and_then(|m| m.modified())
             .and_then(|t| fs::File::options().write(true).open(&to)?.set_modified(t));
@@ -136,24 +140,11 @@ fn main() {
         // aliases for these kernel enums, which `ibv_advise_mr` takes
         .allowlist_type("ib_uverbs_advise_mr_.*")
         .allowlist_var("IBV_LINK_LAYER_.*")
-        .bitfield_enum("ibv_access_flags")
-        .bitfield_enum("ibv_create_cq_wc_flags")
-        .bitfield_enum("ibv_device_cap_flags")
-        .bitfield_enum("ibv_odp_transport_cap_bits")
-        .bitfield_enum("ibv_port_cap_flags")
-        .bitfield_enum("ibv_port_cap_flags2")
-        .bitfield_enum("ibv_qp_attr_mask")
-        .bitfield_enum("ibv_qp_create_send_ops_flags")
-        .bitfield_enum("ibv_qp_init_attr_mask")
-        .bitfield_enum("ibv_qp_open_attr_mask")
-        .bitfield_enum("ibv_raw_packet_caps")
-        .bitfield_enum("ibv_rx_hash_fields")
-        .bitfield_enum("ibv_send_flags")
-        .bitfield_enum("ibv_srq_init_attr_mask")
-        .bitfield_enum("ibv_wc_flags")
-        .bitfield_enum("ibv_wq_attr_mask")
-        .bitfield_enum("ibv_wq_flags")
-        .bitfield_enum("ibv_xrcd_init_attr_mask")
+        // The flag sets, by the names rdma-core gives them (`..._flags`, `..._mask`, `..._caps`,
+        // and so on): they get the bit operators, so `IBV_SRQ_MAX_WR | IBV_SRQ_LIMIT` works.
+        .bitfield_enum("(ibv|ib_uverbs|rdma_cm)_.*_(flags2?|flag|mask|caps|cap_bits|fields)")
+        .bitfield_enum("ibv_pci_atomic_op_size")
+        .bitfield_enum("ibv_qp_attach_comp_cntr_op")
         // C fills these in, and kernels and providers newer than the headers can hand back values
         // the headers do not name; a newtype holds any value, so neither that nor a zeroed
         // `Default` is ever an invalid enum
@@ -168,11 +159,13 @@ fn main() {
         .size_t_is_usize(true);
 
     if efa {
-        // EFA SRD queue pairs are created through the provider's direct-verbs (`efadv`).
+        // EFA SRD queue pairs are created through the provider's direct-verbs (`efadv`). Its
+        // capability, flag, and option values are anonymous enums, which bindgen binds only by
+        // the names of their constants.
         builder = builder
             .allowlist_function("efadv_.*")
             .allowlist_type("efadv_.*")
-            .allowlist_var("EFADV_QP_DRIVER_TYPE_.*");
+            .allowlist_var("EFADV_.*");
     }
 
     if mlx5 {
