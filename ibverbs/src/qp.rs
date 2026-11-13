@@ -1129,10 +1129,12 @@ impl QueuePairEndpoint {
     /// # Errors
     ///
     ///  - [`MalformedWireFormat`](Error::MalformedWireFormat): the flags byte carries bits this
-    ///    version does not know, or the queue pair number or PSN is wider than its 24 bits.
+    ///    version does not know, the GID bytes are not zero although no GID is flagged, or the
+    ///    queue pair number or PSN is wider than its 24 bits.
     pub fn from_bytes(bytes: &[u8; Self::WIRE_LEN]) -> Result<Self> {
         let gid = match bytes[0] {
-            0 => None,
+            // Zero when absent, so that a later version can give those bytes a meaning.
+            0 if bytes[7..23] == [0; 16] => None,
             1 => {
                 let raw: [u8; 16] = bytes[7..23].try_into().expect("slice length is fixed");
                 Some(Gid::from(raw))

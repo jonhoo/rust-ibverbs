@@ -269,6 +269,13 @@ mod test_wire {
             QueuePairEndpoint::from_bytes(&encoded),
             Err(crate::Error::MalformedWireFormat)
         ));
+        // Without the GID flag, the GID bytes are zero.
+        encoded[0] = 0;
+        encoded[22] = 1;
+        assert!(matches!(
+            QueuePairEndpoint::from_bytes(&encoded),
+            Err(crate::Error::MalformedWireFormat)
+        ));
     }
 
     #[test]
