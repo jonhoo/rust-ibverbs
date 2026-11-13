@@ -1043,18 +1043,39 @@ impl Completions<'_> {
         }
         if self.first {
             self.first = false;
-        } else if unsafe { (*self.cq).next_poll.unwrap()(self.cq) } != 0 {
+        } else {
+            let ret = unsafe { (*self.cq).next_poll.unwrap()(self.cq) };
             // ENOENT (no more) or an error: either way the poll is finished. End it here rather
             // than in `Drop`, so that a drained `Completions` holds the poll lock no longer.
-            self.done = true;
-            self.open = false;
-            unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
-            return None;
+            // ionic's `next_poll` is its `start_poll`, so on a queue with wallclock timestamps it
+            // too reports a concurrent clock update as EBUSY, keeping the completion it took off
+            // the queue pending: retry that, as `poll` does.
+            if ret != 0 && (ret != nix::libc::EBUSY || !next_poll_after_busy(self.cq)) {
+                self.done = true;
+                self.open = false;
+                unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+                return None;
+            }
         }
         Some(WorkCompletion {
             cq: self.cq,
             _iter: std::marker::PhantomData,
         })
+    }
+}
+
+/// Retry a `next_poll` on `cq` that reported EBUSY until it no longer does; whether it then
+/// positioned on a completion. Out of line, so the data path keeps one test of `next_poll`'s
+/// result.
+#[cold]
+#[inline(never)]
+fn next_poll_after_busy(cq: *mut ffi::ibv_cq_ex) -> bool {
+    loop {
+        std::hint::spin_loop();
+        match unsafe { (*cq).next_poll.unwrap()(cq) } {
+            e if e == nix::libc::EBUSY => {}
+            ret => return ret == 0,
+        }
     }
 }
 
@@ -1349,11 +1370,13 @@ mod test_conversions {
         }
     }
 
-    /// A provider's poll table over `left` more entries, counting its `end_poll` calls.
+    /// A provider's poll table over `left` more entries, counting its `end_poll` calls. Its
+    /// `next_poll` first reports EBUSY `busy` times.
     #[repr(C)]
     struct SpyCqEx {
         cq_ex: ffi::ibv_cq_ex,
         left: u32,
+        busy: u32,
         ends: u32,
     }
 
@@ -1362,6 +1385,10 @@ mod test_conversions {
         fn started(more: u32) -> Self {
             unsafe extern "C" fn next_poll(cq: *mut ffi::ibv_cq_ex) -> std::os::raw::c_int {
                 let spy = unsafe { &mut *cq.cast::<SpyCqEx>() };
+                if spy.busy > 0 {
+                    spy.busy -= 1;
+                    return nix::libc::EBUSY;
+                }
                 if spy.left == 0 {
                     return nix::libc::ENOENT;
                 }
@@ -1378,6 +1405,7 @@ mod test_conversions {
                     ..Default::default()
                 },
                 left: more,
+                busy: 0,
                 ends: 0,
             }
         }
@@ -1409,6 +1437,24 @@ mod test_conversions {
         assert!(completions.next().is_none());
         drop(completions);
         assert_eq!(unsafe { (*spy).ends }, 1, "ended twice");
+    }
+
+    /// A `next_poll` that reports EBUSY has kept the completion it took off the queue pending, so
+    /// it is asked again instead of ending the poll.
+    #[test]
+    fn a_busy_next_poll_is_retried() {
+        let mut spy = SpyCqEx::started(1);
+        spy.busy = 2;
+        let spy = &raw mut spy;
+        let mut completions = open_poll(spy);
+        assert!(completions.next().is_some());
+        assert!(completions.next().is_some(), "lost the entry behind EBUSY");
+        assert_eq!(unsafe { (*spy).busy }, 0);
+        assert_eq!(unsafe { (*spy).ends }, 0);
+        // EBUSY and then the end of the queue.
+        unsafe { (*spy).busy = 1 };
+        assert!(completions.next().is_none());
+        assert_eq!(unsafe { (*spy).ends }, 1);
     }
 
     #[test]
