@@ -604,13 +604,18 @@ impl AddressHandleAttribute {
     /// datagrams should cache the address handle per sender (keyed by the header's
     /// [`Grh::sgid`], or by the completion's source LID when there is no header).
     ///
+    /// EFA completions carry no route back: they never report a header, and their source LID is
+    /// not a LID but the number of an address handle the receiver already holds for the sender
+    /// (`0xffff` when it holds none). On EFA, learn a peer's GID from the peer.
+    ///
     /// # Errors
     ///
     ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): the completion reports a header
-    ///    but none was given, or libibverbs could not derive the route: `EINVAL` when the
-    ///    header's destination GID is multicast or (on current kernels) not in the port's GID
-    ///    table, and `EPROTONOSUPPORT` when the header is neither an IPv6-style nor an IPv4 one,
-    ///    or its next header is neither UDP (RoCE v2) nor InfiniBand.
+    ///    but none was given; or it reports none on a device without LIDs to route by instead
+    ///    (EFA; [`io::ErrorKind::Unsupported`]); or libibverbs could not derive the route:
+    ///    `EINVAL` when the header's destination GID is multicast or (on current kernels) not in
+    ///    the port's GID table, and `EPROTONOSUPPORT` when the header is neither an IPv6-style
+    ///    nor an IPv4 one, or its next header is neither UDP (RoCE v2) nor InfiniBand.
     ///
     /// [`CompletionQueue::poll_into`]: crate::CompletionQueue::poll_into
     /// [`WcFlags::GRH`]: crate::WcFlags::GRH
@@ -633,7 +638,19 @@ impl AddressHandleAttribute {
                     "the completion reports a GRH, but none was given to derive the route from",
                 )));
             }
-            (false, _) => ffi::ibv_grh::default(),
+            (false, _) => {
+                // Without a header the route is the source LID alone, which only InfiniBand
+                // devices have (RoCE ones always report a header). EFA reports neither, and its
+                // kernel driver would take the result for an address handle to the GID `::`.
+                let transport = unsafe { (*(*context.as_raw()).device).transport_type };
+                if transport != ffi::ibv_transport_type::IBV_TRANSPORT_IB {
+                    return Err(Error::CreateAddressHandle(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "the completion carries no GRH, and the device has no LIDs to route by",
+                    )));
+                }
+                ffi::ibv_grh::default()
+            }
         };
         let mut attr = ffi::ibv_ah_attr::default();
         let ret = unsafe {
