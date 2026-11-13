@@ -614,6 +614,10 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// Set the Shared Receive Queue (SRQ) associated with this QP.
+    ///
+    /// The shared receive queue must come from the builder's protection domain, or
+    /// [`build`](Self::build) fails: rxe checks the buffers of the receives it takes from the
+    /// queue against the queue pair's protection domain, so with another one every receive fails.
     pub fn set_srq(&mut self, srq: &SharedReceiveQueue) -> &mut Self {
         self.srq = Some(srq.clone());
         self
@@ -740,27 +744,30 @@ impl<T: Transport> QueuePairBuilder<T> {
         self.send_ops.unwrap_or_else(|| default_send_ops(T::TYPE))
     }
 
-    /// Refuses completion queues or a shared receive queue from another device context than the
-    /// protection domain's. libibverbs hands the kernel only their handle numbers, which each
-    /// context numbers independently and the kernel looks up in the protection domain's context:
-    /// a foreign object either fails to resolve or silently names a different object there, while
-    /// the provider keeps operating on the foreign one (misrouted completions, and type confusion
-    /// across providers).
+    /// Refuses completion queues from another device context than the protection domain's, and a
+    /// shared receive queue from another protection domain. libibverbs hands the kernel only their
+    /// handle numbers, which each context numbers independently and the kernel looks up in the
+    /// protection domain's context: a foreign object either fails to resolve or silently names a
+    /// different object there, while the provider keeps operating on the foreign one (misrouted
+    /// completions, and type confusion across providers). A shared receive queue from another
+    /// protection domain of the same context is accepted by the kernel, but rxe then checks every
+    /// receive it takes from it against the queue pair's protection domain and fails it.
     pub(crate) fn check_same_context(&self) -> Result<()> {
         let ctx = self.pd.context().as_raw();
+        // One protection domain implies one device context.
         let foreign = unsafe {
             (*self.send.as_raw()).context != ctx
                 || (*self.recv.as_raw()).context != ctx
                 || self
                     .srq
                     .as_ref()
-                    .is_some_and(|s| (*s.as_raw()).context != ctx)
+                    .is_some_and(|s| (*s.as_raw()).pd != self.pd.as_raw())
         };
         if foreign {
             return Err(Error::CreateQueuePair(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the completion queues and the shared receive queue must come from the protection \
-                 domain's device context",
+                "the completion queues must come from the protection domain's device context, and \
+                 the shared receive queue from the protection domain",
             )));
         }
         Ok(())
@@ -884,8 +891,9 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///
     /// # Errors
     ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
-    ///    queue belongs to another device context than the protection domain, or
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
+    ///    device context than the protection domain, or the shared receive queue to another
+    ///    protection domain, or
     ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
     ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
     ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
@@ -906,8 +914,9 @@ impl QueuePairBuilder<Ud> {
     ///
     /// # Errors
     ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue or the shared receive
-    ///    queue belongs to another device context than the protection domain, or
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
+    ///    device context than the protection domain, or the shared receive queue to another
+    ///    protection domain, or
     ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
     ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
     ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not

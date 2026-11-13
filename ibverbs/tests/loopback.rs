@@ -906,6 +906,18 @@ fn objects_from_another_context_are_refused() {
         refused(builder.build()),
         "a foreign shared receive queue is refused"
     );
+    // So is one from another protection domain of the same context, whose receives rxe would
+    // check against the queue pair's protection domain and fail.
+    let other_pd_srq = a
+        .alloc_pd()
+        .expect("failed to allocate PD")
+        .create_srq(16, 1, 0)
+        .expect("failed to create SRQ");
+    builder.set_srq(&other_pd_srq);
+    assert!(
+        refused(builder.build()),
+        "a shared receive queue from another protection domain is refused"
+    );
 
     // The same objects from the protection domain's own context build.
     let _prepared = pd
