@@ -2143,6 +2143,18 @@ fn atomic_local_not_8_bytes(len: usize) -> ! {
     panic!("an atomic writes 8 bytes to its local buffer, which is {len} bytes long")
 }
 
+// `Payload::InlineList` hands its `IoSlice`s to the provider as `ibv_data_buf`s. std lays an
+// `IoSlice` out as an `iovec`, and an `iovec` is an `ibv_data_buf` under other names.
+const _: () = {
+    use nix::libc::iovec;
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<ffi::ibv_data_buf>() == size_of::<iovec>());
+    assert!(align_of::<ffi::ibv_data_buf>() == align_of::<iovec>());
+    assert!(offset_of!(ffi::ibv_data_buf, addr) == offset_of!(iovec, iov_base));
+    assert!(offset_of!(ffi::ibv_data_buf, length) == offset_of!(iovec, iov_len));
+    assert!(size_of::<io::IoSlice<'static>>() == size_of::<iovec>());
+};
+
 /// The data a SEND or RDMA WRITE carries: registered memory the device reads after the request is
 /// posted, or bytes copied into the work request as it is posted.
 ///
@@ -3450,6 +3462,25 @@ mod test_timers {
             assert_eq!(RnrTimer::at_least(timer.duration()), timer);
         }
         assert_eq!(RnrTimer::from_encoding(16).to_string(), "2.56ms");
+    }
+
+    /// The 32 delays without the table: in units of 10 µs, the encodings from 2 on alternate
+    /// between 2 and 3 times a power of two, 1 is the unit, and 0 continues the series past 31
+    /// (the names of Linux's `enum ib_rnr_timeout` spell out the same values).
+    #[test]
+    fn rnr_timer_delays_follow_the_specification() {
+        for v in 0..=31u8 {
+            let units = match v {
+                0 => 2 << 15,
+                1 => 1,
+                v => (2 + u64::from(v & 1)) << (v / 2 - 1),
+            };
+            assert_eq!(
+                RnrTimer::from_encoding(v).duration(),
+                Duration::from_micros(10 * units),
+                "encoding {v}"
+            );
+        }
     }
 
     #[test]
