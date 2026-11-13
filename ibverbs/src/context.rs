@@ -2,7 +2,6 @@ use std::borrow::Cow;
 use std::ffi::CStr;
 use std::fmt;
 use std::io;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::os::fd::BorrowedFd;
 use std::sync::Arc;
@@ -166,7 +165,7 @@ impl Context {
     /// # Errors
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
-    pub fn poll_async_event(&self) -> Result<Option<AsyncEvent<'_>>> {
+    pub fn poll_async_event(&self) -> Result<Option<AsyncEvent>> {
         let mut event = ffi::ibv_async_event::default();
         let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, &mut event) };
         if rc != 0 {
@@ -183,11 +182,7 @@ impl Context {
         // event is acknowledged, so acknowledging only when the caller drops it would let a held
         // (or leaked) event hang the drop of that object forever.
         unsafe { ffi::ibv_ack_async_event(&mut event) };
-        Ok(Some(AsyncEvent {
-            event,
-            qp_num,
-            _ctx: PhantomData,
-        }))
+        Ok(Some(AsyncEvent { event, qp_num }))
     }
 
     /// Block until an asynchronous event is available (up to `timeout`), then consume it.
@@ -200,7 +195,7 @@ impl Context {
     /// # Errors
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
-    pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent<'_>>> {
+    pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent>> {
         let deadline = crate::completion::deadline_after(timeout);
         loop {
             if !crate::completion::wait_readable(self.async_fd(), deadline)
@@ -522,17 +517,19 @@ fn rd_atomic_depths(attr: &ffi::ibv_device_attr) -> (u8, u8) {
 /// An asynchronous event reported by the device, consumed with [`Context::poll_async_event`] /
 /// [`Context::wait_async_event`], which acknowledge it as they read it: holding an `AsyncEvent`
 /// never delays the destruction of the object it names.
-pub struct AsyncEvent<'ctx> {
+pub struct AsyncEvent {
     event: ffi::ibv_async_event,
     /// The number of the queue pair a queue-pair-scoped event names, read before the event was
     /// acknowledged: after that, the queue pair may be destroyed at any time.
     qp_num: Option<u32>,
-    /// The [`Context`] the event was read from. The event is already acknowledged, so nothing
-    /// needs the borrow any more; dropping the lifetime would make events `'static`.
-    _ctx: PhantomData<&'ctx Context>,
 }
 
-impl AsyncEvent<'_> {
+// SAFETY: an acknowledged event is plain data. The pointer in its element is handed out for
+// comparison, and nothing here dereferences it.
+unsafe impl Send for AsyncEvent {}
+unsafe impl Sync for AsyncEvent {}
+
+impl AsyncEvent {
     /// The kind of event.
     pub fn event_type(&self) -> AsyncEventType {
         self.event.event_type.into()
@@ -553,6 +550,39 @@ impl AsyncEvent<'_> {
     /// destroyed.
     pub fn qp_num(&self) -> Option<u32> {
         self.qp_num
+    }
+
+    /// The completion queue the event refers to, for [`CqError`](AsyncEventType::CqError);
+    /// `None` for every other kind. It equals the [`CompletionQueue::as_raw`] of that queue.
+    ///
+    /// The pointer is for comparison only. The event is already acknowledged, so the queue may
+    /// have been destroyed since, and its address may belong to a newer one.
+    ///
+    /// [`CompletionQueue::as_raw`]: crate::CompletionQueue::as_raw
+    pub fn cq(&self) -> Option<*mut ffi::ibv_cq> {
+        match self.event_type() {
+            // SAFETY: for the completion-queue-scoped event, the element union holds the queue.
+            AsyncEventType::CqError => Some(unsafe { self.event.element.cq }),
+            _ => None,
+        }
+    }
+
+    /// The shared receive queue the event refers to, for [`SrqError`](AsyncEventType::SrqError)
+    /// and [`SrqLimitReached`](AsyncEventType::SrqLimitReached); `None` for every other kind. It
+    /// equals the [`SharedReceiveQueue::as_raw`] of that queue.
+    ///
+    /// The pointer is for comparison only. The event is already acknowledged, so the queue may
+    /// have been destroyed since, and its address may belong to a newer one.
+    ///
+    /// [`SharedReceiveQueue::as_raw`]: crate::SharedReceiveQueue::as_raw
+    pub fn srq(&self) -> Option<*mut ffi::ibv_srq> {
+        match self.event_type() {
+            AsyncEventType::SrqError | AsyncEventType::SrqLimitReached => {
+                // SAFETY: for the SRQ-scoped events, the element union holds the queue.
+                Some(unsafe { self.event.element.srq })
+            }
+            _ => None,
+        }
     }
 
     /// The port the event refers to, for the port-scoped events
@@ -581,18 +611,19 @@ impl AsyncEvent<'_> {
     /// The underlying `ibv_async_event`.
     ///
     /// This is the escape hatch for the `element` union: for CQ-, QP-, and SRQ-scoped events it
-    /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to (queue-pair-scoped
-    /// events also expose their queue-pair number directly via [`AsyncEvent::qp_num`]). Those
-    /// pointers cannot be mapped back to this crate's safe wrappers; compare them against the
-    /// `as_raw` handles of the wrappers you own to identify the object. The event is already
-    /// acknowledged, so the object may have been destroyed since, and its address reused by a new
-    /// one: dereference the pointer only while you hold the wrapper it belongs to.
+    /// holds the raw `ibv_cq`/`ibv_qp`/`ibv_srq` pointer the event refers to, which
+    /// [`cq`](Self::cq), [`srq`](Self::srq), and (as the queue pair's number)
+    /// [`qp_num`](Self::qp_num) read for you. Those pointers cannot be mapped back to this
+    /// crate's safe wrappers; compare them against the `as_raw` handles of the wrappers you own
+    /// to identify the object. The event is already acknowledged, so the object may have been
+    /// destroyed since, and its address reused by a new one: dereference the pointer only while
+    /// you hold the wrapper it belongs to.
     pub fn as_raw(&self) -> &ffi::ibv_async_event {
         &self.event
     }
 }
 
-impl fmt::Debug for AsyncEvent<'_> {
+impl fmt::Debug for AsyncEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut f = f.debug_struct("AsyncEvent");
         f.field("event_type", &self.event_type());
@@ -1500,10 +1531,7 @@ mod test_display {
 
     /// An event of `event_type` whose element points at `qp`, built the way
     /// [`Context::poll_async_event`] builds one.
-    fn synthetic_async_event(
-        event_type: ffi::ibv_event_type,
-        qp: *mut ffi::ibv_qp,
-    ) -> AsyncEvent<'static> {
+    fn synthetic_async_event(event_type: ffi::ibv_event_type, qp: *mut ffi::ibv_qp) -> AsyncEvent {
         let event = ffi::ibv_async_event {
             event_type,
             element: ffi::ibv_async_event__bindgen_ty_1 { qp },
@@ -1512,7 +1540,6 @@ mod test_display {
             // SAFETY: `qp` points to a live `ibv_qp`.
             qp_num: unsafe { event_qp_num(&event) },
             event,
-            _ctx: PhantomData,
         }
     }
 
@@ -1570,6 +1597,27 @@ mod test_display {
                 event.event_type()
             );
         }
+    }
+
+    /// The completion-queue and SRQ-scoped events name their queue; no other event names one.
+    #[test]
+    fn cq_and_srq_scoped_async_events_expose_their_queue() {
+        let mut raw_qp = zeroed_qp_with_num(4242);
+        // The element is a union of pointers: the queue is whatever object the event points at.
+        let element = raw_qp.as_mut_ptr();
+        let cq = synthetic_async_event(ffi::ibv_event_type::IBV_EVENT_CQ_ERR, element);
+        assert_eq!(cq.cq(), Some(element.cast()));
+        assert_eq!(cq.srq(), None);
+        for event_type in [
+            ffi::ibv_event_type::IBV_EVENT_SRQ_ERR,
+            ffi::ibv_event_type::IBV_EVENT_SRQ_LIMIT_REACHED,
+        ] {
+            let srq = synthetic_async_event(event_type, element);
+            assert_eq!(srq.srq(), Some(element.cast()));
+            assert_eq!(srq.cq(), None);
+        }
+        let other = synthetic_async_event(ffi::ibv_event_type::IBV_EVENT_QP_FATAL, element);
+        assert_eq!((other.cq(), other.srq()), (None, None));
     }
 
     /// The Debug representation of a queue-pair-scoped asynchronous event includes its queue-pair

@@ -786,6 +786,7 @@ fn srq_limit_reached_async_event() {
         {
             Some(event) if event.event_type() == ibverbs::AsyncEventType::SrqLimitReached => {
                 assert_eq!(event.port_num(), None, "an SRQ event is not port-scoped");
+                assert_eq!(event.srq(), Some(srq.as_raw()), "the event names its queue");
                 break;
             }
             Some(_other) => continue,
