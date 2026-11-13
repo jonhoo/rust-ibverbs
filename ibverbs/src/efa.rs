@@ -24,9 +24,17 @@ use crate::{ProtectionDomain, QueuePair, WorkCompletion};
 ///
 /// Begin building an SRD queue pair with [`ProtectionDomain::create_qp`]`::<Srd>`, configure it
 /// like any other queue pair (GID index, queue/SGE limits), create it with
-/// [`build`](QueuePairBuilder::build), and bring it to ready with
+/// [`build`](QueuePairBuilder::build) (`efadv_create_qp_ex`), and bring it to ready with
 /// [`activate`](PreparedQueuePair::activate). Send with [`start_send`](QueuePair::start_send) and
 /// [`to(..)`](crate::SendBatch::to), receive with [`post_recv`](QueuePair::post_recv).
+///
+/// The queue pair is created with the builder's send operations
+/// ([`send_ops`](QueuePairBuilder::send_ops)): by default SEND, with and without an immediate,
+/// plus RDMA READ and RDMA WRITE (with and without an immediate) where the device has them
+/// ([`Context::efa_device_attr`]). EFA refuses a request for an operation the device lacks (as
+/// [`Unsupported`](crate::Error::Unsupported)), and installs only the operations requested:
+/// posting another one panics (a [`send`](SendOp::send) with an [`imm`](SendOp::imm), for one, on
+/// a queue pair created with `SendOps::SEND` alone).
 ///
 /// Every SRD work request generates a completion: EFA refuses unsignaled ones, so the queue pair
 /// is created to signal every send and [`signaled`](SendOp::signaled) is implied. Size
@@ -87,39 +95,16 @@ impl sealed::Sealed for Srd {
         }
         ops
     }
-}
-impl Transport for Srd {}
-impl Datagram for Srd {}
 
-impl QueuePairBuilder<Srd> {
-    /// Create the EFA SRD queue pair described by this builder (`efadv_create_qp_ex`).
-    ///
-    /// The queue pair is created with the builder's send operations
-    /// ([`send_ops`](QueuePairBuilder::send_ops)): by default SEND, with and without an
-    /// immediate, plus RDMA READ and RDMA WRITE (with and without an immediate) where the device
-    /// has them ([`Context::efa_device_attr`]). EFA refuses a request for an operation the device
-    /// lacks, and installs only the operations requested: posting another one panics (a
-    /// [`send`](SendOp::send) with an [`imm`](SendOp::imm), for one, on a queue pair created with
-    /// `SendOps::SEND` alone). Activate the result with
-    /// [`activate`](PreparedQueuePair::activate).
-    ///
-    /// # Errors
-    ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
-    ///    device context than the protection domain, or `efadv_create_qp_ex` failed (`EINVAL` for
-    ///    an invalid value in the queue pair attributes, `ENOMEM` when out of resources).
-    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`; RDMA READ or WRITE on a device without them), or created the
-    ///    queue pair without the extended work-request interface this crate posts through
-    ///    (`ibv_qp_to_qp_ex` returned no handle).
-    pub fn build(&self) -> Result<PreparedQueuePair<Srd>> {
-        self.check_same_context()?;
+    /// Creates the SRD queue pair `builder` describes (`efadv_create_qp_ex`).
+    fn create(builder: &QueuePairBuilder<Srd>) -> Result<PreparedQueuePair<Srd>> {
+        builder.check_same_context()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
             // EFA rejects a work request without `IBV_SEND_SIGNALED` unless the queue pair signals
             // every send, and requests a completion for every work request either way, so
             // signaling all costs nothing and spares each request the flag.
             sq_sig_all: 1,
-            ..self.init_attr_ex()
+            ..builder.init_attr_ex()
         };
         // rdma-core adds fields to this struct over time (64.0 added `wr_flags`); the provider
         // reads only as much as the passed-in length covers.
@@ -129,7 +114,7 @@ impl QueuePairBuilder<Srd> {
         };
         let qp = unsafe {
             ffi::efadv_create_qp_ex(
-                self.pd.context().as_raw(),
+                builder.pd.context().as_raw(),
                 &mut attr,
                 &mut efa_attr,
                 std::mem::size_of::<ffi::efadv_qp_init_attr>() as u32,
@@ -137,9 +122,11 @@ impl QueuePairBuilder<Srd> {
         };
         let qp = nonnull(qp, Error::CreateQueuePair)
             .map_err(|e| e.for_operation(&"efadv_create_qp_ex"))?;
-        self.prepared(qp, &attr)
+        builder.prepared(qp, &attr)
     }
 }
+impl Transport for Srd {}
+impl Datagram for Srd {}
 
 /// The EFA-specific limits and capabilities of a device, as returned by
 /// [`Context::efa_device_attr`] (`efadv_query_device`).

@@ -14,6 +14,9 @@ use crate::srq::SharedReceiveQueue;
 
 /// Seals the transport traits: only the markers defined by this crate implement them.
 pub(crate) mod sealed {
+    use super::{PreparedQueuePair, QueuePairBuilder, Transport};
+    use crate::error::Result;
+
     /// Implemented by every transport marker.
     pub trait Sealed {
         /// The queue-pair type (`IBV_QPT_*`) the marker stands for.
@@ -25,6 +28,15 @@ pub(crate) mod sealed {
         /// them (`atomics`). SRD asks the device (see `efa.rs`).
         fn default_send_ops(_ctx: &crate::Context, atomics: bool) -> super::SendOps {
             super::default_send_ops(Self::TYPE, atomics)
+        }
+
+        /// Creates the queue pair `builder` describes, with `ibv_create_qp_ex` unless the
+        /// transport's queue pairs come from a provider's own verb (SRD's, in `efa.rs`).
+        fn create(builder: &QueuePairBuilder<Self>) -> Result<PreparedQueuePair<Self>>
+        where
+            Self: Transport + Sized,
+        {
+            builder.create_qp_ex()
         }
     }
 }
@@ -826,9 +838,33 @@ impl<T: Transport> QueuePairBuilder<T> {
         }
     }
 
-    /// The `ibv_create_qp_ex` creation shared by the `build` of every transport it serves (SRD
-    /// goes through `efadv_create_qp_ex` instead; see `efa.rs`).
-    fn build_impl(&self) -> Result<PreparedQueuePair<T>> {
+    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`, or
+    /// `efadv_create_qp_ex` for SRD).
+    ///
+    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
+    ///
+    /// This method will fail if an unreliable-connection (UC) queue pair is associated with an
+    /// SRQ (devices support SRQs on RC and UD queue pairs).
+    ///
+    /// # Errors
+    ///
+    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
+    ///    device context than the protection domain, or the shared receive queue to another
+    ///    protection domain, or the creation failed (`EINVAL` for an invalid `ProtectionDomain`
+    ///    or `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
+    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
+    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
+    ///    with this Transport Service Type).
+    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
+    ///    operations (`EOPNOTSUPP`; on EFA, RDMA READ or WRITE on a device without them), or
+    ///    created the queue pair without the extended work-request interface this crate posts
+    ///    through (`ibv_qp_to_qp_ex` returned no handle).
+    pub fn build(&self) -> Result<PreparedQueuePair<T>> {
+        T::create(self)
+    }
+
+    /// The `ibv_create_qp_ex` creation of every transport but SRD.
+    fn create_qp_ex(&self) -> Result<PreparedQueuePair<T>> {
         self.check_same_context()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
@@ -904,53 +940,6 @@ impl<T: Connected> QueuePairBuilder<T> {
     pub fn set_path_mtu(&mut self, path_mtu: Mtu) -> &mut Self {
         self.bring_up.rtr.set_path_mtu(path_mtu);
         self
-    }
-
-    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
-    ///
-    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
-    ///
-    /// This method will fail if an unreliable-connection (UC) queue pair is associated with an
-    /// SRQ (devices support SRQs on RC and UD queue pairs).
-    ///
-    /// # Errors
-    ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
-    ///    device context than the protection domain, or the shared receive queue to another
-    ///    protection domain, or
-    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
-    ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
-    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
-    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
-    ///    with this Transport Service Type).
-    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
-    pub fn build(&self) -> Result<PreparedQueuePair<T>> {
-        self.build_impl()
-    }
-}
-
-impl QueuePairBuilder<Ud> {
-    /// Create a new [`PreparedQueuePair`] from this builder template (`ibv_create_qp_ex`).
-    ///
-    /// The returned `PreparedQueuePair` is associated with the builder's `ProtectionDomain`.
-    ///
-    /// # Errors
-    ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
-    ///    device context than the protection domain, or the shared receive queue to another
-    ///    protection domain, or
-    ///    `ibv_create_qp_ex` failed (`EINVAL` for an invalid `ProtectionDomain` or
-    ///    `CompletionQueue`, or an invalid value in `max_send_wr`, `max_recv_wr`, or
-    ///    `max_inline_data`; `ENOMEM` when out of resources; `ENOSYS` when the device does not
-    ///    support this Transport Service Type; `EPERM` without enough permissions to create a QP
-    ///    with this Transport Service Type).
-    ///  - [`Unsupported`](Error::Unsupported): the provider declined the requested send
-    ///    operations (`EOPNOTSUPP`), or created the queue pair without the extended work-request
-    ///    interface this crate posts through (`ibv_qp_to_qp_ex` returned no handle).
-    pub fn build(&self) -> Result<PreparedQueuePair<Ud>> {
-        self.build_impl()
     }
 }
 
