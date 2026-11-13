@@ -739,6 +739,8 @@ fn srq_limit_reached_async_event() {
     let attrs = srq.query().expect("failed to query the SRQ");
     assert!(attrs.max_wr >= 16, "{attrs:?}");
     assert!(attrs.max_sge >= 1, "{attrs:?}");
+    assert!(srq.capacity() >= 16 && srq.capacity() <= attrs.max_wr);
+    assert!(srq.max_sge() >= 1);
     assert_eq!(attrs.limit, 2, "{attrs:?}");
     // Resizing is provider-dependent; where it works, the queue reports the larger capacity.
     match srq.set_max_wr(32) {
@@ -1321,7 +1323,9 @@ fn post_recv_reports_how_many_were_posted() {
         .expect("failed to query queue pair");
     let room = caps.max_recv_wr;
     expect_room(unsafe { lb.qp.post_recv(overflow(room)) }, room);
-    let room = srq.query().expect("failed to query SRQ").max_wr;
+    // The granted capacity, not `query().max_wr`: mlx5 reports its whole ring there, about half
+    // of which it keeps for receives parked on a page fault.
+    let room = srq.capacity();
     expect_room(unsafe { srq.post_recv(overflow(room)) }, room);
 
     // Destroy the queues, discarding the posted receives, before the buffer they point at.

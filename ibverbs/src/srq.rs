@@ -8,6 +8,9 @@ use crate::qp::{RecvRequest, post_recv_error};
 struct SharedReceiveQueueInner {
     _pd: ProtectionDomain,
     srq: *mut ffi::ibv_srq,
+    /// The capacities the provider granted at creation.
+    max_wr: u32,
+    max_sge: u32,
 }
 
 unsafe impl Sync for SharedReceiveQueueInner {}
@@ -27,8 +30,11 @@ impl Drop for SharedReceiveQueueInner {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SrqAttributes {
-    /// The number of receives the queue can hold: the capacity the device granted, at least what
-    /// was asked at creation or in the last [`set_max_wr`](SharedReceiveQueue::set_max_wr).
+    /// The size of the queue as the kernel reports it, at least what was asked at creation or in
+    /// the last [`set_max_wr`](SharedReceiveQueue::set_max_wr). This is not always the number of
+    /// receives that can be posted: mlx5 keeps about half of its ring for receives parked on a
+    /// page fault, and reports the whole ring here. [`SharedReceiveQueue::capacity`] is the number
+    /// that can be posted.
     pub max_wr: u32,
     /// The number of scatter/gather entries a receive may carry.
     pub max_sge: u32,
@@ -52,12 +58,37 @@ unsafe impl Sync for SharedReceiveQueue {}
 unsafe impl Send for SharedReceiveQueue {}
 
 impl SharedReceiveQueue {
-    /// Wraps `srq`, created on `pd` (for [`ProtectionDomain::create_srq`]).
-    pub(crate) fn new(pd: ProtectionDomain, srq: *mut ffi::ibv_srq) -> SharedReceiveQueue {
+    /// Wraps `srq`, created on `pd` with the capacities `granted` (for
+    /// [`ProtectionDomain::create_srq`]).
+    pub(crate) fn new(
+        pd: ProtectionDomain,
+        srq: *mut ffi::ibv_srq,
+        granted: &ffi::ibv_srq_attr,
+    ) -> SharedReceiveQueue {
         SharedReceiveQueue {
-            _inner: Arc::new(SharedReceiveQueueInner { _pd: pd, srq }),
+            _inner: Arc::new(SharedReceiveQueueInner {
+                _pd: pd,
+                srq,
+                max_wr: granted.max_wr,
+                max_sge: granted.max_sge,
+            }),
             srq,
         }
+    }
+
+    /// The number of receives the queue can hold at once: the capacity the provider granted at
+    /// creation, at least the `max_wr` asked of
+    /// [`ProtectionDomain::create_srq`](crate::ProtectionDomain::create_srq) (providers round it
+    /// up; mlx5 to one below a power of two). Posting more fails with `ENOMEM`. The value is the
+    /// one from creation: it does not follow a later [`set_max_wr`](Self::set_max_wr).
+    pub fn capacity(&self) -> u32 {
+        self._inner.max_wr
+    }
+
+    /// The number of scatter/gather entries a receive may carry: what the provider granted at
+    /// creation, at least the `max_sge` asked.
+    pub fn max_sge(&self) -> u32 {
+        self._inner.max_sge
     }
 
     /// Returns the underlying `ibv_srq` pointer.
@@ -90,8 +121,10 @@ impl SharedReceiveQueue {
     /// Arm the low-watermark event (`ibv_modify_srq` with `IBV_SRQ_LIMIT`): once fewer than
     /// `limit` receives remain posted, the device raises
     /// [`AsyncEventType::SrqLimitReached`](crate::AsyncEventType::SrqLimitReached) once and
-    /// disarms, so re-arm to be told again. A `limit` of 0 disarms. The limit must be below the
-    /// queue's capacity ([`SrqAttributes::max_wr`]).
+    /// disarms, so re-arm to be told again. A `limit` of 0 disarms. Keep the limit at or below the
+    /// queue's [`capacity`](Self::capacity): the kernel refuses only a limit at or above the size
+    /// it reports ([`SrqAttributes::max_wr`]), which on mlx5 is about twice the capacity, and a
+    /// limit above the capacity is one the posted receives can never reach.
     ///
     /// # Errors
     ///

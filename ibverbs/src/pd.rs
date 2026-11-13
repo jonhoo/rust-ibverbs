@@ -365,7 +365,9 @@ impl ProtectionDomain {
     /// each queue pair separately.
     ///
     /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
-    /// `max_sge` is the maximum number of scatter/gather elements per work request.
+    /// `max_sge` is the maximum number of scatter/gather elements per work request. Providers
+    /// round both up; [`SharedReceiveQueue::capacity`] and
+    /// [`max_sge`](SharedReceiveQueue::max_sge) report what was granted.
     /// `srq_limit` is recorded at creation and, on providers that honor it there (Soft-RoCE's rxe
     /// does; this crate's test suite relies on that), arms the low-watermark event: once fewer
     /// receives than the limit remain posted, the device raises
@@ -403,7 +405,12 @@ impl ProtectionDomain {
             unsafe { ffi::ibv_create_srq(self.inner.pd, &mut srq_init_attr as *mut _) },
             Error::CreateSharedReceiveQueue,
         )?;
-        Ok(SharedReceiveQueue::new(self.clone(), srq))
+        // Creation wrote the granted capacities back into the attributes.
+        Ok(SharedReceiveQueue::new(
+            self.clone(),
+            srq,
+            &srq_init_attr.attr,
+        ))
     }
 }
 
