@@ -276,13 +276,16 @@ impl Context {
     ///
     /// Not every entry routes. On RoCE over plain Ethernet, peers answer on the RoCE v2 entry that
     /// holds the interface's IP address, and for an IPv4 network that is the IPv4-mapped one
-    /// (`::ffff:a.b.c.d`). This prefers such an entry, then any other RoCE v2 entry (an IPv6
-    /// address, or the link-local one), and otherwise falls back to the port's first entry: on
-    /// InfiniBand the port GID at index 0, where any entry routes, and on RoCE a RoCE v1 entry,
-    /// which reaches only peers on the same Ethernet segment that still speak RoCE v1. Pass the
-    /// entry's [`gid_index`](GidEntry::gid_index) to [`QueuePairBuilder::set_gid_index`], and its
-    /// [`gid`](GidEntry::gid) to the peer or to [`AddressHandleAttribute::set_grh`]. Choose
-    /// differently from [`gid_table`](Self::gid_table) when the network needs another entry.
+    /// (`::ffff:a.b.c.d`). This prefers such an entry, then a RoCE v2 entry holding a routable
+    /// IPv6 address, then the link-local RoCE v2 entry (the kernel's default GID, at the start of
+    /// the table, which reaches only peers on the same link), and otherwise falls back to the
+    /// port's first entry: on InfiniBand the port GID at index 0, where any entry routes, and on
+    /// RoCE a RoCE v1 entry, which reaches only peers on the same Ethernet segment that still
+    /// speak RoCE v1. Entries above index 255 are passed over: an address vector cannot route from
+    /// them. Pass the entry's [`gid_index`](GidEntry::gid_index) to
+    /// [`QueuePairBuilder::set_gid_index`], and its [`gid`](GidEntry::gid) to the peer or to
+    /// [`AddressHandleAttribute::set_grh`]. Choose differently from
+    /// [`gid_table`](Self::gid_table) when the network needs another entry.
     ///
     /// # Errors
     ///
@@ -455,11 +458,19 @@ impl Context {
 
 /// The entry of `table` that [`Context::routable_gid`] picks for `port_num`.
 fn routable_entry(table: &[GidEntry], port_num: u8) -> Option<&GidEntry> {
-    let on_port = || table.iter().filter(move |entry| entry.port_num == port_num);
+    // An address vector holds the source GID index in 8 bits.
+    let on_port = || {
+        table
+            .iter()
+            .filter(move |entry| entry.port_num == port_num && entry.gid_index <= 255)
+    };
     let roce_v2 = |entry: &&GidEntry| entry.gid_type == GidType::RoceV2;
+    let link_local =
+        |entry: &&GidEntry| std::net::Ipv6Addr::from(entry.gid).is_unicast_link_local();
     on_port()
         .filter(roce_v2)
         .find(|entry| entry.gid.is_ipv4_mapped())
+        .or_else(|| on_port().filter(roce_v2).find(|entry| !link_local(entry)))
         .or_else(|| on_port().find(roce_v2))
         .or_else(|| on_port().next())
 }
@@ -1416,8 +1427,15 @@ mod test_display {
             entry(5, 1, "::ffff:192.0.2.1", GidType::RoceV2),
         ];
         assert_eq!(routable(&table), Some(5));
-        // Without an IPv4 address, any RoCE v2 entry rather than the RoCE v1 one at index 0.
+        // Without an IPv4 address, the RoCE v2 entry of the routable IPv6 address rather than the
+        // link-local default one at index 1, or the RoCE v1 one at index 0.
         table.truncate(5);
+        assert_eq!(routable(&table), Some(3));
+        // With only the default GIDs, the link-local RoCE v2 one.
+        table.truncate(3);
+        assert_eq!(routable(&table), Some(1));
+        // An IPv4 address past index 255 cannot route; the link-local entry can.
+        table.push(entry(300, 1, "::ffff:192.0.2.3", GidType::RoceV2));
         assert_eq!(routable(&table), Some(1));
         let ib = [
             entry(0, 1, "fe80::2", GidType::Ib),
