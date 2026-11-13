@@ -196,19 +196,12 @@ impl Context {
     ///
     ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
     pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent>> {
-        let deadline = crate::completion::deadline_after(timeout);
-        loop {
-            if !crate::completion::wait_readable(self.async_fd(), deadline)
-                .map_err(Error::AsyncEvent)?
-            {
-                return Ok(None);
-            }
-            // The descriptor was readable, but another thread may have consumed the event
-            // first; if so, go back to waiting for the next one.
-            if let Some(event) = self.poll_async_event()? {
-                return Ok(Some(event));
-            }
-        }
+        crate::completion::wait_and_take(
+            self.async_fd(),
+            crate::completion::deadline_after(timeout),
+            Error::AsyncEvent,
+            || self.poll_async_event(),
+        )
     }
 
     /// Allocate a protection domain (PD) for the device's context.

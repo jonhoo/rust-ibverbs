@@ -543,19 +543,12 @@ impl EventChannel {
     /// `poll(2)`ed with the remaining time and the event then read without blocking, so the wait
     /// never runs past the deadline.
     fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<CmEvent> {
-        loop {
-            if !crate::completion::wait_readable(self.as_fd(), deadline)
-                .map_err(Error::ConnectionSetup)?
-            {
-                return Err(Error::TimedOut);
-            }
-            // The descriptor was readable, but another thread may have taken the event first, or
-            // librdmacm consumed it internally; if so, go back to waiting for the next one with
-            // whatever time is left.
-            if let Some(event) = self.poll_cm_event()? {
-                return Ok(event);
-            }
-        }
+        // A readable descriptor whose event librdmacm consumed internally is waited past like one
+        // that another thread took first.
+        crate::completion::wait_and_take(self.as_fd(), deadline, Error::ConnectionSetup, || {
+            self.poll_cm_event()
+        })?
+        .ok_or(Error::TimedOut)
     }
 
     /// The ids on the channel, by address.
@@ -719,7 +712,7 @@ impl CmId {
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the channel's file descriptor
     ///    (`poll`) or reading the event (`rdma_get_cm_event`) failed.
     pub fn get_cm_event(&self) -> Result<CmEvent> {
-        self.get_cm_event_deadline(None)
+        self.inner.channel.get_cm_event()
     }
 
     /// Returns the next event on this id's channel, or `None` if none is currently pending. This
@@ -826,12 +819,6 @@ impl CmId {
         Ok(QueuePairAttribute::from_raw(attr, mask))
     }
 
-    /// Blocks until the next event on this id's channel arrives (up to `deadline`, indefinitely
-    /// with `None`) and returns it, or [`TimedOut`](Error::TimedOut) once the deadline passes.
-    fn get_cm_event_deadline(&self, deadline: Option<Instant>) -> Result<CmEvent> {
-        self.inner.channel.get_cm_event_deadline(deadline)
-    }
-
     /// Blocks until an `expected` event arrives (up to `deadline`) and returns it, acknowledging
     /// and skipping any others, and returning an error on a failure event or on an expired
     /// deadline. Drives the blocking setup helpers.
@@ -840,7 +827,7 @@ impl CmId {
             // This blocks on the channel's fd until an event arrives — it does not spin. The loop
             // only goes around to skip a non-matching event, re-blocking on the next read. Each
             // skipped event is acknowledged when it drops at the iteration end.
-            let event = self.get_cm_event_deadline(deadline)?;
+            let event = self.inner.channel.get_cm_event_deadline(deadline)?;
             let kind = event.event_type();
             if kind == expected {
                 return Ok(event);
@@ -2225,7 +2212,7 @@ impl Connection {
         let deadline = crate::completion::deadline_after(timeout);
         self.disconnect()?;
         loop {
-            let event = self.id.get_cm_event_deadline(deadline)?;
+            let event = self.id.inner.channel.get_cm_event_deadline(deadline)?;
             if matches!(
                 event.event_type(),
                 CmEventType::Disconnected | CmEventType::TimewaitExit | CmEventType::DeviceRemoval

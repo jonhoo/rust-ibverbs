@@ -15,13 +15,23 @@ pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
     timeout.and_then(|timeout| Instant::now().checked_add(timeout))
 }
 
-/// Block until `fd` is readable (`true`) or `deadline` passes (`false`); with no deadline, wait
-/// indefinitely.
+/// Wait until `fd` is readable and `take` (which returns `None` while nothing is pending) takes an
+/// item, or until `deadline` passes (`None`); with no deadline, wait indefinitely. A readable `fd`
+/// whose item another thread took first sends the wait back to waiting for the next one, and a
+/// failed wait on `fd` becomes the error `wrap` makes of it.
 ///
 /// `poll(2)` waits at most `i32::MAX` milliseconds (about 24.8 days) per call, so a later deadline
 /// is waited out in slices; each is rounded up to whole milliseconds so the wait never ends
-/// fractionally early. A signal interrupting `poll(2)` (`EINTR`) resumes the wait.
-pub(crate) fn wait_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io::Result<bool> {
+/// fractionally early. A signal interrupting `poll(2)` (`EINTR`) resumes the wait. Out of line:
+/// it blocks anyway, and inlined it would weigh on [`CompletionChannel::wait`]'s path for a
+/// notification that is already pending.
+#[inline(never)]
+pub(crate) fn wait_and_take<T>(
+    fd: BorrowedFd<'_>,
+    deadline: Option<Instant>,
+    wrap: fn(io::Error) -> Error,
+    mut take: impl FnMut() -> Result<Option<T>>,
+) -> Result<Option<T>> {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     loop {
         let timeout = match deadline {
@@ -36,12 +46,16 @@ pub(crate) fn wait_readable(fd: BorrowedFd<'_>, deadline: Option<Instant>) -> io
             // A slice ran out: the wait is over only once the deadline itself has passed.
             Ok(0) => {
                 if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                    return Ok(false);
+                    return Ok(None);
                 }
             }
-            Ok(_) => return Ok(true),
+            Ok(_) => {
+                if let Some(item) = take()? {
+                    return Ok(Some(item));
+                }
+            }
             Err(nix::errno::Errno::EINTR) => {}
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(wrap(e.into())),
         }
     }
 }
@@ -186,17 +200,12 @@ impl CompletionChannel {
         if let Some(context) = self.get_event()? {
             return Ok(Some(context));
         }
-        let deadline = deadline_after(timeout);
-        loop {
-            if !wait_readable(self.as_fd(), deadline).map_err(Error::PollCompletionQueue)? {
-                return Ok(None);
-            }
-            // The descriptor was readable, but another thread may have consumed the notification
-            // first; if so, go back to waiting for the next one.
-            if let Some(context) = self.get_event()? {
-                return Ok(Some(context));
-            }
-        }
+        wait_and_take(
+            self.as_fd(),
+            deadline_after(timeout),
+            Error::PollCompletionQueue,
+            || self.get_event(),
+        )
     }
 
     /// Returns the underlying `ibv_comp_channel` pointer.
