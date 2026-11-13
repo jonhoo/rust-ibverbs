@@ -989,6 +989,10 @@ impl PortSpeed {
 
     /// The effective data rate of a single (1x) lane in gigabits per second, accounting for the
     /// link's encoding overhead. Returns `None` for an unrecognized speed.
+    ///
+    /// That is the rate of an InfiniBand link. On an Ethernet (RoCE) port the kernel reports the
+    /// InfiniBand speed and width that come nearest the interface's rate, which need not multiply
+    /// out to it: 1 GbE reads as SDR 1x.
     pub fn lane_gbps(self) -> Option<f64> {
         Some(match self {
             PortSpeed::Sdr => 2.0,

@@ -271,6 +271,10 @@ impl LocalMemorySlice {
 ///
 /// Created by [`MemoryRegion::remote`], and typically serialized to the peer that initiates the
 /// access through [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes).
+///
+/// The length is for the initiator to plan with: an operation transfers as many bytes as its
+/// local buffers hold, starting at `addr`, and is not checked against `len`. What bounds it is
+/// the region registered on the other side.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteMemorySlice {
     /// Memory address of the registered region (might have been offset by slicing).

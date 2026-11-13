@@ -2000,6 +2000,11 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
     /// request, which moves the queue pairs on both sides to the error state.
     ///
+    /// The operands are numbers; which byte order spells one in the 8 bytes at `remote`, and in
+    /// the 8 written to `local`, is the device's choice. It is each host's native order on rxe
+    /// and on mlx5 (whose kernel driver offers atomics only when the device answers in host
+    /// order), so read both with `u64::from_ne_bytes` there.
+    ///
     /// # Panics
     ///
     /// Panics if `local` is not 8 bytes long, or the queue pair was built without room for a
@@ -2019,7 +2024,8 @@ impl<T: Reliable> SendOp<'_, '_, T> {
     }
 
     /// Post an atomic fetch-and-add on the 8-byte value at `remote`: `add` is added to it. The
-    /// value it held before is written to `local`.
+    /// value it held before is written to `local`, in the byte order
+    /// [`atomic_cmp_swap`](Self::atomic_cmp_swap) describes.
     ///
     /// `remote` must be 8-byte aligned: the responder refuses a misaligned target as an invalid
     /// request, which moves the queue pairs on both sides to the error state.
@@ -2148,6 +2154,14 @@ fn atomic_local_not_8_bytes(len: usize) -> ! {
 ///
 /// A scatter/gather list converts implicitly, so `batch.op().send(id, &[mr.slice(..)])` reads
 /// naturally; inline payloads are spelled out: `batch.op().send(id, Payload::Inline(b"ping"))`.
+///
+/// One work request carries at most the port's `max_msg_sz` bytes
+/// ([`Context::query_port`](crate::Context::query_port); typically 1 GiB on mlx5, and never more
+/// than the 2 GiB the transport allows), counting every entry of the list, and nothing here
+/// checks that. Past it the providers go wrong each in its own way: mlx5 reads the top bit of an
+/// entry's length as its inline-data marker, and rxe and hns add the lengths up in 32 bits, so a
+/// list of 4 GiB or more is posted as its length modulo 4 GiB. Split a larger transfer across
+/// requests.
 #[derive(Clone, Copy)]
 pub enum Payload<'a> {
     /// Registered memory, as scatter/gather entries.

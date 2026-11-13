@@ -505,7 +505,8 @@ pub enum WcStatus {
     /// The remote side rejected an RD read request as invalid (RD only). EFA reports a
     /// destination queue pair that does not exist, or is in the error state, this way.
     RemoteInvalidRdRequest,
-    /// The remote side aborted the operation (RD only; on EFA, the remote side was reset).
+    /// The remote side aborted the operation (UD or UC queue pairs on a shared receive queue; on
+    /// EFA, the remote side was reset).
     RemoteAborted,
     /// An invalid EE context number was detected (RD only).
     InvalidEecn,

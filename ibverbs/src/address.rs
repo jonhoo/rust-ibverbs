@@ -77,8 +77,10 @@ impl From<std::net::Ipv6Addr> for Gid {
 }
 
 impl fmt::Display for Gid {
-    /// Formats the GID the way `ibv_devinfo -v` and `show_gids` do: as an IPv6 address, for
-    /// example `fe80::5054:ff:fe12:3456` or `::ffff:192.0.2.1`.
+    /// Formats the GID as an IPv6 address, for example `fe80::5054:ff:fe12:3456` or
+    /// `::ffff:192.0.2.1`: the way `ibv_devinfo -v` prints a RoCE v2 GID. For an InfiniBand or
+    /// RoCE v1 GID `ibv_devinfo`, like sysfs and `show_gids` for every GID, prints all eight
+    /// groups in full instead (`fe80:0000:0000:0000:5054:00ff:fe12:3456`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         std::net::Ipv6Addr::from(*self).fmt(f)
     }
