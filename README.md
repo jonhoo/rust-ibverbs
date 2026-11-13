@@ -168,6 +168,10 @@ them include `mlx5`, `hns`, `efa`, and `rxe`; on providers that do not (for exam
 `mlx4`-generation hardware), creation fails cleanly (with `Error::Unsupported`) rather than
 degrading to the legacy verbs.
 
+With `mlx5` devices, run rdma-core 65.0 or newer. Older versions of its `libmlx5` can lose a
+completion on a queue with wallclock timestamps, and can loop forever when a queue pair is
+destroyed or reset while its completion queue's consumer index is exactly 2^31.
+
 ## Documentation
 
 Much of the documentation of this crate borrows heavily from the excellent posts over at

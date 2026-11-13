@@ -102,7 +102,9 @@ impl ProtectionDomain {
     ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): `ibv_create_ah` failed (`EINVAL`
     ///    for an invalid value in `attr`, `ENOMEM` when out of resources), or the provider
     ///    refused `attr` without naming a reason ([`io::ErrorKind::InvalidInput`]; mlx5 for a
-    ///    port number the device does not have).
+    ///    port number the device does not have). On RoCE the kernel resolves the destination GID
+    ///    to a MAC address during the call, which can take up to a second and fail with
+    ///    `ETIMEDOUT` or `ENETUNREACH` when the GID does not answer.
     ///  - [`Unsupported`](Error::Unsupported): the provider has no address handles (`EOPNOTSUPP`).
     pub fn create_address_handle(&self, attr: &AddressHandleAttribute) -> Result<AddressHandle> {
         let mut ah_attr = attr.attr;
@@ -134,7 +136,9 @@ impl ProtectionDomain {
     ///  - [`Unsupported`](Error::Unsupported): the device does not support `ibv_advise_mr`
     ///    (`EOPNOTSUPP`).
     ///  - [`AdviseMemoryRegion`](Error::AdviseMemoryRegion): `ibv_advise_mr` failed (`EINVAL` for
-    ///    an invalid value in the arguments, `ENOMEM` when out of resources).
+    ///    an invalid value in the arguments, `ENOMEM` when out of resources; on mlx5 also `ENOENT`
+    ///    for a region that is not registered [`ON_DEMAND`](AccessFlags::ON_DEMAND), and `EPERM`
+    ///    for a write prefetch of a region without local write access).
     pub fn advise_mr(
         &self,
         advice: MrAdvice,

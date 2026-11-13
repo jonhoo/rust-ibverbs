@@ -148,7 +148,9 @@
 //! - Setting `MLX5_SINGLE_THREADED=1` in the environment tells mlx5 the process is single threaded
 //!   and turns its locks into best-effort checks, which voids the `Sync` of completion queues,
 //!   queue pairs, and shared receive queues: do not set it in a program that uses them from
-//!   several threads.
+//!   several threads. A check that fires aborts the process, also on one thread: polling a
+//!   completion queue again, or dropping or resetting one of its queue pairs, while a
+//!   [`Completions`] of that queue is alive.
 //!
 //! # Resource cleanup
 //!

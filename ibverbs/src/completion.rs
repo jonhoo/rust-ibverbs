@@ -429,6 +429,12 @@ flags_newtype! {
         /// The tag-matching information.
         TM_INFO = IBV_WC_EX_WITH_TM_INFO;
         /// The wallclock completion timestamp ([`WorkCompletion::completion_wallclock_ns`]).
+        ///
+        /// On mlx5 this needs rdma-core 65.0 or newer: a poll of such a queue that finds a
+        /// completion re-reads the clock parameters the kernel publishes, and reports `EBUSY` when
+        /// it catches the kernel updating them, which [`CompletionQueue::poll`] retries. Before
+        /// 65.0, libmlx5 had already consumed the completion when it reported that, so the retry
+        /// loses it.
         COMPLETION_TIMESTAMP_WALLCLOCK = IBV_WC_EX_WITH_COMPLETION_TIMESTAMP_WALLCLOCK;
     }
 }
@@ -1133,7 +1139,9 @@ impl CompletionQueue {
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
         // paired with `end_poll`) when the queue is empty. On a queue with wallclock timestamps it
         // can also fail transiently with EBUSY while the kernel updates the clock information (mlx5,
-        // ionic); the queue is left unchanged and ibv_create_cq_ex(3) says to retry.
+        // ionic); ibv_create_cq_ex(3) says to retry, and the queue is left unchanged (by libmlx5
+        // only since rdma-core 65.0: before that it had consumed a completion, which the retry
+        // cannot recover).
         loop {
             match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
                 0 => {

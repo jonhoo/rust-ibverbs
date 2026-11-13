@@ -1702,6 +1702,13 @@ pub struct SendOp<'b, 'qp, T: Transport> {
 impl<T: Transport> SendOp<'_, '_, T> {
     /// Mark this work request signaled (`IBV_SEND_SIGNALED`), so it generates a completion.
     ///
+    /// An unsignaled request keeps its slot in the send queue until the completion of a later
+    /// signaled request on the same queue has been polled (on mlx5; Soft-RoCE frees the slot as
+    /// soon as the request is done, so a test there does not show this). Signal at least one
+    /// request in every [`max_send_wr`](QueuePairBuilder::set_max_send_wr) and poll its
+    /// completion, or the queue fills up for good: with the default capacity of 1, that is every
+    /// request.
+    ///
     /// On SRD every work request generates a completion, so this is implied there. EFA refuses
     /// unsignaled work requests on UD too, so on EFA mark every UD send signaled.
     #[inline]
