@@ -1707,6 +1707,12 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     /// - hns devices in owner-doorbell mode may execute each request as soon as its opcode method
     ///   returns, before `submit` and even if the batch is dropped.
     ///
+    /// On hns, a reset releases the requests posted before it only if no batch is started while
+    /// the queue pair is below `RTS` afterwards: such a batch fails, and rolls hns' send queue back
+    /// to where the last batch before the reset began, so the next doorbell in `RTS` makes the
+    /// device execute those earlier requests again. Bring a reset queue pair back to `RTS` before
+    /// starting a batch on it.
+    ///
     /// # Errors
     ///
     ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
@@ -2870,6 +2876,10 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// As with any send, the memory backing each scatter/gather slice must stay valid until the
     /// device is done with the request (see [`submit`](SendBatch::submit)).
+    ///
+    /// Start batches only once the queue pair is in `RTS`: providers handle a batch below it
+    /// differently (most fail it at `submit`), and after a reset hns also loses track of its send
+    /// queue (see the safety section of [`submit`](SendBatch::submit)).
     ///
     /// # Examples
     ///
