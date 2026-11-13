@@ -1229,14 +1229,13 @@ impl<T: Transport> PreparedQueuePair<T> {
     ///  - [`QueryGid`](Error::QueryGid): querying the GID at the configured index failed
     ///    (`ibv_query_gid`), or that entry of the GID table is empty (`ENODATA`).
     pub fn endpoint(&self) -> Result<QueuePairEndpoint> {
-        let qp_num = unsafe { (*self.qp.qp).qp_num };
         let gid = if let Some(gid_index) = self.gid_index {
             Some(self.qp.pd.context().query_gid(self.port_num, gid_index)?)
         } else {
             None
         };
         Ok(QueuePairEndpoint {
-            qp_num,
+            qp_num: self.qp.qp_num(),
             lid: self.lid,
             gid,
             psn: self.bring_up.rts.sq_psn(),
@@ -3153,6 +3152,17 @@ mod test_recv_link {
         }
     }
 
+    /// A batch open on `spy`, as `start_send` hands one out, posting through its readers. Built
+    /// from a raw pointer, so the test can read the spy while the batch is open.
+    fn spy_batch(spy: *mut SpyQpEx) -> SendBatch<'static, Rc> {
+        SendBatch {
+            qpx: spy.cast::<ffi::ibv_qp_ex>(),
+            max_inline_data: 64,
+            max_send_sge: 1,
+            _qp: std::marker::PhantomData,
+        }
+    }
+
     // Building a receive work request with an empty SGE slice sets `sg_list` to null rather than
     // `NonNull::dangling()`.
     #[test]
@@ -3182,12 +3192,7 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_sge_slice_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&raw mut spy);
 
         let empty_sges: &[LocalMemorySlice] = &[];
         batch.op().send(1, empty_sges);
@@ -3200,12 +3205,7 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_inline_slice_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&raw mut spy);
 
         batch.op().send(2, Payload::Inline(&[]));
         assert_eq!(spy.last_inline_len, 0);
@@ -3217,12 +3217,7 @@ mod test_recv_link {
     #[test]
     fn send_op_with_empty_inline_list_passes_null_pointer_to_provider() {
         let mut spy = SpyQpEx::new();
-        let mut batch = SendBatch::<Rc> {
-            qpx: (&raw mut spy).cast::<ffi::ibv_qp_ex>(),
-            max_inline_data: 64,
-            max_send_sge: 1,
-            _qp: std::marker::PhantomData,
-        };
+        let mut batch = spy_batch(&raw mut spy);
 
         let empty_iov: &[io::IoSlice<'_>] = &[];
         batch.op().send(3, Payload::InlineList(empty_iov));

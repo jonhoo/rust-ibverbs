@@ -575,7 +575,7 @@ impl AsRawFd for EventChannel {
     /// blocking. It is non-blocking and becomes readable when an event is pending, to be consumed
     /// with [`poll_cm_event`](EventChannel::poll_cm_event).
     fn as_raw_fd(&self) -> RawFd {
-        unsafe { (*self.inner.chan).fd }
+        self.as_fd().as_raw_fd()
     }
 }
 
@@ -1440,7 +1440,7 @@ impl CmEvent {
         Error::ConnectionManager(Box::new(CmFailure::new(
             self.event_type(),
             self.status(),
-            self.private_data().map_or_else(Vec::new, <[u8]>::to_vec),
+            self.private_data().unwrap_or_default().to_vec(),
         )))
     }
 
@@ -1527,16 +1527,15 @@ impl CmEvent {
             )));
         }
         let id = unsafe { (*self.event).id };
-        if self.channel.inner.shared {
-            // From here on the id is ours to release: `Drop` must no longer reject and destroy it.
-            self.taken = true;
-            return Ok(CmId::on(self.channel.clone(), id));
-        }
-        let channel = EventChannel::open(false)?;
+        let shared = self.channel.inner.shared;
+        let channel = if shared {
+            self.channel.clone()
+        } else {
+            EventChannel::open(false)?
+        };
         // From here on the id is ours to release: `Drop` must no longer reject and destroy it.
         self.taken = true;
-        let ret = unsafe { ffi::rdma_migrate_id(id, channel.as_raw()) };
-        if ret != 0 {
+        if !shared && unsafe { ffi::rdma_migrate_id(id, channel.as_raw()) } != 0 {
             let err = io::Error::last_os_error();
             // The request id is ours to destroy once we abandon it; `channel` drops after.
             unsafe { ffi::rdma_destroy_id(id) };
@@ -1880,9 +1879,7 @@ impl Resolved {
         param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
         self.id.connect(&param)?;
         let response = self.id.wait_for(CmEventType::ConnectResponse, deadline)?;
-        let private_data = response
-            .private_data()
-            .map_or_else(Vec::new, <[u8]>::to_vec);
+        let private_data = response.private_data().unwrap_or_default().to_vec();
         drop(response);
         // The `INIT` attributes applied before connecting carried no remote-access flags (there
         // was no connection to derive them from); now there is one, so apply `INIT` again — as
@@ -1984,7 +1981,7 @@ impl Acceptor {
         let request = self
             .listener
             .wait_for(CmEventType::ConnectRequest, deadline)?;
-        let private_data = request.private_data().map_or_else(Vec::new, <[u8]>::to_vec);
+        let private_data = request.private_data().unwrap_or_default().to_vec();
         Ok(Incoming {
             id: request.connection_request()?,
             private_data,

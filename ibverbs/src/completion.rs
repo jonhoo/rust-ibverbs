@@ -1,6 +1,6 @@
 use std::fmt;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::c_void;
 use std::ptr;
 use std::sync::Arc;
@@ -88,7 +88,7 @@ fn provider_poll_failure(verb: &str, code: i32) -> Error {
 /// and build the queue on it with [`CompletionQueueBuilder::set_comp_channel`]; then arm the queue
 /// with [`CompletionQueue::req_notify`], drain it with [`poll`](CompletionQueue::poll), and block
 /// on the channel ([`wait`](Self::wait)), or watch its descriptor
-/// ([`AsFd`]/[`AsRawFd`](std::os::fd::AsRawFd)) from your own reactor and consume notifications
+/// ([`AsFd`]/[`AsRawFd`]) from your own reactor and consume notifications
 /// with [`get_event`](Self::get_event). After each notification, re-arm the queue and then drain
 /// it again, in that order (see [`req_notify`](CompletionQueue::req_notify)).
 ///
@@ -218,12 +218,12 @@ impl CompletionChannel {
     }
 }
 
-impl std::os::fd::AsRawFd for CompletionChannel {
+impl AsRawFd for CompletionChannel {
     /// The raw file descriptor of this completion channel. It is non-blocking and becomes readable
     /// when a notification arrives for any queue built on it after
     /// [`req_notify`](CompletionQueue::req_notify).
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        unsafe { (*self.inner.cc).fd }
+    fn as_raw_fd(&self) -> RawFd {
+        self.as_fd().as_raw_fd()
     }
 }
 

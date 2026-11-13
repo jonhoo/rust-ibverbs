@@ -290,7 +290,7 @@ impl Error {
     }
 
     /// The verb (or step) this error came from, as [`Unsupported`](Self::Unsupported) names it.
-    pub(crate) fn operation(&self) -> &'static &'static str {
+    fn operation(&self) -> &'static &'static str {
         match self {
             Error::Unsupported { operation, .. } => operation,
             Error::PortNotActive(_) => &"port activation",

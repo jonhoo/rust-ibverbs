@@ -467,7 +467,7 @@ impl Grh {
     /// with a sum it folds only once (`ipv4_calc_hdr_csum`), which fails a few valid headers in
     /// 100,000 and makes it read those as IPv6 ones. So it is handed zeroes there: no flow label,
     /// and an IPv4 header by its version alone.
-    pub(crate) fn raw(&self) -> ffi::ibv_grh {
+    fn raw(&self) -> ffi::ibv_grh {
         let mut bytes = self.bytes;
         if let GrhForm::Ipv4 = self.form() {
             bytes[..Self::IPV4_OFFSET].fill(0);
