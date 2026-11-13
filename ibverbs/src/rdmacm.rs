@@ -1584,7 +1584,8 @@ unsafe impl Sync for ConnectionParameter {}
 impl Default for ConnectionParameter {
     /// Reliable-connection defaults: as many outstanding RDMA reads and atomics in each direction
     /// as both devices support (librdmacm's `RDMA_MAX_RESP_RES` / `RDMA_MAX_INIT_DEPTH`), the
-    /// maximum retry counts, and no private data.
+    /// maximum retry counts (7, which for receiver-not-ready errors means retrying indefinitely),
+    /// and no private data.
     fn default() -> Self {
         ConnectionParameter {
             param: ffi::rdma_conn_param {
@@ -1624,13 +1625,31 @@ impl ConnectionParameter {
     ///
     /// Only the connecting side's value counts: accepting ignores it (`rdma_accept(3)`), and the
     /// accepting queue pair retries as often as the connection request asked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `retry_count > 7` (the field is 3 bits, and the kernel would send 7 instead).
     pub fn set_retry_count(&mut self, retry_count: u8) -> &mut Self {
+        assert!(
+            retry_count <= 7,
+            "the retry count is 3 bits, got {retry_count}"
+        );
         self.param.retry_count = retry_count;
         self
     }
 
-    /// Sets how many times to retry sending after a receiver-not-ready error (0-7).
+    /// Sets how many times to retry sending after a receiver-not-ready error (0-7), where 7
+    /// retries indefinitely.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rnr_retry_count > 7` (the field is 3 bits, and the kernel would send 7 instead,
+    /// which retries indefinitely).
     pub fn set_rnr_retry_count(&mut self, rnr_retry_count: u8) -> &mut Self {
+        assert!(
+            rnr_retry_count <= 7,
+            "the RNR retry count is 3 bits, got {rnr_retry_count}"
+        );
         self.param.rnr_retry_count = rnr_retry_count;
         self
     }
@@ -2232,6 +2251,26 @@ mod test_conversions {
             .set_qp_num(0x12_3456)
             .as_raw();
         assert_eq!((raw.srq, raw.flow_control, raw.qp_num), (1, 1, 0x12_3456));
+    }
+
+    #[test]
+    fn retry_counts_are_three_bits() {
+        let raw = ConnectionParameter::default()
+            .set_retry_count(0)
+            .set_rnr_retry_count(7)
+            .as_raw();
+        assert_eq!((raw.retry_count, raw.rnr_retry_count), (0, 7));
+        type Setter = fn(&mut ConnectionParameter, u8) -> &mut ConnectionParameter;
+        let setters: [Setter; 2] = [
+            ConnectionParameter::set_retry_count,
+            ConnectionParameter::set_rnr_retry_count,
+        ];
+        for set in setters {
+            let wide = std::panic::catch_unwind(|| {
+                set(&mut ConnectionParameter::default(), 8);
+            });
+            assert!(wide.is_err());
+        }
     }
 
     #[test]
