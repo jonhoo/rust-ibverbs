@@ -432,9 +432,9 @@ impl EventChannel {
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_create_event_channel` failed
-    ///    (`ENODEV` when there is no RDMA device, `EPERM` when the kernel's connection manager,
-    ///    the `rdma_ucm` module, is not loaded), or making its file descriptor non-blocking
-    ///    failed.
+    ///    (`ENODEV` when there is no RDMA device, `ENOENT` when the kernel's connection manager,
+    ///    the `rdma_ucm` module, is not loaded and could not be loaded on demand), or making its
+    ///    file descriptor non-blocking failed.
     pub fn new() -> Result<EventChannel> {
         EventChannel::open(true)
     }
@@ -660,8 +660,8 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): opening the event channel
     ///    (`rdma_create_event_channel`) or creating the id (`rdma_create_id`) failed: `ENODEV`
-    ///    when there is no RDMA device, `EPERM` when the kernel's connection manager (the
-    ///    `rdma_ucm` module) is not loaded.
+    ///    when there is no RDMA device, `ENOENT` when the kernel's connection manager (the
+    ///    `rdma_ucm` module) is not loaded and could not be loaded on demand.
     pub fn create(port_space: PortSpace) -> Result<CmId> {
         CmId::create_in(EventChannel::open(false)?, port_space)
     }

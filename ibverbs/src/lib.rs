@@ -2,7 +2,7 @@
 //!
 //! RDMA "verbs" let userspace perform high-throughput, low-latency network operations directly
 //! against the network adapter (zero copies on the data path and no kernel involvement) over
-//! InfiniBand, RoCE, and iWARP transports. This crate wraps both the control path (creating,
+//! InfiniBand and RoCE. This crate wraps both the control path (creating,
 //! querying, and tearing down resources such as protection domains, completion queues, queue
 //! pairs, and memory regions) and the data path (posting work requests and reaping completions) in
 //! safe Rust types whose lifetimes and aliasing rules encode the verbs contracts, while keeping
@@ -69,7 +69,8 @@
 //! event-driven loop over a shared completion channel, an `ibv_devinfo`-style device dump,
 //! doorbell batching, the `rdmacm` connection manager, and EFA SRD queue pairs. You can run all
 //! of them except the EFA example (and this crate's test suite) without RDMA hardware on any
-//! modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`.
+//! modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`,
+//! with SoftRoCE's provider library from rdma-core 63.1 or newer (see the README).
 //!
 //! You do not have to poll: completion channels ([`Context::create_comp_channel`]) deliver
 //! completion notifications on a file descriptor to block on ([`CompletionChannel::wait`]) or hand

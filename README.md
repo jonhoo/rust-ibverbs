@@ -197,14 +197,19 @@ $ sudo rdma link add rxe0 type rxe netdev <netdev>
 ```
 
 The examples (except the EFA one, which needs EFA hardware) and the integration test suite run
-against it unchanged. CI runs the whole data-path test suite (two-sided, one-sided, atomics,
-inline, UC/UD, and the connection manager) against a SoftRoCE device on every pull request and
-asserts on the transferred bytes; it builds the examples but does not run them.
+against it unchanged, given the SoftRoCE provider library from rdma-core 63.1 or newer: older ones
+drop a completion after a poll drains the queue (before 55), unlock the queue twice per drained
+poll (before 59), and mis-size gathered and inline-list sends (before 63.1). CI runs the whole
+data-path test suite (two-sided, one-sided, atomics, inline, UC/UD, and the connection manager)
+against a SoftRoCE device on every pull request and asserts on the transferred bytes; it builds
+the examples but does not run them.
 
 The tests that need a device are `#[ignore]`d. Run them the way CI does, one at a time (they
 share the device, and SoftRoCE drops completions when many queue pairs drive it at once), with
 the connection-manager and mlx5 suites under their features (the mlx5 one checks that SoftRoCE
-refuses the mlx5 calls):
+refuses the mlx5 calls). Where the distribution's rdma-core is older, do as CI does and build the
+vendored one in place (`./configure-ci.sh --vendored-libs` does, into `rdma-core-build/`), then
+point `RDMA_CORE_LIB_DIR` and `LD_LIBRARY_PATH` at its `lib` directory:
 
 ```console
 $ IBVERBS_TEST_DEVICE=rxe0 cargo test -- --ignored --test-threads=1
