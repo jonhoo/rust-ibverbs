@@ -65,7 +65,7 @@ fn server(addr: SocketAddr) {
     let mut conn = incoming
         .accept(
             qp,
-            ConnectionParameter::default(),
+            &ConnectionParameter::default(),
             Some(Duration::from_secs(10)),
         )
         .unwrap();
@@ -101,7 +101,7 @@ fn client(addr: SocketAddr) {
     let mut conn = resolved
         .connect(
             qp,
-            ConnectionParameter::default(),
+            &ConnectionParameter::default(),
             Some(Duration::from_secs(10)),
         )
         .unwrap();

@@ -36,7 +36,7 @@
 //! let qp = pd
 //!     .create_qp::<ibverbs::Rc>(&cq, &cq, port)?
 //!     .build()?;
-//! let mut conn = resolved.connect(qp, ConnectionParameter::default(), None)?;
+//! let mut conn = resolved.connect(qp, &ConnectionParameter::default(), None)?;
 //! // `conn.queue_pair()` is ready to post on; poll completions on `cq`.
 //! # let _ = &mut conn;
 //! # Ok(())
@@ -1561,11 +1561,12 @@ const MAX_PRIVATE_DATA: usize = 196;
 
 /// Parameters for connecting and accepting.
 ///
-/// [`Default`] gives sane reliable-connection defaults, and the setters consume and return the
-/// value, so a parameter is built up in one expression:
-/// `ConnectionParameter::default().set_qp_num(qpn).set_private_data(b"hello")`. The local queue
-/// pair's number, and whether it uses a shared receive queue, are set automatically by
-/// [`Resolved::connect`] / [`Incoming::accept`].
+/// [`Default`] gives sane reliable-connection defaults. The setters change the value in place and
+/// return it for chaining, like the other setters of this crate, so a parameter can be built
+/// where it is passed: `&ConnectionParameter::default()`, or
+/// `ConnectionParameter::default().set_private_data(b"hello")`. The local queue pair's number,
+/// and whether it uses a shared receive queue, are set automatically by [`Resolved::connect`] /
+/// [`Incoming::accept`].
 #[derive(Clone, Copy)]
 pub struct ConnectionParameter {
     param: ffi::rdma_conn_param,
@@ -1574,6 +1575,11 @@ pub struct ConnectionParameter {
     /// [`as_raw`](Self::as_raw) at the connect/accept call sites, not stored.
     private_data: [u8; MAX_PRIVATE_DATA],
 }
+
+// SAFETY: `param.private_data` is the only pointer, and it is null in every stored value:
+// `as_raw` aims a copy of it at the inline bytes for the duration of a call.
+unsafe impl Send for ConnectionParameter {}
+unsafe impl Sync for ConnectionParameter {}
 
 impl Default for ConnectionParameter {
     /// Reliable-connection defaults: as many outstanding RDMA reads and atomics in each direction
@@ -1596,7 +1602,7 @@ impl Default for ConnectionParameter {
 impl ConnectionParameter {
     /// Sets the number of outstanding RDMA read/atomic operations the local side can service as a
     /// responder. Defaults to the device's limit, negotiated down to what the peer issues.
-    pub fn set_responder_resources(mut self, responder_resources: u8) -> Self {
+    pub fn set_responder_resources(&mut self, responder_resources: u8) -> &mut Self {
         self.param.responder_resources = responder_resources;
         self
     }
@@ -1608,7 +1614,7 @@ impl ConnectionParameter {
     /// (`rdma_accept(3)`); the default does. Nothing checks this: a peer that cannot raise its
     /// responder resources to match fails the connection, or answers the excess reads with an
     /// invalid-request error.
-    pub fn set_initiator_depth(mut self, initiator_depth: u8) -> Self {
+    pub fn set_initiator_depth(&mut self, initiator_depth: u8) -> &mut Self {
         self.param.initiator_depth = initiator_depth;
         self
     }
@@ -1618,13 +1624,13 @@ impl ConnectionParameter {
     ///
     /// Only the connecting side's value counts: accepting ignores it (`rdma_accept(3)`), and the
     /// accepting queue pair retries as often as the connection request asked.
-    pub fn set_retry_count(mut self, retry_count: u8) -> Self {
+    pub fn set_retry_count(&mut self, retry_count: u8) -> &mut Self {
         self.param.retry_count = retry_count;
         self
     }
 
     /// Sets how many times to retry sending after a receiver-not-ready error (0-7).
-    pub fn set_rnr_retry_count(mut self, rnr_retry_count: u8) -> Self {
+    pub fn set_rnr_retry_count(&mut self, rnr_retry_count: u8) -> &mut Self {
         self.param.rnr_retry_count = rnr_retry_count;
         self
     }
@@ -1637,7 +1643,7 @@ impl ConnectionParameter {
     /// # Panics
     ///
     /// Panics if `qp_num > 0xFF_FFFF` (queue pair numbers are 24 bits).
-    pub fn set_qp_num(mut self, qp_num: u32) -> Self {
+    pub fn set_qp_num(&mut self, qp_num: u32) -> &mut Self {
         assert!(
             qp_num <= crate::qp::MAX_24_BITS,
             "a queue pair number is 24 bits, got {qp_num:#x}"
@@ -1652,7 +1658,7 @@ impl ConnectionParameter {
     /// yourself when driving [`CmId::connect`] or [`CmId::accept`] directly.
     ///
     /// Defaults to `false`.
-    pub fn set_srq(mut self, srq: bool) -> Self {
+    pub fn set_srq(&mut self, srq: bool) -> &mut Self {
         self.param.srq = srq.into();
         self
     }
@@ -1663,7 +1669,7 @@ impl ConnectionParameter {
     /// The connection manager only passes it on.
     ///
     /// Defaults to `false`.
-    pub fn set_flow_control(mut self, flow_control: bool) -> Self {
+    pub fn set_flow_control(&mut self, flow_control: bool) -> &mut Self {
         self.param.flow_control = flow_control.into();
         self
     }
@@ -1682,7 +1688,7 @@ impl ConnectionParameter {
     /// # Panics
     ///
     /// Panics if `data` is longer than 196 bytes, more than any call accepts.
-    pub fn set_private_data(mut self, data: &[u8]) -> Self {
+    pub fn set_private_data(&mut self, data: &[u8]) -> &mut Self {
         assert!(
             data.len() <= MAX_PRIVATE_DATA,
             "connection private data is limited to {MAX_PRIVATE_DATA} bytes, got {}",
@@ -1810,7 +1816,7 @@ impl Resolved {
     pub fn connect(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
         self.connect_with(qp, param, timeout, |_| Ok(()))
@@ -1829,14 +1835,15 @@ impl Resolved {
     pub fn connect_with(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
         prepare: impl FnOnce(&QueuePair<Rc>) -> Result<()>,
     ) -> Result<Connection> {
         let deadline = crate::completion::deadline_after(timeout);
-        self.id.check_connect_private_data(&param)?;
+        self.id.check_connect_private_data(param)?;
         let mut qp = self.id.init_qp(qp)?;
-        let param = param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
+        let mut param = *param;
+        param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
         self.id.connect(&param)?;
         let response = self.id.wait_for(CmEventType::ConnectResponse, deadline)?;
         let private_data = response
@@ -2014,7 +2021,7 @@ impl Incoming {
     pub fn accept(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
     ) -> Result<Connection> {
         self.accept_with(qp, param, timeout, |_| Ok(()))
@@ -2033,7 +2040,7 @@ impl Incoming {
     pub fn accept_with(
         self,
         qp: PreparedQueuePair<Rc>,
-        param: ConnectionParameter,
+        param: &ConnectionParameter,
         timeout: Option<Duration>,
         prepare: impl FnOnce(&QueuePair<Rc>) -> Result<()>,
     ) -> Result<Connection> {
@@ -2046,7 +2053,8 @@ impl Incoming {
         self.id
             .ready(&mut qp, responder_resources, initiator_depth)?;
         prepare(&qp)?;
-        let param = param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
+        let mut param = *param;
+        param.set_qp_num(qp.qp_num()).set_srq(qp.uses_srq());
         self.id.accept(&param)?;
         self.id.wait_for(CmEventType::Established, deadline)?;
         Ok(Connection {

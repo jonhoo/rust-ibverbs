@@ -153,7 +153,7 @@ where
         let port = incoming.cm_id().port_num().expect("server port");
         let (pd, cq, qp) = resources(&ctx, port);
         let mut conn = incoming
-            .accept(qp, server_param(), SETUP_TIMEOUT)
+            .accept(qp, &server_param(), SETUP_TIMEOUT)
             .expect("accept");
         server(&mut conn, &cq, &pd, addr);
         done_rx
@@ -170,7 +170,7 @@ where
     let port = resolved.cm_id().port_num().expect("client port");
     let (pd, cq, qp) = resources(&ctx, port);
     let mut conn = resolved
-        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     client(&mut conn, &cq, &pd, addr);
     let _ = done_tx.send(());
@@ -229,7 +229,8 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
     // fail at once, since neither side retries after a receiver-not-ready NAK (a side's count is
     // the one its peer asks for); the receives posted from the setup hooks are in place first.
     let ip = device_ip(&open_test_device());
-    let no_rnr_retries = || ConnectionParameter::default().set_rnr_retry_count(0);
+    let mut no_rnr_retries = ConnectionParameter::default();
+    no_rnr_retries.set_rnr_retry_count(0);
     // Send `MESSAGE` as work request 2 and wait for it and receive 1 to complete.
     fn exchange(conn: &mut Connection, cq: &CompletionQueue, pd: &ProtectionDomain) {
         let mut send = mr(pd, 64);
@@ -263,7 +264,7 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
         let (pd, cq, qp) = resources(&ctx, port);
         let recv = mr(&pd, 64);
         let mut conn = incoming
-            .accept_with(qp, no_rnr_retries(), SETUP_TIMEOUT, |qp| unsafe {
+            .accept_with(qp, &no_rnr_retries, SETUP_TIMEOUT, |qp| unsafe {
                 qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
             })
             .expect("accept");
@@ -284,7 +285,7 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
     let (pd, cq, qp) = resources(&ctx, port);
     let recv = mr(&pd, 64);
     let mut conn = resolved
-        .connect_with(qp, no_rnr_retries(), SETUP_TIMEOUT, |qp| unsafe {
+        .connect_with(qp, &no_rnr_retries, SETUP_TIMEOUT, |qp| unsafe {
             qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
         })
         .expect("connect");
@@ -337,8 +338,9 @@ fn request_tells_the_peer_about_srq_and_flow_control() {
         .set_srq(&srq)
         .build()
         .expect("client qp");
-    let param = ConnectionParameter::default().set_flow_control(true);
-    match resolved.connect(qp, param, SETUP_TIMEOUT) {
+    let mut param = ConnectionParameter::default();
+    param.set_flow_control(true);
+    match resolved.connect(qp, &param, SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
@@ -430,7 +432,7 @@ fn racing_accepts_time_out_on_time() {
     let ctx = resolved.context().expect("client device context");
     let port = resolved.cm_id().port_num().expect("client port");
     let (_pd, _cq, qp) = resources(&ctx, port);
-    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+    match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
@@ -483,7 +485,7 @@ fn two_connections() {
             let (pd, cq, qp) = resources(&ctx, port);
             let mut recv = mr(&pd, 64);
             let mut conn = incoming
-                .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+                .accept(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
                 .expect("accept");
             unsafe {
                 conn.queue_pair()
@@ -516,7 +518,7 @@ fn two_connections() {
                 let mut send = mr(&pd, 64);
                 send.bytes_mut()[..MESSAGE.len()].fill(tag);
                 let mut conn = resolved
-                    .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+                    .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
                     .expect("connect");
                 let mut batch = conn.queue_pair().start_send();
                 batch
@@ -636,9 +638,8 @@ fn low_level_connect_and_send() {
             Err(Error::Accept(e)) if e.kind() == io::ErrorKind::InvalidInput => {}
             other => panic!("expected the missing queue pair number refused, got {other:?}"),
         }
-        let param = ConnectionParameter::default()
-            .set_qp_num(qp.qp_num())
-            .set_private_data(SERVER_PDATA);
+        let mut param = ConnectionParameter::default();
+        param.set_qp_num(qp.qp_num()).set_private_data(SERVER_PDATA);
         request.accept(&param).expect("accept");
         loop {
             let event = request.get_cm_event().expect("server event");
@@ -692,7 +693,8 @@ fn low_level_connect_and_send() {
         Err(Error::Connect(e)) if e.kind() == io::ErrorKind::InvalidInput => {}
         other => panic!("expected the missing queue pair number refused, got {other:?}"),
     }
-    let param = ConnectionParameter::default()
+    let mut param = ConnectionParameter::default();
+    param
         .set_qp_num(qp.qp_num())
         .set_private_data(&client_endpoint.to_bytes());
     id.connect(&param).expect("connect");
@@ -795,7 +797,7 @@ fn shared_event_channel_routes_events_by_id() {
     let mut client_qp = qp.into_queue_pair();
     transition(&client, &mut client_qp, &[QueuePairState::Init]);
     client
-        .connect(&ConnectionParameter::default().set_qp_num(client_qp.qp_num()))
+        .connect(ConnectionParameter::default().set_qp_num(client_qp.qp_num()))
         .expect("connect");
 
     let server = next_on(&channel, CmEventType::ConnectRequest, &listener)
@@ -819,7 +821,7 @@ fn shared_event_channel_routes_events_by_id() {
     unsafe { server_qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) }
         .expect("post_recv");
     server
-        .accept(&ConnectionParameter::default().set_qp_num(server_qp.qp_num()))
+        .accept(ConnectionParameter::default().set_qp_num(server_qp.qp_num()))
         .expect("accept");
 
     next_on(&channel, CmEventType::ConnectResponse, &client);
@@ -866,7 +868,8 @@ fn accept_low_level(request: &CmId, qp: &mut ibverbs::QueuePair<Rc>) {
         let attr = request.init_qp_attr(state).expect("server init_qp_attr");
         qp.modify(&attr).expect("server modify");
     }
-    let param = ConnectionParameter::default().set_qp_num(qp.qp_num());
+    let mut param = ConnectionParameter::default();
+    param.set_qp_num(qp.qp_num());
     request.accept(&param).expect("accept");
     // Bounded, so a connection that never establishes fails the test instead of hanging it.
     pump_until(request, CmEventType::Established);
@@ -912,7 +915,7 @@ fn server_writes_into_client() {
         src.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
         let notify = mr(&pd, 1);
         let mut conn = incoming
-            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+            .accept(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
 
         let mut batch = conn.queue_pair().start_send();
@@ -939,9 +942,11 @@ fn server_writes_into_client() {
     let (pd, cq, qp) = resources(&ctx, port);
     let target = mr(&pd, 64);
     let notify = mr(&pd, 1);
-    let param = ConnectionParameter::default()
-        .set_private_data(&target.remote().slice(..MESSAGE.len()).to_bytes());
-    let mut conn = resolved.connect(qp, param, SETUP_TIMEOUT).expect("connect");
+    let mut param = ConnectionParameter::default();
+    param.set_private_data(&target.remote().slice(..MESSAGE.len()).to_bytes());
+    let mut conn = resolved
+        .connect(qp, &param, SETUP_TIMEOUT)
+        .expect("connect");
     unsafe {
         conn.queue_pair()
             .post_recv([RecvRequest::new(1, &[notify.slice(..)])])
@@ -963,9 +968,9 @@ fn accept_applies_rd_atomic_parameters() {
     connect_pair(
         device_ip(&open_test_device()),
         || {
-            ConnectionParameter::default()
-                .set_responder_resources(4)
-                .set_initiator_depth(2)
+            let mut param = ConnectionParameter::default();
+            param.set_responder_resources(4).set_initiator_depth(2);
+            param
         },
         move |conn, _, _, _| {
             let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
@@ -1054,7 +1059,7 @@ fn rejected_request_reports_reason_and_private_data() {
     let ctx = resolved.context().expect("client device context");
     let port = resolved.cm_id().port_num().expect("client port");
     let (_pd, _cq, qp) = resources(&ctx, port);
-    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+    match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {
             // 28 is the InfiniBand CM's "consumer defined" reject reason: the peer itself said no.
             assert_eq!(failure.status, 28, "reject reason");
@@ -1091,7 +1096,7 @@ fn request_without_listener_is_rejected_as_invalid_service() {
         .expect("client qp builder")
         .build()
         .expect("client qp");
-    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+    match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {
             assert_eq!(failure.status, 8, "reject reason");
         }
@@ -1132,7 +1137,7 @@ fn dropped_connect_request_is_rejected() {
     let port = resolved.cm_id().port_num().expect("client port");
     let (_pd, _cq, qp) = resources(&ctx, port);
     let before = Instant::now();
-    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+    match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
@@ -1187,7 +1192,7 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
     let port = resolved.cm_id().port_num().expect("client port");
     let (_pd, _cq, qp) = resources(&ctx, port);
     let before = Instant::now();
-    match resolved.connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT) {
+    match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
         Err(other) => panic!("expected a rejection, got {other:?}"),
         Ok(_) => panic!("expected a rejection, got a connection"),
@@ -1270,7 +1275,7 @@ fn dropping_connection_disconnects_peer() {
     let port = resolved.cm_id().port_num().expect("client port");
     let (pd, cq, qp) = resources(&ctx, port);
     let conn = resolved
-        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     // `ctx`, `pd`, and `cq` (all on the connection's device context) outlive the connection
     // itself.
@@ -1292,7 +1297,8 @@ fn connect_rejects_oversized_private_data() {
         (PortSpace::Ib, 92),
     ] {
         let id = CmId::create(port_space).expect("id");
-        let param = ConnectionParameter::default().set_private_data(&vec![0x5a; len]);
+        let mut param = ConnectionParameter::default();
+        param.set_private_data(&vec![0x5a; len]);
         match id.connect(&param) {
             // Pin the size check itself: the id has no device either, which `connect` also
             // refuses with InvalidInput, so the kind alone would not notice the check going.
@@ -1410,7 +1416,7 @@ fn cm_id_options_and_accessors() {
         let port = incoming.cm_id().port_num().expect("server port");
         let (_pd, _cq, qp) = resources(&ctx, port);
         let mut conn = incoming
-            .accept(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+            .accept(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
         // The connection keeps the id the request arrived on.
         assert_eq!(conn.cm_id().peer_addr(), peer);
@@ -1441,7 +1447,7 @@ fn cm_id_options_and_accessors() {
     let port = resolved.cm_id().port_num().expect("client port");
     let (_pd, _cq, qp) = resources(&ctx, port);
     let mut conn = resolved
-        .connect(qp, ConnectionParameter::default(), SETUP_TIMEOUT)
+        .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
         .expect("connect");
     assert_eq!(conn.cm_id().peer_addr(), Some(addr));
     // The connection keeps the id that resolved the route, bound to the same local address.
