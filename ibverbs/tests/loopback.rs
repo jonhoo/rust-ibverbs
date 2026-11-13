@@ -2633,3 +2633,91 @@ fn address_handle_from_completion_without_grh() {
     AddressHandleAttribute::from_wc(&ctx, 1, &wc, Some(&unread))
         .expect("a header given alongside a GRH-less completion is left unread");
 }
+
+/// `handshake_with` and `activate_with` run their hook while the queue pair is in `INIT`, so the
+/// receives posted from it are in place before the queue pair can receive.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn bring_up_hooks_post_the_first_receives() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    let payload = b"early";
+    let mut send = mr(&pd, 64);
+    send.bytes_mut()[..payload.len()].copy_from_slice(payload);
+    let completed = |n| {
+        let mut wr_ids: Vec<u64> = drain(&cq, n).iter().map(Completed::wr_id).collect();
+        wr_ids.sort_unstable();
+        wr_ids
+    };
+
+    // A reliable connection to itself.
+    let reliable = || {
+        let prepared = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("failed to create queue pair")
+            .set_gid_index(gid_index)
+            .build()
+            .expect("failed to build queue pair");
+        let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+        (prepared, endpoint)
+    };
+    let mut recv = mr(&pd, 64);
+    let (prepared, endpoint) = reliable();
+    let mut qp = prepared
+        .handshake_with(endpoint, |qp| unsafe {
+            qp.post_recv([RecvRequest::new(1, &[recv.slice(..payload.len())])])
+        })
+        .expect("handshake_with failed");
+    let mut batch = qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .send(2, &[send.slice(..payload.len())]);
+    unsafe { batch.submit() }.expect("send failed");
+    assert_eq!(completed(2), [1, 2]);
+    assert_eq!(&recv.bytes_mut()[..payload.len()], payload);
+
+    // A hook that fails abandons the bring-up with its error.
+    let (prepared, endpoint) = reliable();
+    assert!(matches!(
+        prepared.handshake_with(endpoint, |_| Err(Error::GidMismatch)),
+        Err(Error::GidMismatch)
+    ));
+
+    // A datagram queue pair, addressed through its own GID.
+    const QKEY: u32 = 0x1234_5678;
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build()
+        .expect("failed to build UD QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    // UD receives prepend a 40-byte GRH.
+    let mut recv = mr(&pd, 40 + 64);
+    let mut qp = prepared
+        .activate_with(QKEY, |qp| unsafe {
+            qp.post_recv([RecvRequest::new(3, &[recv.slice(..40 + payload.len())])])
+        })
+        .expect("activate_with failed");
+    let mut ah_attr = AddressHandleAttribute::new(1);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
+    let ah = pd
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+    let mut batch = qp.start_send();
+    batch
+        .to(&ah, endpoint.qp_num, QKEY)
+        .signaled()
+        .send(4, &[send.slice(..payload.len())]);
+    unsafe { batch.submit() }.expect("UD send failed");
+    assert_eq!(completed(2), [3, 4]);
+    assert_eq!(&recv.bytes_mut()[40..40 + payload.len()], payload);
+}

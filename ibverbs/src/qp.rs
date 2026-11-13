@@ -1278,11 +1278,28 @@ impl<T: Datagram> PreparedQueuePair<T> {
     ///    invalid value in `attr` or `attr_mask`, `ENOMEM` when out of resources, `EPERM` for a
     ///    privileged `qkey` without the privilege).
     pub fn activate(self, qkey: u32) -> Result<QueuePair<T>> {
-        let attributes = self.activate_attributes(qkey);
+        self.activate_with(qkey, |_| Ok(()))
+    }
+
+    /// As [`activate`](Self::activate), running `prepare` on the queue pair while it is in
+    /// `INIT`, before it can receive: the place to post the first receives, so that no datagram
+    /// arrives before them (one that does is dropped).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`activate`](Self::activate), plus whatever `prepare` returns, which abandons the
+    /// bring-up (the queue pair is destroyed, discarding what was posted to it).
+    pub fn activate_with(
+        self,
+        qkey: u32,
+        prepare: impl FnOnce(&QueuePair<T>) -> Result<()>,
+    ) -> Result<QueuePair<T>> {
+        let [init, rtr, rts] = self.activate_attributes(qkey);
         let mut qp = self.qp;
-        for attr in &attributes {
-            qp.modify(attr)?;
-        }
+        qp.modify(&init)?;
+        prepare(&qp)?;
+        qp.modify(&rtr)?;
+        qp.modify(&rts)?;
         Ok(qp)
     }
 }
@@ -1417,11 +1434,30 @@ impl<T: Connected> PreparedQueuePair<T> {
     ///
     /// [RDMAmojo]: http://www.rdmamojo.com/2014/01/18/connecting-queue-pairs/
     pub fn handshake(self, remote: QueuePairEndpoint) -> Result<QueuePair<T>> {
+        self.handshake_with(remote, |_| Ok(()))
+    }
+
+    /// As [`handshake`](Self::handshake), running `prepare` on the queue pair while it is in
+    /// `INIT`, before it can receive: the place to post the receives the peer's first messages
+    /// need. Posted after `handshake` returns instead, they race the peer's first send, which on
+    /// missing them is retried after a receiver-not-ready back-off (RC; it fails once the peer's
+    /// [`set_rnr_retry`](QueuePairBuilder::set_rnr_retry) budget is spent) or dropped (UC).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`handshake`](Self::handshake), plus whatever `prepare` returns, which abandons
+    /// the handshake (the queue pair is destroyed, discarding what was posted to it).
+    pub fn handshake_with(
+        self,
+        remote: QueuePairEndpoint,
+        prepare: impl FnOnce(&QueuePair<T>) -> Result<()>,
+    ) -> Result<QueuePair<T>> {
         let init = self.init_attributes();
         let rtr = self.rtr_attributes(&remote)?;
         let rts = self.rts_attributes(&remote);
         let mut qp = self.qp;
         qp.modify(&init)?;
+        prepare(&qp)?;
         if let Err(err) = qp.modify(&rtr) {
             // On RoCE, the provider resolves the route to the remote GID during this transition,
             // and reports a GID that does not answer as a timeout or unreachable network. Spell
