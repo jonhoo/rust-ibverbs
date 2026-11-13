@@ -134,7 +134,7 @@ pub enum Error {
     #[error("failed to create a completion queue")]
     CreateCompletionQueue(#[source] io::Error),
 
-    /// Creating a queue pair failed (`ibv_create_qp_ex` / `efadv_create_qp_ex`).
+    /// Creating a queue pair failed (`ibv_create_qp_ex`, `ibv_create_qp` or `efadv_create_qp_ex`).
     #[error("failed to create a queue pair")]
     CreateQueuePair(#[source] io::Error),
 
@@ -196,9 +196,26 @@ pub enum Error {
     #[error("failed to query the shared receive queue")]
     QuerySharedReceiveQueue(#[source] io::Error),
 
-    /// Posting a send work request failed.
+    /// Posting a send work request failed (`ibv_wr_complete`).
     #[error("failed to post a send work request")]
     PostSend(#[source] io::Error),
+
+    /// Posting a batch of send work requests with `ibv_post_send`
+    /// ([`QueuePair::post_send`](crate::QueuePair::post_send)) failed at one of its requests; the
+    /// ones ahead of it were posted. A send batch ([`SendBatch::submit`](crate::SendBatch::submit))
+    /// reports its failures as [`PostSend`](Self::PostSend).
+    #[error("failed to post a send work request after posting {posted} of the batch")]
+    #[non_exhaustive]
+    PostSendBatch {
+        /// How many requests at the front of the batch were posted before the one that failed:
+        /// they are on the queue like any other posted send, so their memory regions stay in use
+        /// and their signaled completions will arrive. rxe can queue more than it reports here
+        /// (see the safety section of [`QueuePair::post_send`](crate::QueuePair::post_send)).
+        posted: u32,
+        /// The underlying error.
+        #[source]
+        source: io::Error,
+    },
 
     /// Posting a batch of receive work requests failed (`ibv_post_recv` / `ibv_post_srq_recv`)
     /// at one of its requests; the ones ahead of it were posted.
@@ -321,6 +338,7 @@ impl Error {
             Error::ModifySharedReceiveQueue(_) => &"ibv_modify_srq",
             Error::QuerySharedReceiveQueue(_) => &"ibv_query_srq",
             Error::PostSend(_) => &"ibv_wr_complete",
+            Error::PostSendBatch { .. } => &"ibv_post_send",
             Error::PostReceive { .. } => &"ibv_post_recv",
             Error::PollCompletionQueue(_) => &"completion-queue polling",
             Error::AsyncEvent(_) => &"ibv_get_async_event",

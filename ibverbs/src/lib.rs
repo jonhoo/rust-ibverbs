@@ -107,12 +107,19 @@
 //! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`; they must come from rdma-core 50 or newer
 //! (54 with the `mlx5` feature).
 //!
-//! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
-//! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a
-//! provider that implements them — of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`,
-//! `rxe` (SoftRoCE), and, for reliable connections only, `ionic` implement both. A provider that
-//! lacks them fails cleanly at completion-queue or queue-pair creation (with
-//! [`Error::Unsupported`]) rather than degrading to the legacy verbs.
+//! The crate creates every completion queue with rdma-core's extended `ibv_create_cq_ex`, so it
+//! needs a provider that implements it. Queue pairs are created one of two ways:
+//!
+//! - [`QueuePairBuilder::build`] uses `ibv_create_qp_ex` with the `ibv_wr_*` send API
+//!   ([`QueuePair::start_send`]). Of the in-tree rdma-core providers, `mlx5`, `hns`, `efa`, `rxe`
+//!   (SoftRoCE), and, for reliable connections only, `ionic` implement both.
+//! - [`QueuePairBuilder::build_legacy`] uses the legacy `ibv_create_qp`, for providers without the
+//!   extended queue-pair verbs, such as `irdma` (which has `ibv_create_cq_ex` from its second
+//!   hardware generation on). Such a queue pair sends with [`QueuePair::post_send`], which works on
+//!   a queue pair from either method.
+//!
+//! Neither method falls back to the other: a provider that lacks what a call needs fails cleanly
+//! (with [`Error::Unsupported`]), and the caller chooses `build_legacy` explicitly.
 //!
 //! # Typed transports
 //!
@@ -130,12 +137,13 @@
 //! `Sync` where that holds. Handles like [`Context`], [`ProtectionDomain`], and
 //! [`CompletionQueue`] can be shared freely across threads. Operations whose verbs contracts are
 //! per-caller are encoded in the types instead: a send batch ([`QueuePair::start_send`]) takes
-//! `&mut QueuePair` and borrows it until submitted, so at most one is open per send queue (wrap the
-//! queue pair in a lock to send from several threads), while receives
+//! `&mut QueuePair` and borrows it until submitted, so at most one is open per send queue, and
+//! [`QueuePair::post_send`] takes `&mut QueuePair` too, so it never runs inside an open batch (wrap
+//! the queue pair in a lock to send from several threads), while receives
 //! ([`QueuePair::post_recv`]) take `&self` and may be posted from several threads at once;
-//! [`QueuePair::split`] separates the two so one thread can keep a batch open while others post
-//! receives. The views handed out during a poll ([`Completions`], [`WorkCompletion`]) borrow the
-//! queue and cannot outlive or escape it.
+//! [`QueuePair::split`] separates the two so one thread can send (with a batch or
+//! [`SendQueue::post_send`]) while others post receives. The views handed out during a poll
+//! ([`Completions`], [`WorkCompletion`]) borrow the queue and cannot outlive or escape it.
 //!
 //! A few calls keep unlocked bookkeeping in the provider, so the same object must not see two of
 //! them at once even though its type is `Sync`:

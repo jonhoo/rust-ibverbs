@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 use common::{mr, open_test_device, poll_until, test_device};
 use ibverbs::{
     AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
-    LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
-    QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
-    QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, TransportType, Uc, Ud, WcFields,
+    InlineSlice, LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain,
+    QueuePair, QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
+    QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, SendRequest, TransportType, Uc, Ud,
+    WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -1507,6 +1508,544 @@ fn create_qp_ex_with_only_a_protection_domain() {
         assert_eq!((*qp).pd, pd.as_raw());
         assert_eq!(ffi::ibv_destroy_qp(qp), 0);
     }
+}
+
+/// `build_legacy` creates RC and UD queue pairs without the extended view, and they come up like
+/// any other: handshake or activate, and query.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_queue_pair_bring_up() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair")
+        .set_gid_index(gid_index)
+        .build_legacy()
+        .expect("failed to build legacy RC queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let mut qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition legacy queue pair to RTS");
+    assert!(!qp.as_raw().is_null());
+    assert!(qp.as_raw_ex().is_null());
+    let (attr, _) = qp
+        .query(QueuePairAttributeMask::STATE)
+        .expect("failed to query legacy queue pair");
+    assert_eq!(attr.state(), QueuePairState::ReadyToSend);
+
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build_legacy()
+        .expect("failed to build legacy UD queue pair");
+    let ud = prepared
+        .activate(0x1234_5678)
+        .expect("failed to activate legacy UD queue pair");
+    assert!(ud.as_raw_ex().is_null());
+}
+
+/// A queue pair from `build_legacy` draws its receives from a shared receive queue like any other:
+/// a `post_send` lands in a buffer posted to the queue.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_shared_receive_queue() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
+
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair")
+        .set_gid_index(gid_index(&ctx))
+        .set_srq(&srq)
+        .build_legacy()
+        .expect("failed to build legacy RC queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let mut qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition legacy queue pair to RTS");
+
+    let mut recv = mr(&pd, 64);
+    let mut send = mr(&pd, 64);
+    send.bytes_mut()[..4].copy_from_slice(b"srq!");
+    unsafe { srq.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
+        .expect("SRQ post_recv failed");
+    unsafe { qp.post_send([SendRequest::send(2, &[send.slice(..4)]).signaled()]) }
+        .expect("legacy post_send failed");
+    let comps = drain(&cq, 2);
+    for id in [1, 2] {
+        assert!(
+            comps.iter().any(|wc| wc.wr_id() == id),
+            "missing completion {id}"
+        );
+    }
+    assert_eq!(&recv.bytes_mut()[..4], b"srq!");
+}
+
+/// A send batch needs the extended view, which a queue pair from `build_legacy` lacks.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "created by build_legacy and has no extended work-request interface")]
+fn start_send_on_legacy_queue_pair_panics() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair")
+        .set_gid_index(gid_index(&ctx))
+        .build_legacy()
+        .expect("failed to build legacy RC queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let mut qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition legacy queue pair to RTS");
+    let _batch = qp.start_send();
+}
+
+/// A reliable-connected self-loopback queue pair from `build_legacy`, with [`generous`] limits,
+/// remote-atomic access and `inline` bytes of inline capacity. It runs on every device the suite
+/// runs on, not only on providers that lack the extended verbs.
+fn legacy_loopback(inline: u32) -> Loopback<Rc> {
+    let ctx = open_test_device();
+    let cq = ctx
+        .create_cq(64)
+        .build()
+        .expect("failed to create completion queue");
+    let pd = ctx
+        .alloc_pd()
+        .expect("failed to allocate protection domain");
+    let mut builder = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair");
+    generous::<Rc>(AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)(&mut builder);
+    let prepared = builder
+        .set_gid_index(gid_index(&ctx))
+        .set_max_inline_data(inline)
+        .build_legacy()
+        .expect("failed to build legacy queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition queue pair to RTS");
+    assert!(
+        qp.as_raw_ex().is_null(),
+        "a legacy queue pair has no extended view"
+    );
+    Loopback { qp, cq, pd }
+}
+
+/// Two-sided SEND / RECV and one-sided WRITE and READ through `post_send`, in one call.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_send_recv_write_read() {
+    let mut lb = legacy_loopback(0);
+
+    let mut recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
+    let mut src = mr(&lb.pd, 64);
+    let mut dst = mr(&lb.pd, 64);
+    let mut local = mr(&lb.pd, 64);
+    send.bytes_mut()[..5].copy_from_slice(b"hello");
+    src.bytes_mut()[..6].copy_from_slice(b"verbs!");
+
+    unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }
+        .expect("post_recv failed");
+
+    let (send_sges, src_sges, local_sges) =
+        ([send.slice(..5)], [src.slice(..6)], [local.slice(..6)]);
+    let remote = dst.remote().slice(..6);
+    let chain = [
+        SendRequest::send(2, &send_sges).signaled(),
+        SendRequest::write(3, &src_sges, remote).signaled(),
+        SendRequest::read(4, &local_sges, remote)
+            .signaled()
+            .fenced(),
+    ];
+    unsafe { lb.qp.post_send(chain) }.expect("post_send failed");
+
+    let comps = drain(&lb.cq, 4);
+    for id in [1, 2, 3, 4] {
+        assert!(
+            comps.iter().any(|wc| wc.wr_id() == id),
+            "missing completion {id}"
+        );
+    }
+    assert_eq!(&recv.bytes_mut()[..5], b"hello");
+    assert_eq!(&dst.bytes_mut()[..6], b"verbs!");
+    assert_eq!(&local.bytes_mut()[..6], b"verbs!");
+}
+
+/// Inline payloads through `post_send`: the bytes are copied during the call, so the caller's
+/// buffers may go away right after it, and a write with an immediate consumes a receive.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_inline_and_imm() {
+    let mut lb = legacy_loopback(64);
+
+    let mut recv = mr(&lb.pd, 64);
+    let mut dst = mr(&lb.pd, 64);
+    let dummy = mr(&lb.pd, 64);
+
+    unsafe {
+        lb.qp.post_recv([
+            RecvRequest::new(1, &[recv.slice(..5)]),
+            RecvRequest::new(2, &[dummy.slice(..1)]),
+        ])
+    }
+    .expect("post_recv failed");
+
+    let remote = dst.remote().slice(..4);
+    {
+        let (message, w, y) = (*b"inrun", *b"wx", *b"yz");
+        let one = [InlineSlice::new(&message)];
+        let two = [InlineSlice::new(&w), InlineSlice::new(&y)];
+        let chain = [
+            SendRequest::send_inline(10, &one).signaled(),
+            SendRequest::write_inline(11, &two, remote)
+                .signaled()
+                .imm(0xdead_beef),
+        ];
+        unsafe { lb.qp.post_send(chain) }.expect("inline post_send failed");
+        // The inline bytes end here; the device already holds its own copy.
+    }
+
+    let comps = drain(&lb.cq, 4);
+    assert_eq!(&recv.bytes_mut()[..5], b"inrun");
+    assert_eq!(&dst.bytes_mut()[..4], b"wxyz");
+    let consumed = comps
+        .iter()
+        .find(|wc| wc.wr_id() == 2)
+        .expect("missing recv completion for write-with-imm");
+    assert_eq!(consumed.imm_data(), Some(0xdead_beef));
+}
+
+/// Atomics through `post_send`: fetch-and-add and compare-and-swap land, and return the previous
+/// value. As in `atomic_operations`, the byte order of the 8-byte operand in memory is
+/// implementation defined, so the value assertions accept either endianness.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_atomics() {
+    let mut lb = legacy_loopback(0);
+
+    // The target needs remote-atomic access, which `AccessFlags::PERMISSIVE` leaves out. It starts
+    // zeroed, which reads the same in either byte order.
+    let mut counter = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
+        .expect("failed to register the atomic target");
+    let mut old = mr(&lb.pd, 64);
+
+    let remote = counter.remote().slice(..8);
+    let first = old.slice(..8);
+    let request = SendRequest::atomic_fetch_add(1, &first, remote, 10).signaled();
+    unsafe { lb.qp.post_send([request]) }.expect("fetch-and-add failed");
+    let comps = drain(&lb.cq, 1);
+    assert_eq!(comps[0].wr_id(), 1);
+    assert_eq!(
+        first_u64(old.bytes_mut()),
+        0,
+        "fetch-and-add returns the old value"
+    );
+    let sum = first_u64(counter.bytes_mut());
+    assert!(
+        sum == 10 || sum == 10u64.swap_bytes(),
+        "fetch-and-add should add 10"
+    );
+
+    // The compare matches the 10 the device just stored, in whichever byte order it keeps it, so
+    // the swap takes effect and the old value comes back as the bytes the target held.
+    let second = old.slice(8..16);
+    let request = SendRequest::atomic_cmp_swap(2, &second, remote, 10, 99).signaled();
+    unsafe { lb.qp.post_send([request]) }.expect("compare-and-swap failed");
+    let comps = drain(&lb.cq, 1);
+    assert_eq!(comps[0].wr_id(), 2);
+    assert_eq!(
+        first_u64(&old.bytes_mut()[8..]),
+        sum,
+        "compare-and-swap returns the old value"
+    );
+    let swapped = first_u64(counter.bytes_mut());
+    assert!(
+        swapped == 99 || swapped == 99u64.swap_bytes(),
+        "compare-and-swap should store 99"
+    );
+}
+
+/// Zero-length operations through `post_send` pass null scatter lists and complete with zero
+/// bytes.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_zero_length_ops() {
+    let mut lb = legacy_loopback(16);
+
+    let remote_mr = lb
+        .pd
+        .allocate(64, AccessFlags::PERMISSIVE)
+        .expect("failed to register remote MR");
+    let remote = remote_mr.remote();
+    let empty_sges: &[ibverbs::LocalMemorySlice] = &[];
+    let empty_inline: &[InlineSlice<'_>] = &[];
+    let one_empty_inline = [InlineSlice::new(&[])];
+    unsafe {
+        lb.qp.post_recv([
+            RecvRequest::new(1, empty_sges),
+            RecvRequest::new(2, empty_sges),
+        ])
+    }
+    .expect("post_recv failed");
+
+    let chain = [
+        SendRequest::write(10, empty_sges, remote).signaled(),
+        SendRequest::send(11, empty_sges).signaled(),
+        SendRequest::send_inline(12, empty_inline).signaled(),
+        SendRequest::write_inline(13, &one_empty_inline, remote).signaled(),
+    ];
+    unsafe { lb.qp.post_send(chain) }.expect("post_send with empty payloads failed");
+
+    let comps = drain(&lb.cq, 6);
+    for id in [1, 2] {
+        let wc = comps
+            .iter()
+            .find(|c| c.wr_id() == id)
+            .expect("missing recv completion");
+        assert_eq!(wc.len(), 0);
+    }
+    for id in [10, 11, 12, 13] {
+        assert!(
+            comps.iter().any(|c| c.wr_id() == id),
+            "missing send completion {id}"
+        );
+    }
+}
+
+/// Over-filling the send queue through `post_send` reports how many requests were posted before
+/// the one that did not fit, and exactly those complete.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_partial_post_reports_posted_count() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(64).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    // Room for two requests; post four.
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair")
+        .set_gid_index(gid_index(&ctx))
+        .set_max_send_wr(2)
+        .set_access(AccessFlags::PERMISSIVE)
+        .build_legacy()
+        .expect("failed to build legacy queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let mut qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition queue pair to RTS");
+    let dst = mr(&pd, 64);
+    let src = mr(&pd, 64);
+    let remote = dst.remote().slice(..1);
+    let sges = [src.slice(..1)];
+    let chain: Vec<_> = (1..=4)
+        .map(|id| SendRequest::write(id, &sges, remote).signaled())
+        .collect();
+    match unsafe { qp.post_send(chain) } {
+        Err(Error::PostSendBatch { posted, .. }) => {
+            // The provider may have granted a deeper queue than asked; whatever it took is
+            // reported, and at least the two it promised fit.
+            assert!((2..4).contains(&posted), "posted {posted} of 4");
+            let comps = drain(&cq, posted as usize);
+            assert!(comps.iter().all(|wc| wc.wr_id() <= u64::from(posted)));
+        }
+        Ok(()) => {
+            // A provider that rounds the queue up to four or more posts the whole chain.
+            drain(&cq, 4);
+        }
+        Err(e) => panic!("unexpected error {e}"),
+    }
+}
+
+/// `post_send` and a send batch take turns on one queue pair from `build`: rdma-core allows
+/// `ibv_post_send` outside an open batch.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn post_send_on_extended_qp() {
+    let mut lb = loopback();
+    assert!(!lb.qp.as_raw_ex().is_null());
+    let recv = mr(&lb.pd, 64);
+    let mut send = mr(&lb.pd, 64);
+    send.bytes_mut()[..3].copy_from_slice(b"abc");
+
+    unsafe {
+        lb.qp.post_recv([
+            RecvRequest::new(1, &[recv.slice(..1)]),
+            RecvRequest::new(2, &[recv.slice(1..2)]),
+            RecvRequest::new(3, &[recv.slice(2..3)]),
+        ])
+    }
+    .expect("post_recv failed");
+
+    let mut batch = lb.qp.start_send();
+    batch.op().signaled().send(10, &[send.slice(..1)]);
+    unsafe { batch.submit() }.expect("batch failed");
+    let middle = [send.slice(1..2)];
+    unsafe { lb.qp.post_send([SendRequest::send(11, &middle).signaled()]) }
+        .expect("post_send failed");
+    let mut batch = lb.qp.start_send();
+    batch.op().signaled().send(12, &[send.slice(2..3)]);
+    unsafe { batch.submit() }.expect("batch failed");
+
+    let comps = drain(&lb.cq, 6);
+    for id in [1, 2, 3, 10, 11, 12] {
+        assert!(
+            comps.iter().any(|wc| wc.wr_id() == id),
+            "missing completion {id}"
+        );
+    }
+    assert_eq!(recv.bytes()[..3], *b"abc");
+}
+
+/// A split legacy queue pair: one thread posts the receives and another sends into them with
+/// `SendQueue::post_send`.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_split_queue_pair_across_threads() {
+    const N: u64 = 8;
+    let mut lb = legacy_loopback(0);
+    let recv = mr(&lb.pd, N as usize * 8);
+    let mut send = mr(&lb.pd, N as usize * 8);
+    for (i, chunk) in send.bytes_mut().chunks_mut(8).enumerate() {
+        chunk.copy_from_slice(&(i as u64).to_le_bytes());
+    }
+
+    let (mut sends, recvs) = lb.qp.split();
+    let posted = std::sync::Barrier::new(2);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            for i in 0..N {
+                let range = i as usize * 8..(i as usize + 1) * 8;
+                unsafe { recvs.post_recv([RecvRequest::new(i, &[recv.slice(range)])]) }
+                    .expect("post_recv failed");
+            }
+            posted.wait();
+        });
+        s.spawn(|| {
+            // RC delivers in order, so send once every receive is in place.
+            posted.wait();
+            for i in 0..N {
+                let range = i as usize * 8..(i as usize + 1) * 8;
+                let sges = [send.slice(range)];
+                unsafe { sends.post_send([SendRequest::send(100 + i, &sges).signaled()]) }
+                    .expect("send failed");
+            }
+        });
+    });
+
+    let comps = drain(&lb.cq, 2 * N as usize);
+    for i in 0..N {
+        assert!(comps.iter().any(|c| c.wr_id() == i), "missing recv {i}");
+        assert!(
+            comps.iter().any(|c| c.wr_id() == 100 + i),
+            "missing send {i}"
+        );
+    }
+    assert_eq!(recv.bytes(), send.bytes());
+}
+
+/// UD through `post_send`: a legacy UD queue pair sends a datagram to itself through an address
+/// handle, and the receive carries the 40-byte GRH in front of the payload.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_ud_send_to() {
+    const QKEY: u32 = 0x1234_5678;
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build_legacy()
+        .expect("failed to build legacy UD queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared.activate(QKEY).expect("failed to activate UD QP");
+
+    let mut ah_attr = AddressHandleAttribute::new(1);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
+    let ah = pd
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+
+    let payload = b"datagram";
+    let mut recv = mr(&pd, 40 + 64);
+    let mut send = mr(&pd, 64);
+    send.bytes_mut()[..payload.len()].copy_from_slice(payload);
+    unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..40 + payload.len())])]) }
+        .expect("post_recv failed");
+    let sges = [send.slice(..payload.len())];
+    let request = SendRequest::send_to(&ah, endpoint.qp_num, QKEY, 2, &sges).signaled();
+    unsafe { qp.post_send([request]) }.expect("UD post_send failed");
+
+    let comps = drain(&cq, 2);
+    let recv_wc = comps
+        .iter()
+        .find(|wc| wc.wr_id() == 1)
+        .expect("missing recv completion");
+    assert_eq!(recv_wc.len(), 40 + payload.len());
+    assert!(
+        comps.iter().any(|wc| wc.wr_id() == 2),
+        "missing send completion"
+    );
+    assert_eq!(&recv.bytes_mut()[40..40 + payload.len()], payload);
+}
+
+/// `post_send` refuses a UD request whose address handle is from another protection domain, as
+/// `SendBatch::to` does.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "the address handle must come from the queue pair's protection domain")]
+fn legacy_post_send_refuses_address_handle_from_another_protection_domain() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build_legacy()
+        .expect("failed to build legacy UD queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    let mut qp = prepared
+        .activate(0x1234_5678)
+        .expect("failed to activate UD QP");
+
+    let mut ah_attr = AddressHandleAttribute::new(1);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
+    let other_pd_ah = ctx
+        .alloc_pd()
+        .expect("failed to allocate PD")
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+
+    let none: &[ibverbs::LocalMemorySlice] = &[];
+    let request = SendRequest::send_to(&other_pd_ah, endpoint.qp_num, 0x1234_5678, 1, none);
+    unsafe { qp.post_send([request]) }.expect("post_send must panic before it posts");
 }
 
 /// The raw-handle escape hatches return the live, non-null FFI pointers for each resource.
