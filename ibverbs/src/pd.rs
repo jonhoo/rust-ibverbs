@@ -190,9 +190,9 @@ impl ProtectionDomain {
         // when each builder is created; `PreparedQueuePair::endpoint` documents the stale-LID case.
         let port_attr = self.context().query_port(port_num)?;
         require_active(port_num, &port_attr)?;
-        // Only reliable connections carry RDMA read and atomic limits.
-        let rd_atomic_limits = if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
-            Some(self.context().rd_atomic_limits()?)
+        // Only reliable connections carry RDMA read and atomic limits, and default to the atomics.
+        let rc_limits = if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
+            Some(self.context().rc_limits()?)
         } else {
             None
         };
@@ -202,7 +202,7 @@ impl ProtectionDomain {
             port_num,
             send.clone(),
             recv.clone(),
-            rd_atomic_limits,
+            rc_limits,
         ))
     }
 

@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
-use crate::context::Mtu;
+use crate::context::{Mtu, RcLimits};
 use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
@@ -450,8 +450,9 @@ flags_newtype! {
 
 /// The send operations a queue pair of `qp_type` is created with unless the builder says
 /// otherwise: SEND on every transport, RDMA WRITE on the connected transports and SRD, RDMA READ
-/// on RC and SRD, and the atomics on RC only.
-fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
+/// on RC and SRD, and the atomics on RC only, and there only when the device executes them
+/// (`atomics`): mlx5 refuses to create a queue pair that requests atomics on a device without.
+fn default_send_ops(qp_type: ffi::ibv_qp_type, atomics: bool) -> SendOps {
     use ffi::ibv_qp_type as T;
     let mut ops = SendOps::SEND | SendOps::SEND_WITH_IMM;
     if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_UC | T::IBV_QPT_DRIVER) {
@@ -460,7 +461,7 @@ fn default_send_ops(qp_type: ffi::ibv_qp_type) -> SendOps {
     if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_DRIVER) {
         ops |= SendOps::RDMA_READ;
     }
-    if qp_type == T::IBV_QPT_RC {
+    if qp_type == T::IBV_QPT_RC && atomics {
         ops |= SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
     }
     ops
@@ -495,6 +496,8 @@ pub struct QueuePairBuilder<T: Transport> {
     max_inline_data: u32,
     /// the send operations to request at creation, or the transport's default set
     send_ops: Option<SendOps>,
+    /// the transport's default set of send operations on this device
+    default_send_ops: SendOps,
 
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
@@ -512,15 +515,15 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// Prepare a new `QueuePair` builder on port `port_num`, whose attributes are `port_attr`, with
     /// the defaults the setters document.
     ///
-    /// `rd_atomic_limits` is the device's `(initiator, responder)` RDMA read and atomic limit, the
-    /// default for a reliable connection; it is `None` for the other transports.
+    /// `rc_limits` is what a reliable connection's defaults take from the device (its RDMA read
+    /// and atomic depths, and whether it executes atomics); it is `None` for the other transports.
     pub(crate) fn new(
         pd: ProtectionDomain,
         port_attr: &ffi::ibv_port_attr,
         port_num: u8,
         send: CompletionQueue,
         recv: CompletionQueue,
-        rd_atomic_limits: Option<(u8, u8)>,
+        rc_limits: Option<RcLimits>,
     ) -> QueuePairBuilder<T> {
         let reliable = T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC;
         let connected = reliable || T::TYPE == ffi::ibv_qp_type::IBV_QPT_UC;
@@ -544,7 +547,11 @@ impl<T: Transport> QueuePairBuilder<T> {
                 .set_retry_count(7)
                 .set_rnr_retry(7);
         }
-        if let Some((initiator, responder)) = rd_atomic_limits {
+        if let Some(RcLimits {
+            rd_atomic: (initiator, responder),
+            ..
+        }) = rc_limits
+        {
             rtr.set_max_dest_rd_atomic(responder);
             rts.set_max_rd_atomic(initiator);
         }
@@ -566,6 +573,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             max_recv_sge: 1,
             max_inline_data: 0,
             send_ops: None,
+            default_send_ops: default_send_ops(T::TYPE, rc_limits.is_some_and(|l| l.atomics)),
 
             service_level: 0,
             bring_up: BringUp { init, rtr, rts },
@@ -726,8 +734,8 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// set (see [`send_ops`](Self::send_ops)).
     ///
     /// The device must support every operation requested, or [`build`](Self::build) fails with
-    /// [`Unsupported`](Error::Unsupported): a device without extended atomics, for example, can
-    /// still create a send-only RC queue pair this way. Conversely, do not call an opcode method
+    /// [`Unsupported`](Error::Unsupported): mlx5, for example, refuses the atomics on a device
+    /// that reports no atomic capability. Conversely, do not call an opcode method
     /// whose operation was not requested: what happens depends on the provider (rxe and EFA
     /// install only the requested operations, so the method panics; mlx5 posts it anyway).
     /// Operations beyond the ones this crate posts (`LOCAL_INV`, `BIND_MW`, `SEND_WITH_INV`, `TSO`,
@@ -740,10 +748,11 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The send operations the queue pair will be created with: the set given to
     /// [`set_send_ops`](Self::set_send_ops), or else the transport's default — SEND (with and
     /// without an immediate) everywhere, plus RDMA WRITE on RC, UC, and SRD, RDMA READ on RC and
-    /// SRD, and the atomics on RC. Start from it to add an operation:
+    /// SRD, and the atomics on RC where the device executes them (its `atomic_cap` is not
+    /// `IBV_ATOMIC_NONE`). Start from it to add an operation:
     /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
     pub fn send_ops(&self) -> SendOps {
-        self.send_ops.unwrap_or_else(|| default_send_ops(T::TYPE))
+        self.send_ops.unwrap_or(self.default_send_ops)
     }
 
     /// Refuses completion queues from another device context than the protection domain's, and a
@@ -3061,6 +3070,32 @@ mod test_recv_link {
         batch.op().send(3, Payload::InlineList(empty_iov));
         assert_eq!(spy.last_inline_list_len, 0);
         assert!(spy.last_inline_list_ptr.is_null());
+    }
+}
+
+#[cfg(test)]
+mod test_default_send_ops {
+    use super::*;
+    use ffi::ibv_qp_type as T;
+
+    /// A reliable connection defaults to the atomics only where the device executes them; the
+    /// other operations, and the other transports, do not depend on it.
+    #[test]
+    fn atomics_follow_the_device() {
+        let atomics = SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
+        let with = default_send_ops(T::IBV_QPT_RC, true);
+        let without = default_send_ops(T::IBV_QPT_RC, false);
+        assert!(with.contains(atomics));
+        assert_eq!(without & atomics, SendOps::empty());
+        assert_eq!(without | atomics, with);
+        assert!(without.contains(SendOps::RDMA_READ | SendOps::RDMA_WRITE | SendOps::SEND));
+        for qp_type in [T::IBV_QPT_UC, T::IBV_QPT_UD, T::IBV_QPT_DRIVER] {
+            assert_eq!(
+                default_send_ops(qp_type, true),
+                default_send_ops(qp_type, false)
+            );
+            assert_eq!(default_send_ops(qp_type, true) & atomics, SendOps::empty());
+        }
     }
 }
 

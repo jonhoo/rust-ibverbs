@@ -356,11 +356,17 @@ impl Context {
         query_device(self.inner.ctx).map(DeviceAttr)
     }
 
-    /// The most outstanding RDMA reads and atomics a queue pair on this device can issue as the
-    /// initiator and service as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`),
-    /// clamped to the `u8` the queue-pair attributes carry.
-    pub(crate) fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
-        rd_atomic_limits(self.inner.ctx)
+    /// What a reliable connection's defaults take from the device (one `ibv_query_device`): the
+    /// most outstanding RDMA reads and atomics a queue pair can issue as the initiator and service
+    /// as the responder (`max_qp_init_rd_atom` and `max_qp_rd_atom`), clamped to the `u8` the
+    /// queue-pair attributes carry, and whether the device executes RDMA atomics at all
+    /// (`atomic_cap` is not `IBV_ATOMIC_NONE`).
+    pub(crate) fn rc_limits(&self) -> Result<RcLimits> {
+        let attr = query_device(self.inner.ctx)?;
+        Ok(RcLimits {
+            rd_atomic: rd_atomic_depths(&attr),
+            atomics: attr.atomic_cap != ffi::ibv_atomic_cap::IBV_ATOMIC_NONE,
+        })
     }
 
     /// Query the extended attributes and capabilities of this context's device
@@ -490,12 +496,27 @@ fn query_device(ctx: *mut ffi::ibv_context) -> Result<ffi::ibv_device_attr> {
     Ok(device_attr)
 }
 
-/// [`Context::rd_atomic_limits`] for any open context on a device, such as the one librdmacm
-/// keeps for a connection-manager id.
+/// The device limits a reliable connection's defaults follow (see [`Context::rc_limits`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RcLimits {
+    /// The `(initiator, responder)` RDMA read and atomic depths.
+    pub(crate) rd_atomic: (u8, u8),
+    /// Whether the device executes RDMA atomics.
+    pub(crate) atomics: bool,
+}
+
+/// The `(initiator, responder)` RDMA read and atomic depths of [`Context::rc_limits`] for any open
+/// context on a device, such as the one librdmacm keeps for a connection-manager id.
+#[cfg(feature = "rdmacm")]
 pub(crate) fn rd_atomic_limits(ctx: *mut ffi::ibv_context) -> Result<(u8, u8)> {
-    let attr = query_device(ctx)?;
+    Ok(rd_atomic_depths(&query_device(ctx)?))
+}
+
+/// The `(initiator, responder)` RDMA read and atomic depths `attr` reports, clamped to the `u8`
+/// the queue-pair attributes carry.
+fn rd_atomic_depths(attr: &ffi::ibv_device_attr) -> (u8, u8) {
     let clamp = |n: i32| n.clamp(0, i32::from(u8::MAX)) as u8;
-    Ok((clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom)))
+    (clamp(attr.max_qp_init_rd_atom), clamp(attr.max_qp_rd_atom))
 }
 
 /// An asynchronous event reported by the device, consumed with [`Context::poll_async_event`] /
