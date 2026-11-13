@@ -313,18 +313,19 @@ impl CompletionQueueBuilder {
     ///  - [`Unsupported`](Error::Unsupported): the device does not support a requested
     ///    work-completion field, or a completion channel (EFA devices without completion
     ///    notifications) (`EOPNOTSUPP`).
-    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `min_cq_entries` is 0 or above
-    ///    `i32::MAX`, or the completion channel comes from another device context (both
+    ///  - [`CreateCompletionQueue`](Error::CreateCompletionQueue): `min_cq_entries` is 0 or 2^30
+    ///    or more, or the completion channel comes from another device context (both
     ///    [`io::ErrorKind::InvalidInput`]), or `ibv_create_cq_ex` failed (`EINVAL` for an invalid
     ///    `min_cq_entries`, which must be `1 <= cqe <= dev_cap.max_cqe`, or an invalid completion
     ///    vector, `ENOMEM` when out of resources).
     pub fn build(&self) -> Result<CompletionQueue> {
-        // The legacy verbs take the size as an `int`, and providers do unsigned arithmetic on it
-        // that wraps near `u32::MAX` (mlx5 then accepts `u32::MAX` as a one-entry queue).
-        if self.min_cq_entries == 0 || self.min_cq_entries > i32::MAX as u32 {
+        // mlx5 rounds the size plus one up to a power of two in an `int`: from 2^30 on that
+        // overflows (and near `u32::MAX` it wraps to a one-entry queue it accepts). No device holds
+        // that many entries: mlx5 itself refuses more than 2^24.
+        if self.min_cq_entries == 0 || self.min_cq_entries >= 1 << 30 {
             return Err(Error::CreateCompletionQueue(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "min_cq_entries must be between 1 and i32::MAX",
+                "min_cq_entries must be between 1 and 2^30 - 1",
             )));
         }
         // The kernel looks a completion channel up in the creating context's own file table, so a
