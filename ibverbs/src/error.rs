@@ -344,30 +344,23 @@ impl Error {
         }
     }
 
-    /// Whether `err` says the operation is unsupported: `EOPNOTSUPP` from the provider or kernel,
-    /// or `EPROTONOSUPPORT`, which the kernel's ioctl dispatch returns for a method or attribute
-    /// it does not know (a kernel older than the request) and reserves for exactly that: a
-    /// driver's own `EPROTONOSUPPORT` reaches userspace as `EINVAL` (`uverbs_ioctl.c`).
-    pub(crate) fn is_unsupported(err: &io::Error) -> bool {
-        matches!(
-            err.raw_os_error(),
-            Some(nix::libc::EOPNOTSUPP | nix::libc::EPROTONOSUPPORT)
-        )
-    }
-
-    /// Build an [`Error`] from an OS error, promoting an unsupported one (see
-    /// [`is_unsupported`](Error::is_unsupported)) to [`Error::Unsupported`]
+    /// Build an [`Error`] from an OS error, promoting an unsupported one to [`Error::Unsupported`]
     /// (naming the operation `wrap` identifies) and otherwise tagging it with `wrap` (the variant
     /// identifying the operation that failed).
+    ///
+    /// Unsupported means `EOPNOTSUPP` from the provider or kernel, or `EPROTONOSUPPORT`, which the
+    /// kernel's ioctl dispatch returns for a method or attribute it does not know (a kernel older
+    /// than the request) and reserves for exactly that: a driver's own `EPROTONOSUPPORT` reaches
+    /// userspace as `EINVAL` (`uverbs_ioctl.c`).
     pub(crate) fn os(err: io::Error, wrap: impl FnOnce(io::Error) -> Error) -> Error {
-        let unsupported = err.raw_os_error().filter(|_| Error::is_unsupported(&err));
-        let wrapped = wrap(err);
-        match unsupported {
-            Some(errno) => Error::Unsupported {
-                operation: wrapped.operation(),
-                errno,
-            },
-            None => wrapped,
+        match err.raw_os_error() {
+            Some(errno @ (nix::libc::EOPNOTSUPP | nix::libc::EPROTONOSUPPORT)) => {
+                Error::Unsupported {
+                    operation: wrap(err).operation(),
+                    errno,
+                }
+            }
+            _ => wrap(err),
         }
     }
 

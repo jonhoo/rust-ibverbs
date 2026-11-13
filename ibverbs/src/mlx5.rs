@@ -137,13 +137,7 @@ fn has_data_direct_device(ctx: &Context) -> bool {
 }
 
 fn registration_error(err: io::Error) -> Error {
-    match err.raw_os_error().filter(|_| Error::is_unsupported(&err)) {
-        Some(errno) => Error::Unsupported {
-            operation: &"mlx5dv_reg_dmabuf_mr",
-            errno,
-        },
-        None => Error::RegisterMemoryRegion(err),
-    }
+    Error::os(err, Error::RegisterMemoryRegion).for_operation(&"mlx5dv_reg_dmabuf_mr")
 }
 
 #[cfg(test)]
