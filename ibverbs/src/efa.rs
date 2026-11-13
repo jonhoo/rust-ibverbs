@@ -256,30 +256,32 @@ impl SendOp<'_, '_, Srd> {
     /// Post an RDMA WRITE of `local` into `remote`, with the immediate set by [`imm`](Self::imm)
     /// if any.
     ///
-    /// The data must come from registered memory: EFA writes inline data only on a queue pair
-    /// created with its inline-write flag (`EFADV_QP_FLAGS_INLINE_WRITE`), which doubles the size
-    /// of every send work request and needs rdma-core 63, so this crate does not set it.
+    /// The data comes from one piece of registered memory: an EFA RDMA work request holds a
+    /// single local scatter/gather entry, and EFA writes inline data only on a queue pair created
+    /// with its inline-write flag (`EFADV_QP_FLAGS_INLINE_WRITE`), which doubles the size of every
+    /// send work request and needs rdma-core 63, so this crate does not set it.
     ///
     /// # Panics
     ///
-    /// Panics if `local` has more entries than the queue pair was built for
+    /// Panics if the queue pair was built without room for a scatter/gather entry
     /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
-    pub fn write(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
+    pub fn write(self, wr_id: u64, local: LocalMemorySlice, remote: RemoteMemorySlice) {
         let imm = self.imm;
-        let op = SendOp::<Srd>::write_op(imm, remote);
-        self.build(wr_id, Payload::Sges(local), op)
+        let op = Self::write_op(imm, remote);
+        self.build(wr_id, Payload::Sges(std::slice::from_ref(&local)), op)
     }
 
-    /// Post an RDMA READ from `remote` into `local`.
+    /// Post an RDMA READ from `remote` into `local`, one piece of registered memory (an EFA RDMA
+    /// work request holds a single local scatter/gather entry).
     ///
     /// # Panics
     ///
-    /// Panics if `local` has more entries than the queue pair was built for
+    /// Panics if the queue pair was built without room for a scatter/gather entry
     /// ([`QueuePairBuilder::set_max_send_sge`]).
     #[inline]
-    pub fn read(self, wr_id: u64, local: &[LocalMemorySlice], remote: RemoteMemorySlice) {
-        let op = SendOp::<Srd>::read_op(remote);
-        self.build(wr_id, Payload::Sges(local), op)
+    pub fn read(self, wr_id: u64, local: LocalMemorySlice, remote: RemoteMemorySlice) {
+        let op = Self::read_op(remote);
+        self.build(wr_id, Payload::Sges(std::slice::from_ref(&local)), op)
     }
 }
