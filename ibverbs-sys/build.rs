@@ -172,11 +172,13 @@ fn main() {
         .size_t_is_usize(true);
 
     if efa {
-        // EFA SRD queue pairs are created through the provider's direct-verbs (`efadv`).
+        // EFA SRD queue pairs are created through the provider's direct-verbs (`efadv`). Its
+        // capability, flag, and option values are anonymous enums, which bindgen binds only by
+        // the names of their constants.
         builder = builder
             .allowlist_function("efadv_.*")
             .allowlist_type("efadv_.*")
-            .allowlist_var("EFADV_QP_DRIVER_TYPE_.*");
+            .allowlist_var("EFADV_.*");
     }
 
     if mlx5 {
