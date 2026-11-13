@@ -1846,7 +1846,10 @@ impl Resolved {
     ///    is touched.
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
     ///    is not on the device of [`context`](Self::context).
+    ///  - [`QueryDevice`](Error::QueryDevice): reading the device's read and atomic limits failed
+    ///    (see [`CmId::init_qp_attr`]).
     ///  - [`TimedOut`](Error::TimedOut): the response did not arrive in time.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading an event failed.
     ///
     /// Any error, a refused `param` included, consumes `self` and `qp`: resolve again to retry.
     pub fn connect(
@@ -1977,6 +1980,10 @@ impl Acceptor {
     ///    acceptor, and with several waiters give each a timeout and stop them all once one sees
     ///    the failure.
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading an event failed, or
+    ///    a request arrived but could not get an event channel of its own (`EMFILE` once the
+    ///    process is out of file descriptors, one per accepted connection): the request is then
+    ///    declined, and the acceptor stays usable.
     pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = crate::completion::deadline_after(timeout);
         let request = self
@@ -2047,7 +2054,10 @@ impl Incoming {
     ///    it established (its ready-to-use message was lost).
     ///  - [`ModifyQueuePair`](Error::ModifyQueuePair): a queue-pair transition failed, or `qp`
     ///    is not on the device of [`context`](Self::context).
+    ///  - [`QueryDevice`](Error::QueryDevice): reading the device's read and atomic limits failed
+    ///    (see [`CmId::init_qp_attr`]).
     ///  - [`TimedOut`](Error::TimedOut): the connection was not established in time.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading an event failed.
     ///
     /// A peer that withdrew its request before this side replied (for example by dropping its id
     /// after its connect timed out) shows up as `EINVAL` instead: in
