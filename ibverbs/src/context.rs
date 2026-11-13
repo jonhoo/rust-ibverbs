@@ -267,7 +267,12 @@ impl Context {
             return Err(Error::errno(-num_entries as i32, Error::QueryGidTable));
         }
         gid_table.truncate(num_entries as usize);
-        let gid_table = gid_table.into_iter().map(GidEntry::from).collect();
+        let gid_table = gid_table
+            .into_iter()
+            .map(GidEntry::from)
+            // An entry of a port above 255 is of no use: nothing here can name its port.
+            .filter(|entry| entry.port_num != 0)
+            .collect();
         Ok(gid_table)
     }
 
@@ -534,7 +539,8 @@ impl AsyncEvent<'_> {
     /// [`LidChange`](AsyncEventType::LidChange), [`PkeyChange`](AsyncEventType::PkeyChange),
     /// [`SmChange`](AsyncEventType::SmChange),
     /// [`ClientReregister`](AsyncEventType::ClientReregister), and
-    /// [`GidChange`](AsyncEventType::GidChange)); `None` for every other kind.
+    /// [`GidChange`](AsyncEventType::GidChange)); `None` for every other kind, and for a port
+    /// above 255, which this crate cannot name.
     pub fn port_num(&self) -> Option<u8> {
         match self.event_type() {
             AsyncEventType::PortActive
@@ -545,7 +551,7 @@ impl AsyncEvent<'_> {
             | AsyncEventType::ClientReregister
             | AsyncEventType::GidChange => {
                 // SAFETY: for the port-scoped events, the element union holds the port number.
-                Some(unsafe { self.event.element.port_num } as u8)
+                u8::try_from(unsafe { self.event.element.port_num }).ok()
             }
             _ => None,
         }

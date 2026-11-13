@@ -166,7 +166,8 @@ pub struct GidEntry {
     pub gid: Gid,
     /// The GID table index of this entry.
     pub gid_index: u32,
-    /// The port number that this GID belongs to (numbered from 1, like every port in this crate).
+    /// The port number that this GID belongs to (numbered from 1, like every port in this crate),
+    /// or 0 for a port above 255, which no verb of libibverbs can address.
     pub port_num: u8,
     /// The type of the GID (InfiniBand, RoCE v1, or RoCE v2).
     pub gid_type: GidType,
@@ -181,9 +182,11 @@ impl From<ffi::ibv_gid_entry> for GidEntry {
         Self {
             gid: gid_entry.gid.into(),
             gid_index: gid_entry.gid_index,
-            // Port numbers are 8-bit on the wire; the C struct widens the field to u32 purely to
-            // keep `ibv_gid_entry` free of implicit padding across the kernel boundary.
-            port_num: gid_entry.port_num as u8,
+            // The kernel numbers ports in 32 bits, and a device can have more than 255 of them
+            // (an mlx5 device in switchdev mode has one per representor), while every verb takes
+            // the port in 8. Such a port becomes 0, which is no port, rather than whichever
+            // real port its low byte names.
+            port_num: u8::try_from(gid_entry.port_num).unwrap_or(0),
             gid_type: GidType::from_raw(gid_entry.gid_type),
             ndev_ifindex: gid_entry.ndev_ifindex,
         }
@@ -330,6 +333,15 @@ mod test {
         assert_eq!(GidType::from_raw(2), GidType::RoceV2);
         // An unrecognized value is preserved rather than panicking.
         assert_eq!(GidType::from_raw(7), GidType::Unknown(7));
+        // A port the crate cannot name is not mistaken for one it can.
+        let port = |port_num| {
+            GidEntry::from(ffi::ibv_gid_entry {
+                port_num,
+                ..Default::default()
+            })
+            .port_num
+        };
+        assert_eq!((port(1), port(255), port(256), port(257)), (1, 255, 0, 0));
         assert_eq!(GidType::RoceV2.to_string(), "RoCE v2");
         assert_eq!(GidType::Unknown(7).to_string(), "unknown (7)");
     }
