@@ -211,7 +211,7 @@ fn connect_and_send() {
             assert_eq!(conn.cm_id().peer_addr(), Some(addr));
             let local = conn.cm_id().local_addr().expect("client local address");
             assert_eq!(local.ip(), addr.ip());
-            let mut batch = conn.queue_pair().start_send();
+            let mut batch = conn.queue_pair_mut().start_send();
             batch
                 .op()
                 .signaled()
@@ -235,7 +235,7 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
     fn exchange(conn: &mut Connection, cq: &CompletionQueue, pd: &ProtectionDomain) {
         let mut send = mr(pd, 64);
         send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
-        let mut batch = conn.queue_pair().start_send();
+        let mut batch = conn.queue_pair_mut().start_send();
         batch
             .op()
             .signaled()
@@ -484,7 +484,7 @@ fn two_connections() {
             let port = incoming.cm_id().port_num().expect("server port");
             let (pd, cq, qp) = resources(&ctx, port);
             let mut recv = mr(&pd, 64);
-            let mut conn = incoming
+            let conn = incoming
                 .accept(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
                 .expect("accept");
             unsafe {
@@ -520,7 +520,7 @@ fn two_connections() {
                 let mut conn = resolved
                     .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
                     .expect("connect");
-                let mut batch = conn.queue_pair().start_send();
+                let mut batch = conn.queue_pair_mut().start_send();
                 batch
                     .op()
                     .signaled()
@@ -918,7 +918,7 @@ fn server_writes_into_client() {
             .accept(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
 
-        let mut batch = conn.queue_pair().start_send();
+        let mut batch = conn.queue_pair_mut().start_send();
         batch
             .op()
             .signaled()
@@ -944,7 +944,7 @@ fn server_writes_into_client() {
     let notify = mr(&pd, 1);
     let mut param = ConnectionParameter::default();
     param.set_private_data(&target.remote().slice(..MESSAGE.len()).to_bytes());
-    let mut conn = resolved
+    let conn = resolved
         .connect(qp, &param, SETUP_TIMEOUT)
         .expect("connect");
     unsafe {
@@ -973,12 +973,18 @@ fn accept_applies_rd_atomic_parameters() {
             param
         },
         move |conn, _, _, _| {
-            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
+            let (attr, _) = conn
+                .queue_pair_mut()
+                .query(rd_atomic)
+                .expect("server query");
             assert_eq!(attr.max_dest_rd_atomic(), 4, "server responder resources");
             assert_eq!(attr.max_rd_atomic(), 2, "server initiator depth");
         },
         |conn, _, _, _| {
-            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
+            let (attr, _) = conn
+                .queue_pair_mut()
+                .query(rd_atomic)
+                .expect("client query");
             assert_eq!(
                 attr.max_rd_atomic(),
                 4,
@@ -1022,11 +1028,17 @@ fn default_parameters_use_the_device_rd_atomic_limits() {
         ip,
         ConnectionParameter::default,
         move |conn, _, _, _| {
-            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("server query");
+            let (attr, _) = conn
+                .queue_pair_mut()
+                .query(rd_atomic)
+                .expect("server query");
             check(attr, "server");
         },
         |conn, _, _, _| {
-            let (attr, _) = conn.queue_pair().query(rd_atomic).expect("client query");
+            let (attr, _) = conn
+                .queue_pair_mut()
+                .query(rd_atomic)
+                .expect("client query");
             check(attr, "client");
         },
     );
@@ -1501,7 +1513,7 @@ fn cm_id_options_and_accessors() {
 /// path's traffic class) that [`cm_id_options_and_accessors`] sets.
 fn check_options(conn: &mut Connection, side: &str) {
     let (attr, _) = conn
-        .queue_pair()
+        .queue_pair_mut()
         .query(QueuePairAttributeMask::TIMEOUT | QueuePairAttributeMask::AV)
         .expect("query the queue pair");
     assert_eq!(

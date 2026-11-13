@@ -37,7 +37,7 @@
 //!     .create_qp::<ibverbs::Rc>(&cq, &cq, port)?
 //!     .build()?;
 //! let mut conn = resolved.connect(qp, &ConnectionParameter::default(), None)?;
-//! // `conn.queue_pair()` is ready to post on; poll completions on `cq`.
+//! // `conn.queue_pair_mut()` is ready to post on; poll completions on `cq`.
 //! # let _ = &mut conn;
 //! # Ok(())
 //! # }
@@ -2115,9 +2115,16 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// The connected queue pair, for posting work requests. Poll completions on the completion queue
-    /// you built it with.
-    pub fn queue_pair(&mut self) -> &mut QueuePair<Rc> {
+    /// The connected queue pair, for what a shared reference can do: posting receives
+    /// ([`QueuePair::post_recv`]), which several threads may do at once. Poll completions on the
+    /// completion queue you built it with.
+    pub fn queue_pair(&self) -> &QueuePair<Rc> {
+        &self.qp
+    }
+
+    /// The connected queue pair, for sending ([`QueuePair::start_send`]) and everything else
+    /// that takes it exclusively.
+    pub fn queue_pair_mut(&mut self) -> &mut QueuePair<Rc> {
         &mut self.qp
     }
 

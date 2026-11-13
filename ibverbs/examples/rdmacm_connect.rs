@@ -105,7 +105,7 @@ fn client(addr: SocketAddr) {
             Some(Duration::from_secs(10)),
         )
         .unwrap();
-    let mut batch = conn.queue_pair().start_send();
+    let mut batch = conn.queue_pair_mut().start_send();
     batch
         .op()
         .signaled()
