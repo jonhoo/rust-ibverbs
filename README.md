@@ -151,8 +151,8 @@ At build time, `bindgen` generates the bindings from the `rdma-core` headers ven
 `ibverbs-sys` crate, so building needs `libclang` but not the installed headers; the development
 packages are still needed for the unversioned library links (`libibverbs.so` and the like) that
 the linker looks for. To use installed `rdma-core` headers instead, set `RDMA_CORE_INCLUDE_DIR`
-and `RDMA_CORE_LIB_DIR`. You do not need to depend on `ibverbs-sys` directly: it is re-exported
-as `ibverbs::ffi`.
+and `RDMA_CORE_LIB_DIR`; they must come from rdma-core 50 or newer (54 with the `mlx5` feature).
+You do not need to depend on `ibverbs-sys` directly: it is re-exported as `ibverbs::ffi`.
 `RDMA_CORE_LIB_DIR` also works alone when using vendored headers. The `mlx5` feature
 requires libraries exporting both Data Direct functions; newer headers do not upgrade
 older system libraries. Set the runtime library search path as well when linking a
@@ -175,6 +175,10 @@ created one of two ways:
 
 Neither method falls back to the other. On a provider that lacks what a call needs (for example
 `build` on `irdma`), creation fails cleanly with `Error::Unsupported`.
+
+With `mlx5` devices, run rdma-core 65.0 or newer. Older versions of its `libmlx5` can lose a
+completion on a queue with wallclock timestamps, and can loop forever when a queue pair is
+destroyed or reset while its completion queue's consumer index is exactly 2^31.
 
 ## Documentation
 
@@ -201,14 +205,19 @@ $ sudo rdma link add rxe0 type rxe netdev <netdev>
 ```
 
 The examples (except the EFA one, which needs EFA hardware) and the integration test suite run
-against it unchanged. CI runs the whole data-path test suite (two-sided, one-sided, atomics,
-inline, UC/UD, and the connection manager) against a SoftRoCE device on every pull request and
-asserts on the transferred bytes; it builds the examples but does not run them.
+against it unchanged, given the SoftRoCE provider library from rdma-core 63.1 or newer: older ones
+drop a completion after a poll drains the queue (before 55), unlock the queue twice per drained
+poll (before 59), and mis-size gathered and inline-list sends (before 63.1). CI runs the whole
+data-path test suite (two-sided, one-sided, atomics, inline, UC/UD, and the connection manager)
+against a SoftRoCE device on every pull request and asserts on the transferred bytes; it builds
+the examples but does not run them.
 
 The tests that need a device are `#[ignore]`d. Run them the way CI does, one at a time (they
 share the device, and SoftRoCE drops completions when many queue pairs drive it at once), with
 the connection-manager and mlx5 suites under their features (the mlx5 one checks that SoftRoCE
-refuses the mlx5 calls):
+refuses the mlx5 calls). Where the distribution's rdma-core is older, do as CI does and build the
+vendored one in place (`./configure-ci.sh --vendored-libs` does, into `rdma-core-build/`), then
+point `RDMA_CORE_LIB_DIR` and `LD_LIBRARY_PATH` at its `lib` directory:
 
 ```console
 $ IBVERBS_TEST_DEVICE=rxe0 cargo test -- --ignored --test-threads=1

@@ -56,7 +56,7 @@ impl DeviceList {
         self.len
     }
 
-    /// Returns `true` if there are any devices.
+    /// Returns `true` if there are no devices.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
@@ -285,7 +285,7 @@ impl<'devlist> Device<'devlist> {
 }
 
 /// The transport a device speaks. Returned by [`Device::transport_type`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum TransportType {
     /// The transport could not be determined.

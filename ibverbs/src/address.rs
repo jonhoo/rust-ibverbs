@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::io;
 
-use crate::completion::WorkCompletion;
+use crate::completion::{Completion, WorkCompletion};
 use crate::context::Context;
 use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
@@ -77,8 +77,10 @@ impl From<std::net::Ipv6Addr> for Gid {
 }
 
 impl fmt::Display for Gid {
-    /// Formats the GID the way `ibv_devinfo -v` and `show_gids` do: as an IPv6 address, for
-    /// example `fe80::5054:ff:fe12:3456` or `::ffff:192.0.2.1`.
+    /// Formats the GID as an IPv6 address, for example `fe80::5054:ff:fe12:3456` or
+    /// `::ffff:192.0.2.1`: the way `ibv_devinfo -v` prints a RoCE v2 GID. For an InfiniBand or
+    /// RoCE v1 GID `ibv_devinfo`, like sysfs and `show_gids` for every GID, prints all eight
+    /// groups in full instead (`fe80:0000:0000:0000:5054:00ff:fe12:3456`).
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         std::net::Ipv6Addr::from(*self).fmt(f)
     }
@@ -120,7 +122,7 @@ impl From<[u8; 16]> for Gid {
 
 /// The type of a GID table entry, deciding how packets sent from it are framed and routed.
 /// Carried by [`GidEntry::gid_type`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum GidType {
     /// An InfiniBand GID.
@@ -166,7 +168,8 @@ pub struct GidEntry {
     pub gid: Gid,
     /// The GID table index of this entry.
     pub gid_index: u32,
-    /// The port number that this GID belongs to (numbered from 1, like every port in this crate).
+    /// The port number that this GID belongs to (numbered from 1, like every port in this crate),
+    /// or 0 for a port above 255, which no verb of libibverbs can address.
     pub port_num: u8,
     /// The type of the GID (InfiniBand, RoCE v1, or RoCE v2).
     pub gid_type: GidType,
@@ -181,9 +184,11 @@ impl From<ffi::ibv_gid_entry> for GidEntry {
         Self {
             gid: gid_entry.gid.into(),
             gid_index: gid_entry.gid_index,
-            // Port numbers are 8-bit on the wire; the C struct widens the field to u32 purely to
-            // keep `ibv_gid_entry` free of implicit padding across the kernel boundary.
-            port_num: gid_entry.port_num as u8,
+            // The kernel numbers ports in 32 bits, and a device can have more than 255 of them
+            // (an mlx5 device in switchdev mode has one per representor), while every verb takes
+            // the port in 8. Such a port becomes 0, which is no port, rather than whichever
+            // real port its low byte names.
+            port_num: u8::try_from(gid_entry.port_num).unwrap_or(0),
             gid_type: GidType::from_raw(gid_entry.gid_type),
             ndev_ifindex: gid_entry.ndev_ifindex,
         }
@@ -266,6 +271,13 @@ mod test_wire {
             QueuePairEndpoint::from_bytes(&encoded),
             Err(crate::Error::MalformedWireFormat)
         ));
+        // Without the GID flag, the GID bytes are zero.
+        encoded[0] = 0;
+        encoded[22] = 1;
+        assert!(matches!(
+            QueuePairEndpoint::from_bytes(&encoded),
+            Err(crate::Error::MalformedWireFormat)
+        ));
     }
 
     #[test]
@@ -330,6 +342,15 @@ mod test {
         assert_eq!(GidType::from_raw(2), GidType::RoceV2);
         // An unrecognized value is preserved rather than panicking.
         assert_eq!(GidType::from_raw(7), GidType::Unknown(7));
+        // A port the crate cannot name is not mistaken for one it can.
+        let port = |port_num| {
+            GidEntry::from(ffi::ibv_gid_entry {
+                port_num,
+                ..Default::default()
+            })
+            .port_num
+        };
+        assert_eq!((port(1), port(255), port(256), port(257)), (1, 255, 0, 0));
         assert_eq!(GidType::RoceV2.to_string(), "RoCE v2");
         assert_eq!(GidType::Unknown(7).to_string(), "unknown (7)");
     }
@@ -338,7 +359,10 @@ mod test {
 /// Attributes describing how to reach a destination, used to build an [`AddressHandle`].
 ///
 /// Describes a non-global (LID-only) route until a global route is set with
-/// [`set_grh`](Self::set_grh), which RoCE and routed InfiniBand require.
+/// [`set_grh`](Self::set_grh), which RoCE and routed InfiniBand require. So does EFA, which
+/// addresses a peer by its GID alone (source GID index 0; the other fields are ignored), and
+/// where nothing refuses an attribute without one: the device is asked for a handle to the GID
+/// `::`.
 #[derive(Clone)]
 pub struct AddressHandleAttribute {
     pub(crate) attr: ffi::ibv_ah_attr,
@@ -435,17 +459,29 @@ impl Grh {
         Grh { bytes: *bytes }
     }
 
-    /// The header as libibverbs' `ibv_grh`, for passing to the C routines that decode it (they
-    /// apply the same IPv4 detection).
-    pub(crate) fn raw(&self) -> ffi::ibv_grh {
+    /// The header as libibverbs' `ibv_grh`, for passing to the C routines that decode it.
+    ///
+    /// In the IPv4 form the first 20 bytes are not part of the header, and what they hold is
+    /// undefined. libibverbs reads them all the same. It takes the reply's flow label from them,
+    /// and when they start with an IPv6 version nibble it re-checks the IPv4 header's checksum
+    /// with a sum it folds only once (`ipv4_calc_hdr_csum`), which fails a few valid headers in
+    /// 100,000 and makes it read those as IPv6 ones. So it is handed zeroes there: no flow label,
+    /// and an IPv4 header by its version alone.
+    fn raw(&self) -> ffi::ibv_grh {
+        let mut bytes = self.bytes;
+        if let GrhForm::Ipv4 = self.form() {
+            bytes[..Self::IPV4_OFFSET].fill(0);
+        }
         // The struct holds GIDs, whose union type wants 8-byte alignment that the byte array does
         // not promise, so copy it out unaligned.
-        unsafe { std::ptr::read_unaligned(self.bytes.as_ptr().cast::<ffi::ibv_grh>()) }
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<ffi::ibv_grh>()) }
     }
 
-    /// Tell the two forms apart the way libibverbs does: an IPv6 version nibble means the IPv6
-    /// form, unless the bytes also parse as a well-formed IPv4 header with a valid checksum, in
-    /// which case the IPv4 form is the one the device wrote.
+    /// Tell the two forms apart as the kernel does (`ib_get_rdma_header_version`): an IPv6
+    /// version nibble means the IPv6 form, unless the bytes also parse as a well-formed IPv4
+    /// header with a valid checksum, in which case the IPv4 form is the one the device wrote.
+    /// Stricter than the kernel and libibverbs in one respect: they take any header of five words
+    /// with a matching checksum for an IPv4 one, whatever its version field says.
     fn form(&self) -> GrhForm {
         let ipv4 = &self.bytes[Self::IPV4_OFFSET..];
         if self.bytes[0] >> 4 != 6 {
@@ -559,7 +595,7 @@ impl AddressHandleAttribute {
     /// a request without the peer telling it its address. Pass the result to
     /// [`ProtectionDomain::create_address_handle`].
     ///
-    /// `wc` is the receive's completion in the classic form ([`CompletionQueue::poll_into`]), and
+    /// `wc` is the receive's completion in the batch form ([`CompletionQueue::poll_into`]), and
     /// `port_num` the local port the datagram arrived on, which the reply leaves through. `grh` is
     /// the header from the front of the receive buffer ([`Grh::from_bytes`]); it is required when
     /// the completion reports one ([`WcFlags::GRH`], always the case on RoCE) and not read
@@ -573,23 +609,28 @@ impl AddressHandleAttribute {
     /// datagrams should cache the address handle per sender (keyed by the header's
     /// [`Grh::sgid`], or by the completion's source LID when there is no header).
     ///
+    /// EFA completions carry no route back: they never report a header, and their source LID is
+    /// not a LID but the number of an address handle the receiver already holds for the sender
+    /// (`0xffff` when it holds none). On EFA, learn a peer's GID from the peer.
+    ///
     /// # Errors
     ///
     ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): the completion reports a header
-    ///    but none was given, or libibverbs could not derive the route: `EINVAL` when the
-    ///    header's destination GID is multicast or (on current kernels) not in the port's GID
-    ///    table, and `EPROTONOSUPPORT` when the header is neither an IPv6-style nor an IPv4 one,
-    ///    or its next header is neither UDP (RoCE v2) nor InfiniBand.
+    ///    but none was given; or it reports none on a device without LIDs to route by instead
+    ///    (EFA; [`io::ErrorKind::Unsupported`]); or libibverbs could not derive the route:
+    ///    `EINVAL` when the header's destination GID is multicast or (on current kernels) not in
+    ///    the port's GID table, and `EPROTONOSUPPORT` when the header is neither an IPv6-style
+    ///    nor an IPv4 one, or its next header is neither UDP (RoCE v2) nor InfiniBand.
     ///
     /// [`CompletionQueue::poll_into`]: crate::CompletionQueue::poll_into
     /// [`WcFlags::GRH`]: crate::WcFlags::GRH
     pub fn from_wc(
         context: &Context,
         port_num: u8,
-        wc: &ffi::ibv_wc,
+        wc: &Completion,
         grh: Option<&Grh>,
     ) -> Result<Self> {
-        let mut wc = *wc;
+        let mut wc = *wc.as_raw();
         let has_grh = (wc.wc_flags & ffi::ibv_wc_flags::IBV_WC_GRH).0 != 0;
         // `ibv_init_ah_from_wc` reads the header's first word (the flow label) before it checks
         // `IBV_WC_GRH`, so it must always be handed a header: the caller's when the completion
@@ -602,7 +643,19 @@ impl AddressHandleAttribute {
                     "the completion reports a GRH, but none was given to derive the route from",
                 )));
             }
-            (false, _) => ffi::ibv_grh::default(),
+            (false, _) => {
+                // Without a header the route is the source LID alone, which only InfiniBand
+                // devices have (RoCE ones always report a header). EFA reports neither, and its
+                // kernel driver would take the result for an address handle to the GID `::`.
+                let transport = unsafe { (*(*context.as_raw()).device).transport_type };
+                if transport != ffi::ibv_transport_type::IBV_TRANSPORT_IB {
+                    return Err(Error::CreateAddressHandle(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "the completion carries no GRH, and the device has no LIDs to route by",
+                    )));
+                }
+                ffi::ibv_grh::default()
+            }
         };
         let mut attr = ffi::ibv_ah_attr::default();
         let ret = unsafe {
@@ -619,14 +672,12 @@ impl AddressHandleAttribute {
     /// As [`from_wc`](Self::from_wc), for a completion read through the extended interface
     /// ([`CompletionQueue::poll`]).
     ///
-    /// On RoCE the route comes from the header alone. On InfiniBand it also needs the source LID,
-    /// service level, and path bits, which the completion only carries if its queue requested
-    /// [`WcFields::SLID`], [`WcFields::SL`], and [`WcFields::DLID_PATH_BITS`]; fields the queue
-    /// did not request are taken as zero.
+    /// On RoCE the route comes from the header alone. On InfiniBand it also needs the source LID
+    /// and service level, which every completion carries, and the path bits, which it only
+    /// carries if its queue requested [`WcFields::DLID_PATH_BITS`]; they are taken as zero
+    /// otherwise, which is what they are unless the subnet assigns a port several LIDs (LMC).
     ///
     /// [`CompletionQueue::poll`]: crate::CompletionQueue::poll
-    /// [`WcFields::SLID`]: crate::WcFields::SLID
-    /// [`WcFields::SL`]: crate::WcFields::SL
     /// [`WcFields::DLID_PATH_BITS`]: crate::WcFields::DLID_PATH_BITS
     pub fn from_completion(
         context: &Context,
@@ -716,6 +767,21 @@ mod test_grh {
     }
 
     #[test]
+    fn the_ipv4_forms_undefined_half_is_kept_from_libibverbs() {
+        // What a device leaves in front of the IPv4 header: here an earlier IPv6 header's start.
+        let mut bytes = ipv4_form().bytes;
+        bytes[..4].copy_from_slice(&0x6abc_def0_u32.to_be_bytes());
+        bytes[4..20].fill(0xa5);
+        let grh = Grh::from_bytes(&bytes);
+        assert_eq!(grh.sgid().to_string(), "::ffff:10.1.0.134");
+        let raw = grh.raw();
+        assert_eq!(raw.version_tclass_flow, 0);
+        let raw: [u8; Grh::LEN] = unsafe { std::mem::transmute(raw) };
+        assert_eq!(raw[..20], [0; 20]);
+        assert_eq!(raw[20..], bytes[20..]);
+    }
+
+    #[test]
     fn ipv6_header_reads_the_grh_fields() {
         let mut bytes = [0u8; Grh::LEN];
         // Version 6, traffic class 0x1c, flow label 0xabcde; payload 100; hop limit 63.
@@ -731,5 +797,7 @@ mod test_grh {
         assert_eq!(grh.traffic_class(), 0x1c);
         assert_eq!(grh.flow_label(), 0xabcde);
         assert_eq!(grh.payload_len(), 100);
+        let raw: [u8; Grh::LEN] = unsafe { std::mem::transmute(grh.raw()) };
+        assert_eq!(raw, bytes);
     }
 }

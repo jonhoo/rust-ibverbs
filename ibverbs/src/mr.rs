@@ -65,13 +65,15 @@ struct MemoryRegionInner {
 unsafe impl Sync for MemoryRegionInner {}
 unsafe impl Send for MemoryRegionInner {}
 
-impl Drop for MemoryRegionInner {
-    fn drop(&mut self) {
+impl MemoryRegionInner {
+    /// Deregisters the region. `false` means it is still registered: the deregistration failed
+    /// on a thread that was already unwinding (anywhere else a failure panics).
+    fn deregister(&mut self) -> bool {
         destroyed(
             "ibv_dereg_mr",
             unsafe { ffi::ibv_dereg_mr(self.mr) },
             || keep(&self._pd),
-        );
+        )
     }
 }
 
@@ -82,20 +84,25 @@ impl Drop for MemoryRegionInner {
 /// [`register_dmabuf`](crate::ProtectionDomain::register_dmabuf) for memory managed elsewhere.
 ///
 /// Dropping it deregisters the region and then frees the buffer. If deregistration fails, the drop
-/// panics and leaks the buffer instead, since the device may still access it.
+/// panics (or, on a thread that is already unwinding, reports the failure on standard error) and
+/// leaks the buffer instead, since the device may still access it.
 #[must_use = "the memory region is deregistered when dropped"]
 pub struct MemoryRegion<O> {
-    // Both are dropped by hand, buffer last, so that a failed deregistration (which panics) leaks
-    // the buffer instead of freeing memory the device may still access.
+    // Both are dropped by hand, buffer last, so that a failed deregistration leaks the buffer
+    // instead of freeing memory the device may still access.
     inner: ManuallyDrop<MemoryRegionInner>,
     owner: ManuallyDrop<O>,
 }
 
 impl<O> Drop for MemoryRegion<O> {
     fn drop(&mut self) {
+        let deregistered = self.inner.deregister();
+        // SAFETY: neither field is used again.
         unsafe {
             ManuallyDrop::drop(&mut self.inner);
-            ManuallyDrop::drop(&mut self.owner);
+            if deregistered {
+                ManuallyDrop::drop(&mut self.owner);
+            }
         }
     }
 }
@@ -140,8 +147,15 @@ impl<O> MemoryRegion<O> {
     }
 
     /// Deregister the memory region and return the buffer that backed it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the deregistration fails: the buffer is not handed back while the device may
+    /// still access it. (On a thread that is already unwinding, that second panic aborts.)
     pub fn into_inner(self) -> O {
         let mut this = ManuallyDrop::new(self);
+        assert!(this.inner.deregister(), "ibv_dereg_mr failed");
+        // SAFETY: `this` is never dropped, so each field is dropped or moved out once.
         unsafe {
             ManuallyDrop::drop(&mut this.inner);
             ManuallyDrop::take(&mut this.owner)
@@ -156,7 +170,9 @@ impl<O> MemoryRegion<O> {
     ///
     /// # Panics
     ///
-    /// Panics if `bounds` is empty or falls outside the region.
+    /// Panics if `bounds` is empty or falls outside the region. A message of no bytes is an empty
+    /// list of slices (`&[]`), not an empty slice: where a length comes from a peer, such as the
+    /// [`len`](crate::WorkCompletion::len) of a receive to echo, check it for zero before slicing.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) =
             calc_addr_len(bounds, self.inner.addr, unsafe { (*self.inner.mr).length });
@@ -257,7 +273,11 @@ impl LocalMemorySlice {
 ///
 /// Created by [`MemoryRegion::remote`], and typically serialized to the peer that initiates the
 /// access through [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+///
+/// The length is for the initiator to plan with: an operation transfers as many bytes as its
+/// local buffers hold, starting at `addr`, and is not checked against `len`. What bounds it is
+/// the region registered on the other side.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteMemorySlice {
     /// Memory address of the registered region (might have been offset by slicing).
     pub addr: u64,
@@ -319,24 +339,39 @@ impl RemoteMemorySlice {
     }
 }
 
+/// The address and length of the `bounds` sub-range of the `bytes_len` bytes at `addr`.
+///
+/// The checks share one out-of-line panic: with a panic site per check, the `slice` methods grow
+/// too large to inline, and cutting a slice per request then costs a call and a return through
+/// memory.
 fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, usize) {
-    let outside = "the slice bounds fall outside the region";
+    use std::ops::Bound;
     let start = match bounds.start_bound() {
-        std::ops::Bound::Included(i) => *i,
-        std::ops::Bound::Excluded(i) => i.checked_add(1).expect(outside),
-        std::ops::Bound::Unbounded => 0,
+        Bound::Included(&i) => Some(i),
+        Bound::Excluded(&i) => i.checked_add(1),
+        Bound::Unbounded => Some(0),
     };
     let end = match bounds.end_bound() {
-        std::ops::Bound::Included(i) => i.checked_add(1).expect(outside),
-        std::ops::Bound::Excluded(i) => *i,
-        std::ops::Bound::Unbounded => bytes_len,
+        Bound::Included(&i) => i.checked_add(1),
+        Bound::Excluded(&i) => Some(i),
+        Bound::Unbounded => Some(bytes_len),
     };
-    assert!(start < end);
-    assert!(start <= bytes_len);
-    assert!(end <= bytes_len);
-    let addr = addr.checked_add(start as u64).expect(outside);
-    let len = end - start;
-    (addr, len)
+    match (start, end) {
+        (Some(start), Some(end)) if start < end && end <= bytes_len => {
+            match addr.checked_add(start as u64) {
+                Some(addr) => (addr, end - start),
+                None => slice_outside(),
+            }
+        }
+        _ => slice_outside(),
+    }
+}
+
+/// The panic for slice bounds that are empty or fall outside the region (or the address space).
+#[cold]
+#[inline(never)]
+fn slice_outside() -> ! {
+    panic!("the slice bounds are empty or fall outside the region")
 }
 
 #[cfg(test)]
@@ -369,6 +404,36 @@ mod test {
             RemoteMemorySlice::from_bytes(&bytes),
             Err(Error::MalformedWireFormat)
         ));
+    }
+
+    #[test]
+    fn slices_refuse_empty_outside_and_wrapping_bounds() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let remote = RemoteMemorySlice {
+            addr: 0x1000,
+            len: 64,
+            rkey: 1,
+        };
+        assert_eq!(
+            (remote.slice(8..=15).addr, remote.slice(8..=15).len),
+            (0x1008, 8)
+        );
+        assert_eq!((remote.slice(..).addr, remote.slice(..).len), (0x1000, 64));
+        // A region that itself wraps (its fields are public) fails where its address would.
+        let wrapping = RemoteMemorySlice {
+            addr: u64::MAX,
+            len: 2,
+            rkey: 1,
+        };
+        for (remote, bounds) in [
+            (remote, (Included(8), Excluded(8))),
+            (remote, (Included(0), Excluded(65))),
+            (remote, (Excluded(usize::MAX), Unbounded)),
+            (remote, (Unbounded, Included(usize::MAX))),
+            (wrapping, (Included(1), Unbounded)),
+        ] {
+            assert!(std::panic::catch_unwind(|| remote.slice(bounds)).is_err());
+        }
     }
 
     #[test]

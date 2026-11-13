@@ -175,16 +175,13 @@ fn drain(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
 /// instead of the extended lazy-read path, so the tests cover both interfaces.
 fn drain_into(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     let mut observed = Vec::with_capacity(n);
-    let mut wc = vec![ibverbs::ffi::ibv_wc::default(); n];
+    let mut wc = vec![ibverbs::Completion::default(); n];
     let deadline = Instant::now() + Duration::from_secs(5);
 
     loop {
         for completion in cq.poll_into(&mut wc).expect("failed to poll CQ") {
-            if let Some((status, vendor_err)) = completion.error() {
-                panic!(
-                    "work request {} failed: {status:?} (vendor {vendor_err})",
-                    completion.wr_id()
-                );
+            if let Err(e) = completion.ok() {
+                panic!("work request {} failed: {e}", completion.wr_id());
             }
             observed.push(Completed {
                 wr_id: completion.wr_id(),
@@ -201,6 +198,15 @@ fn drain_into(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
             observed.len()
         );
     }
+}
+
+/// The message a caught panic carries.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("")
 }
 
 /// Read the first 8 bytes of a buffer as a host-order `u64`.
@@ -334,7 +340,7 @@ fn send_recv_poll_into() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn poll_into_empty_is_empty() {
     let lb = loopback();
-    let mut wc = [ibverbs::ffi::ibv_wc::default(); 8];
+    let mut wc = [ibverbs::Completion::default(); 8];
     let ready = lb.cq.poll_into(&mut wc).expect("failed to poll CQ");
     assert!(ready.is_empty(), "no completions were posted");
 }
@@ -668,7 +674,7 @@ fn shared_receive_queue() {
 
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
 
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder.set_srq(&srq);
@@ -735,11 +741,13 @@ fn srq_limit_reached_async_event() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     // Arm the low watermark after creation: dropping below 2 posted receives raises the event.
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
     srq.set_limit(2).expect("failed to arm the SRQ limit");
     let attrs = srq.query().expect("failed to query the SRQ");
     assert!(attrs.max_wr >= 16, "{attrs:?}");
     assert!(attrs.max_sge >= 1, "{attrs:?}");
+    assert!(srq.capacity() >= 16 && srq.capacity() <= attrs.max_wr);
+    assert!(srq.max_sge() >= 1);
     assert_eq!(attrs.limit, 2, "{attrs:?}");
     // Resizing is provider-dependent; where it works, the queue reports the larger capacity.
     match srq.set_max_wr(32) {
@@ -785,6 +793,7 @@ fn srq_limit_reached_async_event() {
         {
             Some(event) if event.event_type() == ibverbs::AsyncEventType::SrqLimitReached => {
                 assert_eq!(event.port_num(), None, "an SRQ event is not port-scoped");
+                assert_eq!(event.srq(), Some(srq.as_raw()), "the event names its queue");
                 break;
             }
             Some(_other) => continue,
@@ -807,7 +816,7 @@ fn qp_async_event() {
         == SOFT_ROCE_VENDOR_ID;
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder.set_srq(&srq);
     });
@@ -881,7 +890,7 @@ fn objects_from_another_context_are_refused() {
     let foreign_srq = b
         .alloc_pd()
         .expect("failed to allocate PD")
-        .create_srq(16, 1, 0)
+        .create_srq(16, 1)
         .expect("failed to create SRQ");
     let refused = |result: ibverbs::Result<_>| {
         matches!(
@@ -906,6 +915,18 @@ fn objects_from_another_context_are_refused() {
     assert!(
         refused(builder.build()),
         "a foreign shared receive queue is refused"
+    );
+    // So is one from another protection domain of the same context, whose receives rxe would
+    // check against the queue pair's protection domain and fail.
+    let other_pd_srq = a
+        .alloc_pd()
+        .expect("failed to allocate PD")
+        .create_srq(16, 1)
+        .expect("failed to create SRQ");
+    builder.set_srq(&other_pd_srq);
+    assert!(
+        refused(builder.build()),
+        "a shared receive queue from another protection domain is refused"
     );
 
     // The same objects from the protection domain's own context build.
@@ -1182,7 +1203,9 @@ fn dmabuf_registration_names_its_verb() {
         .expect("failed to allocate protection domain");
     let not_dmabuf = std::fs::File::open("/dev/null").expect("failed to open /dev/null");
     match pd.register_dmabuf(not_dmabuf.as_fd(), 0, 4096, 0, AccessFlags::LOCAL_WRITE) {
-        Err(Error::Unsupported { operation, errno }) => {
+        Err(Error::Unsupported {
+            operation, errno, ..
+        }) => {
             assert_eq!(*operation, "ibv_reg_dmabuf_mr");
             assert_eq!(errno, nix::libc::EOPNOTSUPP);
         }
@@ -1288,7 +1311,7 @@ fn split_queue_pair_across_threads() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn post_recv_reports_how_many_were_posted() {
     let mut lb = loopback();
-    let srq = lb.pd.create_srq(4, 1, 0).expect("failed to create SRQ");
+    let srq = lb.pd.create_srq(4, 1).expect("failed to create SRQ");
     let recv = mr(&lb.pd, 8);
     let sges = [recv.slice(..8)];
     let overflow = |room: u32| -> Vec<RecvRequest<'_>> {
@@ -1297,7 +1320,7 @@ fn post_recv_reports_how_many_were_posted() {
             .collect()
     };
     let expect_room = |result: Result<(), Error>, room: u32| match result {
-        Err(Error::PostReceive { posted, source }) => {
+        Err(Error::PostReceive { posted, source, .. }) => {
             assert_eq!(posted, room, "{source}");
             assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM), "{source}");
         }
@@ -1310,7 +1333,9 @@ fn post_recv_reports_how_many_were_posted() {
         .expect("failed to query queue pair");
     let room = caps.max_recv_wr;
     expect_room(unsafe { lb.qp.post_recv(overflow(room)) }, room);
-    let room = srq.query().expect("failed to query SRQ").max_wr;
+    // The granted capacity, not `query().max_wr`: mlx5 reports its whole ring there, about half
+    // of which it keeps for receives parked on a page fault.
+    let room = srq.capacity();
     expect_room(unsafe { srq.post_recv(overflow(room)) }, room);
 
     // Destroy the queues, discarding the posted receives, before the buffer they point at.
@@ -1466,6 +1491,19 @@ fn create_qp_ex_with_only_a_protection_domain() {
         "ibv_create_qp_ex: {}",
         std::io::Error::last_os_error()
     );
+    // Soft-RoCE's extended create marks every queue pair it makes as extended and its legacy
+    // create none, so there a queue pair without the extended view is one `ibv_create_qp` made.
+    if ctx
+        .query_device()
+        .expect("failed to query device")
+        .vendor_id
+        == SOFT_ROCE_VENDOR_ID
+    {
+        assert!(
+            unsafe { ffi::ibv_qp_to_qp_ex(qp) }.is_null(),
+            "the queue pair was made by the extended create, not by ibv_create_qp"
+        );
+    }
     unsafe {
         assert_eq!((*qp).pd, pd.as_raw());
         assert_eq!(ffi::ibv_destroy_qp(qp), 0);
@@ -1519,7 +1557,7 @@ fn legacy_shared_receive_queue() {
     let ctx = open_test_device();
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
 
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
@@ -2040,8 +2078,16 @@ fn raw_handles() {
     assert!(!mr.as_raw().is_null());
     assert_eq!(mr.lkey(), mr.slice(..).lkey());
 
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
     assert!(!srq.as_raw().is_null());
+
+    // Clones of a handle are equal and hash alike; another object of the same kind is neither.
+    assert!(ctx == ctx2 && cq == cq.clone() && srq == srq.clone());
+    let other_pd = ctx.alloc_pd().expect("failed to allocate PD");
+    assert!(pd == pd.clone() && pd != other_pd);
+    let distinct: std::collections::HashSet<_> =
+        [pd.clone(), pd.clone(), other_pd].into_iter().collect();
+    assert_eq!(distinct.len(), 2);
 
     // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
     let gid_index = gid_index(&ctx);
@@ -2113,9 +2159,12 @@ fn inline_capacity_is_enforced() {
     let ctx = open_test_device();
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    // With four entries, Soft-RoCE grants 64 bytes of inline room (the larger of 16 bytes per entry
+    // and the inline data asked for), so the checks below hold payloads to the request, not the grant.
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder
             .set_max_inline_data(16)
+            .set_max_send_sge(4)
             .set_access(AccessFlags::PERMISSIVE);
     });
     let (_, init) = qp
@@ -2137,9 +2186,11 @@ fn inline_capacity_is_enforced() {
             let mut batch = qp.start_send();
             batch.op().signaled().send(1, payload);
         }));
+        let message = posted.expect_err("an inline payload over the capacity was posted");
         assert!(
-            posted.is_err(),
-            "an inline payload over the capacity was posted"
+            panic_message(&message).contains("inline capacity of 16 bytes"),
+            "{}",
+            panic_message(&message)
         );
     }
 
@@ -2171,18 +2222,31 @@ fn send_sge_capacity_is_enforced() {
         .expect("failed to register MR");
     let one = [mr.slice(..8)];
     let two = [mr.slice(..8), mr.slice(8..)];
-    for (max_send_sge, sges) in [(0, &one[..]), (1, &two[..])] {
+    // The last case asks for 64 bytes of inline data as well, for which Soft-RoCE grants four
+    // entries: the list is still held to the one entry asked for.
+    for (max_send_sge, sges, max_inline_data) in
+        [(0, &one[..], 0), (1, &two[..], 0), (1, &two[..], 64)]
+    {
         let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-            builder.set_max_send_sge(max_send_sge);
+            builder
+                .set_max_send_sge(max_send_sge)
+                .set_max_inline_data(max_inline_data);
         });
         let posted = catch_unwind(AssertUnwindSafe(|| {
             let mut batch = qp.start_send();
             batch.op().signaled().send(1, sges);
         }));
+        let Err(message) = posted else {
+            panic!(
+                "{} entries were posted to a queue pair built for {max_send_sge}",
+                sges.len()
+            );
+        };
         assert!(
-            posted.is_err(),
-            "{} entries were posted to a queue pair built for {max_send_sge}",
-            sges.len()
+            panic_message(&message)
+                .contains(&format!("capacity of {max_send_sge} per send work request")),
+            "{}",
+            panic_message(&message)
         );
     }
 }
@@ -2263,9 +2327,9 @@ fn completion_timestamps() {
     let _delta: u64 = latest - earliest;
 }
 
-/// The extended work-completion accessors: the always-available GRH flag, the SL / source-LID /
-/// DLID-path-bits fields requested through the completion-queue builder (standard fields every
-/// provider of extended completion queues accepts), and the optional packet-classification fields.
+/// The extended work-completion accessors: the always-available GRH flag, service level, and
+/// source LID, the DLID path bits requested through the completion-queue builder, and the optional
+/// packet-classification fields.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn extended_wc_fields() {
@@ -2273,9 +2337,9 @@ fn extended_wc_fields() {
 
     let cq = ctx
         .create_cq(16)
-        .set_wc_flags(WcFields::SLID | WcFields::SL | WcFields::DLID_PATH_BITS)
+        .set_wc_flags(WcFields::DLID_PATH_BITS)
         .build()
-        .expect("failed to create a CQ with the addressing fields");
+        .expect("failed to create a CQ with the path bits");
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
@@ -2495,7 +2559,7 @@ fn modify_and_query_queue_pair() {
     let mut to_init = QueuePairAttribute::new();
     to_init.set_state(QueuePairState::Init);
     match lb.qp.modify(&to_init) {
-        Err(Error::InvalidQueuePairTransition { current, next }) => {
+        Err(Error::InvalidQueuePairTransition { current, next, .. }) => {
             assert_eq!(current, QueuePairState::ReadyToSend);
             assert_eq!(next, QueuePairState::Init);
         }
@@ -3076,12 +3140,12 @@ fn reply_through_address_handle_from_wc() {
         .signaled()
         .send(2, &[send.slice(..4)]);
     unsafe { batch.submit() }.expect("UD send failed");
-    let mut wcs = [ibverbs::ffi::ibv_wc::default(); 4];
+    let mut wcs = [ibverbs::Completion::default(); 4];
     let mut request_wc = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while request_wc.is_none() {
         for wc in cq.poll_into(&mut wcs).expect("poll_into failed") {
-            assert!(wc.is_valid(), "work request {} failed", wc.wr_id());
+            assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
             if wc.wr_id() == 1 {
                 request_wc = Some(*wc);
             }
@@ -3108,7 +3172,7 @@ fn reply_through_address_handle_from_wc() {
         .expect("post_recv");
     let mut batch = qp.start_send();
     batch
-        .to(&reply_ah, request_wc.src_qp, QKEY)
+        .to(&reply_ah, request_wc.src_qp(), QKEY)
         .signaled()
         .send(4, &[send.slice(16..20)]);
     unsafe { batch.submit() }.expect("UD reply failed");
@@ -3150,9 +3214,99 @@ fn address_handle_from_completion_without_grh() {
     let mut wc = ibverbs::ffi::ibv_wc::default();
     wc.slid = 7;
     wc.sl = 3;
+    let wc = ibverbs::Completion::from(wc);
+    assert_eq!((wc.slid(), wc.sl(), wc.has_grh()), (7, 3, false));
     AddressHandleAttribute::from_wc(&ctx, 1, &wc, None)
         .expect("a completion without a GRH derives a local route");
     let unread = Grh::from_bytes(&[0; Grh::LEN]);
     AddressHandleAttribute::from_wc(&ctx, 1, &wc, Some(&unread))
         .expect("a header given alongside a GRH-less completion is left unread");
+}
+
+/// `handshake_with` and `activate_with` run their hook while the queue pair is in `INIT`, so the
+/// receives posted from it are in place before the queue pair can receive.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn bring_up_hooks_post_the_first_receives() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let gid_index = gid_index(&ctx);
+    let payload = b"early";
+    let mut send = mr(&pd, 64);
+    send.bytes_mut()[..payload.len()].copy_from_slice(payload);
+    let completed = |n| {
+        let mut wr_ids: Vec<u64> = drain(&cq, n).iter().map(Completed::wr_id).collect();
+        wr_ids.sort_unstable();
+        wr_ids
+    };
+
+    // A reliable connection to itself.
+    let reliable = || {
+        let prepared = pd
+            .create_qp::<Rc>(&cq, &cq, 1)
+            .expect("failed to create queue pair")
+            .set_gid_index(gid_index)
+            .build()
+            .expect("failed to build queue pair");
+        let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+        (prepared, endpoint)
+    };
+    let mut recv = mr(&pd, 64);
+    let (prepared, endpoint) = reliable();
+    let mut qp = prepared
+        .handshake_with(endpoint, |qp| unsafe {
+            qp.post_recv([RecvRequest::new(1, &[recv.slice(..payload.len())])])
+        })
+        .expect("handshake_with failed");
+    let mut batch = qp.start_send();
+    batch
+        .op()
+        .signaled()
+        .send(2, &[send.slice(..payload.len())]);
+    unsafe { batch.submit() }.expect("send failed");
+    assert_eq!(completed(2), [1, 2]);
+    assert_eq!(&recv.bytes_mut()[..payload.len()], payload);
+
+    // A hook that fails abandons the bring-up with its error.
+    let (prepared, endpoint) = reliable();
+    assert!(matches!(
+        prepared.handshake_with(endpoint, |_| Err(Error::GidMismatch)),
+        Err(Error::GidMismatch)
+    ));
+
+    // A datagram queue pair, addressed through its own GID.
+    const QKEY: u32 = 0x1234_5678;
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build()
+        .expect("failed to build UD QP");
+    let endpoint = prepared.endpoint().expect("failed to read endpoint");
+    // UD receives prepend a 40-byte GRH.
+    let mut recv = mr(&pd, 40 + 64);
+    let mut qp = prepared
+        .activate_with(QKEY, |qp| unsafe {
+            qp.post_recv([RecvRequest::new(3, &[recv.slice(..40 + payload.len())])])
+        })
+        .expect("activate_with failed");
+    let mut ah_attr = AddressHandleAttribute::new(1);
+    ah_attr.set_grh(
+        endpoint.gid.expect("RoCE requires a GID"),
+        gid_index as u8,
+        64,
+        0,
+    );
+    let ah = pd
+        .create_address_handle(&ah_attr)
+        .expect("failed to create address handle");
+    let mut batch = qp.start_send();
+    batch
+        .to(&ah, endpoint.qp_num, QKEY)
+        .signaled()
+        .send(4, &[send.slice(..payload.len())]);
+    unsafe { batch.submit() }.expect("UD send failed");
+    assert_eq!(completed(2), [3, 4]);
+    assert_eq!(&recv.bytes_mut()[40..40 + payload.len()], payload);
 }

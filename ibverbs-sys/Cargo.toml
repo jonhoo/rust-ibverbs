@@ -56,9 +56,7 @@ mlx5 = []
 # build and run time.
 rdmacm = []
 
-# to make -Zminimal-versions work
-[target.'cfg(any())'.dependencies]
-proc-macro2 = "1.0.80"
-
 [build-dependencies]
-bindgen = "0.72"
+# 0.72.0 silently generates opaque structs with clang 22 and newer (fixed in 0.72.1), and already
+# requires the proc-macro2 that -Zminimal-versions needs.
+bindgen = "0.72.1"

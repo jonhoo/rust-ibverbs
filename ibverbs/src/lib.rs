@@ -2,7 +2,7 @@
 //!
 //! RDMA "verbs" let userspace perform high-throughput, low-latency network operations directly
 //! against the network adapter (zero copies on the data path and no kernel involvement) over
-//! InfiniBand, RoCE, and iWARP transports. This crate wraps both the control path (creating,
+//! InfiniBand and RoCE. This crate wraps both the control path (creating,
 //! querying, and tearing down resources such as protection domains, completion queues, queue
 //! pairs, and memory regions) and the data path (posting work requests and reaping completions) in
 //! safe Rust types whose lifetimes and aliasing rules encode the verbs contracts, while keeping
@@ -69,7 +69,8 @@
 //! event-driven loop over a shared completion channel, an `ibv_devinfo`-style device dump,
 //! doorbell batching, the `rdmacm` connection manager, and EFA SRD queue pairs. You can run all
 //! of them except the EFA example (and this crate's test suite) without RDMA hardware on any
-//! modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`.
+//! modern Linux kernel using [SoftRoCE][soft]: `rdma link add rxe0 type rxe netdev <netdev>`,
+//! with SoftRoCE's provider library from rdma-core 63.1 or newer (see the README).
 //!
 //! You do not have to poll: completion channels ([`Context::create_comp_channel`]) deliver
 //! completion notifications on a file descriptor to block on ([`CompletionChannel::wait`]) or hand
@@ -103,7 +104,8 @@
 //! `ibverbs-sys`, so building needs `libclang` but not the installed headers; the development
 //! packages are still needed for the unversioned library links (`libibverbs.so` and the like)
 //! that the linker looks for. To generate bindings from installed `rdma-core` headers instead,
-//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
+//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`; they must come from rdma-core 50 or newer
+//! (54 with the `mlx5` feature).
 //!
 //! The crate creates every completion queue with rdma-core's extended `ibv_create_cq_ex`, so it
 //! needs a provider that implements it. Queue pairs are created one of two ways:
@@ -152,24 +154,37 @@
 //!   sequence number without one (on mlx5, EFA, and hns): arm, poll, and consume the
 //!   notifications of a given queue from one thread at a time, or an arm can be lost and its
 //!   notification never arrive.
+//! - Polling a completion queue ([`CompletionQueue::poll`]) on ionic: its extended poll takes the
+//!   queue's lock only while it copies a completion into a buffer it keeps per queue, not from the
+//!   poll's start to its end as mlx5, rxe, EFA, and hns do, so a second thread's poll of the same
+//!   queue overwrites the completion a live [`Completions`] is reading (its `wr_id`, status, and
+//!   fields become the other thread's). On ionic, poll a given queue from one thread at a time.
 //! - Setting `MLX5_SINGLE_THREADED=1` in the environment tells mlx5 the process is single threaded
 //!   and turns its locks into best-effort checks, which voids the `Sync` of completion queues,
 //!   queue pairs, and shared receive queues: do not set it in a program that uses them from
-//!   several threads.
+//!   several threads. A check that fires aborts the process, also on one thread: polling a
+//!   completion queue again, or dropping or resetting one of its queue pairs, while a
+//!   [`Completions`] of that queue is alive.
 //!
 //! # Resource cleanup
 //!
 //! Wrappers return their resource to the device when dropped, in dependency order (internal
 //! reference counts keep, for example, a completion queue alive until the last queue pair built on
-//! it is gone). If the device rejects a teardown — which can only happen when raw handles obtained
-//! through the escape hatches still reference the resource — the drop panics rather than silently
-//! leak the resource. The resource then stays allocated, and so do the ones it was created on.
+//! it is gone). If the device rejects a teardown — when raw handles obtained through the escape
+//! hatches still reference the resource, when a forked child already destroyed it (see below), or
+//! when the device's firmware fails the command — the drop panics rather than silently leak the
+//! resource. The resource then stays allocated, and so do the ones it was created on. A drop that
+//! fails while its thread is already unwinding from a panic (such as the panic of another failed
+//! drop) reports the failure on standard error instead, since a second panic there would abort
+//! the process.
 //!
 //! # Forking
 //!
 //! Since Linux 5.13, registered memory stays intact across `fork()` without `ibv_fork_init`. A
-//! forked child shares the parent's device handles, though, and its drops destroy the parent's
-//! resources (the parent's own drops then fail): a child must `exec` or exit without dropping the
+//! forked child shares the parent's device handles, though: its drops destroy the parent's
+//! resources (the parent's own drops then fail), and it inherits the parent's doorbell mappings
+//! but only private copies of the queues, so posting from it can make the device run the parent's
+//! stale or half-built work requests. A child must `exec` or exit without using or dropping the
 //! ibverbs objects it inherited.
 //!
 //! # For the detail-oriented
@@ -302,6 +317,27 @@ macro_rules! flags_newtype {
     };
 }
 
+/// Implements identity comparison and hashing for a cloneable handle: two handles are equal when
+/// they name the same underlying object (they are clones of one another), so a handle can key a
+/// map or be told apart from another.
+macro_rules! handle_identity {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl PartialEq for $ty {
+            fn eq(&self, other: &Self) -> bool {
+                ::std::ptr::eq(self.as_raw(), other.as_raw())
+            }
+        }
+
+        impl Eq for $ty {}
+
+        impl ::std::hash::Hash for $ty {
+            fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                self.as_raw().hash(state);
+            }
+        }
+    )+};
+}
+
 mod address;
 mod completion;
 mod context;
@@ -316,7 +352,7 @@ mod srq;
 mod efa;
 
 #[cfg(feature = "efa")]
-pub use efa::Srd;
+pub use efa::{EfaDeviceAttr, Srd};
 
 #[cfg(feature = "mlx5")]
 mod mlx5;
@@ -341,6 +377,17 @@ pub mod rdmacm;
 /// not cover — without adding a separate dependency on `ibverbs-sys` and keeping its version in
 /// sync.
 pub use ffi;
+
+handle_identity!(
+    Context,
+    ProtectionDomain,
+    CompletionChannel,
+    CompletionQueue,
+    SharedReceiveQueue,
+);
+// `CmId` implements its identity next to its definition.
+#[cfg(feature = "rdmacm")]
+handle_identity!(rdmacm::EventChannel);
 
 #[cfg(test)]
 mod test_flags_newtype {

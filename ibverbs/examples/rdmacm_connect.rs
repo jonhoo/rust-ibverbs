@@ -62,20 +62,18 @@ fn server(addr: SocketAddr) {
     let qp = pd.create_qp::<Rc>(&cq, &cq, port).unwrap().build().unwrap();
     let mut recv = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
 
+    // Post the receive while accepting, before the reply lets the client send: posted after
+    // `accept` returns, it would race the client's message, which on missing it waits out a
+    // 655 ms receiver-not-ready back-off.
     let mut conn = incoming
-        .accept(
+        .accept_with(
             qp,
-            ConnectionParameter::default(),
+            &ConnectionParameter::default(),
             Some(Duration::from_secs(10)),
+            |qp| unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])]) },
         )
         .unwrap();
     println!("connected to {:?}", conn.cm_id().peer_addr());
-    // The queue pair is RTS now; rnr_retry keeps the peer's send retrying until this is posted.
-    unsafe {
-        conn.queue_pair()
-            .post_recv([RecvRequest::new(1, &[recv.slice(..MESSAGE.len())])])
-    }
-    .unwrap();
 
     wait_for(&cq, 1);
     println!(
@@ -101,11 +99,11 @@ fn client(addr: SocketAddr) {
     let mut conn = resolved
         .connect(
             qp,
-            ConnectionParameter::default(),
+            &ConnectionParameter::default(),
             Some(Duration::from_secs(10)),
         )
         .unwrap();
-    let mut batch = conn.queue_pair().start_send();
+    let mut batch = conn.queue_pair_mut().start_send();
     batch
         .op()
         .signaled()
