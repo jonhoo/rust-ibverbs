@@ -267,6 +267,21 @@ unsafe fn socket_addr_of(sa: *const ffi::sockaddr) -> Option<SocketAddr> {
         .or_else(|| unsafe { SockaddrIn6::from_raw(sa, None) }.map(SocketAddr::from))
 }
 
+/// `addr` as the kernel's connection manager needs it: an IPv4-mapped IPv6 address (the form a
+/// dual-stack TCP socket reports its IPv4 peers in) becomes the IPv4 address it stands for. The
+/// connection manager has no dual-stack addressing: it looks the mapped form up as an IPv6
+/// address, which no interface has (a bind fails with `EADDRNOTAVAIL`) and which routes like any
+/// other IPv6 destination.
+fn canonical(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(v4.into(), v6.port()),
+            None => addr,
+        },
+        SocketAddr::V4(_) => addr,
+    }
+}
+
 /// `timeout` in the whole milliseconds librdmacm takes, rounded up like every other wait in the
 /// crate: truncated, a sub-millisecond timeout would become 0 and expire at once.
 fn timeout_ms(timeout: Duration) -> c_int {
@@ -806,12 +821,14 @@ impl CmId {
     /// Binds to a local `addr` (passive side). Bind to an unspecified address such as
     /// `0.0.0.0:port` to accept connections on any device. Follow with [`listen`](Self::listen).
     ///
+    /// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is bound as the IPv4 address it stands for.
+    ///
     /// # Errors
     ///
     ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed (`ENODEV` when no RDMA
     ///    device answers to `addr`, `EADDRINUSE` when its port is taken).
     pub fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
-        let addr = SockaddrStorage::from(addr);
+        let addr = SockaddrStorage::from(canonical(addr));
         let ret =
             unsafe { ffi::rdma_bind_addr(self.inner.id, addr.as_ptr() as *mut ffi::sockaddr) };
         check(ret, Error::BindAddress)
@@ -839,12 +856,16 @@ impl CmId {
     /// [`context`](Self::context) is available and [`resolve_route`](Self::resolve_route) is the
     /// next step.
     ///
+    /// An IPv4-mapped IPv6 destination (`::ffff:a.b.c.d`) is resolved as the IPv4 address it stands
+    /// for.
+    ///
     /// # Errors
     ///
     ///  - [`ResolveAddress`](Error::ResolveAddress): `rdma_resolve_addr` could not start the
     ///    resolution (`EINVAL` on an id past that step). A resolution that fails or times out
     ///    later is reported by an [`AddressError`](CmEventType::AddressError) event instead.
     pub fn resolve_addr(&self, dst: SocketAddr, timeout: Duration) -> Result<()> {
+        let dst = canonical(dst);
         let dst = SockaddrStorage::from(dst);
         let ret = unsafe {
             ffi::rdma_resolve_addr(
@@ -2082,6 +2103,24 @@ mod test_conversions {
         ] {
             assert_eq!(CmEventType::from(raw), wrapper);
         }
+    }
+
+    #[test]
+    fn mapped_addresses_become_ipv4() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.1]:18515".parse().unwrap();
+        assert_eq!(canonical(mapped), "192.0.2.1:18515".parse().unwrap());
+        // Everything else passes through untouched, scope id and flow label included.
+        let scoped = SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            18515,
+            7,
+            3,
+        ));
+        assert_eq!(canonical(scoped), scoped);
+        let v4: SocketAddr = "192.0.2.1:18515".parse().unwrap();
+        assert_eq!(canonical(v4), v4);
+        let wildcard: SocketAddr = "[::]:0".parse().unwrap();
+        assert_eq!(canonical(wildcard), wildcard);
     }
 
     #[test]
