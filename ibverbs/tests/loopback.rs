@@ -1473,21 +1473,19 @@ fn create_qp_ex_with_only_a_protection_domain() {
 }
 
 /// `build_legacy` creates RC and UD queue pairs without the extended view, and they come up like
-/// any other: handshake or activate, query, and a `post_send` into a shared receive queue.
+/// any other: handshake or activate, and query.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn legacy_queue_pair_bring_up() {
     let ctx = open_test_device();
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
     let gid_index = gid_index(&ctx);
 
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
         .expect("failed to create queue pair")
         .set_gid_index(gid_index)
-        .set_srq(&srq)
         .build_legacy()
         .expect("failed to build legacy RC queue pair");
     let endpoint = prepared.endpoint().expect("failed to read local endpoint");
@@ -1500,6 +1498,40 @@ fn legacy_queue_pair_bring_up() {
         .query(QueuePairAttributeMask::STATE)
         .expect("failed to query legacy queue pair");
     assert_eq!(attr.state(), QueuePairState::ReadyToSend);
+
+    let prepared = pd
+        .create_qp::<Ud>(&cq, &cq, 1)
+        .expect("failed to create UD QP")
+        .set_gid_index(gid_index)
+        .build_legacy()
+        .expect("failed to build legacy UD queue pair");
+    let ud = prepared
+        .activate(0x1234_5678)
+        .expect("failed to activate legacy UD queue pair");
+    assert!(ud.as_raw_ex().is_null());
+}
+
+/// A queue pair from `build_legacy` draws its receives from a shared receive queue like any other:
+/// a `post_send` lands in a buffer posted to the queue.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+fn legacy_shared_receive_queue() {
+    let ctx = open_test_device();
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+
+    let prepared = pd
+        .create_qp::<Rc>(&cq, &cq, 1)
+        .expect("failed to create queue pair")
+        .set_gid_index(gid_index(&ctx))
+        .set_srq(&srq)
+        .build_legacy()
+        .expect("failed to build legacy RC queue pair");
+    let endpoint = prepared.endpoint().expect("failed to read local endpoint");
+    let mut qp = prepared
+        .handshake(endpoint)
+        .expect("failed to transition legacy queue pair to RTS");
 
     let mut recv = mr(&pd, 64);
     let mut send = mr(&pd, 64);
@@ -1516,17 +1548,6 @@ fn legacy_queue_pair_bring_up() {
         );
     }
     assert_eq!(&recv.bytes_mut()[..4], b"srq!");
-
-    let prepared = pd
-        .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
-        .set_gid_index(gid_index)
-        .build_legacy()
-        .expect("failed to build legacy UD queue pair");
-    let ud = prepared
-        .activate(0x1234_5678)
-        .expect("failed to activate legacy UD queue pair");
-    assert!(ud.as_raw_ex().is_null());
 }
 
 /// A send batch needs the extended view, which a queue pair from `build_legacy` lacks.
@@ -1668,19 +1689,20 @@ fn legacy_inline_and_imm() {
 }
 
 /// Atomics through `post_send`: fetch-and-add and compare-and-swap land, and return the previous
-/// value.
+/// value. As in `atomic_operations`, the byte order of the 8-byte operand in memory is
+/// implementation defined, so the value assertions accept either endianness.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn legacy_atomics() {
     let mut lb = legacy_loopback(0);
 
-    // The target needs remote-atomic access, which `AccessFlags::PERMISSIVE` leaves out.
+    // The target needs remote-atomic access, which `AccessFlags::PERMISSIVE` leaves out. It starts
+    // zeroed, which reads the same in either byte order.
     let mut counter = lb
         .pd
         .allocate(64, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
         .expect("failed to register the atomic target");
     let mut old = mr(&lb.pd, 64);
-    counter.bytes_mut()[..8].copy_from_slice(&5u64.to_ne_bytes());
 
     let remote = counter.remote().slice(..8);
     let first = old.slice(..8);
@@ -1688,16 +1710,34 @@ fn legacy_atomics() {
     unsafe { lb.qp.post_send([request]) }.expect("fetch-and-add failed");
     let comps = drain(&lb.cq, 1);
     assert_eq!(comps[0].wr_id(), 1);
-    assert_eq!(first_u64(old.bytes_mut()), 5);
-    assert_eq!(first_u64(counter.bytes_mut()), 15);
+    assert_eq!(
+        first_u64(old.bytes_mut()),
+        0,
+        "fetch-and-add returns the old value"
+    );
+    let sum = first_u64(counter.bytes_mut());
+    assert!(
+        sum == 10 || sum == 10u64.swap_bytes(),
+        "fetch-and-add should add 10"
+    );
 
+    // The compare matches the 10 the device just stored, in whichever byte order it keeps it, so
+    // the swap takes effect and the old value comes back as the bytes the target held.
     let second = old.slice(8..16);
-    let request = SendRequest::atomic_cmp_swap(2, &second, remote, 15, 99).signaled();
+    let request = SendRequest::atomic_cmp_swap(2, &second, remote, 10, 99).signaled();
     unsafe { lb.qp.post_send([request]) }.expect("compare-and-swap failed");
     let comps = drain(&lb.cq, 1);
     assert_eq!(comps[0].wr_id(), 2);
-    assert_eq!(first_u64(&old.bytes_mut()[8..]), 15);
-    assert_eq!(first_u64(counter.bytes_mut()), 99);
+    assert_eq!(
+        first_u64(&old.bytes_mut()[8..]),
+        sum,
+        "compare-and-swap returns the old value"
+    );
+    let swapped = first_u64(counter.bytes_mut());
+    assert!(
+        swapped == 99 || swapped == 99u64.swap_bytes(),
+        "compare-and-swap should store 99"
+    );
 }
 
 /// Zero-length operations through `post_send` pass null scatter lists and complete with zero

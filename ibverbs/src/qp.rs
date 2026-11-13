@@ -705,11 +705,12 @@ impl<T: Transport> QueuePairBuilder<T> {
 
     /// Set the maximum size, in bytes, of inline data that may be posted on the send queue.
     ///
-    /// Inline sends (see [`Payload::Inline`] and [`InlineSlice`]) copy their payload directly into the work request
-    /// rather than referencing a registered memory region, which lowers latency for small messages.
-    /// A send queue must reserve this capacity up front. The device may grant more than requested
-    /// (reported by [`QueuePair::query`], see [`QueuePairInitAttribute::max_inline_data`]), but
-    /// posting more inline bytes than requested here panics.
+    /// Inline sends (see [`Payload::Inline`] and [`InlineSlice`]) copy their payload directly into
+    /// the work request rather than referencing a registered memory region, which lowers latency
+    /// for small messages. A send queue must reserve this capacity up front. The device may grant
+    /// more than requested (reported by [`QueuePair::query`], see
+    /// [`QueuePairInitAttribute::max_inline_data`]), but posting more inline bytes than requested
+    /// here panics.
     ///
     /// Defaults to 0 (inline sends disabled).
     pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
@@ -948,6 +949,22 @@ impl<T: Connected> QueuePairBuilder<T> {
     ///    resources).
     ///  - [`Unsupported`](Error::Unsupported): the provider does not create this transport
     ///    (`EOPNOTSUPP`; irdma refuses UC).
+    ///
+    /// # Examples
+    ///
+    /// `build` never falls back to this on its own. To run on providers with and without the
+    /// extended verbs, fall back explicitly; [`post_send`](QueuePair::post_send) sends on either
+    /// result:
+    ///
+    /// ```no_run
+    /// # use ibverbs::{Error, PreparedQueuePair, QueuePairBuilder, Rc, Result};
+    /// # fn f(builder: &QueuePairBuilder<Rc>) -> Result<PreparedQueuePair<Rc>> {
+    /// match builder.build() {
+    ///     Err(Error::Unsupported { .. }) => builder.build_legacy(),
+    ///     built => built,
+    /// }
+    /// # }
+    /// ```
     pub fn build_legacy(&self) -> Result<PreparedQueuePair<T>> {
         self.build_legacy_impl()
     }
@@ -990,6 +1007,22 @@ impl QueuePairBuilder<Ud> {
     ///    resources).
     ///  - [`Unsupported`](Error::Unsupported): the provider does not create UD queue pairs
     ///    (`EOPNOTSUPP`).
+    ///
+    /// # Examples
+    ///
+    /// `build` never falls back to this on its own. To run on providers with and without the
+    /// extended verbs, fall back explicitly; [`post_send`](QueuePair::post_send) sends on either
+    /// result:
+    ///
+    /// ```no_run
+    /// # use ibverbs::{Error, PreparedQueuePair, QueuePairBuilder, Result, Ud};
+    /// # fn f(builder: &QueuePairBuilder<Ud>) -> Result<PreparedQueuePair<Ud>> {
+    /// match builder.build() {
+    ///     Err(Error::Unsupported { .. }) => builder.build_legacy(),
+    ///     built => built,
+    /// }
+    /// # }
+    /// ```
     pub fn build_legacy(&self) -> Result<PreparedQueuePair<Ud>> {
         self.build_legacy_impl()
     }
@@ -1577,7 +1610,9 @@ impl<'a> InlineSlice<'a> {
 /// `send_to` on UD; which exist depends on the transport `T`), chain the modifiers
 /// ([`signaled`](Self::signaled), [`imm`](Self::imm), `solicited`, and on RC `fenced`), and post a
 /// slice of them with [`QueuePair::post_send`]. Like [`RecvRequest`], requests are posted from a
-/// caller-owned slice and linked in place, so posting allocates nothing.
+/// caller-owned slice and linked in place, so posting allocates nothing. SRD (behind the `efa`
+/// feature) has no constructor: an SRD queue pair sends through a batch
+/// ([`QueuePair::start_send`]).
 ///
 /// # Borrow-checked guarantees
 ///
@@ -1602,8 +1637,8 @@ impl<'a> InlineSlice<'a> {
 /// # }
 /// ```
 ///
-/// A datagram request keeps its [`AddressHandle`] borrowed until `post_send` returns;
-/// [`QueuePair::post_send`]'s safety contract requires keeping it alive until completion:
+/// A datagram request keeps its [`AddressHandle`] borrowed until `post_send` returns, so the
+/// handle cannot be destroyed while the provider still has to read it:
 ///
 /// ```compile_fail,E0505
 /// # fn f(
@@ -1893,12 +1928,11 @@ impl<'a, T: Reliable> SendRequest<'a, T> {
 impl<'a> SendRequest<'a, Ud> {
     /// A SEND of the registered memory in `local` to `remote_qpn` / `remote_qkey` through `ah`.
     ///
-    /// `ah` stays borrowed until `post_send` returns, since the provider reads `ah`
-    /// inside `ibv_post_send`. Keep `ah` alive until the request completes too (see
-    /// [`QueuePair::post_send`] `# Safety`): `irdma`, `efa`, `bnxt_re`, and `rxe` store
-    /// its index in the work request and resolve that index when the request executes.
-    /// `post_send` panics if `ah` comes from another protection domain than the queue
-    /// pair's, as [`SendBatch::to`] does.
+    /// `ah` stays borrowed until `post_send` returns, since the provider reads the handle inside
+    /// `ibv_post_send`. Keep it alive until the request completes too, as for [`SendBatch::to`]:
+    /// irdma, EFA, bnxt_re, and rxe store its index in the work request and only resolve it when
+    /// the request executes (`ibv_post_send(3)` asks for as much). `post_send` panics if `ah`
+    /// comes from another protection domain than the queue pair's, as [`SendBatch::to`] does.
     #[inline]
     pub fn send_to(
         ah: &'a AddressHandle,
@@ -3078,7 +3112,7 @@ impl<T: Transport> QueuePair<T> {
 
     /// Returns the underlying `ibv_qp` pointer.
     ///
-    /// This is an escape hatch for verbs this crate does not yet wrap. The send path uses the
+    /// This is an escape hatch for verbs this crate does not yet wrap. Send batches use the
     /// extended (doorbell) interface; see [`as_raw_ex`](Self::as_raw_ex) for that view. The pointer
     /// is owned by this [`QueuePair`] and stays valid only while it is alive; do not destroy it.
     pub fn as_raw(&self) -> *mut ffi::ibv_qp {
@@ -3259,9 +3293,9 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// `sends` is the caller's storage — a stack array or a reusable `Vec` — linked in place rather
     /// than copied, so posting allocates nothing; the provider reads the requests, their
-    /// scatter/gather lists, inline bytes and address handles during the call. This works on every
-    /// queue pair: one from [`build_legacy`](QueuePairBuilder::build_legacy), which has no send
-    /// batch, and one from `build`, where rdma-core allows `ibv_post_send` outside an open batch
+    /// scatter/gather lists, inline bytes and address handles during the call. This works on a
+    /// queue pair from [`build_legacy`](QueuePairBuilder::build_legacy), which has no send batch,
+    /// and on one from `build`, where rdma-core allows `ibv_post_send` outside an open batch
     /// (`ibv_wr_post(3)`).
     ///
     /// Takes `&mut self`, so it cannot run while a send batch is open, and at most one thread posts
@@ -3283,19 +3317,15 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// # Safety
     ///
-    /// Every memory region and [`AddressHandle`] a request references must stay valid
-    /// until the device is done with it, as for [`SendBatch::submit`]: until a work
-    /// completion has been polled for its request, or for a later signaled request on
-    /// the same send queue, or until the queue pair has been reset or destroyed
-    /// (`ibv_post_send(3)` forbids destroying an [`AddressHandle`] earlier, and `irdma`,
-    /// `efa`, `bnxt_re`, and `rxe` store its index in the work request and resolve that
-    /// index when the request executes).
+    /// Every memory region a request references must stay valid until the device is done with it,
+    /// as for [`SendBatch::submit`]: until a work completion has been polled for its request, or
+    /// for a later signaled request on the same send queue, or until the queue pair has been reset
+    /// or destroyed.
     ///
-    /// After an `Err`, the requests ahead of the one that failed were posted (the
-    /// error's `posted` counts them), so the same holds for theirs. On `rxe`, a failed
-    /// doorbell write after every request was queued reports `posted` as `0`, so on
-    /// `rxe` every request in `sends` is already on the queue and its memory regions and
-    /// [`AddressHandle`]s stay in use too.
+    /// After an `Err`, the requests ahead of the one that failed were posted (the error's `posted`
+    /// counts them), so the same holds for theirs. On rxe it holds for every request in `sends`:
+    /// rxe queues them all before it rings its doorbell, and a refused doorbell (below `RTS`, for
+    /// one) fails the call without naming a request, so `posted` is 0 with all of them queued.
     ///
     /// # Panics
     ///
@@ -3309,8 +3339,8 @@ impl<T: Transport> QueuePair<T> {
     ///  - [`PostSendBatch`](Error::PostSendBatch): `ibv_post_send` failed (`EINVAL` for an invalid
     ///    value in one of the work requests or an operation the provider does not support,
     ///    `ENOMEM` when the send queue is full or out of resources). Its `posted` counts the
-    ///    requests at the front of `sends` that were posted before the one that failed. On rxe, a
-    ///    failed doorbell write after every request was queued reports `posted` as 0.
+    ///    requests at the front of `sends` that were posted before the one that failed (rxe can
+    ///    queue more; see Safety).
     pub unsafe fn post_send<'a>(
         &mut self,
         mut sends: impl AsMut<[SendRequest<'a, T>]>,

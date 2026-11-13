@@ -198,17 +198,13 @@ pub enum Error {
     /// Posting a batch of send work requests with `ibv_post_send`
     /// ([`QueuePair::post_send`](crate::QueuePair::post_send)) failed at one of its requests; the
     /// ones ahead of it were posted. A send batch ([`SendBatch::submit`](crate::SendBatch::submit))
-    /// posts its requests whole or not at all, and reports its failures as
-    /// [`PostSend`](Self::PostSend).
+    /// reports its failures as [`PostSend`](Self::PostSend).
     #[error("failed to post a send work request after posting {posted} of the batch")]
     PostSendBatch {
-        /// How many requests at the front of the batch were posted before the one that
-        /// failed: they are on the queue like any other posted send, so their memory
-        /// regions and [`AddressHandle`](crate::AddressHandle)s stay in use and their
-        /// signaled completions will arrive. On `rxe`, a failed doorbell write after
-        /// queueing every request reports `0`, even though every request in `sends` is
-        /// on the queue (see [`QueuePair::post_send`](crate::QueuePair::post_send)
-        /// `# Safety`).
+        /// How many requests at the front of the batch were posted before the one that failed:
+        /// they are on the queue like any other posted send, so their memory regions stay in use
+        /// and their signaled completions will arrive. rxe can queue more than it reports here
+        /// (see the safety section of [`QueuePair::post_send`](crate::QueuePair::post_send)).
         posted: u32,
         /// The underlying error.
         #[source]

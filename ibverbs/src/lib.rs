@@ -140,8 +140,8 @@
 //! the queue pair in a lock to send from several threads), while receives
 //! ([`QueuePair::post_recv`]) take `&self` and may be posted from several threads at once;
 //! [`QueuePair::split`] separates the two so one thread can send (with a batch or
-//! [`SendQueue::post_send`]) while others post receives. The views handed out during a poll ([`Completions`], [`WorkCompletion`]) borrow the
-//! queue and cannot outlive or escape it.
+//! [`SendQueue::post_send`]) while others post receives. The views handed out during a poll
+//! ([`Completions`], [`WorkCompletion`]) borrow the queue and cannot outlive or escape it.
 //!
 //! A few calls keep unlocked bookkeeping in the provider, so the same object must not see two of
 //! them at once even though its type is `Sync`:
