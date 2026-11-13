@@ -2104,9 +2104,8 @@ impl Incoming {
 /// reap the flushed completions.
 ///
 /// The disconnect request goes out once when the connection is dropped: the kernel retransmits
-/// it only while the id lives. To be sure the peer hears of it, call
-/// [`disconnect`](Self::disconnect) and keep the connection until this side's own
-/// [`Disconnected`](CmEventType::Disconnected) event arrives on [`cm_id`](Self::cm_id).
+/// it only while the id lives. To be sure the peer hears of it, [`close`](Self::close) the
+/// connection instead, which waits for the peer's answer.
 #[must_use = "dropping a connection disconnects it"]
 pub struct Connection {
     id: CmId,
@@ -2160,6 +2159,38 @@ impl Connection {
         let mut error = QueuePairAttribute::new();
         error.set_state(QueuePairState::Error);
         self.qp.modify(&error)
+    }
+
+    /// Disconnects like [`disconnect`](Self::disconnect), then keeps the connection until the
+    /// peer has answered (this side's own [`CmEventType::Disconnected`] event), so that the
+    /// kernel goes on retransmitting the request meanwhile: the way to be sure the peer hears of
+    /// the disconnect. `timeout` bounds the wait; `None` waits until the kernel gives up, which
+    /// with a dead peer takes over a minute.
+    ///
+    /// Do not read this connection's events elsewhere (through a clone of
+    /// [`cm_id`](Self::cm_id)) meanwhile: the answer would go to that reader. If the peer
+    /// disconnected first there is no answer to wait for, and [`disconnect`](Self::disconnect)
+    /// is enough.
+    ///
+    /// # Errors
+    ///
+    /// Those of [`disconnect`](Self::disconnect), and
+    ///
+    ///  - [`TimedOut`](Error::TimedOut): the peer did not answer in time. The connection is
+    ///    dropped all the same.
+    ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting for or reading the event failed.
+    pub fn close(mut self, timeout: Option<Duration>) -> Result<()> {
+        let deadline = crate::completion::deadline_after(timeout);
+        self.disconnect()?;
+        loop {
+            let event = self.id.get_cm_event_deadline(deadline)?;
+            if matches!(
+                event.event_type(),
+                CmEventType::Disconnected | CmEventType::TimewaitExit | CmEventType::DeviceRemoval
+            ) {
+                return Ok(());
+            }
+        }
     }
 }
 

@@ -1286,6 +1286,46 @@ fn dropping_connection_disconnects_peer() {
 
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn closing_a_connection_waits_for_the_peers_answer() {
+    // `close` returns once the peer has answered the disconnect request, which the server here
+    // does by dropping its side as soon as it sees the request.
+    let ip = device_ip(&open_test_device());
+    let (ready_tx, ready_rx) = mpsc::channel();
+
+    let server = std::thread::spawn(move || {
+        let listener = bind_listener(ip);
+        listener.listen(1).expect("listen");
+        ready_tx
+            .send(listener.local_addr().expect("listen address"))
+            .expect("signal ready");
+        let request = pump_until(&listener, CmEventType::ConnectRequest)
+            .connection_request()
+            .expect("connection request");
+        let ctx = request.context().expect("server device context");
+        let port = request.port_num().expect("server port");
+        let (_pd, _cq, qp) = resources(&ctx, port);
+        let mut qp = qp.into_queue_pair();
+        accept_low_level(&request, &mut qp);
+        pump_until(&request, CmEventType::Disconnected);
+    });
+
+    let addr = ready_rx.recv().expect("server ready");
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
+    let (_pd, _cq, qp) = resources(&ctx, port);
+    let conn = resolved
+        .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
+        .expect("connect");
+    conn.close(SETUP_TIMEOUT).expect("close");
+    join(server);
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn connect_rejects_oversized_private_data() {
     // 57 bytes is one more than a request addressed by IP can carry, in the InfiniBand port space
     // as in the TCP one (the IP header takes 36 of the 92 bytes a request has); the parameter
