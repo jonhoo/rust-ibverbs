@@ -85,7 +85,7 @@ use std::net::SocketAddr;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage};
@@ -599,6 +599,9 @@ impl AsFd for EventChannel {
 struct CmIdInner {
     channel: EventChannel,
     id: *mut ffi::rdma_cm_id,
+    /// The read and atomic limits of the id's device, which [`CmId::init_qp_attr`] caps to: queried
+    /// once, since they are device capabilities and the id stays on its device once bound to it.
+    rd_atomic_limits: OnceLock<(u8, u8)>,
 }
 
 // Ownership of an `rdma_cm_id` can be moved (and shared) between threads.
@@ -692,7 +695,11 @@ impl CmId {
 
     /// Takes ownership of `id`, which delivers its events on `channel`, and routes those to it.
     fn on(channel: EventChannel, id: *mut ffi::rdma_cm_id) -> CmId {
-        let inner = Arc::new(CmIdInner { channel, id });
+        let inner = Arc::new(CmIdInner {
+            channel,
+            id,
+            rd_atomic_limits: OnceLock::new(),
+        });
         inner
             .channel
             .ids()
@@ -753,6 +760,17 @@ impl CmId {
         Context::shared(unsafe { (*self.verbs()?).device })
     }
 
+    /// The read and atomic limits of the id's device, for [`init_qp_attr`](Self::init_qp_attr) to
+    /// cap to: queried on first use, so a connection's `ReadyToReceive` and `ReadyToSend`
+    /// attributes share one `ibv_query_device`.
+    fn rd_atomic_limits(&self) -> Result<(u8, u8)> {
+        if let Some(&limits) = self.inner.rd_atomic_limits.get() {
+            return Ok(limits);
+        }
+        let limits = crate::context::rd_atomic_limits(self.verbs()?)?;
+        Ok(*self.inner.rd_atomic_limits.get_or_init(|| limits))
+    }
+
     /// Computes the queue-pair attributes the connection manager derives for transitioning to
     /// `target_state` (`rdma_init_qp_attr`), to apply with [`QueuePair::modify`].
     ///
@@ -796,8 +814,7 @@ impl CmId {
         check(ret, Error::ModifyQueuePair)?;
         let mask = M(mask as u32);
         if mask.0 & (M::IBV_QP_MAX_DEST_RD_ATOMIC.0 | M::IBV_QP_MAX_QP_RD_ATOMIC.0) != 0 {
-            let (max_initiator_depth, max_responder_resources) =
-                crate::context::rd_atomic_limits(self.verbs()?)?;
+            let (max_initiator_depth, max_responder_resources) = self.rd_atomic_limits()?;
             attr.max_dest_rd_atomic = attr.max_dest_rd_atomic.min(max_responder_resources);
             attr.max_rd_atomic = attr.max_rd_atomic.min(max_initiator_depth);
         }
