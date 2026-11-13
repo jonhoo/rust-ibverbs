@@ -1494,11 +1494,21 @@ impl<T: Connected> PreparedQueuePair<T> {
 /// Build one with [`RecvRequest::new`] and post a batch of them with [`QueuePair::post_recv`] or
 /// [`SharedReceiveQueue::post_recv`]. Unlike the send doorbell, receives are posted from a
 /// caller-owned slice, so batching allocates nothing.
+///
+/// A request is plain data until it is posted (posting links the requests of a batch afresh every
+/// time), so it can be copied: `vec![RecvRequest::new(id, &sges); n]` posts `n` identical
+/// receives.
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct RecvRequest<'a> {
     pub(crate) wr: ffi::ibv_recv_wr,
     _local: std::marker::PhantomData<&'a [LocalMemorySlice]>,
 }
+
+// The pointers are the borrowed scatter list (shared, immutable data) and the link to the next
+// request, which every post rewrites before the provider reads it.
+unsafe impl Send for RecvRequest<'_> {}
+unsafe impl Sync for RecvRequest<'_> {}
 
 impl<'a> RecvRequest<'a> {
     /// A receive that scatters an incoming message into `local`, tagged with `wr_id`.
