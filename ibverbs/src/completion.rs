@@ -986,10 +986,11 @@ pub struct TagMatchingInfo {
 ///
 /// # Deadlocks
 ///
-/// The provider holds the queue's poll lock from the poll's start until the `Completions` is
-/// dropped (`ibv_end_poll`), so keep it short-lived; a poll of an empty queue holds nothing. The
-/// lock is not reentrant, and other calls take it too (on mlx5, for one), so while a
-/// `Completions` of a queue is alive, the same thread must not:
+/// The provider holds the queue's poll lock from the poll's start until [`next`](Self::next) has
+/// returned `None` or the `Completions` is dropped, whichever comes first (`ibv_end_poll`); a poll
+/// of an empty queue holds nothing. The lock is not reentrant, and other calls take it too (on
+/// mlx5, for one), so while a `Completions` of a queue is alive and not yet drained, the same
+/// thread must not:
 ///
 /// - poll that queue again ([`poll`](CompletionQueue::poll) or
 ///   [`poll_into`](CompletionQueue::poll_into));
@@ -999,11 +1000,11 @@ pub struct TagMatchingInfo {
 /// - post to such a queue pair while its send or receive queue is full or nearly so: the
 ///   provider then re-checks how full it is under the lock before accepting the post.
 ///
-/// Made from another thread, those calls wait until the `Completions` drops instead, so a poll
-/// loop must not wait for a thread that might be making one of them.
+/// Made from another thread, those calls wait until the poll ends instead, so a poll loop must
+/// not wait for a thread that might be making one of them.
 ///
 /// Posting a reply or reposting a receive from inside the loop is fine while the work queue has
-/// room; when it may be full, drop the `Completions` first.
+/// room; when it may be full, drain or drop the `Completions` first.
 ///
 /// Some providers take the locks the other way around, so polling can wait for a posting thread
 /// too. hns moves a queue pair to `ERR` from inside the poll when it reads one of the pair's error
@@ -1014,8 +1015,8 @@ pub struct TagMatchingInfo {
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,
-    /// Whether `start_poll` handed out an entry, and so `end_poll` is owed on drop; `false` for
-    /// a poll of an empty queue.
+    /// Whether `start_poll` handed out an entry and `end_poll` is still owed (by `next` once the
+    /// entries run out, or by the drop); `false` for a poll of an empty queue.
     open: bool,
     /// Whether the next entry is the one `start_poll` positioned on (not yet yielded).
     first: bool,
@@ -1043,8 +1044,11 @@ impl Completions<'_> {
         if self.first {
             self.first = false;
         } else if unsafe { (*self.cq).next_poll.unwrap()(self.cq) } != 0 {
-            // ENOENT (no more) or an error: either way the poll is finished.
+            // ENOENT (no more) or an error: either way the poll is finished. End it here rather
+            // than in `Drop`, so that a drained `Completions` holds the poll lock no longer.
             self.done = true;
+            self.open = false;
+            unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
             return None;
         }
         Some(WorkCompletion {
@@ -1343,5 +1347,78 @@ mod test_conversions {
         ] {
             assert_eq!(WcOpcode::from(raw), wrapper);
         }
+    }
+
+    /// A provider's poll table over `left` more entries, counting its `end_poll` calls.
+    #[repr(C)]
+    struct SpyCqEx {
+        cq_ex: ffi::ibv_cq_ex,
+        left: u32,
+        ends: u32,
+    }
+
+    impl SpyCqEx {
+        /// A queue on whose first entry `start_poll` has just positioned, with `more` behind it.
+        fn started(more: u32) -> Self {
+            unsafe extern "C" fn next_poll(cq: *mut ffi::ibv_cq_ex) -> std::os::raw::c_int {
+                let spy = unsafe { &mut *cq.cast::<SpyCqEx>() };
+                if spy.left == 0 {
+                    return nix::libc::ENOENT;
+                }
+                spy.left -= 1;
+                0
+            }
+            unsafe extern "C" fn end_poll(cq: *mut ffi::ibv_cq_ex) {
+                unsafe { (*cq.cast::<SpyCqEx>()).ends += 1 };
+            }
+            SpyCqEx {
+                cq_ex: ffi::ibv_cq_ex {
+                    next_poll: Some(next_poll),
+                    end_poll: Some(end_poll),
+                    ..Default::default()
+                },
+                left: more,
+                ends: 0,
+            }
+        }
+    }
+
+    fn open_poll<'a>(spy: *mut SpyCqEx) -> Completions<'a> {
+        Completions {
+            cq: spy.cast(),
+            open: true,
+            first: true,
+            done: false,
+            _cq: std::marker::PhantomData,
+        }
+    }
+
+    /// The poll (and with it the provider's poll lock) ends as soon as the entries run out, not
+    /// only when the `Completions` is dropped: code that follows a drain in the same scope may
+    /// poll again or drop a queue pair.
+    #[test]
+    fn a_drained_poll_ends_before_it_is_dropped() {
+        let mut spy = SpyCqEx::started(1);
+        let spy = &raw mut spy;
+        let mut completions = open_poll(spy);
+        assert!(completions.next().is_some());
+        assert!(completions.next().is_some());
+        assert_eq!(unsafe { (*spy).ends }, 0);
+        assert!(completions.next().is_none());
+        assert_eq!(unsafe { (*spy).ends }, 1);
+        assert!(completions.next().is_none());
+        drop(completions);
+        assert_eq!(unsafe { (*spy).ends }, 1, "ended twice");
+    }
+
+    #[test]
+    fn a_poll_dropped_early_ends_in_the_drop() {
+        let mut spy = SpyCqEx::started(1);
+        let spy = &raw mut spy;
+        let mut completions = open_poll(spy);
+        assert!(completions.next().is_some());
+        assert_eq!(unsafe { (*spy).ends }, 0);
+        drop(completions);
+        assert_eq!(unsafe { (*spy).ends }, 1);
     }
 }
