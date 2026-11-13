@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use common::{mr, open_test_device, poll_until};
 use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, EventChannel,
-    PortSpace,
+    PortSpace, Resolved,
 };
 use ibverbs::{
     AccessFlags, AckTimeout, CompletionQueue, Context, Error, PreparedQueuePair, ProtectionDomain,
@@ -76,6 +76,18 @@ fn resources(
         .build()
         .expect("failed to build a queue pair");
     (pd, cq, qp)
+}
+
+/// Resolves `addr` with a default connector, returning the resolved connection with the device
+/// context and port to build its queue pair on.
+fn resolve(addr: SocketAddr) -> (Resolved, Context, u8) {
+    let resolved = Connector::new(PortSpace::Tcp)
+        .expect("connector")
+        .resolve(addr, Duration::from_secs(5))
+        .expect("resolve");
+    let ctx = resolved.context().expect("client device context");
+    let port = resolved.cm_id().port_num().expect("client port");
+    (resolved, ctx, port)
 }
 
 /// Waits for a test's server thread, re-raising its panic, with the server's own message, if it
@@ -162,12 +174,7 @@ where
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (pd, cq, qp) = resources(&ctx, port);
     let mut conn = resolved
         .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
@@ -276,12 +283,7 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (pd, cq, qp) = resources(&ctx, port);
     let recv = mr(&pd, 64);
     let mut conn = resolved
@@ -323,12 +325,7 @@ fn request_tells_the_peer_about_srq_and_flow_control() {
         }
     });
 
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let srq = pd.create_srq(16, 1).expect("client srq");
@@ -425,12 +422,7 @@ fn racing_accepts_time_out_on_time() {
     // Let every waiter block before the request arrives.
     std::thread::sleep(Duration::from_millis(200));
 
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (_pd, _cq, qp) = resources(&ctx, port);
     match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {}
@@ -508,12 +500,7 @@ fn two_connections() {
         .map(|tag| {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
-                let resolved = Connector::new(PortSpace::Tcp)
-                    .expect("connector")
-                    .resolve(addr, Duration::from_secs(5))
-                    .expect("resolve");
-                let ctx = resolved.context().expect("client device context");
-                let port = resolved.cm_id().port_num().expect("client port");
+                let (resolved, ctx, port) = resolve(addr);
                 let (pd, cq, qp) = resources(&ctx, port);
                 let mut send = mr(&pd, 64);
                 send.bytes_mut()[..MESSAGE.len()].fill(tag);
@@ -925,12 +912,7 @@ fn server_writes_into_client() {
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (pd, cq, qp) = resources(&ctx, port);
     let target = mr(&pd, 64);
     let notify = mr(&pd, 1);
@@ -1056,12 +1038,7 @@ fn rejected_request_reports_reason_and_private_data() {
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (_pd, _cq, qp) = resources(&ctx, port);
     match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
         Err(Error::ConnectionManager(failure)) if failure.event == CmEventType::Rejected => {
@@ -1087,12 +1064,7 @@ fn request_without_listener_is_rejected_as_invalid_service() {
     // answers the request itself, with reject reason 8 (invalid service ID), right away.
     let ip = device_ip(&open_test_device());
     let addr = bind_listener(ip).local_addr().expect("bound address");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
@@ -1131,12 +1103,7 @@ fn dropped_connect_request_is_rejected() {
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (_pd, _cq, qp) = resources(&ctx, port);
     let before = Instant::now();
     match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
@@ -1186,12 +1153,7 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (_pd, _cq, qp) = resources(&ctx, port);
     let before = Instant::now();
     match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
@@ -1269,12 +1231,7 @@ fn dropping_connection_disconnects_peer() {
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (pd, cq, qp) = resources(&ctx, port);
     let conn = resolved
         .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
@@ -1312,12 +1269,7 @@ fn closing_a_connection_waits_for_the_peers_answer() {
     });
 
     let addr = ready_rx.recv().expect("server ready");
-    let resolved = Connector::new(PortSpace::Tcp)
-        .expect("connector")
-        .resolve(addr, Duration::from_secs(5))
-        .expect("resolve");
-    let ctx = resolved.context().expect("client device context");
-    let port = resolved.cm_id().port_num().expect("client port");
+    let (resolved, ctx, port) = resolve(addr);
     let (_pd, _cq, qp) = resources(&ctx, port);
     let conn = resolved
         .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
