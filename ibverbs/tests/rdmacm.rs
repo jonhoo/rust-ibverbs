@@ -743,7 +743,7 @@ fn next_on(channel: &EventChannel, want: CmEventType, id: &CmId) -> CmEvent {
         if let Some(event) = channel.poll_cm_event().expect("poll the shared channel") {
             assert_eq!(event.event_type(), want, "status {}", event.status());
             let about = event.id().expect("the event's id is alive");
-            assert_eq!(about.as_raw(), id.as_raw(), "{want:?} is about another id");
+            assert!(about == id, "{want:?} is about another id");
             return event;
         }
         assert!(Instant::now() < deadline, "timed out waiting for {want:?}");

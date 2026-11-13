@@ -1258,6 +1258,24 @@ impl CmId {
     }
 }
 
+/// Two handles are equal when they are clones of one id. That makes a `CmId` a key for the state
+/// an event loop keeps per id: look an event's [`CmEvent::id`] up in a `HashMap<CmId, _>`.
+/// (Clippy's `mutable_key_type` lint objects to such a map because an id holds its channel's
+/// lock; the hash does not depend on it.)
+impl PartialEq for CmId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+}
+
+impl Eq for CmId {}
+
+impl std::hash::Hash for CmId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.inner).hash(state);
+    }
+}
+
 impl AsRawFd for CmId {
     /// The raw file descriptor of this id's event channel (shared with the other ids on it, if
     /// any), for a reactor to drive connection setup without blocking. It is non-blocking and
