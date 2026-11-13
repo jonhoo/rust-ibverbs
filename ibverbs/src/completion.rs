@@ -962,11 +962,10 @@ impl WorkCompletion<'_> {
         self.cq
     }
 
-    /// The addressing fields of this completion as a classic `ibv_wc`, for deriving the route
-    /// back to a datagram's sender: the flags, the source and local queue pair numbers, the source
-    /// LID, the service level, and — when the queue requested them — the path bits (zero
-    /// otherwise).
-    pub(crate) fn addressing(&self) -> ffi::ibv_wc {
+    /// The addressing fields of this completion in the batch form, for deriving the route back
+    /// to a datagram's sender: the flags, the source and local queue pair numbers, the source LID,
+    /// the service level, and — when the queue requested them — the path bits (zero otherwise).
+    pub(crate) fn addressing(&self) -> Completion {
         let mut wc = ffi::ibv_wc::default();
         wc.wc_flags = self.wc_flags().into();
         wc.src_qp = self.src_qp();
@@ -976,7 +975,152 @@ impl WorkCompletion<'_> {
         if let Some(read_dlid_path_bits) = unsafe { (*self.cq).read_dlid_path_bits } {
             wc.dlid_path_bits = unsafe { read_dlid_path_bits(self.cq) };
         }
-        wc
+        Completion(wc)
+    }
+}
+
+/// A work completion as [`CompletionQueue::poll_into`] fills it in: the fields of C's `ibv_wc`,
+/// read through the accessors a [`WorkCompletion`] has.
+///
+/// Unlike a `WorkCompletion` it is plain data. It borrows nothing, so it can be kept past the
+/// poll, copied, and sent to another thread, and every field is there on every queue, whichever
+/// [`WcFields`] the queue was built with. [`Default`] gives an entry for `poll_into` to fill,
+/// which reads as a failed work request until it has been.
+#[derive(Clone, Copy, Default)]
+#[repr(transparent)]
+pub struct Completion(ffi::ibv_wc);
+
+#[allow(clippy::len_without_is_empty)]
+impl Completion {
+    /// The 64-bit id that was associated with the corresponding work request when it was posted.
+    #[inline]
+    pub fn wr_id(&self) -> u64 {
+        self.0.wr_id()
+    }
+
+    /// `Ok(())` if the work request completed successfully (`IBV_WC_SUCCESS`), otherwise the
+    /// [`WcError`] carrying the status and vendor error syndrome.
+    #[inline]
+    pub fn ok(&self) -> std::result::Result<(), WcError> {
+        match self.0.error() {
+            None => Ok(()),
+            Some((status, vendor_err)) => Err(WcError {
+                status: status.into(),
+                vendor_err,
+            }),
+        }
+    }
+
+    /// The opcode of the completed work request.
+    ///
+    /// Like `len` and the other detail fields, this is only meaningful when the completion
+    /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
+    /// [`wr_id`](Self::wr_id), the status and vendor error ([`WcError`]), and
+    /// [`qp_num`](Self::qp_num) are defined.
+    #[inline]
+    pub fn opcode(&self) -> WcOpcode {
+        self.0.opcode().into()
+    }
+
+    /// The number of bytes transferred, for a successful completion (see
+    /// [`WorkCompletion::len`]).
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// The 32-bit immediate value (host byte order) if one was carried ([`WcFlags::WITH_IMM`]).
+    #[inline]
+    pub fn imm_data(&self) -> Option<u32> {
+        self.0.imm_data()
+    }
+
+    /// The remote key a SEND-with-invalidate invalidated, if this completion reports one
+    /// ([`WcFlags::WITH_INV`]). It shares its field with the immediate data, so a completion
+    /// carries one or the other.
+    #[inline]
+    pub fn invalidated_rkey(&self) -> Option<u32> {
+        if self.0.is_valid() && self.wc_flags().contains(WcFlags::WITH_INV) {
+            Some(self.0.imm_data)
+        } else {
+            None
+        }
+    }
+
+    /// The local QP number of the completed work request (relevant for shared-receive-queue
+    /// completions, to tell which queue pair a receive arrived on).
+    #[inline]
+    pub fn qp_num(&self) -> u32 {
+        self.0.qp_num
+    }
+
+    /// The source (remote) QP number, relevant for datagram receive completions.
+    #[inline]
+    pub fn src_qp(&self) -> u32 {
+        self.0.src_qp
+    }
+
+    /// The flags describing this completion.
+    #[inline]
+    pub fn wc_flags(&self) -> WcFlags {
+        self.0.wc_flags.into()
+    }
+
+    /// Whether the receive completion carries a 40-byte Global Routing Header (GRH) at the front of
+    /// the scatter buffers (set for unreliable-datagram receives with a GRH).
+    #[inline]
+    pub fn has_grh(&self) -> bool {
+        self.wc_flags().contains(WcFlags::GRH)
+    }
+
+    /// The source LID this message was sent from (relevant for datagram receive completions; see
+    /// [`WorkCompletion::slid`] for what EFA reports here).
+    #[inline]
+    pub fn slid(&self) -> u32 {
+        self.0.slid.into()
+    }
+
+    /// The service level this message was sent with (relevant for datagram receive completions).
+    #[inline]
+    pub fn sl(&self) -> u8 {
+        self.0.sl
+    }
+
+    /// The destination LID path bits (relevant for datagram receive completions).
+    #[inline]
+    pub fn dlid_path_bits(&self) -> u8 {
+        self.0.dlid_path_bits
+    }
+
+    /// The underlying `ibv_wc`, for the fields without an accessor here (the P_Key index of a
+    /// completion on a GSI queue pair).
+    #[inline]
+    pub fn as_raw(&self) -> &ffi::ibv_wc {
+        &self.0
+    }
+}
+
+impl From<ffi::ibv_wc> for Completion {
+    /// Wraps a completion that `ibv_poll_cq` filled in elsewhere.
+    fn from(wc: ffi::ibv_wc) -> Self {
+        Completion(wc)
+    }
+}
+
+impl fmt::Debug for Completion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut f = f.debug_struct("Completion");
+        f.field("wr_id", &self.wr_id());
+        match self.ok() {
+            Ok(()) => f
+                .field("opcode", &self.opcode())
+                .field("len", &self.len())
+                .field("wc_flags", &self.wc_flags()),
+            Err(error) => f
+                .field("status", &error.status)
+                .field("vendor_err", &error.vendor_err),
+        };
+        f.field("qp_num", &self.qp_num()).finish_non_exhaustive()
     }
 }
 
@@ -1219,12 +1363,14 @@ impl CompletionQueue {
     ///
     /// This is the batch counterpart to [`poll`](Self::poll). Where `poll` reads each field lazily
     /// through the extended interface — an indirect provider call per field — this copies whole
-    /// completions into caller-owned [`ibv_wc`](ffi::ibv_wc) entries in one call, then lets you read
-    /// their fields as plain struct accesses. For high-throughput draining where you consume many
-    /// completions and touch several fields of each, avoiding the per-field indirection makes this
-    /// the faster path; when you poll a completion at a time and read only a field or two,
-    /// [`poll`](Self::poll) is cheaper. It is also a compatibility fallback for the fields the
-    /// standard `ibv_wc` carries, independent of which extended fields the queue was built with.
+    /// completions into caller-owned [`Completion`] entries in one call, then lets you read
+    /// their fields as plain struct accesses, under the names [`WorkCompletion`] gives them. For
+    /// high-throughput draining where you consume many completions and touch several fields of
+    /// each, avoiding the per-field indirection makes this the faster path; when you poll a
+    /// completion at a time and read only a field or two, [`poll`](Self::poll) is cheaper. The
+    /// entries borrow nothing, so they also suit an event loop that keeps completions past the
+    /// poll, and they carry the fields of the standard `ibv_wc` whichever extended fields the
+    /// queue was built with.
     ///
     /// The returned slice is empty when no completions are ready. Like [`poll`](Self::poll), this
     /// neither blocks nor causes a context switch; to wait for completions, build the queue on a
@@ -1242,23 +1388,25 @@ impl CompletionQueue {
     /// # Examples
     ///
     /// ```no_run
-    /// # use ibverbs::{ffi, CompletionQueue};
+    /// # use ibverbs::{Completion, CompletionQueue};
     /// # fn drain(cq: &CompletionQueue) -> ibverbs::Result<()> {
-    /// let mut wc = [ffi::ibv_wc::default(); 16];
+    /// let mut wc = [Completion::default(); 16];
     /// for completion in cq.poll_into(&mut wc)? {
-    ///     if let Some((status, vendor_err)) = completion.error() {
-    ///         eprintln!("work request {}: {status:?} (vendor {vendor_err})", completion.wr_id());
+    ///     if let Err(e) = completion.ok() {
+    ///         eprintln!("work request {}: {e}", completion.wr_id());
     ///     }
     /// }
     /// # Ok(())
     /// # }
     /// ```
     #[inline]
-    pub fn poll_into<'w>(&self, wc: &'w mut [ffi::ibv_wc]) -> Result<&'w mut [ffi::ibv_wc]> {
+    pub fn poll_into<'w>(&self, wc: &'w mut [Completion]) -> Result<&'w mut [Completion]> {
         // An `ibv_cq_ex` shares its prefix with `ibv_cq`, so the standard poll works on the
-        // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path).
+        // extended queue this crate builds (exactly the `ibv_cq_ex_to_cq` path). A `Completion`
+        // is an `ibv_wc` under another name (`repr(transparent)`).
         let num_entries = wc.len().min(i32::MAX as usize) as i32;
-        let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, wc.as_mut_ptr()) };
+        let entries = wc.as_mut_ptr().cast::<ffi::ibv_wc>();
+        let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, entries) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and leaves `errno` alone, so
             // whatever is there is stale (in an event loop, typically the `EAGAIN` of the `get_event`
@@ -1407,6 +1555,46 @@ mod test_conversions {
         ] {
             assert_eq!(WcOpcode::from(raw), wrapper);
         }
+    }
+
+    /// A batch completion reads its fields as the lending one does: the immediate in host order,
+    /// only when the completion says it carries one, and nothing but the failure for a failed
+    /// request.
+    #[test]
+    fn a_batch_completion_reads_like_a_lending_one() {
+        // All zeroes is a successful SEND.
+        let mut raw: ffi::ibv_wc = unsafe { std::mem::zeroed() };
+        raw.qp_num = 7;
+        raw.src_qp = 9;
+        raw.slid = 3;
+        raw.sl = 2;
+        raw.dlid_path_bits = 1;
+        raw.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_IMM | ffi::ibv_wc_flags::IBV_WC_GRH;
+        raw.imm_data = 0x0102_0304_u32.to_be();
+        let wc = Completion::from(raw);
+        assert!(wc.ok().is_ok());
+        assert_eq!(wc.opcode(), WcOpcode::Send);
+        assert_eq!((wc.qp_num(), wc.src_qp(), wc.slid(), wc.sl()), (7, 9, 3, 2));
+        assert_eq!(wc.dlid_path_bits(), 1);
+        assert_eq!(wc.imm_data(), Some(0x0102_0304));
+        assert_eq!(wc.invalidated_rkey(), None);
+        assert!(wc.has_grh());
+
+        // With the invalidate flag the same field is a remote key, in host order.
+        raw.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_INV;
+        raw.imm_data = 0x1234;
+        let wc = Completion::from(raw);
+        assert_eq!((wc.imm_data(), wc.invalidated_rkey()), (None, Some(0x1234)));
+        assert!(!wc.has_grh());
+
+        // An entry that `poll_into` has not filled reads as a failed request.
+        let unfilled = Completion::default();
+        assert_eq!(
+            unfilled.ok().map_err(|e| e.status),
+            Err(WcStatus::GeneralError)
+        );
+        assert_eq!(unfilled.imm_data(), None);
+        assert!(format!("{unfilled:?}").contains("GeneralError"));
     }
 
     /// A provider's poll table over `left` more entries, counting its `end_poll` calls. Its

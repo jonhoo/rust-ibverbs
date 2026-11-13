@@ -3,7 +3,7 @@ use std::ffi::CStr;
 use std::fmt;
 use std::io;
 
-use crate::completion::WorkCompletion;
+use crate::completion::{Completion, WorkCompletion};
 use crate::context::Context;
 use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
@@ -595,7 +595,7 @@ impl AddressHandleAttribute {
     /// a request without the peer telling it its address. Pass the result to
     /// [`ProtectionDomain::create_address_handle`].
     ///
-    /// `wc` is the receive's completion in the classic form ([`CompletionQueue::poll_into`]), and
+    /// `wc` is the receive's completion in the batch form ([`CompletionQueue::poll_into`]), and
     /// `port_num` the local port the datagram arrived on, which the reply leaves through. `grh` is
     /// the header from the front of the receive buffer ([`Grh::from_bytes`]); it is required when
     /// the completion reports one ([`WcFlags::GRH`], always the case on RoCE) and not read
@@ -627,10 +627,10 @@ impl AddressHandleAttribute {
     pub fn from_wc(
         context: &Context,
         port_num: u8,
-        wc: &ffi::ibv_wc,
+        wc: &Completion,
         grh: Option<&Grh>,
     ) -> Result<Self> {
-        let mut wc = *wc;
+        let mut wc = *wc.as_raw();
         let has_grh = (wc.wc_flags & ffi::ibv_wc_flags::IBV_WC_GRH).0 != 0;
         // `ibv_init_ah_from_wc` reads the header's first word (the flow label) before it checks
         // `IBV_WC_GRH`, so it must always be handed a header: the caller's when the completion

@@ -174,16 +174,13 @@ fn drain(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
 /// instead of the extended lazy-read path, so the tests cover both interfaces.
 fn drain_into(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     let mut observed = Vec::with_capacity(n);
-    let mut wc = vec![ibverbs::ffi::ibv_wc::default(); n];
+    let mut wc = vec![ibverbs::Completion::default(); n];
     let deadline = Instant::now() + Duration::from_secs(5);
 
     loop {
         for completion in cq.poll_into(&mut wc).expect("failed to poll CQ") {
-            if let Some((status, vendor_err)) = completion.error() {
-                panic!(
-                    "work request {} failed: {status:?} (vendor {vendor_err})",
-                    completion.wr_id()
-                );
+            if let Err(e) = completion.ok() {
+                panic!("work request {} failed: {e}", completion.wr_id());
             }
             observed.push(Completed {
                 wr_id: completion.wr_id(),
@@ -342,7 +339,7 @@ fn send_recv_poll_into() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn poll_into_empty_is_empty() {
     let lb = loopback();
-    let mut wc = [ibverbs::ffi::ibv_wc::default(); 8];
+    let mut wc = [ibverbs::Completion::default(); 8];
     let ready = lb.cq.poll_into(&mut wc).expect("failed to poll CQ");
     assert!(ready.is_empty(), "no completions were posted");
 }
@@ -2604,12 +2601,12 @@ fn reply_through_address_handle_from_wc() {
         .signaled()
         .send(2, &[send.slice(..4)]);
     unsafe { batch.submit() }.expect("UD send failed");
-    let mut wcs = [ibverbs::ffi::ibv_wc::default(); 4];
+    let mut wcs = [ibverbs::Completion::default(); 4];
     let mut request_wc = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while request_wc.is_none() {
         for wc in cq.poll_into(&mut wcs).expect("poll_into failed") {
-            assert!(wc.is_valid(), "work request {} failed", wc.wr_id());
+            assert!(wc.ok().is_ok(), "work request {} failed", wc.wr_id());
             if wc.wr_id() == 1 {
                 request_wc = Some(*wc);
             }
@@ -2636,7 +2633,7 @@ fn reply_through_address_handle_from_wc() {
         .expect("post_recv");
     let mut batch = qp.start_send();
     batch
-        .to(&reply_ah, request_wc.src_qp, QKEY)
+        .to(&reply_ah, request_wc.src_qp(), QKEY)
         .signaled()
         .send(4, &[send.slice(16..20)]);
     unsafe { batch.submit() }.expect("UD reply failed");
@@ -2678,6 +2675,8 @@ fn address_handle_from_completion_without_grh() {
     let mut wc = ibverbs::ffi::ibv_wc::default();
     wc.slid = 7;
     wc.sl = 3;
+    let wc = ibverbs::Completion::from(wc);
+    assert_eq!((wc.slid(), wc.sl(), wc.has_grh()), (7, 3, false));
     AddressHandleAttribute::from_wc(&ctx, 1, &wc, None)
         .expect("a completion without a GRH derives a local route");
     let unread = Grh::from_bytes(&[0; Grh::LEN]);
