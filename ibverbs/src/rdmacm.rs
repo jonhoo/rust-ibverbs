@@ -752,6 +752,11 @@ impl CmId {
     /// dropping the id's last handle declines its request or disconnects its connection right
     /// away, however long the queue pair and its resources live on.
     ///
+    /// The device is closed once nothing built on the context is left, and opened again by the
+    /// next call, which on mlx5 allocates the context's doorbell pages in firmware anew. A
+    /// program that sets up one connection at a time should keep a clone of the context (or its
+    /// protection domain and memory regions) across connections.
+    ///
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): the id has no device yet.
