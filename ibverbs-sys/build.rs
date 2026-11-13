@@ -31,7 +31,9 @@ const VENDORED_HEADERS: &[(&str, &str)] = &[
 
 /// Lay the vendored headers out the way an installed rdma-core does, and return that include
 /// directory. The copies keep their sources' modification times, so the `rerun-if-changed` lines
-/// bindgen prints for them fire only when a vendored header itself changes.
+/// bindgen prints for them fire only when a vendored header itself changes. They are written
+/// rather than `fs::copy`'d, which would also copy a read-only source's permissions (Nix store
+/// paths, a read-only vendor directory) and then refuse the dating and any rerun's overwrite.
 fn vendored_include_dir() -> PathBuf {
     let vendor = Path::new("vendor/rdma-core");
     assert!(
@@ -47,7 +49,9 @@ fn vendored_include_dir() -> PathBuf {
         println!("cargo:rerun-if-changed={}", from.display());
         fs::create_dir_all(to.parent().expect("header paths have a directory"))
             .expect("failed to create the vendored include directory");
-        fs::copy(&from, &to).unwrap_or_else(|e| panic!("failed to copy {}: {e}", from.display()));
+        let header =
+            fs::read(&from).unwrap_or_else(|e| panic!("failed to read {}: {e}", from.display()));
+        fs::write(&to, header).unwrap_or_else(|e| panic!("failed to write {}: {e}", to.display()));
         let modified = fs::metadata(&from)
             .and_then(|m| m.modified())
             .and_then(|t| fs::File::options().write(true).open(&to)?.set_modified(t));
