@@ -538,9 +538,11 @@ impl<T: Transport> QueuePairBuilder<T> {
         }
         if reliable {
             rtr.set_min_rnr_timer(RnrTimer::from_encoding(16));
-            rts.set_timeout(AckTimeout::from_exponent(4))
-                .set_retry_count(6)
-                .set_rnr_retry(6);
+            // The values of rdma-core's examples (`rc_pingpong`), and the retry counts of a
+            // connection made through the connection manager.
+            rts.set_timeout(AckTimeout::from_exponent(14))
+                .set_retry_count(7)
+                .set_rnr_retry(7);
         }
         if let Some((initiator, responder)) = rd_atomic_limits {
             rtr.set_max_dest_rd_atomic(responder);
@@ -952,7 +954,15 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// [`AckTimeout::INFINITE`] waits forever (useful for debugging): if a packet is lost and no
     /// ACK or NACK arrives, no retry ever occurs and the QP just stops sending data.
     ///
-    /// Defaults to 65.536 µs.
+    /// A device waits between one and four times the timeout before each retransmission, so the
+    /// timeout and the [retry count](Self::set_retry_count) together bound how long a peer may
+    /// stay silent before the request fails with
+    /// [`RetryExceeded`](crate::WcStatus::RetryExceeded) and the queue pair enters the error
+    /// state. A network that pauses traffic (priority flow control on RoCE, a failover) is silent
+    /// for milliseconds, which timeouts in the microseconds do not survive.
+    ///
+    /// Defaults to 67.1 ms (`n` = 14), which with the default retry count gives a peer between
+    /// half a second and two seconds.
     pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
         self.bring_up.rts.set_timeout(timeout);
         self
@@ -961,7 +971,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// Sets the total number of times that the new `QueuePair` will try to resend the packets
     /// before reporting an error because the remote side doesn't answer in the primary path.
     ///
-    /// This 3-bit value defaults to 6.
+    /// This 3-bit value defaults to 7.
     ///
     /// # Panics
     ///
@@ -974,8 +984,12 @@ impl<T: Reliable> QueuePairBuilder<T> {
     /// Sets the total number of times that the new `QueuePair` will try to resend the packets when
     /// an RNR NACK was sent by the remote QP before reporting an error.
     ///
-    /// This 3-bit value defaults to 6. The value 7 is special: it retries indefinitely when the
-    /// remote side answers with an RNR NAK.
+    /// This 3-bit value defaults to 7, which is special: it retries indefinitely while the remote
+    /// side answers with an RNR NAK, so a send to a peer that never posts a receive never
+    /// completes. With a lower value, a peer that is late with its receives by a few
+    /// [RNR timers](Self::set_min_rnr_timer) fails the request with
+    /// [`RnrRetryExceeded`](crate::WcStatus::RnrRetryExceeded) and the queue pair enters the error
+    /// state.
     ///
     /// # Panics
     ///
@@ -3120,7 +3134,7 @@ mod test_timers {
 
     #[test]
     fn ack_timeout_exact_step_is_itself() {
-        // 4.096 µs × 2^4 = 65.536 µs, the default.
+        // 4.096 µs × 2^4 = 65.536 µs.
         let d = Duration::from_nanos(4096 << 4);
         assert_eq!(AckTimeout::at_least(d), AckTimeout::from_exponent(4));
         assert_eq!(AckTimeout::at_least(d).duration(), Some(d));
