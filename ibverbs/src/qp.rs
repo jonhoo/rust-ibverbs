@@ -2151,6 +2151,14 @@ impl<'a> From<&'a [LocalMemorySlice]> for Payload<'a> {
     }
 }
 
+/// A single slice is a scatter/gather list of one entry: `send(id, &mr.slice(..))`.
+impl<'a> From<&'a LocalMemorySlice> for Payload<'a> {
+    #[inline]
+    fn from(local: &'a LocalMemorySlice) -> Self {
+        Payload::Sges(std::slice::from_ref(local))
+    }
+}
+
 impl<'a, const N: usize> From<&'a [LocalMemorySlice; N]> for Payload<'a> {
     fn from(local: &'a [LocalMemorySlice; N]) -> Self {
         Payload::Sges(local)
