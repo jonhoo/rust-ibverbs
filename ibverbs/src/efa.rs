@@ -8,6 +8,7 @@
 // [`QueuePair::post_recv`], and completions through [`CompletionQueue::poll`].
 // ---------------------------------------------------------------------------
 
+use crate::address::AddressHandle;
 use crate::context::Context;
 use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
@@ -16,7 +17,7 @@ use crate::qp::{
 };
 
 #[cfg(doc)]
-use crate::{AddressHandle, ProtectionDomain, QueuePair};
+use crate::{ProtectionDomain, QueuePair, WorkCompletion};
 
 /// The EFA SRD (Scalable Reliable Datagram) transport: reliable like RC but connectionless and
 /// addressed like UD (a provider-specific `IBV_QPT_DRIVER` queue pair).
@@ -228,6 +229,26 @@ impl Context {
             );
         }
         Ok(EfaDeviceAttr(attr))
+    }
+}
+
+impl AddressHandle {
+    /// The number the EFA device knows this address handle by (`efadv_query_ah`), or `None` on a
+    /// device that is not EFA.
+    ///
+    /// EFA has no LIDs. A receive completion names the sender by the number of the address handle
+    /// the receiving side holds for the sender's GID ([`WorkCompletion::slid`]), and by `0xffff`
+    /// when it holds none: keep a map from this number to the peer to tell who sent a datagram.
+    pub fn efa_ah_number(&self) -> Option<u16> {
+        let mut attr = ffi::efadv_ah_attr::default();
+        let errno = unsafe {
+            ffi::efadv_query_ah(
+                self.as_raw(),
+                &mut attr,
+                std::mem::size_of::<ffi::efadv_ah_attr>() as u32,
+            )
+        };
+        (errno == 0).then_some(attr.ahn)
     }
 }
 
