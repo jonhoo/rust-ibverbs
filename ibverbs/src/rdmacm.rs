@@ -456,45 +456,63 @@ impl EventChannel {
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): reading the event (`rdma_get_cm_event`)
     ///    failed.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
-        // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so an
-        // empty one reports `EAGAIN`.
-        let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
-        nix::errno::Errno::clear();
-        let ret = unsafe { ffi::rdma_get_cm_event(self.inner.chan, &mut event) };
-        if ret != 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
+        loop {
+            // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so
+            // an empty one reports `EAGAIN`.
+            let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
+            nix::errno::Errno::clear();
+            let ret = unsafe { ffi::rdma_get_cm_event(self.inner.chan, &mut event) };
+            if ret != 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(None);
+                }
+                return Err(Error::os(e, Error::ConnectionSetup));
             }
-            return Err(Error::os(e, Error::ConnectionSetup));
+            // The kernel reports a failure as a negative errno, but when librdmacm itself fails
+            // to finish an address or route resolution while reading the event (querying the
+            // device, address, or path), it sets the status to -1 and leaves the reason in
+            // `errno`, which is only readable now. `errno` was cleared above, so a -1 from the
+            // kernel (`-EPERM`) stays.
+            let mut status = unsafe { (*event).status };
+            if status == -1 {
+                let errno = nix::errno::Errno::last_raw();
+                if errno != 0 {
+                    status = -errno;
+                }
+            }
+            // A connection request is about the listener it arrived at: the event's own id is the
+            // request's new one, which `connection_request` takes over.
+            let about = unsafe {
+                if (*event).event == ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
+                    (*event).listen_id
+                } else {
+                    (*event).id
+                }
+            };
+            let event = CmEvent {
+                event,
+                status,
+                id: None,
+                channel: self.clone(),
+                taken: false,
+            };
+            let routed = self.ids().get(&(about as usize)).map(Weak::upgrade);
+            match routed {
+                Some(Some(inner)) => {
+                    let mut event = event;
+                    event.id = Some(CmId { inner });
+                    return Ok(Some(event));
+                }
+                // The id's last handle is gone and it is being destroyed, which waits for this
+                // event to be acknowledged: acknowledge it now (declining a connection request to
+                // a listener that is going away) and read on, rather than hand out an event
+                // nobody can act on and make the destroy wait for whoever holds it.
+                Some(None) => drop(event),
+                // Not an id of this crate's.
+                None => return Ok(Some(event)),
+            }
         }
-        // The kernel reports a failure as a negative errno, but when librdmacm itself fails to
-        // finish an address or route resolution while reading the event (querying the device,
-        // address, or path), it sets the status to -1 and leaves the reason in `errno`, which is
-        // only readable now. `errno` was cleared above, so a -1 from the kernel (`-EPERM`) stays.
-        let mut status = unsafe { (*event).status };
-        if status == -1 {
-            let errno = nix::errno::Errno::last_raw();
-            if errno != 0 {
-                status = -errno;
-            }
-        }
-        // A connection request is about the listener it arrived at: the event's own id is the
-        // request's new one, which `connection_request` takes over.
-        let about = unsafe {
-            if (*event).event == ffi::rdma_cm_event_type::RDMA_CM_EVENT_CONNECT_REQUEST {
-                (*event).listen_id
-            } else {
-                (*event).id
-            }
-        };
-        Ok(Some(CmEvent {
-            event,
-            status,
-            id: self.id(about),
-            channel: self.clone(),
-            taken: false,
-        }))
     }
 
     /// Blocks until the next event arrives (up to `deadline`, indefinitely with `None`) and returns
@@ -524,12 +542,6 @@ impl EventChannel {
             .ids
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The live [`CmId`] for `id` on this channel, if there is one.
-    fn id(&self, id: *mut ffi::rdma_cm_id) -> Option<CmId> {
-        let inner = self.ids().get(&(id as usize))?.upgrade()?;
-        Some(CmId { inner })
     }
 
     /// Returns the underlying `rdma_event_channel` pointer.
@@ -572,12 +584,17 @@ unsafe impl Sync for CmIdInner {}
 
 impl Drop for CmIdInner {
     fn drop(&mut self) {
-        // Stop routing events to the id first, while its address is still its own: any of its
-        // events read from here on, which `rdma_destroy_id` waits to see acknowledged, come
-        // without one.
-        self.channel.ids().remove(&(self.id as usize));
-        // Destroy the id before its channel (the `channel` field drops right after this).
+        // Destroy the id before its channel (the `channel` field drops right after this). Until
+        // the destroy returns, the id's entry stays in the channel's map, dead, so that a reader
+        // that takes one of its events acknowledges it at once instead of handing it out: the
+        // destroy waits for every event read for the id to be acknowledged.
         unsafe { ffi::rdma_destroy_id(self.id) };
+        // Then stop routing the address to the id, unless an id created since has taken it over.
+        let mut ids = self.channel.ids();
+        let key = self.id as usize;
+        if ids.get(&key).is_some_and(|id| ptr::eq(id.as_ptr(), self)) {
+            ids.remove(&key);
+        }
     }
 }
 
@@ -1330,9 +1347,8 @@ impl CmEvent {
     /// it reports on. On an [`EventChannel`] shared by several ids, this is how their events are
     /// told apart.
     ///
-    /// `None` when that id was not created through this crate, or is going away: its last handle
-    /// was dropped after the event was queued, and destroying it waits for this event to be
-    /// acknowledged (dropped).
+    /// `None` when that id was not created through this crate. (The events of an id whose last
+    /// handle is gone are acknowledged as they are read, and never handed out.)
     pub fn id(&self) -> Option<&CmId> {
         self.id.as_ref()
     }
