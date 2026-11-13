@@ -533,7 +533,7 @@ fn two_connections() {
         .collect();
 
     for client in clients {
-        client.join().expect("client thread");
+        join(client);
     }
     let mut received = join(server);
     received.sort();
@@ -595,28 +595,25 @@ fn low_level_connect_and_send() {
         let addr = listener.local_addr().expect("listen address");
         ready_tx.send(addr).expect("signal ready");
 
-        let request = loop {
-            let event = listener.get_cm_event().expect("listener event");
-            if event.event_type() == CmEventType::ConnectRequest {
-                // The client sent its queue-pair endpoint's wire encoding as private data (the
-                // in-band bootstrap the fixed format enables). The transport pads the payload, so
-                // decode the known-length prefix.
-                let pdata = event
-                    .private_data()
-                    .expect("connect request carries private data");
-                assert!(
-                    pdata.len() >= QueuePairEndpoint::WIRE_LEN,
-                    "reported private data is shorter than an endpoint encoding"
-                );
-                let bytes: [u8; QueuePairEndpoint::WIRE_LEN] =
-                    pdata[..QueuePairEndpoint::WIRE_LEN].try_into().unwrap();
-                let client_endpoint =
-                    QueuePairEndpoint::from_bytes(&bytes).expect("well-formed endpoint bytes");
-                assert!(client_endpoint.qp_num > 0, "{client_endpoint:?}");
-                assert!(client_endpoint.gid.is_none(), "{client_endpoint:?}");
-                break event.connection_request().expect("connection request");
-            }
-        };
+        // Bounded, so a request that never arrives fails the test instead of hanging it.
+        let event = pump_until(&listener, CmEventType::ConnectRequest);
+        // The client sent its queue-pair endpoint's wire encoding as private data (the in-band
+        // bootstrap the fixed format enables). The transport pads the payload, so decode the
+        // known-length prefix.
+        let pdata = event
+            .private_data()
+            .expect("connect request carries private data");
+        assert!(
+            pdata.len() >= QueuePairEndpoint::WIRE_LEN,
+            "reported private data is shorter than an endpoint encoding"
+        );
+        let bytes: [u8; QueuePairEndpoint::WIRE_LEN] =
+            pdata[..QueuePairEndpoint::WIRE_LEN].try_into().unwrap();
+        let client_endpoint =
+            QueuePairEndpoint::from_bytes(&bytes).expect("well-formed endpoint bytes");
+        assert!(client_endpoint.qp_num > 0, "{client_endpoint:?}");
+        assert!(client_endpoint.gid.is_none(), "{client_endpoint:?}");
+        let request = event.connection_request().expect("connection request");
         let ctx = request.context().expect("server device context");
         let port = request.port_num().expect("server port");
         let (pd, cq, qp) = resources(&ctx, port);
@@ -641,12 +638,7 @@ fn low_level_connect_and_send() {
         let mut param = ConnectionParameter::default();
         param.set_qp_num(qp.qp_num()).set_private_data(SERVER_PDATA);
         request.accept(&param).expect("accept");
-        loop {
-            let event = request.get_cm_event().expect("server event");
-            if event.event_type() == CmEventType::Established {
-                break;
-            }
-        }
+        pump_until(&request, CmEventType::Established);
 
         wait_for(&cq, 1);
         assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
@@ -1132,9 +1124,7 @@ fn dropped_connect_request_is_rejected() {
         ready_tx
             .send(listener.local_addr().expect("listen address"))
             .expect("signal ready");
-        let event = listener.get_cm_event().expect("listener event");
-        assert_eq!(event.event_type(), CmEventType::ConnectRequest);
-        drop(event);
+        drop(pump_until(&listener, CmEventType::ConnectRequest));
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("client saw the rejection");

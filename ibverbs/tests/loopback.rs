@@ -202,6 +202,15 @@ fn drain_into(cq: &CompletionQueue, n: usize) -> Vec<Completed> {
     }
 }
 
+/// The message a caught panic carries.
+fn panic_message(payload: &Box<dyn std::any::Any + Send>) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("")
+}
+
 /// Read the first 8 bytes of a buffer as a host-order `u64`.
 fn first_u64(bytes: &[u8]) -> u64 {
     u64::from_ne_bytes(bytes[..8].try_into().unwrap())
@@ -1484,6 +1493,19 @@ fn create_qp_ex_with_only_a_protection_domain() {
         "ibv_create_qp_ex: {}",
         std::io::Error::last_os_error()
     );
+    // Soft-RoCE's extended create marks every queue pair it makes as extended and its legacy
+    // create none, so there a queue pair without the extended view is one `ibv_create_qp` made.
+    if ctx
+        .query_device()
+        .expect("failed to query device")
+        .vendor_id
+        == SOFT_ROCE_VENDOR_ID
+    {
+        assert!(
+            unsafe { ffi::ibv_qp_to_qp_ex(qp) }.is_null(),
+            "the queue pair was made by the extended create, not by ibv_create_qp"
+        );
+    }
     unsafe {
         assert_eq!((*qp).pd, pd.as_raw());
         assert_eq!(ffi::ibv_destroy_qp(qp), 0);
@@ -1601,9 +1623,12 @@ fn inline_capacity_is_enforced() {
     let ctx = open_test_device();
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
+    // With four entries, Soft-RoCE grants 64 bytes of inline room (the larger of 16 bytes per entry
+    // and the inline data asked for), so the checks below hold payloads to the request, not the grant.
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder
             .set_max_inline_data(16)
+            .set_max_send_sge(4)
             .set_access(AccessFlags::PERMISSIVE);
     });
     let (_, init) = qp
@@ -1625,9 +1650,11 @@ fn inline_capacity_is_enforced() {
             let mut batch = qp.start_send();
             batch.op().signaled().send(1, payload);
         }));
+        let message = posted.expect_err("an inline payload over the capacity was posted");
         assert!(
-            posted.is_err(),
-            "an inline payload over the capacity was posted"
+            panic_message(&message).contains("inline capacity of 16 bytes"),
+            "{}",
+            panic_message(&message)
         );
     }
 
@@ -1659,18 +1686,31 @@ fn send_sge_capacity_is_enforced() {
         .expect("failed to register MR");
     let one = [mr.slice(..8)];
     let two = [mr.slice(..8), mr.slice(8..)];
-    for (max_send_sge, sges) in [(0, &one[..]), (1, &two[..])] {
+    // The last case asks for 64 bytes of inline data as well, for which Soft-RoCE grants four
+    // entries: the list is still held to the one entry asked for.
+    for (max_send_sge, sges, max_inline_data) in
+        [(0, &one[..], 0), (1, &two[..], 0), (1, &two[..], 64)]
+    {
         let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-            builder.set_max_send_sge(max_send_sge);
+            builder
+                .set_max_send_sge(max_send_sge)
+                .set_max_inline_data(max_inline_data);
         });
         let posted = catch_unwind(AssertUnwindSafe(|| {
             let mut batch = qp.start_send();
             batch.op().signaled().send(1, sges);
         }));
+        let Err(message) = posted else {
+            panic!(
+                "{} entries were posted to a queue pair built for {max_send_sge}",
+                sges.len()
+            );
+        };
         assert!(
-            posted.is_err(),
-            "{} entries were posted to a queue pair built for {max_send_sge}",
-            sges.len()
+            panic_message(&message)
+                .contains(&format!("capacity of {max_send_sge} per send work request")),
+            "{}",
+            panic_message(&message)
         );
     }
 }

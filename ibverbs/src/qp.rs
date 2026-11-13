@@ -3064,6 +3064,28 @@ mod test_recv_link {
         ));
     }
 
+    #[test]
+    fn a_failed_post_takes_ionics_negated_errno_and_names_an_srq_attachment() {
+        let sges = [LocalMemorySlice::default()];
+        let mut recvs = [RecvRequest::new(1, &sges)];
+        let head = RecvRequest::link(&mut recvs);
+        // ionic returns its errnos negated (6173038).
+        match post_recv_error(-nix::libc::EAGAIN, &recvs, head, false) {
+            Error::PostReceive { posted: 0, source } => {
+                assert_eq!(source.raw_os_error(), Some(nix::libc::EAGAIN));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A queue pair on a shared receive queue is named, whatever its provider reports (67d61aa).
+        match post_recv_error(nix::libc::ENOMEM, &recvs, head, true) {
+            Error::PostReceive { posted: 0, source } => {
+                assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+                assert_eq!(source.raw_os_error(), None);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[repr(C)]
     struct SpyQpEx {
         qp_ex: ffi::ibv_qp_ex,
