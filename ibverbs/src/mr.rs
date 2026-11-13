@@ -65,13 +65,15 @@ struct MemoryRegionInner {
 unsafe impl Sync for MemoryRegionInner {}
 unsafe impl Send for MemoryRegionInner {}
 
-impl Drop for MemoryRegionInner {
-    fn drop(&mut self) {
+impl MemoryRegionInner {
+    /// Deregisters the region. `false` means it is still registered: the deregistration failed
+    /// on a thread that was already unwinding (anywhere else a failure panics).
+    fn deregister(&mut self) -> bool {
         destroyed(
             "ibv_dereg_mr",
             unsafe { ffi::ibv_dereg_mr(self.mr) },
             || keep(&self._pd),
-        );
+        )
     }
 }
 
@@ -82,20 +84,25 @@ impl Drop for MemoryRegionInner {
 /// [`register_dmabuf`](crate::ProtectionDomain::register_dmabuf) for memory managed elsewhere.
 ///
 /// Dropping it deregisters the region and then frees the buffer. If deregistration fails, the drop
-/// panics and leaks the buffer instead, since the device may still access it.
+/// panics (or, on a thread that is already unwinding, reports the failure on standard error) and
+/// leaks the buffer instead, since the device may still access it.
 #[must_use = "the memory region is deregistered when dropped"]
 pub struct MemoryRegion<O> {
-    // Both are dropped by hand, buffer last, so that a failed deregistration (which panics) leaks
-    // the buffer instead of freeing memory the device may still access.
+    // Both are dropped by hand, buffer last, so that a failed deregistration leaks the buffer
+    // instead of freeing memory the device may still access.
     inner: ManuallyDrop<MemoryRegionInner>,
     owner: ManuallyDrop<O>,
 }
 
 impl<O> Drop for MemoryRegion<O> {
     fn drop(&mut self) {
+        let deregistered = self.inner.deregister();
+        // SAFETY: neither field is used again.
         unsafe {
             ManuallyDrop::drop(&mut self.inner);
-            ManuallyDrop::drop(&mut self.owner);
+            if deregistered {
+                ManuallyDrop::drop(&mut self.owner);
+            }
         }
     }
 }
@@ -140,8 +147,15 @@ impl<O> MemoryRegion<O> {
     }
 
     /// Deregister the memory region and return the buffer that backed it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the deregistration fails: the buffer is not handed back while the device may
+    /// still access it. (On a thread that is already unwinding, that second panic aborts.)
     pub fn into_inner(self) -> O {
         let mut this = ManuallyDrop::new(self);
+        assert!(this.inner.deregister(), "ibv_dereg_mr failed");
+        // SAFETY: `this` is never dropped, so each field is dropped or moved out once.
         unsafe {
             ManuallyDrop::drop(&mut this.inner);
             ManuallyDrop::take(&mut this.owner)

@@ -411,12 +411,27 @@ pub(crate) fn check(ret: i32, wrap: impl FnOnce(io::Error) -> Error) -> Result<(
 /// the references it holds to them before the panic unwinds through its fields. Released, the last
 /// of them would destroy its object under this one, fail the same way, and panic again during the
 /// unwind, which aborts the process.
+///
+/// For the same reason this does not panic on a thread that is already unwinding: there the
+/// failure is reported on standard error, the object (with its parents) is leaked, and `false`
+/// comes back for the callers that own more than the object (a memory region's buffer). That is
+/// the case when one cause fails several destroys at once (a forked child that destroyed the
+/// objects first, a device that went away under a kernel that refuses destroys afterwards): the
+/// first failed drop panics, and the drops the unwind then runs fail the same way.
+///
+/// Returns whether the object is gone.
 #[track_caller]
-pub(crate) fn destroyed(verb: &str, errno: i32, keep_parents: impl FnOnce()) {
-    if errno != 0 {
-        keep_parents();
-        panic!("{verb} failed: {}", io::Error::from_raw_os_error(errno));
+pub(crate) fn destroyed(verb: &str, errno: i32, keep_parents: impl FnOnce()) -> bool {
+    if errno == 0 {
+        return true;
     }
+    keep_parents();
+    let error = io::Error::from_raw_os_error(errno);
+    if std::thread::panicking() {
+        eprintln!("{verb} failed while unwinding from a panic: {error}; the object is leaked");
+        return false;
+    }
+    panic!("{verb} failed: {error}");
 }
 
 /// Leaks one reference to `parent`, for [`destroyed`]'s `keep_parents`.
@@ -526,6 +541,34 @@ mod tests {
         let parent = Arc::downgrade(&child.parent);
         assert!(catch_unwind(move || drop(child)).is_err());
         assert!(parent.upgrade().is_some(), "the parent was released");
+    }
+
+    /// A destroy that fails while the thread already unwinds (here: from the failed destroy of
+    /// the object dropped just before it) must not panic again, which would abort the process. It
+    /// reports that the object is still there instead.
+    #[test]
+    fn a_failed_destroy_during_an_unwind_does_not_abort() {
+        use std::panic::catch_unwind;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        static STILL_THERE: AtomicU32 = AtomicU32::new(0);
+        struct Failing;
+        impl Drop for Failing {
+            fn drop(&mut self) {
+                // Returns only when it did not panic, so only for the second drop.
+                if !destroyed("ibv_destroy_qp", nix::libc::EIO, || ()) {
+                    STILL_THERE.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let unwound = catch_unwind(|| {
+            let _first = Failing;
+            let _second = Failing;
+        });
+        assert!(unwound.is_err(), "the first failed destroy still panics");
+        assert_eq!(STILL_THERE.load(Ordering::Relaxed), 1);
+        assert!(destroyed("ibv_destroy_qp", 0, || ()));
     }
 
     #[test]

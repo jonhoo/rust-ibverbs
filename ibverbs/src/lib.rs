@@ -156,7 +156,10 @@
 //! reference counts keep, for example, a completion queue alive until the last queue pair built on
 //! it is gone). If the device rejects a teardown — which can only happen when raw handles obtained
 //! through the escape hatches still reference the resource — the drop panics rather than silently
-//! leak the resource. The resource then stays allocated, and so do the ones it was created on.
+//! leak the resource. The resource then stays allocated, and so do the ones it was created on. A
+//! drop that fails while its thread is already unwinding from a panic (such as the panic of
+//! another failed drop) reports the failure on standard error instead, since a second panic there
+//! would abort the process.
 //!
 //! # Forking
 //!
