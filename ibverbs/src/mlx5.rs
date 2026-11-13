@@ -15,7 +15,9 @@ impl ProtectionDomain {
     /// region within `fd`, and `iova` is the address used in work requests. `iova` and
     /// `offset` must have the same page offset. The returned region retains this PD,
     /// but does not own the exporter: keep the exported allocation alive until the MR
-    /// is dropped, and finish all operations using the MR before dropping it.
+    /// is dropped, and finish all operations using the MR before dropping it. As with
+    /// `register_dmabuf`, turn mlx5's scatter to CQE off before receiving small messages into
+    /// the region (see "Receiving small messages on mlx5" there).
     ///
     /// Data Direct requires a supported device and a compatible DMA-BUF exporter (for example,
     /// a PCIe-mapped GPU export), a page-aligned `iova`, and no

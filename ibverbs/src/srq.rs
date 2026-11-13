@@ -190,6 +190,10 @@ impl SharedReceiveQueue {
     /// ahead of the one that failed were posted (the error's `posted` counts them), so the same
     /// holds for theirs.
     ///
+    /// A slice of a DMA-BUF region must also meet what "Receiving small messages on mlx5" asks
+    /// for in [`register_dmabuf`](crate::ProtectionDomain::register_dmabuf): there the provider
+    /// writes a small message to the slice's address with the CPU.
+    ///
     /// # Errors
     ///
     ///  - [`PostReceive`](Error::PostReceive): `ibv_post_srq_recv` failed (`EINVAL` for an invalid

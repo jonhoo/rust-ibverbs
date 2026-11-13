@@ -325,6 +325,19 @@ impl ProtectionDomain {
     /// and covers `len` bytes. `iova` is the virtual base address of the region when accessed
     /// through an `lkey` or `rkey`; it must have the same page offset as `offset`.
     ///
+    /// # Receiving small messages on mlx5
+    ///
+    /// mlx5 hands a message of up to 32 bytes (64 with 128-byte completion entries,
+    /// `MLX5_CQE_SIZE=128`) that arrives on an RC or UC queue pair to its library inside the
+    /// completion entry, and the library copies it to the receive's buffer with the CPU while the
+    /// completion is polled ("scatter to CQE", on by default). It copies to the address the receive
+    /// request carries, which for a slice of this region is `iova`-based: the bytes land in
+    /// whatever this process has mapped at that address, not in the DMA-BUF, and the poll crashes
+    /// if nothing is mapped there. Before posting receives that point into such a region (on a
+    /// queue pair or a shared receive queue), set `MLX5_SCATTER_TO_CQE=0` in the environment
+    /// (libmlx5 reads it whenever a queue pair is created), or choose an `iova` at which this
+    /// process maps the same memory. Sends, and RDMA reads and writes, are not affected.
+    ///
     /// # Errors
     ///
     ///  - [`Unsupported`](Error::Unsupported): the device or kernel does not support DMA-BUF
