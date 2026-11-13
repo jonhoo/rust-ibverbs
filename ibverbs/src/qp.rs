@@ -1519,15 +1519,7 @@ impl<'a> RecvRequest<'a> {
             wr: ffi::ibv_recv_wr {
                 wr_id,
                 next: ptr::null_mut(),
-                // An empty Rust slice's `.as_ptr()` is `NonNull::dangling()` (for example `0x8` for
-                // `LocalMemorySlice`), not `NULL`. C providers such as `irdma` (`irdma_set_fragment`
-                // in `providers/irdma/uk.c`) check `if (sge)` before checking `num_sge == 0` and
-                // dereference `sg_list`, so pass a genuine null pointer when the slice is empty.
-                sg_list: if local.is_empty() {
-                    ptr::null_mut()
-                } else {
-                    local.as_ptr() as *mut ffi::ibv_sge
-                },
+                sg_list: ptr_or_null(local).cast::<ffi::ibv_sge>().cast_mut(),
                 num_sge: local.len() as i32,
             },
             _local: std::marker::PhantomData,
@@ -1892,27 +1884,14 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 Payload::Sges([one]) => {
                     (*qpx).wr_set_sge.unwrap()(qpx, one.lkey(), one.addr(), one.len() as u32)
                 }
-                // An empty Rust slice's `.as_ptr()` is `NonNull::dangling()` rather than `NULL`;
-                // pass a genuine null pointer when the slice is empty so C providers never observe
-                // a dangling address alongside a zero count/length.
-                Payload::Sges(local) => (*qpx).wr_set_sge_list.unwrap()(
-                    qpx,
-                    local.len(),
-                    if local.is_empty() {
-                        ptr::null()
-                    } else {
-                        local.as_ptr() as *const ffi::ibv_sge
-                    },
-                ),
+                Payload::Sges(local) => {
+                    (*qpx).wr_set_sge_list.unwrap()(qpx, local.len(), ptr_or_null(local).cast())
+                }
                 // The bytes are copied during this call, so the payload need not outlive the work
                 // completion.
                 Payload::Inline(data) => (*qpx).wr_set_inline_data.unwrap()(
                     qpx,
-                    if data.is_empty() {
-                        ptr::null_mut()
-                    } else {
-                        data.as_ptr() as *mut c_void
-                    },
+                    ptr_or_null(data).cast_mut().cast(),
                     data.len(),
                 ),
                 // `std::io::IoSlice` is guaranteed ABI-compatible with `struct iovec` on Unix (the
@@ -1922,11 +1901,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
                 Payload::InlineList(bufs) => (*qpx).wr_set_inline_data_list.unwrap()(
                     qpx,
                     bufs.len(),
-                    if bufs.is_empty() {
-                        ptr::null()
-                    } else {
-                        bufs.as_ptr() as *const ffi::ibv_data_buf
-                    },
+                    ptr_or_null(bufs).cast(),
                 ),
             }
         }
@@ -2127,6 +2102,18 @@ fn post_recv_error(
         io::Error::from_raw_os_error(errno.abs())
     };
     Error::PostReceive { posted, source }
+}
+
+/// `s`'s address, or null if `s` is empty: an empty slice's address is dangling (`0x8` for a
+/// `LocalMemorySlice`), and C providers such as irdma follow a non-null list even when its count
+/// is 0 (`irdma_set_fragment` in `providers/irdma/uk.c`), so they get a genuine null instead.
+#[inline(always)]
+fn ptr_or_null<T>(s: &[T]) -> *const T {
+    if s.is_empty() {
+        ptr::null()
+    } else {
+        s.as_ptr()
+    }
 }
 
 /// The panic for an inline payload longer than the queue pair's inline capacity, kept out of line
