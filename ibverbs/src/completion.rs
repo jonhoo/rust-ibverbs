@@ -468,7 +468,7 @@ flags_newtype! {
 /// connected queue pair, that the queue pair has moved to the error state); once one work request
 /// fails, the ones behind it complete as [`WorkRequestFlushed`](Self::WorkRequestFlushed).
 /// `Display` gives the human-readable message.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WcStatus {
     /// The work request completed successfully.
@@ -594,7 +594,7 @@ impl fmt::Display for WcStatus {
 
 /// The failure of a work request, reported by [`WorkCompletion::ok`]: the completion status and
 /// the provider-specific vendor error syndrome.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WcError {
     /// The completion status (anything other than [`WcStatus::Success`]).
     pub status: WcStatus,
@@ -615,7 +615,7 @@ impl fmt::Display for WcError {
 impl std::error::Error for WcError {}
 
 /// The kind of operation a work completion reports on. Returned by [`WorkCompletion::opcode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WcOpcode {
     /// A SEND completed.
@@ -970,7 +970,7 @@ impl WorkCompletion<'_> {
 
 /// The tag-matching information of a receive on a tag-matching queue, read with
 /// [`WorkCompletion::tag_matching`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TagMatchingInfo {
     /// The tag from the tag-matching header.
     pub tag: u64,

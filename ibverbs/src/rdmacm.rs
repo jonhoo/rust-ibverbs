@@ -99,7 +99,7 @@ use crate::{
 /// The port space a connection-manager identifier lives in: which namespace its port numbers are
 /// allocated from, and which transport its connections use. Passed to [`Connector::new`],
 /// [`Acceptor::bind`], and [`CmId::create`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortSpace {
     /// The IP-over-InfiniBand port space: unreliable datagrams (UD) that share IPoIB's multicast
@@ -131,7 +131,7 @@ impl From<PortSpace> for ffi::rdma_port_space {
 
 /// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
 /// the sequence in which the events arrive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CmEventType {
     /// The destination address resolved to an RDMA device.

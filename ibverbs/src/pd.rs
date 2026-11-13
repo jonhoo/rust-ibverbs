@@ -13,7 +13,7 @@ use crate::qp::{QueuePairBuilder, Transport};
 use crate::srq::SharedReceiveQueue;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum MrAdvice {
     /// Prefetch the pages for read access (a best-effort hint; the ranges must allow local read).

@@ -640,7 +640,7 @@ unsafe fn event_qp_num(event: &ffi::ibv_async_event) -> Option<u32> {
 /// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which
 /// object, and queue-pair events also expose [`AsyncEvent::qp_num`]), port-level changes (with
 /// [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum AsyncEventType {
     /// An error occurred on a completion queue (overrun or protection fault); the queue and the
@@ -776,7 +776,7 @@ impl std::fmt::Display for AsyncEventType {
 /// between two readings reverses how they compare.
 ///
 /// [`Sub`]: std::ops::Sub
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct HcaClock(pub(crate) u64);
 
 impl HcaClock {
@@ -800,7 +800,7 @@ impl std::ops::Sub for HcaClock {
 ///
 /// Returned by [`PortAttr::active_mtu`] / [`PortAttr::max_mtu`], and set on a queue pair with
 /// [`QueuePairBuilder::set_path_mtu`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Mtu {
     /// 256 bytes.
@@ -864,7 +864,7 @@ impl fmt::Display for Mtu {
 }
 
 /// The logical state of a port. Returned by [`PortAttr::state`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortState {
     /// Reserved value (no state change).
@@ -915,7 +915,7 @@ impl fmt::Display for PortState {
 /// The signaling rate of a port's active link, decoded from `ibv_port_attr::active_speed` (or
 /// `active_speed_ex`, where the provider reports the speeds the legacy 8-bit field cannot, such
 /// as XDR).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortSpeed {
     /// Single data rate (2.5 Gb/s signaling per lane).
@@ -993,7 +993,7 @@ impl fmt::Display for PortSpeed {
 }
 
 /// The width (number of lanes) of a port's active link, decoded from `ibv_port_attr::active_width`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PortWidth {
     /// A single lane.
@@ -1049,7 +1049,7 @@ impl fmt::Display for PortWidth {
 }
 
 /// The link layer of a port, decoded from `ibv_port_attr::link_layer`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LinkLayer {
     /// The link layer is unspecified.
@@ -1087,7 +1087,7 @@ impl fmt::Display for LinkLayer {
 }
 
 /// The physical state of a port, decoded from `ibv_port_attr::phys_state`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum PhysicalState {
     /// The port is sleeping.

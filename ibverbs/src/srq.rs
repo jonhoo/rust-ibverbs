@@ -27,7 +27,7 @@ impl Drop for SharedReceiveQueueInner {
 }
 
 /// The attributes of a [`SharedReceiveQueue`], read with [`SharedReceiveQueue::query`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct SrqAttributes {
     /// The size of the queue as the kernel reports it, at least what was asked at creation or in

@@ -120,7 +120,7 @@ impl From<[u8; 16]> for Gid {
 
 /// The type of a GID table entry, deciding how packets sent from it are framed and routed.
 /// Carried by [`GidEntry::gid_type`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum GidType {
     /// An InfiniBand GID.

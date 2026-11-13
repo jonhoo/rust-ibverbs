@@ -271,7 +271,7 @@ impl LocalMemorySlice {
 ///
 /// Created by [`MemoryRegion::remote`], and typically serialized to the peer that initiates the
 /// access through [`to_bytes`](Self::to_bytes)/[`from_bytes`](Self::from_bytes).
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub struct RemoteMemorySlice {
     /// Memory address of the registered region (might have been offset by slicing).
     pub addr: u64,

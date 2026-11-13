@@ -137,7 +137,7 @@ impl Datagram for Ud {}
 /// Set through [`QueuePairAttribute::set_state`] + [`QueuePair::modify`] and read back by
 /// [`QueuePair::query`]. [`PreparedQueuePair::handshake`] and friends drive the
 /// `Reset -> Init -> ReadyToReceive -> ReadyToSend` bring-up for you.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum QueuePairState {
     /// The newly created queue pair: posting work requests is an error.
@@ -275,7 +275,7 @@ flags_newtype! {
 /// [`INFINITE`](Self::INFINITE) (never time out). Construct a timeout from a [`Duration`] with
 /// [`at_least`](Self::at_least), which rounds up to the next representable step, or from a raw
 /// encoding with [`from_exponent`](Self::from_exponent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AckTimeout(u8);
 
 impl AckTimeout {
@@ -354,7 +354,7 @@ impl std::fmt::Display for AckTimeout {
 /// increasing order from 0.01 ms to 491.52 ms. Construct a delay from a [`Duration`] with
 /// [`at_least`](Self::at_least), which rounds up to the next representable delay, or from a raw
 /// encoding with [`from_encoding`](Self::from_encoding).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RnrTimer(u8);
 
 impl RnrTimer {
@@ -1125,7 +1125,7 @@ pub(crate) const MAX_24_BITS: u32 = 0xFF_FFFF;
 /// Internally, this contains the `QueuePair`'s `qp_num`, its port's `lid` and `gid`, the
 /// packet sequence number the queue pair's send queue starts at, and how many RDMA reads and
 /// atomics it services at once.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct QueuePairEndpoint {
     /// the `QueuePair`'s `qp_num` (24 bits)
     pub qp_num: u32,
