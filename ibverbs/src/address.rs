@@ -447,17 +447,29 @@ impl Grh {
         Grh { bytes: *bytes }
     }
 
-    /// The header as libibverbs' `ibv_grh`, for passing to the C routines that decode it (they
-    /// apply the same IPv4 detection).
+    /// The header as libibverbs' `ibv_grh`, for passing to the C routines that decode it.
+    ///
+    /// In the IPv4 form the first 20 bytes are not part of the header, and what they hold is
+    /// undefined. libibverbs reads them all the same. It takes the reply's flow label from them,
+    /// and when they start with an IPv6 version nibble it re-checks the IPv4 header's checksum
+    /// with a sum it folds only once (`ipv4_calc_hdr_csum`), which fails a few valid headers in
+    /// 100,000 and makes it read those as IPv6 ones. So it is handed zeroes there: no flow label,
+    /// and an IPv4 header by its version alone.
     pub(crate) fn raw(&self) -> ffi::ibv_grh {
+        let mut bytes = self.bytes;
+        if let GrhForm::Ipv4 = self.form() {
+            bytes[..Self::IPV4_OFFSET].fill(0);
+        }
         // The struct holds GIDs, whose union type wants 8-byte alignment that the byte array does
         // not promise, so copy it out unaligned.
-        unsafe { std::ptr::read_unaligned(self.bytes.as_ptr().cast::<ffi::ibv_grh>()) }
+        unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<ffi::ibv_grh>()) }
     }
 
-    /// Tell the two forms apart the way libibverbs does: an IPv6 version nibble means the IPv6
-    /// form, unless the bytes also parse as a well-formed IPv4 header with a valid checksum, in
-    /// which case the IPv4 form is the one the device wrote.
+    /// Tell the two forms apart as the kernel does (`ib_get_rdma_header_version`): an IPv6
+    /// version nibble means the IPv6 form, unless the bytes also parse as a well-formed IPv4
+    /// header with a valid checksum, in which case the IPv4 form is the one the device wrote.
+    /// Stricter than the kernel and libibverbs in one respect: they take any header of five words
+    /// with a matching checksum for an IPv4 one, whatever its version field says.
     fn form(&self) -> GrhForm {
         let ipv4 = &self.bytes[Self::IPV4_OFFSET..];
         if self.bytes[0] >> 4 != 6 {
@@ -728,6 +740,21 @@ mod test_grh {
     }
 
     #[test]
+    fn the_ipv4_forms_undefined_half_is_kept_from_libibverbs() {
+        // What a device leaves in front of the IPv4 header: here an earlier IPv6 header's start.
+        let mut bytes = ipv4_form().bytes;
+        bytes[..4].copy_from_slice(&0x6abc_def0_u32.to_be_bytes());
+        bytes[4..20].fill(0xa5);
+        let grh = Grh::from_bytes(&bytes);
+        assert_eq!(grh.sgid().to_string(), "::ffff:10.1.0.134");
+        let raw = grh.raw();
+        assert_eq!(raw.version_tclass_flow, 0);
+        let raw: [u8; Grh::LEN] = unsafe { std::mem::transmute(raw) };
+        assert_eq!(raw[..20], [0; 20]);
+        assert_eq!(raw[20..], bytes[20..]);
+    }
+
+    #[test]
     fn ipv6_header_reads_the_grh_fields() {
         let mut bytes = [0u8; Grh::LEN];
         // Version 6, traffic class 0x1c, flow label 0xabcde; payload 100; hop limit 63.
@@ -743,5 +770,7 @@ mod test_grh {
         assert_eq!(grh.traffic_class(), 0x1c);
         assert_eq!(grh.flow_label(), 0xabcde);
         assert_eq!(grh.payload_len(), 100);
+        let raw: [u8; Grh::LEN] = unsafe { std::mem::transmute(grh.raw()) };
+        assert_eq!(raw, bytes);
     }
 }
