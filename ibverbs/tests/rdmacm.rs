@@ -4,7 +4,9 @@
 //! connection manager to set up the connection over the device's own IP address (Soft-RoCE works
 //! for this).
 //! Like the other data-path tests it needs a real RDMA device, so it is `#[ignore]`d; run it with
-//! `cargo test --features rdmacm -- --ignored`. It uses the first device, or `IBVERBS_TEST_DEVICE`.
+//! `cargo test --features rdmacm -- --ignored`. It uses the first device, or `IBVERBS_TEST_DEVICE`,
+//! and that device's IPv4 RoCE address, or the address in `IBVERBS_TEST_ADDR` (for InfiniBand, the
+//! IPoIB interface's; for a RoCE device with IPv6 addresses only, a global one).
 #![cfg(feature = "rdmacm")]
 
 mod common;
@@ -30,6 +32,11 @@ use ibverbs::{
 /// The device's IPv4 address, from its routable GID on port 1 (the IPv4-mapped RoCEv2 entry of the
 /// interface's address). The connection manager needs to route over an IP address.
 fn device_ip(ctx: &Context) -> IpAddr {
+    if let Ok(addr) = std::env::var("IBVERBS_TEST_ADDR") {
+        return addr
+            .parse()
+            .expect("IBVERBS_TEST_ADDR is not an IP address");
+    }
     let gid = ctx
         .routable_gid(1)
         .expect("failed to read GID table")
@@ -38,7 +45,7 @@ fn device_ip(ctx: &Context) -> IpAddr {
     Ipv6Addr::from(gid)
         .to_ipv4_mapped()
         .map(IpAddr::V4)
-        .expect("no IPv4 GID on port 1; the connection manager needs an IP-addressed device")
+        .expect("no IPv4 RoCE GID on port 1; name the device's IP address in IBVERBS_TEST_ADDR")
 }
 
 /// Poll `cq` until a completion with `wr_id` arrives (or time out), checking it succeeded.
@@ -1461,4 +1468,78 @@ fn check_options(conn: &mut Connection, side: &str) {
         0x08,
         "{side} traffic class"
     );
+}
+
+/// The errno of a bind that fails, or `None` if it succeeded.
+fn bind_errno(result: ibverbs::Result<()>) -> Option<i32> {
+    match result {
+        Ok(()) => None,
+        Err(Error::BindAddress(e)) => Some(e.raw_os_error().expect("an errno from the kernel")),
+        Err(other) => panic!("expected a bind error, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn a_taken_wildcard_port_is_address_not_available() {
+    // The bind the docs recommend (an unspecified address) reports a taken port as
+    // EADDRNOTAVAIL: the kernel keeps EADDRINUSE for two binds of one specific address.
+    let any: SocketAddr = "0.0.0.0:0".parse().unwrap();
+    let first = Acceptor::bind(any, PortSpace::Tcp, 1).expect("first acceptor");
+    let taken = first.local_addr().expect("listen address");
+    assert_ne!(taken.port(), 0, "the ephemeral port is read back");
+    match Acceptor::bind(taken, PortSpace::Tcp, 1) {
+        Err(Error::BindAddress(e)) => {
+            assert_eq!(e.raw_os_error(), Some(nix::libc::EADDRNOTAVAIL), "{e}");
+            assert_eq!(e.kind(), io::ErrorKind::AddrNotAvailable);
+        }
+        Err(other) => panic!("expected a bind error, got {other:?}"),
+        Ok(_) => panic!("two acceptors share a wildcard port"),
+    }
+    // The same port in another port space is free.
+    let datagram = CmId::create(PortSpace::Udp).expect("datagram id");
+    assert_eq!(bind_errno(datagram.bind_addr(taken)), None);
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn a_loopback_bind_is_a_wildcard_bind() {
+    // The kernel treats a loopback address as the unspecified one: the id gets no device, and it
+    // holds the port against a wildcard bind the way another wildcard bind would.
+    let loopback = CmId::create(PortSpace::Tcp).expect("id");
+    loopback
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .expect("bind loopback");
+    assert_eq!(loopback.port_num(), None, "a loopback bind picks no device");
+    loopback.listen(1).expect("listen");
+    let port = loopback.local_addr().expect("bound address").port();
+    let any = CmId::create(PortSpace::Tcp).expect("id");
+    assert_eq!(
+        bind_errno(any.bind_addr(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), port))),
+        Some(nix::libc::EADDRNOTAVAIL)
+    );
+}
+
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
+fn reuse_address_shares_a_bind_but_not_a_listener() {
+    let bound = |addr: SocketAddr| {
+        let id = CmId::create(PortSpace::Tcp).expect("id");
+        id.set_reuse_addr(true).expect("set_reuse_addr");
+        id.bind_addr(addr).expect("bind with reuse-address");
+        id
+    };
+    let first = bound("0.0.0.0:0".parse().unwrap());
+    let second = bound(first.local_addr().expect("bound address"));
+    for id in [&first, &second] {
+        match id.listen(1) {
+            Err(Error::ConnectionSetup(e)) => {
+                assert_eq!(e.raw_os_error(), Some(nix::libc::EADDRNOTAVAIL), "{e}");
+            }
+            other => panic!("expected listen refused while the port is shared, got {other:?}"),
+        }
+    }
+    // Alone on the port, the first can listen.
+    drop(second);
+    first.listen(1).expect("listen once the other id is gone");
 }
