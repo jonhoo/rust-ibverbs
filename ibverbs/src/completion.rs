@@ -502,9 +502,10 @@ pub enum WcStatus {
     RnrRetryExceeded,
     /// A local RD domain violation (RD only).
     LocalRddViolation,
-    /// The remote side rejected an RD read request as invalid (RD only).
+    /// The remote side rejected an RD read request as invalid (RD only). EFA reports a
+    /// destination queue pair that does not exist, or is in the error state, this way.
     RemoteInvalidRdRequest,
-    /// The remote side aborted the operation (RD only).
+    /// The remote side aborted the operation (RD only; on EFA, the remote side was reset).
     RemoteAborted,
     /// An invalid EE context number was detected (RD only).
     InvalidEecn,
@@ -512,7 +513,8 @@ pub enum WcStatus {
     InvalidEecState,
     /// A fatal transport error occurred; further use of the device is undefined.
     Fatal,
-    /// The response timer expired before a response arrived.
+    /// The response timer expired before a response arrived (on EFA, the remote address is
+    /// unreachable or stopped responding).
     ResponseTimeout,
     /// An error not covered by the other statuses.
     GeneralError,
@@ -771,6 +773,9 @@ impl WorkCompletion<'_> {
     /// succeeded ([`ok`](Self::ok)); for a failed or flushed work request only
     /// [`wr_id`](Self::wr_id), the status and vendor error ([`WcError`]), and
     /// [`qp_num`](Self::qp_num) are defined.
+    ///
+    /// EFA reports a completed RDMA READ as [`Send`](WcOpcode::Send), with a length of 0: tell
+    /// its reads from its sends by `wr_id`.
     #[inline]
     pub fn opcode(&self) -> WcOpcode {
         unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }.into()
@@ -856,6 +861,10 @@ impl WorkCompletion<'_> {
     }
 
     /// The source LID this message was sent from (relevant for datagram receive completions).
+    ///
+    /// EFA has no LIDs and reports here the number of the address handle the receiving side holds
+    /// for the sender's GID (`AddressHandle::efa_ah_number`, with the `efa` feature), or `0xffff`
+    /// when it holds none.
     #[inline]
     pub fn slid(&self) -> u32 {
         unsafe { (*self.cq).read_slid.unwrap()(self.cq) }
@@ -1028,7 +1037,8 @@ impl Completions<'_> {
     /// `None` also ends the poll if the provider reports an error mid-poll (a rare provider-level
     /// failure, distinct from a completion *status* error, which is reported per work completion
     /// through [`WorkCompletion::ok`]); resources are still released correctly in that case, and
-    /// later calls keep returning `None`.
+    /// later calls keep returning `None`. EFA reports one for each completion of a queue pair
+    /// that no longer exists, so more completions can be waiting behind such a `None`.
     #[allow(clippy::should_implement_trait)]
     #[inline]
     pub fn next(&mut self) -> Option<WorkCompletion<'_>> {
@@ -1116,7 +1126,9 @@ impl CompletionQueue {
     /// # Errors
     ///
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): starting the poll failed
-    ///    (`ibv_start_poll`).
+    ///    (`ibv_start_poll`). On EFA, `EINVAL` means the next completion belonged to a queue pair
+    ///    that has been destroyed since (the device completes a destroyed queue pair's
+    ///    outstanding requests as flushed): the entry is consumed, so poll again.
     ///
     /// # Examples
     ///

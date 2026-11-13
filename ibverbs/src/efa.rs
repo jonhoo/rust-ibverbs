@@ -33,6 +33,30 @@ use crate::{ProtectionDomain, QueuePair, WorkCompletion};
 /// the send completion queue for a completion per work request (see
 /// [`CompletionQueue::capacity`](crate::CompletionQueue::capacity)).
 ///
+/// What SRD does not share with RC:
+///
+///  - Delivery is reliable but not ordered: two messages to the same peer can arrive, and
+///    complete, in either order.
+///  - A SEND carries at most one MTU: the `max_msg_sz` of
+///    [`Context::query_port`](crate::Context::query_port) (its `active_mtu` rounds the same
+///    number down to at most 4096 bytes). Larger transfers need RDMA READ or WRITE, where the
+///    device has them, up to [`EfaDeviceAttr::max_rdma_size`].
+///  - The device serves an RDMA READ or WRITE only if the side that owns the memory holds an
+///    [`AddressHandle`] for the requester's GID; otherwise the request fails with
+///    [`RemoteOperationError`](crate::WcStatus::RemoteOperationError) (vendor error 14).
+///  - A SEND that finds no receive posted on the remote queue pair fails with
+///    [`RnrRetryExceeded`](crate::WcStatus::RnrRetryExceeded).
+///    [`activate`](PreparedQueuePair::activate) asks for no RNR retries; where the device has
+///    them ([`EfaDeviceAttr::has_rnr_retry`]), set a count on the `RTS` attributes of
+///    [`activate_attributes`](PreparedQueuePair::activate_attributes) and apply them with
+///    [`QueuePair::modify`].
+///  - Every receive needs at least one scatter/gather entry, also one that only absorbs an RDMA
+///    WRITE with an immediate: libefa accepts a receive without entries but never hands it to the
+///    device, and its slot in the receive queue stays taken.
+///  - Destroy a queue pair rather than move it to `RESET` and use it again (EFA UD too): libefa
+///    does not rebuild its table of free work-request slots on a reset, so later completions can
+///    report the `wr_id` of another request.
+///
 /// EFA also refuses the solicited flag, so an SRD work request has no
 /// [`solicited`](SendOp::solicited) modifier:
 ///

@@ -357,7 +357,10 @@ mod test {
 /// Attributes describing how to reach a destination, used to build an [`AddressHandle`].
 ///
 /// Describes a non-global (LID-only) route until a global route is set with
-/// [`set_grh`](Self::set_grh), which RoCE and routed InfiniBand require.
+/// [`set_grh`](Self::set_grh), which RoCE and routed InfiniBand require. So does EFA, which
+/// addresses a peer by its GID alone (source GID index 0; the other fields are ignored), and
+/// where nothing refuses an attribute without one: the device is asked for a handle to the GID
+/// `::`.
 #[derive(Clone)]
 pub struct AddressHandleAttribute {
     pub(crate) attr: ffi::ibv_ah_attr,

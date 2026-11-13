@@ -2634,6 +2634,12 @@ impl<T: Transport> QueuePair<T> {
     /// for teardown, setting a custom partition-key index or packet sequence number, and so on.
     /// Only the attributes whose mask bits are set in `attr` are applied.
     ///
+    /// On EFA, do not use a queue pair again after moving it to `RESET`; destroy it and create
+    /// another. libefa neither rebuilds its table of free work-request slots nor removes the
+    /// queue pair's entries from its completion queues on a reset, so completions polled
+    /// afterwards can report the `wr_id` of another request, and one generated before the reset
+    /// corrupts that table.
+    ///
     /// # Errors
     ///
     /// If the device rejects the transition with `EINVAL`, the crate consults its queue-pair state
@@ -2749,7 +2755,9 @@ impl<T: Transport> QueuePair<T> {
     ///
     /// On a UD queue pair the 40-byte GRH of an incoming message is placed at the front of the
     /// scatter buffers, so the payload starts at offset 40. If the queue pair uses a shared receive
-    /// queue, post to the [`SharedReceiveQueue`] instead; its own receive queue is unused.
+    /// queue, post to the [`SharedReceiveQueue`] instead; its own receive queue is unused. On EFA,
+    /// give every receive at least one scatter/gather entry: one without is accepted but lost,
+    /// and keeps its slot in the receive queue.
     ///
     /// Takes `&self`: the provider serializes posts to the receive queue, so several threads may
     /// post at once. To post receives while a send batch is open, [`split`](Self::split) the
