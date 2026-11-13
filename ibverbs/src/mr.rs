@@ -170,7 +170,9 @@ impl<O> MemoryRegion<O> {
     ///
     /// # Panics
     ///
-    /// Panics if `bounds` is empty or falls outside the region.
+    /// Panics if `bounds` is empty or falls outside the region. A message of no bytes is an empty
+    /// list of slices (`&[]`), not an empty slice: where a length comes from a peer, such as the
+    /// [`len`](crate::WorkCompletion::len) of a receive to echo, check it for zero before slicing.
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) =
             calc_addr_len(bounds, self.inner.addr, unsafe { (*self.inner.mr).length });

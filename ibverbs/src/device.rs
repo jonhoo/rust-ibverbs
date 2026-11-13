@@ -56,7 +56,7 @@ impl DeviceList {
         self.len
     }
 
-    /// Returns `true` if there are any devices.
+    /// Returns `true` if there are no devices.
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }

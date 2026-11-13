@@ -1785,7 +1785,7 @@ impl<T: Transport> SendOp<'_, '_, T> {
     ///
     /// Registered memory converts implicitly (`send(id, &[mr.slice(..)])`); inline data is spelled
     /// out (`send(id, Payload::Inline(b"ping"))`). See [`Payload`] for the lifetime and capacity
-    /// requirements of each.
+    /// requirements of each. A message of no bytes is the empty list (`send(id, &[])`).
     ///
     /// # Panics
     ///

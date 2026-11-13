@@ -782,7 +782,9 @@ impl WorkCompletion<'_> {
         unsafe { (*self.cq).read_opcode.unwrap()(self.cq) }.into()
     }
 
-    /// The number of bytes transferred, for a successful completion.
+    /// The number of bytes transferred, for a successful completion. A message can have none:
+    /// slicing a region by a length of 0 panics (see
+    /// [`MemoryRegion::slice`](crate::MemoryRegion::slice)).
     #[inline]
     pub fn len(&self) -> usize {
         unsafe { (*self.cq).read_byte_len.unwrap()(self.cq) as usize }
