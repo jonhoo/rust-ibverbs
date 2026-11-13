@@ -1520,6 +1520,14 @@ fn raw_handles() {
     let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
     assert!(!srq.as_raw().is_null());
 
+    // Clones of a handle are equal and hash alike; another object of the same kind is neither.
+    assert!(ctx == ctx2 && cq == cq.clone() && srq == srq.clone());
+    let other_pd = ctx.alloc_pd().expect("failed to allocate PD");
+    assert!(pd == pd.clone() && pd != other_pd);
+    let distinct: std::collections::HashSet<_> =
+        [pd.clone(), pd.clone(), other_pd].into_iter().collect();
+    assert_eq!(distinct.len(), 2);
+
     // A UD queue pair plus an address handle to our own GID exercise the QP and AH accessors.
     let gid_index = gid_index(&ctx);
     let (qp, endpoint) = activate_self(&pd, &cq, gid_index, 0x1234_5678);

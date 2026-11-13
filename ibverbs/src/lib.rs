@@ -300,6 +300,27 @@ macro_rules! flags_newtype {
     };
 }
 
+/// Implements identity comparison and hashing for a cloneable handle: two handles are equal when
+/// they name the same underlying object (they are clones of one another), so a handle can key a
+/// map or be told apart from another.
+macro_rules! handle_identity {
+    ($($ty:ty),+ $(,)?) => {$(
+        impl PartialEq for $ty {
+            fn eq(&self, other: &Self) -> bool {
+                ::std::ptr::eq(self.as_raw(), other.as_raw())
+            }
+        }
+
+        impl Eq for $ty {}
+
+        impl ::std::hash::Hash for $ty {
+            fn hash<H: ::std::hash::Hasher>(&self, state: &mut H) {
+                self.as_raw().hash(state);
+            }
+        }
+    )+};
+}
+
 mod address;
 mod completion;
 mod context;
@@ -339,6 +360,17 @@ pub mod rdmacm;
 /// not cover — without adding a separate dependency on `ibverbs-sys` and keeping its version in
 /// sync.
 pub use ffi;
+
+handle_identity!(
+    Context,
+    ProtectionDomain,
+    CompletionChannel,
+    CompletionQueue,
+    SharedReceiveQueue,
+);
+// `CmId` implements its identity next to its definition.
+#[cfg(feature = "rdmacm")]
+handle_identity!(rdmacm::EventChannel);
 
 #[cfg(test)]
 mod test_flags_newtype {
