@@ -1056,20 +1056,27 @@ impl<T: Reliable> QueuePairBuilder<T> {
 /// [`handshake`](Self::handshake) on both sides with the other side's endpoint:
 ///
 /// ```text
-/// // on host 1
+/// // on host 1, which connects
 /// let pqp: PreparedQueuePair = ...;
-/// let host1end = pqp.endpoint()?;
-/// host2.send(host1end);
+/// host2.send(pqp.endpoint()?);
 /// let host2end = host2.recv();
 /// let qp = pqp.handshake(host2end)?;
+/// // host 2 is ready by now: send
 ///
-/// // on host 2
+/// // on host 2, which answers
 /// let pqp: PreparedQueuePair = ...;
-/// let host2end = pqp.endpoint()?;
-/// host1.send(host2end);
 /// let host1end = host1.recv();
+/// let host2end = pqp.endpoint()?;
 /// let qp = pqp.handshake(host1end)?;
+/// host1.send(host2end);
+/// // host 1 may still be in its handshake: let it send first
 /// ```
+///
+/// The answering side finishes its `handshake` before it replies, so it is ready for whatever the
+/// connecting side sends once that side's own `handshake` returns. A queue pair drops what
+/// arrives before its `handshake` is done, and the sender retransmits only after its
+/// [ACK timeout](QueuePairBuilder::set_timeout): a message in the other direction, sent while the
+/// connecting side is still in its `handshake`, arrives late by at least that long.
 ///
 /// For a runnable version of this exchange (self-connected, so it fits one process), see
 /// `examples/loopback.rs`; `examples/rdmacm_connect.rs` shows the same bring-up driven by the
