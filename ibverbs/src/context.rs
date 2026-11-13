@@ -682,7 +682,9 @@ impl From<ffi::ibv_event_type> for AsyncEventType {
             E::IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
             E::IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
             E::IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
-            E::IBV_EVENT_DEVICE_SPEED_CHANGE => AsyncEventType::DeviceSpeedChange,
+            // `IBV_EVENT_DEVICE_SPEED_CHANGE`, spelled by value: rdma-core 62 added it, and
+            // installed headers from an older rdma-core lack the name.
+            E(20) => AsyncEventType::DeviceSpeedChange,
             other => AsyncEventType::Unknown(other.0),
         }
     }

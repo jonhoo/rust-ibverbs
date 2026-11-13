@@ -103,7 +103,8 @@
 //! `ibverbs-sys`, so building needs `libclang` but not the installed headers; the development
 //! packages are still needed for the unversioned library links (`libibverbs.so` and the like)
 //! that the linker looks for. To generate bindings from installed `rdma-core` headers instead,
-//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`.
+//! set `RDMA_CORE_INCLUDE_DIR` and `RDMA_CORE_LIB_DIR`; they must come from rdma-core 50 or newer
+//! (54 with the `mlx5` feature).
 //!
 //! The crate drives completion queues and queue pairs exclusively through rdma-core's extended
 //! verbs (`ibv_create_cq_ex`, and `ibv_create_qp_ex` with the `ibv_wr_*` send API), so it needs a

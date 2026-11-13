@@ -195,10 +195,12 @@ impl From<ffi::rdma_cm_event_type> for CmEventType {
             E::RDMA_CM_EVENT_MULTICAST_ERROR => CmEventType::MulticastError,
             E::RDMA_CM_EVENT_ADDR_CHANGE => CmEventType::AddressChange,
             E::RDMA_CM_EVENT_TIMEWAIT_EXIT => CmEventType::TimewaitExit,
-            E::RDMA_CM_EVENT_ADDRINFO_RESOLVED => CmEventType::AddressInfoResolved,
-            E::RDMA_CM_EVENT_ADDRINFO_ERROR => CmEventType::AddressInfoError,
-            E::RDMA_CM_EVENT_USER => CmEventType::User,
-            E::RDMA_CM_EVENT_INTERNAL => CmEventType::Internal,
+            // `RDMA_CM_EVENT_ADDRINFO_RESOLVED`, `_ADDRINFO_ERROR`, `_USER`, and `_INTERNAL`,
+            // spelled by value: installed headers from rdma-core before 60 lack the names.
+            E(16) => CmEventType::AddressInfoResolved,
+            E(17) => CmEventType::AddressInfoError,
+            E(18) => CmEventType::User,
+            E(19) => CmEventType::Internal,
             other => CmEventType::Unknown(other.0),
         }
     }
