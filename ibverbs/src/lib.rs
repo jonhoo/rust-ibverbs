@@ -161,18 +161,21 @@
 //!
 //! Wrappers return their resource to the device when dropped, in dependency order (internal
 //! reference counts keep, for example, a completion queue alive until the last queue pair built on
-//! it is gone). If the device rejects a teardown — which can only happen when raw handles obtained
-//! through the escape hatches still reference the resource — the drop panics rather than silently
-//! leak the resource. The resource then stays allocated, and so do the ones it was created on. A
-//! drop that fails while its thread is already unwinding from a panic (such as the panic of
-//! another failed drop) reports the failure on standard error instead, since a second panic there
-//! would abort the process.
+//! it is gone). If the device rejects a teardown — when raw handles obtained through the escape
+//! hatches still reference the resource, when a forked child already destroyed it (see below), or
+//! when the device's firmware fails the command — the drop panics rather than silently leak the
+//! resource. The resource then stays allocated, and so do the ones it was created on. A drop that
+//! fails while its thread is already unwinding from a panic (such as the panic of another failed
+//! drop) reports the failure on standard error instead, since a second panic there would abort
+//! the process.
 //!
 //! # Forking
 //!
 //! Since Linux 5.13, registered memory stays intact across `fork()` without `ibv_fork_init`. A
-//! forked child shares the parent's device handles, though, and its drops destroy the parent's
-//! resources (the parent's own drops then fail): a child must `exec` or exit without dropping the
+//! forked child shares the parent's device handles, though: its drops destroy the parent's
+//! resources (the parent's own drops then fail), and it inherits the parent's doorbell mappings
+//! but only private copies of the queues, so posting from it can make the device run the parent's
+//! stale or half-built work requests. A child must `exec` or exit without using or dropping the
 //! ibverbs objects it inherited.
 //!
 //! # For the detail-oriented
