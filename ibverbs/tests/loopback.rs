@@ -1195,7 +1195,9 @@ fn dmabuf_registration_names_its_verb() {
         .expect("failed to allocate protection domain");
     let not_dmabuf = std::fs::File::open("/dev/null").expect("failed to open /dev/null");
     match pd.register_dmabuf(not_dmabuf.as_fd(), 0, 4096, 0, AccessFlags::LOCAL_WRITE) {
-        Err(Error::Unsupported { operation, errno }) => {
+        Err(Error::Unsupported {
+            operation, errno, ..
+        }) => {
             assert_eq!(*operation, "ibv_reg_dmabuf_mr");
             assert_eq!(errno, nix::libc::EOPNOTSUPP);
         }
@@ -1310,7 +1312,7 @@ fn post_recv_reports_how_many_were_posted() {
             .collect()
     };
     let expect_room = |result: Result<(), Error>, room: u32| match result {
-        Err(Error::PostReceive { posted, source }) => {
+        Err(Error::PostReceive { posted, source, .. }) => {
             assert_eq!(posted, room, "{source}");
             assert_eq!(source.raw_os_error(), Some(nix::libc::ENOMEM), "{source}");
         }
@@ -1980,7 +1982,7 @@ fn modify_and_query_queue_pair() {
     let mut to_init = QueuePairAttribute::new();
     to_init.set_state(QueuePairState::Init);
     match lb.qp.modify(&to_init) {
-        Err(Error::InvalidQueuePairTransition { current, next }) => {
+        Err(Error::InvalidQueuePairTransition { current, next, .. }) => {
             assert_eq!(current, QueuePairState::ReadyToSend);
             assert_eq!(next, QueuePairState::Init);
         }

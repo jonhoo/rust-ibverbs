@@ -28,6 +28,7 @@ pub enum Error {
     /// work-completion field; `operation` names the verb that was declined, and `errno` who
     /// declined it.
     #[error("{operation} is not supported by the device, provider, or kernel")]
+    #[non_exhaustive]
     Unsupported {
         /// The verb (or the capability it asked for) the device, provider, or kernel declined. A
         /// reference to the name rather than the name itself, so that `Error` stays two words.
@@ -78,6 +79,7 @@ pub enum Error {
 
     /// Querying port attributes failed (`ibv_query_port`).
     #[error("failed to query attributes of port {port_num}")]
+    #[non_exhaustive]
     QueryPort {
         /// The port that was queried.
         port_num: u8,
@@ -88,6 +90,7 @@ pub enum Error {
 
     /// Querying a GID failed (`ibv_query_gid`).
     #[error("failed to query GID index {gid_index} on port {port_num}")]
+    #[non_exhaustive]
     QueryGid {
         /// The port that was queried.
         port_num: u8,
@@ -145,6 +148,7 @@ pub enum Error {
     /// Surfaced by [`QueuePair::modify`] when the device rejects the transition and the crate's
     /// state-table check confirms that `current -> next` is not allowed.
     #[error("invalid queue pair state transition from {current} to {next}")]
+    #[non_exhaustive]
     InvalidQueuePairTransition {
         /// The queue pair's current state.
         current: QueuePairState,
@@ -160,6 +164,7 @@ pub enum Error {
         "invalid attribute mask for queue pair transition from {current} to {next}: \
          disallowed bits {invalid:?}, missing required bits {needed:?}"
     )]
+    #[non_exhaustive]
     InvalidQueuePairAttributeMask {
         /// The queue pair's current state.
         current: QueuePairState,
@@ -198,6 +203,7 @@ pub enum Error {
     /// Posting a batch of receive work requests failed (`ibv_post_recv` / `ibv_post_srq_recv`)
     /// at one of its requests; the ones ahead of it were posted.
     #[error("failed to post a receive work request after posting {posted} of the batch")]
+    #[non_exhaustive]
     PostReceive {
         /// How many requests at the front of the batch were posted before the one that failed:
         /// they are on the queue like any other posted receive, so their buffers are in use.
