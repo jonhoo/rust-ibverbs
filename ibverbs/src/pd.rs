@@ -100,14 +100,23 @@ impl ProtectionDomain {
     /// # Errors
     ///
     ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): `ibv_create_ah` failed (`EINVAL`
-    ///    for an invalid value in `attr`, `ENOMEM` when out of resources).
+    ///    for an invalid value in `attr`, `ENOMEM` when out of resources), or the provider
+    ///    refused `attr` without naming a reason ([`io::ErrorKind::InvalidInput`]; mlx5 for a
+    ///    port number the device does not have).
     ///  - [`Unsupported`](Error::Unsupported): the provider has no address handles (`EOPNOTSUPP`).
     pub fn create_address_handle(&self, attr: &AddressHandleAttribute) -> Result<AddressHandle> {
         let mut ah_attr = attr.attr;
-        let ah = nonnull(
-            unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) },
-            Error::CreateAddressHandle,
-        )?;
+        // libmlx5 returns null for a port number the device does not have without setting
+        // `errno`, which would then name whatever failed last on this thread. Clear it to tell.
+        nix::errno::Errno::clear();
+        let ah = unsafe { ffi::ibv_create_ah(self.inner.pd, &mut ah_attr as *mut _) };
+        if ah.is_null() && nix::errno::Errno::last_raw() == 0 {
+            return Err(Error::CreateAddressHandle(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the provider refused the address handle's attributes",
+            )));
+        }
+        let ah = nonnull(ah, Error::CreateAddressHandle)?;
         Ok(AddressHandle::new(self.clone(), ah))
     }
 
