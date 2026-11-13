@@ -6,6 +6,10 @@
 //! out of band the way [`PreparedQueuePair::handshake`](crate::PreparedQueuePair::handshake)
 //! requires. It picks the device, resolves the route, and negotiates the queue pair parameters.
 //!
+//! This module is for InfiniBand and RoCE. No iWARP provider can create this crate's queue pairs,
+//! and the blocking helpers follow the InfiniBand connection manager's event sequence, which
+//! iWARP's differs from.
+//!
 //! Connection setup is blocking and has two roles, with distinct types so they cannot be mixed up:
 //! the active side uses a [`Connector`], the passive side an [`Acceptor`]. Each owns its event
 //! channel and drives the whole exchange internally, handing back a connected [`Connection`].
@@ -98,14 +102,18 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum PortSpace {
-    /// IP over InfiniBand.
+    /// The IP-over-InfiniBand port space: unreliable datagrams (UD) that share IPoIB's multicast
+    /// groups and Q_Key. Not the port space for connecting over an IPoIB address: that is
+    /// [`Tcp`](Self::Tcp), as on any other interface.
     Ipoib,
     /// TCP port space: reliable connections (RC). The usual choice.
     Tcp,
     /// UDP port space: unreliable datagrams (UD).
     Udp,
-    /// The InfiniBand port space, open to every queue-pair type (`rdma_create_id(3)`); the
-    /// blocking helpers use it for reliable connections, like [`Tcp`](Self::Tcp).
+    /// The InfiniBand port space: reliable connections like [`Tcp`](Self::Tcp), in a range of
+    /// service IDs of its own, so the two do not reach each other's listeners. (The other
+    /// queue-pair types `rdma_create_id(3)` lists for it need `rdma_create_ep`, which this module
+    /// does not use: an id created here is a reliable-connection one.)
     Ib,
 }
 
@@ -730,7 +738,10 @@ impl CmId {
     ///
     /// The context is this crate's own, independent of the id: one per device, shared by every id
     /// on that device while any of them uses it, so its asynchronous events
-    /// ([`Context::poll_async_event`]) are those of all of them. It does not keep this id alive:
+    /// ([`Context::poll_async_event`]) are those of all of them. Any other context on the same
+    /// device serves as well: a server can build every connection's queue pair on a protection
+    /// domain it created at startup, with its registered memory, and never call this. It does not
+    /// keep this id alive:
     /// dropping the id's last handle declines its request or disconnects its connection right
     /// away, however long the queue pair and its resources live on.
     ///
@@ -821,12 +832,21 @@ impl CmId {
     /// Binds to a local `addr` (passive side). Bind to an unspecified address such as
     /// `0.0.0.0:port` to accept connections on any device. Follow with [`listen`](Self::listen).
     ///
+    /// A loopback address is not local-only here, as it is with TCP: the kernel treats it like the
+    /// unspecified address, so the id listens on every device and takes requests for any of the
+    /// host's addresses, from any peer.
+    ///
     /// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) is bound as the IPv4 address it stands for.
     ///
     /// # Errors
     ///
-    ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed (`ENODEV` when no RDMA
-    ///    device answers to `addr`, `EADDRINUSE` when its port is taken).
+    ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed: `ENODEV` when no RDMA
+    ///    device answers to `addr`; `EADDRNOTAVAIL` when the address is not this host's, or when
+    ///    its port is taken and either holder is bound to an unspecified address (a second
+    ///    `0.0.0.0:port` listener gets this, not `EADDRINUSE`); `EADDRINUSE` when the same
+    ///    specific address and port is taken; `EACCES` for a port below 1024 without
+    ///    `CAP_NET_BIND_SERVICE`; `EINVAL` for an id that is already bound, or a link-local
+    ///    address without a scope id.
     pub fn bind_addr(&self, addr: SocketAddr) -> Result<()> {
         let addr = SockaddrStorage::from(canonical(addr));
         let ret =
@@ -856,8 +876,16 @@ impl CmId {
     /// [`context`](Self::context) is available and [`resolve_route`](Self::resolve_route) is the
     /// next step.
     ///
+    /// The connection comes from whichever local address routes to `dst`; to choose it (or the
+    /// source port), [`bind_addr`](Self::bind_addr) the id first. A `timeout` of zero asks only
+    /// for an answer the kernel has at hand (a local address, a cached neighbor).
+    ///
     /// An IPv4-mapped IPv6 destination (`::ffff:a.b.c.d`) is resolved as the IPv4 address it stands
     /// for.
+    ///
+    /// A link-local IPv6 destination needs its scope id (the index of the interface to reach it
+    /// through). Without one the kernel resolves it over whichever interface its routing table
+    /// lists first, and typically reports the failure only when `timeout` runs out.
     ///
     /// # Errors
     ///
@@ -882,7 +910,11 @@ impl CmId {
     /// success a [`CmEventType::RouteResolved`] event is delivered, after which the queue pair can
     /// be built and [`connect`](Self::connect) called.
     ///
-    /// A zero `timeout` is raised to a millisecond: the kernel refuses zero here.
+    /// `timeout` bounds the subnet administrator's path query on InfiniBand; RoCE has no query to
+    /// wait for. A zero `timeout` is raised to a millisecond: the kernel refuses zero here. On a
+    /// host that runs the `ibacm` address-resolution daemon, librdmacm first asks it for the path
+    /// and waits for its answer, however long that takes: there this call can block, on RoCE
+    /// devices too.
     ///
     /// # Errors
     ///
@@ -997,7 +1029,12 @@ impl CmId {
     }
 
     /// Disconnects an established connection, delivering [`CmEventType::Disconnected`] to both
-    /// sides.
+    /// sides: to the peer when the request arrives, and to this id when the peer has answered
+    /// (or, with status `-ETIMEDOUT`, when the kernel has given up retrying).
+    ///
+    /// The kernel retransmits the request only while the id lives. Dropping the id's last handle
+    /// before its own `Disconnected` has arrived leaves the peer with the one transmission: if
+    /// that is lost, the peer keeps believing the connection is up until its next send fails.
     ///
     /// The queue pair is not touched: it is not attached to the id, so `rdma_disconnect` does not
     /// move it to the error state the way it would a connection-manager-created one. Do that
@@ -1047,6 +1084,11 @@ impl CmId {
     /// accepts take their traffic class and service level from the peer's request, so set it on
     /// the connecting side.
     ///
+    /// The description above is RoCE's. On InfiniBand the value instead selects the QoS class of
+    /// the path the subnet administrator is asked for, and only for IPv4 addresses: with IPv6
+    /// ones it is ignored, and the traffic class comes from the flow information of the address
+    /// the id is bound to.
+    ///
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): `rdma_set_option` failed.
@@ -1056,7 +1098,9 @@ impl CmId {
     }
 
     /// Allow the local address to be shared, like `SO_REUSEADDR`: another id with the same
-    /// setting may bind the same address and port. Set it before binding.
+    /// setting may bind the same address and port. Only one of them can listen there, though:
+    /// [`listen`](Self::listen) fails (`EADDRNOTAVAIL`, or `EADDRINUSE` between two binds of one
+    /// specific address) while another id is bound to the port. Set it before binding.
     ///
     /// # Errors
     ///
@@ -1119,8 +1163,11 @@ impl CmId {
         check(ret, Error::ConnectionSetup)
     }
 
-    /// The IP address and port of the remote end of this id, or `None` while the destination has
-    /// not been resolved yet (or its address family is neither IPv4 nor IPv6).
+    /// The IP address and port of the remote end of this id: the destination from the moment
+    /// [`resolve_addr`](Self::resolve_addr) is called (whether or not it then resolves), or a
+    /// request's sender. `None` before that, or if the address family is neither IPv4 nor IPv6.
+    /// A link-local IPv6 peer of a request comes without its scope id, which the request does not
+    /// carry.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         // SAFETY: the id is valid, and its address storage is sockaddr_storage-sized.
         unsafe { socket_addr_of(ffi::rdma_get_peer_addr(self.inner.id)) }
@@ -1219,7 +1266,8 @@ impl CmId {
         if unsafe { (*(*qp.as_raw()).context).device } != device {
             return Err(Error::ModifyQueuePair(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the queue pair must come from the connection's device (the one `context` returns)",
+                "the queue pair must come from the connection's device (`context` returns a \
+                 context on it)",
             )));
         }
         self.transition(&mut qp, QueuePairState::Init)?;
@@ -1682,7 +1730,8 @@ impl Connector {
     }
 
     /// The underlying id, for options that must be set before resolving ([`CmId::set_tos`],
-    /// [`CmId::set_ack_timeout`]).
+    /// [`CmId::set_ack_timeout`]), and to choose the local address or port the connection comes
+    /// from ([`CmId::bind_addr`]) on a host with several.
     pub fn cm_id(&self) -> &CmId {
         &self.id
     }
@@ -1820,7 +1869,8 @@ impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
     /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
     /// listening, queueing up to `backlog` requests not yet taken by [`accept`](Self::accept) (0
-    /// means the kernel's limit, see [`CmId::listen`]).
+    /// means the kernel's limit, see [`CmId::listen`]). A loopback address listens on every
+    /// device too, for peers anywhere (see [`CmId::bind_addr`]).
     ///
     /// # Errors
     ///
@@ -1828,7 +1878,8 @@ impl Acceptor {
     ///    `port_space` is a datagram port space ([`Udp`](PortSpace::Udp) /
     ///    [`Ipoib`](PortSpace::Ipoib)): the blocking helpers set up reliable connections only.
     ///  - [`BindAddress`](Error::BindAddress): `rdma_bind_addr` failed, for example because no
-    ///    RDMA device answers to `addr`.
+    ///    RDMA device answers to `addr` (`ENODEV`) or another listener holds the port
+    ///    (`EADDRNOTAVAIL` for a bind to an unspecified address; see [`CmId::bind_addr`]).
     pub fn bind(addr: SocketAddr, port_space: PortSpace, backlog: u32) -> Result<Self> {
         Self::bind_with(addr, port_space, backlog, |_| Ok(()))
     }
@@ -2024,6 +2075,11 @@ impl Incoming {
 /// Dropping it disconnects (the peer sees [`CmEventType::Disconnected`]) and destroys the queue
 /// pair; [`disconnect`](Self::disconnect) does the same while keeping the queue pair around to
 /// reap the flushed completions.
+///
+/// The disconnect request goes out once when the connection is dropped: the kernel retransmits
+/// it only while the id lives. To be sure the peer hears of it, call
+/// [`disconnect`](Self::disconnect) and keep the connection until this side's own
+/// [`Disconnected`](CmEventType::Disconnected) event arrives on [`cm_id`](Self::cm_id).
 #[must_use = "dropping a connection disconnects it"]
 pub struct Connection {
     id: CmId,
@@ -2041,7 +2097,11 @@ impl Connection {
 
     /// The connection's id, to watch what happens to it after establishment — the peer
     /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
-    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. Its
+    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. A connection can
+    /// also end with [`Unreachable`](CmEventType::Unreachable) (on RoCE, when the peer's link
+    /// address changes under an id that connected) or [`Rejected`](CmEventType::Rejected) (the
+    /// peer answering a connection it no longer knows), so treat those as the end too, not
+    /// `Disconnected` alone. Its
     /// [`peer_addr`](CmId::peer_addr) and [`local_addr`](CmId::local_addr) are the connection's two
     /// ends.
     pub fn cm_id(&self) -> &CmId {
