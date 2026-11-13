@@ -882,13 +882,17 @@ impl CmId {
     /// success a [`CmEventType::RouteResolved`] event is delivered, after which the queue pair can
     /// be built and [`connect`](Self::connect) called.
     ///
+    /// A zero `timeout` is raised to a millisecond: the kernel refuses zero here.
+    ///
     /// # Errors
     ///
     ///  - [`ResolveRoute`](Error::ResolveRoute): `rdma_resolve_route` failed, or the address has
     ///    not resolved yet (the [`CmEventType::AddressResolved`] event has not been read).
     pub fn resolve_route(&self, timeout: Duration) -> Result<()> {
         self.device_or(Error::ResolveRoute)?;
-        let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout)) };
+        // The kernel refuses a timeout of 0 (`EINVAL`), unlike `rdma_resolve_addr`, for which 0
+        // means "only if the answer is at hand": ask for the shortest wait it takes instead.
+        let ret = unsafe { ffi::rdma_resolve_route(self.inner.id, timeout_ms(timeout).max(1)) };
         check(ret, Error::ResolveRoute)
     }
 
