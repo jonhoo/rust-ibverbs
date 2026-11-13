@@ -577,6 +577,8 @@ mod tests {
         assert!(destroyed("ibv_destroy_qp", 0, || ()));
     }
 
+    // On 32-bit targets an `io::Error` alone takes two words, and `Error` is 16 bytes there too.
+    #[cfg(target_pointer_width = "64")]
     #[test]
     fn error_fits_in_two_words() {
         // Returned in registers rather than through memory, on every data-path call.
