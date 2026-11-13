@@ -145,6 +145,11 @@
 //!   sequence number without one (on mlx5, EFA, and hns): arm, poll, and consume the
 //!   notifications of a given queue from one thread at a time, or an arm can be lost and its
 //!   notification never arrive.
+//! - Polling a completion queue ([`CompletionQueue::poll`]) on ionic: its extended poll takes the
+//!   queue's lock only while it copies a completion into a buffer it keeps per queue, not from the
+//!   poll's start to its end as mlx5, rxe, EFA, and hns do, so a second thread's poll of the same
+//!   queue overwrites the completion a live [`Completions`] is reading (its `wr_id`, status, and
+//!   fields become the other thread's). On ionic, poll a given queue from one thread at a time.
 //! - Setting `MLX5_SINGLE_THREADED=1` in the environment tells mlx5 the process is single threaded
 //!   and turns its locks into best-effort checks, which voids the `Sync` of completion queues,
 //!   queue pairs, and shared receive queues: do not set it in a program that uses them from

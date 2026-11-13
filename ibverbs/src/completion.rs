@@ -991,8 +991,10 @@ pub struct TagMatchingInfo {
 ///
 /// The provider holds the queue's poll lock from the poll's start until [`next`](Self::next) has
 /// returned `None` or the `Completions` is dropped, whichever comes first (`ibv_end_poll`); a poll
-/// of an empty queue holds nothing. The lock is not reentrant, and other calls take it too (on
-/// mlx5, for one), so while a `Completions` of a queue is alive and not yet drained, the same
+/// of an empty queue holds nothing. (ionic is the exception: it holds the lock only inside each
+/// step, so on ionic only one thread may poll a queue at a time; see
+/// [Thread safety](crate#thread-safety).) The lock is not reentrant, and other calls take it too
+/// (on mlx5, for one), so while a `Completions` of a queue is alive and not yet drained, the same
 /// thread must not:
 ///
 /// - poll that queue again ([`poll`](CompletionQueue::poll) or
