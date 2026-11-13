@@ -2893,7 +2893,9 @@ impl<T: Transport> QueuePair<T> {
     /// queues separately, so neither side waits for the other. ionic is the exception: an open
     /// send batch also holds its send completion queue's lock, so when one completion queue serves
     /// both queues, receives posted meanwhile wait for the batch to end, and the thread holding the
-    /// batch must not post receives itself (see [`SendBatch`]).
+    /// batch must not post receives itself (see [`SendBatch`]). So is hns once the queue pair is in
+    /// the error state (after a failed completion, for one): every receive post then moves it to
+    /// `ERR` again, which takes the send queue's lock too, with the same two consequences.
     ///
     /// Both borrow the queue pair, which is usable again once they are dropped.
     ///

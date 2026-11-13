@@ -1016,8 +1016,11 @@ pub struct TagMatchingInfo {
 /// completions, taking the pair's send and receive queue locks under the poll lock; so do not poll
 /// on a thread that has a [`SendBatch`](crate::SendBatch) open on a queue pair this queue serves.
 /// EFA takes a queue pair's send queue lock under the poll lock to retire each of its send
-/// completions, failed or not, so the same rule applies there to every completion. ionic holds
-/// the send completion queue's poll lock for as long as a send batch is open (see
+/// completions, failed or not, so the same rule applies there to every completion. Across
+/// threads, hns's order is the reverse of a post's to a nearly full queue (queue lock, then the
+/// poll lock to re-check how full it is), so on hns such a poll and post can deadlock each other:
+/// keep the pair's work queues from filling, or post to and poll it from one thread.
+/// ionic holds the send completion queue's poll lock for as long as a send batch is open (see
 /// [`SendBatch`](crate::SendBatch)).
 #[must_use]
 pub struct Completions<'cq> {
