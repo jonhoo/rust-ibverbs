@@ -1613,7 +1613,10 @@ impl<'a> RecvRequest<'a> {
 /// batch is open, the thread holding it must not poll or arm its send completion queue or post
 /// receives through it, and other threads doing so wait until the batch ends. On hns, polling a
 /// failed completion takes the send queue's lock, so do not poll this queue pair's completion
-/// queues while holding an open batch either (see [`Completions`](crate::Completions)).
+/// queues while holding an open batch either (see [`Completions`](crate::Completions)). On EFA,
+/// polling any of this queue pair's send completions takes the send queue's lock to retire it,
+/// so on EFA the thread holding the batch must not poll the send completion queue at all, and
+/// other threads' polls that reach such a completion wait until the batch ends.
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
