@@ -1736,9 +1736,9 @@ fn completion_timestamps() {
     let _delta: u64 = latest - earliest;
 }
 
-/// The extended work-completion accessors: the always-available GRH flag, the SL / source-LID /
-/// DLID-path-bits fields requested through the completion-queue builder (standard fields every
-/// provider of extended completion queues accepts), and the optional packet-classification fields.
+/// The extended work-completion accessors: the always-available GRH flag, service level, and
+/// source LID, the DLID path bits requested through the completion-queue builder, and the optional
+/// packet-classification fields.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn extended_wc_fields() {
@@ -1746,9 +1746,9 @@ fn extended_wc_fields() {
 
     let cq = ctx
         .create_cq(16)
-        .set_wc_flags(WcFields::SLID | WcFields::SL | WcFields::DLID_PATH_BITS)
+        .set_wc_flags(WcFields::DLID_PATH_BITS)
         .build()
-        .expect("failed to create a CQ with the addressing fields");
+        .expect("failed to create a CQ with the path bits");
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {

@@ -276,9 +276,9 @@ impl CompletionQueueBuilder {
 
     /// Request additional work-completion fields beyond the standard set.
     ///
-    /// The standard fields (byte length, immediate data, QP number, and source QP) are always
-    /// available, so their [`WorkCompletion`] accessors work on every queue without a flag; the
-    /// fields given here are requested *in addition*. For example, pass
+    /// The standard fields (byte length, immediate data, QP number, source QP, source LID, and
+    /// service level) are always available, so their [`WorkCompletion`] accessors work on every
+    /// queue without a flag; the fields given here are requested *in addition*. For example, pass
     /// [`WcFields::COMPLETION_TIMESTAMP`] to make [`WorkCompletion::completion_timestamp`]
     /// available.
     ///
@@ -344,10 +344,16 @@ impl CompletionQueueBuilder {
 
         // Always request the standard work-completion fields so the lazy readers in `WorkCompletion`
         // can serve them, then add any caller-requested extras (such as the completion timestamp).
+        // These are C's `IBV_WC_STANDARD_FLAGS` without the DLID path bits, which irdma refuses:
+        // every provider with extended completion queues takes the rest, and none sizes its
+        // entries by them. The source LID and service level are among them because the route back
+        // to a datagram's sender needs them on InfiniBand (`from_completion`).
         let wc_flags = ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_BYTE_LEN.0
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_IMM.0
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_QP_NUM.0
             | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SRC_QP.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SLID.0
+            | ffi::ibv_create_cq_wc_flags::IBV_WC_EX_WITH_SL.0
             | self.wc_flags;
         let mut cq_attr = ffi::ibv_cq_init_attr_ex {
             cqe: self.min_cq_entries,
@@ -407,16 +413,12 @@ flags_newtype! {
     /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
     ///
     /// The byte length ([`WorkCompletion::len`]), immediate data ([`WorkCompletion::imm_data`]),
-    /// QP number ([`WorkCompletion::qp_num`]), and source QP ([`WorkCompletion::src_qp`]) are
-    /// always available and need no flag; these flags add fields on top, at the cost of a larger
-    /// completion entry. Fields with an accessor on [`WorkCompletion`] panic when read if they
-    /// were not requested.
+    /// QP number ([`WorkCompletion::qp_num`]), source QP ([`WorkCompletion::src_qp`]), source LID
+    /// ([`WorkCompletion::slid`]), and service level ([`WorkCompletion::sl`]) are always available
+    /// and need no flag; these flags add fields on top, at the cost of a larger completion entry.
+    /// Fields with an accessor on [`WorkCompletion`] panic when read if they were not requested.
     pub struct WcFields(ffi::ibv_create_cq_wc_flags) {
-        /// The source LID ([`WorkCompletion::slid`]).
-        SLID = IBV_WC_EX_WITH_SLID;
-        /// The service level ([`WorkCompletion::sl`]).
-        SL = IBV_WC_EX_WITH_SL;
-        /// The destination LID path bits ([`WorkCompletion::dlid_path_bits`]).
+        /// The destination LID path bits ([`WorkCompletion::dlid_path_bits`]). irdma has none.
         DLID_PATH_BITS = IBV_WC_EX_WITH_DLID_PATH_BITS;
         /// The hardware completion timestamp ([`WorkCompletion::completion_timestamp`]).
         COMPLETION_TIMESTAMP = IBV_WC_EX_WITH_COMPLETION_TIMESTAMP;
@@ -848,25 +850,15 @@ impl WorkCompletion<'_> {
     }
 
     /// The source LID this message was sent from (relevant for datagram receive completions).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the completion queue did not request [`WcFields::SLID`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn slid(&self) -> u32 {
-        wc_reader!(self.cq, read_slid, "the source LID")
+        unsafe { (*self.cq).read_slid.unwrap()(self.cq) }
     }
 
     /// The service level this message was sent with (relevant for datagram receive completions).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the completion queue did not request [`WcFields::SL`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
     #[inline]
     pub fn sl(&self) -> u8 {
-        wc_reader!(self.cq, read_sl, "the service level")
+        unsafe { (*self.cq).read_sl.unwrap()(self.cq) }
     }
 
     /// The destination LID path bits (relevant for datagram receive completions).
@@ -944,23 +936,18 @@ impl WorkCompletion<'_> {
     }
 
     /// The addressing fields of this completion as a classic `ibv_wc`, for deriving the route
-    /// back to a datagram's sender: the flags, the source and local queue pair numbers, and — when
-    /// the queue requested them — the source LID, service level, and path bits (zero otherwise).
+    /// back to a datagram's sender: the flags, the source and local queue pair numbers, the source
+    /// LID, the service level, and — when the queue requested them — the path bits (zero
+    /// otherwise).
     pub(crate) fn addressing(&self) -> ffi::ibv_wc {
         let mut wc = ffi::ibv_wc::default();
         wc.wc_flags = self.wc_flags().into();
         wc.src_qp = self.src_qp();
         wc.qp_num = self.qp_num();
-        unsafe {
-            if let Some(read_slid) = (*self.cq).read_slid {
-                wc.slid = read_slid(self.cq) as u16;
-            }
-            if let Some(read_sl) = (*self.cq).read_sl {
-                wc.sl = read_sl(self.cq);
-            }
-            if let Some(read_dlid_path_bits) = (*self.cq).read_dlid_path_bits {
-                wc.dlid_path_bits = read_dlid_path_bits(self.cq);
-            }
+        wc.slid = self.slid() as u16;
+        wc.sl = self.sl();
+        if let Some(read_dlid_path_bits) = unsafe { (*self.cq).read_dlid_path_bits } {
+            wc.dlid_path_bits = unsafe { read_dlid_path_bits(self.cq) };
         }
         wc
     }

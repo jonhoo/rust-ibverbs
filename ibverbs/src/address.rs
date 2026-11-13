@@ -667,14 +667,12 @@ impl AddressHandleAttribute {
     /// As [`from_wc`](Self::from_wc), for a completion read through the extended interface
     /// ([`CompletionQueue::poll`]).
     ///
-    /// On RoCE the route comes from the header alone. On InfiniBand it also needs the source LID,
-    /// service level, and path bits, which the completion only carries if its queue requested
-    /// [`WcFields::SLID`], [`WcFields::SL`], and [`WcFields::DLID_PATH_BITS`]; fields the queue
-    /// did not request are taken as zero.
+    /// On RoCE the route comes from the header alone. On InfiniBand it also needs the source LID
+    /// and service level, which every completion carries, and the path bits, which it only
+    /// carries if its queue requested [`WcFields::DLID_PATH_BITS`]; they are taken as zero
+    /// otherwise, which is what they are unless the subnet assigns a port several LIDs (LMC).
     ///
     /// [`CompletionQueue::poll`]: crate::CompletionQueue::poll
-    /// [`WcFields::SLID`]: crate::WcFields::SLID
-    /// [`WcFields::SL`]: crate::WcFields::SL
     /// [`WcFields::DLID_PATH_BITS`]: crate::WcFields::DLID_PATH_BITS
     pub fn from_completion(
         context: &Context,
