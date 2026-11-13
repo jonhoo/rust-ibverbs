@@ -333,24 +333,39 @@ impl RemoteMemorySlice {
     }
 }
 
+/// The address and length of the `bounds` sub-range of the `bytes_len` bytes at `addr`.
+///
+/// The checks share one out-of-line panic: with a panic site per check, the `slice` methods grow
+/// too large to inline, and cutting a slice per request then costs a call and a return through
+/// memory.
 fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -> (u64, usize) {
-    let outside = "the slice bounds fall outside the region";
+    use std::ops::Bound;
     let start = match bounds.start_bound() {
-        std::ops::Bound::Included(i) => *i,
-        std::ops::Bound::Excluded(i) => i.checked_add(1).expect(outside),
-        std::ops::Bound::Unbounded => 0,
+        Bound::Included(&i) => Some(i),
+        Bound::Excluded(&i) => i.checked_add(1),
+        Bound::Unbounded => Some(0),
     };
     let end = match bounds.end_bound() {
-        std::ops::Bound::Included(i) => i.checked_add(1).expect(outside),
-        std::ops::Bound::Excluded(i) => *i,
-        std::ops::Bound::Unbounded => bytes_len,
+        Bound::Included(&i) => i.checked_add(1),
+        Bound::Excluded(&i) => Some(i),
+        Bound::Unbounded => Some(bytes_len),
     };
-    assert!(start < end);
-    assert!(start <= bytes_len);
-    assert!(end <= bytes_len);
-    let addr = addr.checked_add(start as u64).expect(outside);
-    let len = end - start;
-    (addr, len)
+    match (start, end) {
+        (Some(start), Some(end)) if start < end && end <= bytes_len => {
+            match addr.checked_add(start as u64) {
+                Some(addr) => (addr, end - start),
+                None => slice_outside(),
+            }
+        }
+        _ => slice_outside(),
+    }
+}
+
+/// The panic for slice bounds that are empty or fall outside the region (or the address space).
+#[cold]
+#[inline(never)]
+fn slice_outside() -> ! {
+    panic!("the slice bounds are empty or fall outside the region")
 }
 
 #[cfg(test)]
@@ -383,6 +398,36 @@ mod test {
             RemoteMemorySlice::from_bytes(&bytes),
             Err(Error::MalformedWireFormat)
         ));
+    }
+
+    #[test]
+    fn slices_refuse_empty_outside_and_wrapping_bounds() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let remote = RemoteMemorySlice {
+            addr: 0x1000,
+            len: 64,
+            rkey: 1,
+        };
+        assert_eq!(
+            (remote.slice(8..=15).addr, remote.slice(8..=15).len),
+            (0x1008, 8)
+        );
+        assert_eq!((remote.slice(..).addr, remote.slice(..).len), (0x1000, 64));
+        // A region that itself wraps (its fields are public) fails where its address would.
+        let wrapping = RemoteMemorySlice {
+            addr: u64::MAX,
+            len: 2,
+            rkey: 1,
+        };
+        for (remote, bounds) in [
+            (remote, (Included(8), Excluded(8))),
+            (remote, (Included(0), Excluded(65))),
+            (remote, (Excluded(usize::MAX), Unbounded)),
+            (remote, (Unbounded, Included(usize::MAX))),
+            (wrapping, (Included(1), Unbounded)),
+        ] {
+            assert!(std::panic::catch_unwind(|| remote.slice(bounds)).is_err());
+        }
     }
 
     #[test]
