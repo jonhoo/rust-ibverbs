@@ -1690,7 +1690,11 @@ impl<'qp, T: Transport> SendBatch<'qp, T> {
     /// Every memory region the batch references must stay valid until the device is done with it:
     /// until a work completion has been polled for its request, or for a later signaled request on
     /// the same send queue (an unsignaled request produces no completion of its own), or until the
-    /// queue pair has been reset or destroyed.
+    /// queue pair has been reset or destroyed. EFA is the exception to the middle rule: its send
+    /// queues complete requests out of order (SRD delivers over several paths), so there a
+    /// request's memory is free only once its own completion has been polled (every request is
+    /// signaled there anyway: SRD queue pairs signal them all, and EFA refuses unsignaled UD
+    /// sends; see [`SendOp::signaled`]).
     ///
     /// That holds even when this returns `Err`, and for requests of a batch that was dropped:
     ///
