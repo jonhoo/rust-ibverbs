@@ -97,8 +97,10 @@ impl QueuePairBuilder<Srd> {
     /// The queue pair is created with the builder's send operations
     /// ([`send_ops`](QueuePairBuilder::send_ops)): by default SEND, with and without an
     /// immediate, plus RDMA READ and RDMA WRITE (with and without an immediate) where the device
-    /// has them ([`Context::efa_device_attr`]). EFA installs only the operations requested, and
-    /// refuses a request for one the device lacks. Activate the result with
+    /// has them ([`Context::efa_device_attr`]). EFA refuses a request for an operation the device
+    /// lacks, and installs only the operations requested: posting another one panics (a
+    /// [`send`](SendOp::send) with an [`imm`](SendOp::imm), for one, on a queue pair created with
+    /// `SendOps::SEND` alone). Activate the result with
     /// [`activate`](PreparedQueuePair::activate).
     ///
     /// # Errors

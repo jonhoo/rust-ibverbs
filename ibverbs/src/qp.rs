@@ -733,7 +733,8 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// rather than referencing a registered memory region, which lowers latency for small messages.
     /// A send queue must reserve this capacity up front. The device may grant more than requested
     /// (reported by [`QueuePair::query`], see [`QueuePairInitAttribute::max_inline_data`]), but
-    /// posting more inline bytes than requested here panics.
+    /// posting more inline bytes than requested here panics. hns instead grants at most its
+    /// device's limit without failing, and the send path then holds payloads to that.
     ///
     /// Defaults to 0 (inline sends disabled).
     pub fn set_max_inline_data(&mut self, max_inline_data: u32) -> &mut Self {
@@ -1612,11 +1613,12 @@ impl<'a> RecvRequest<'a> {
 /// a receive to a queue pair whose receive completion queue is the same one. So on ionic, while a
 /// batch is open, the thread holding it must not poll or arm its send completion queue or post
 /// receives through it, and other threads doing so wait until the batch ends. On hns, polling a
-/// failed completion takes the send queue's lock, so do not poll this queue pair's completion
-/// queues while holding an open batch either (see [`Completions`](crate::Completions)). On EFA,
-/// polling any of this queue pair's send completions takes the send queue's lock to retire it,
-/// so on EFA the thread holding the batch must not poll the send completion queue at all, and
-/// other threads' polls that reach such a completion wait until the batch ends.
+/// failed completion takes the send queue's lock, and so does posting a receive once the queue
+/// pair is in the error state: do not poll this queue pair's completion queues or post receives
+/// to it while holding an open batch either (see [`Completions`](crate::Completions)).
+/// On EFA, polling any of this queue pair's send completions takes the send queue's lock to
+/// retire it, so on EFA the thread holding the batch must not poll the send completion queue at
+/// all, and other threads' polls that reach such a completion wait until the batch ends.
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,
@@ -2732,8 +2734,8 @@ impl<T: Transport> QueuePair<T> {
     /// configured capacities.
     ///
     /// Takes `&mut self`: libibverbs stores the queried state in the queue pair's cached `state`
-    /// without a lock, and rxe, EFA, and hns read that cache on every receive post, so a query must
-    /// not overlap any other use of the queue pair.
+    /// without a lock, and rxe, EFA, hns, and ionic read that cache on every receive post, so a
+    /// query must not overlap any other use of the queue pair.
     ///
     /// # Errors
     ///
@@ -2845,9 +2847,10 @@ impl<T: Transport> QueuePair<T> {
     ///
     ///  - [`PostReceive`](Error::PostReceive): the queue pair receives through a shared receive
     ///    queue ([`io::ErrorKind::InvalidInput`]), or `ibv_post_recv` failed (`EINVAL` for an
-    ///    invalid value in one of the work requests, `ENOMEM` when the receive queue is full or out
-    ///    of resources). Its `posted` counts the requests at the front of `recvs` that were posted
-    ///    before the one that failed, so the rest can be posted again once there is room.
+    ///    invalid value in one of the work requests or a queue pair in `RESET`, and on EFA in
+    ///    `ERR`; `ENOMEM` when the receive queue is full or out of resources). Its `posted` counts
+    ///    the requests at the front of `recvs` that were posted before the one that failed, so
+    ///    the rest can be posted again once there is room.
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
         let recvs = recvs.as_mut();
         if recvs.is_empty() {
@@ -2900,12 +2903,12 @@ impl<T: Transport> QueuePair<T> {
     /// Splits the queue pair into its send half and a shared reference for the receive side, so
     /// that one thread can build and submit send batches while others post receives
     /// ([`post_recv`](Self::post_recv) takes `&self`). mlx5, rxe, EFA, and hns lock the two
-    /// queues separately, so neither side waits for the other. ionic is the exception: an open
-    /// send batch also holds its send completion queue's lock, so when one completion queue serves
-    /// both queues, receives posted meanwhile wait for the batch to end, and the thread holding the
-    /// batch must not post receives itself (see [`SendBatch`]). So is hns once the queue pair is in
-    /// the error state (after a failed completion, for one): every receive post then moves it to
-    /// `ERR` again, which takes the send queue's lock too, with the same two consequences.
+    /// queues separately, so neither side waits for the other, except that hns, once the queue
+    /// pair is in the error state, takes the send queue's lock to post a receive. ionic is the
+    /// other exception: an open send batch also holds its send completion queue's lock, so when
+    /// one completion queue serves both queues, receives posted meanwhile wait for the batch to
+    /// end. On either, the thread holding a batch must not post receives itself (see
+    /// [`SendBatch`]).
     ///
     /// Both borrow the queue pair, which is usable again once they are dropped.
     ///
