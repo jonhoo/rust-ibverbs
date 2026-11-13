@@ -1029,6 +1029,10 @@ pub struct TagMatchingInfo {
 /// keep the pair's work queues from filling, or post to and poll it from one thread.
 /// ionic holds the send completion queue's poll lock for as long as a send batch is open (see
 /// [`SendBatch`](crate::SendBatch)).
+///
+/// Nothing else releases the lock: a `Completions` that is leaked while it holds it
+/// ([`std::mem::forget`], a reference cycle) keeps it for good, and every later poll of the queue,
+/// and the drop or reset of every queue pair on it, then blocks forever.
 #[must_use]
 pub struct Completions<'cq> {
     cq: *mut ffi::ibv_cq_ex,

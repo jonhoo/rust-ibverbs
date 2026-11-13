@@ -288,11 +288,16 @@ impl ProtectionDomain {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that, for the entire lifetime of the returned `MemoryRegion`:
+    /// The caller must ensure that, for as long as the memory is registered:
     ///
     ///  - `ptr` is valid for reads and writes of `len` bytes,
     ///  - the memory is not moved, freed, or unmapped, and
     ///  - the memory is not accessed in a way that races with the device reading or writing it.
+    ///
+    /// The memory is registered until the returned `MemoryRegion` has been dropped (or consumed
+    /// by [`into_inner`](MemoryRegion::into_inner)) *without panicking*. A drop that panics could
+    /// not deregister the region: the device can still reach the memory, which must then never be
+    /// freed or reused.
     ///
     /// # Panics
     ///

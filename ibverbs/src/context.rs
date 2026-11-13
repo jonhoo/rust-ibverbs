@@ -547,7 +547,10 @@ impl AsyncEvent {
     /// [`QpLastWqeReached`](AsyncEventType::QpLastWqeReached)); `None` for every other kind.
     ///
     /// The number is read as the event is, so it stays available after the queue pair is
-    /// destroyed.
+    /// destroyed. Nothing holds the queue pair once the event is read, though: by the time the
+    /// event is handled, the number may name no queue pair any more, or (once the device has
+    /// handed it out again) a newer one. Handle events and drop queue pairs under one lock, or
+    /// tolerate an event about a queue pair that is gone.
     pub fn qp_num(&self) -> Option<u32> {
         self.qp_num
     }

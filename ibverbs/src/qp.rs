@@ -1619,6 +1619,9 @@ impl<'a> RecvRequest<'a> {
 /// On EFA, polling any of this queue pair's send completions takes the send queue's lock to
 /// retire it, so on EFA the thread holding the batch must not poll the send completion queue at
 /// all, and other threads' polls that reach such a completion wait until the batch ends.
+///
+/// The lock is released by `submit` or the drop alone: a leaked batch ([`std::mem::forget`]) is
+/// never aborted, and the next batch on its queue pair then blocks forever.
 #[must_use = "a started batch must be `.submit()`ed (otherwise it is aborted on drop)"]
 pub struct SendBatch<'qp, T: Transport> {
     qpx: *mut ffi::ibv_qp_ex,

@@ -1370,6 +1370,9 @@ impl AsFd for CmId {
 /// outstanding event. A [`ConnectRequest`](CmEventType::ConnectRequest) whose new id is never
 /// taken with [`connection_request`](Self::connection_request) is rejected on drop, so the peer
 /// learns right away rather than after its retries time out.
+///
+/// Both happen in the drop alone: a leaked event ([`std::mem::forget`]) is never acknowledged, so
+/// its id is never destroyed (the event holds it), and an untaken request in it is never answered.
 pub struct CmEvent {
     event: *mut ffi::rdma_cm_event,
     /// The event's status, with librdmacm's own failures turned into a negative errno (see
