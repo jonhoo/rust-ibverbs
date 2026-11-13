@@ -140,24 +140,11 @@ fn main() {
         // aliases for these kernel enums, which `ibv_advise_mr` takes
         .allowlist_type("ib_uverbs_advise_mr_.*")
         .allowlist_var("IBV_LINK_LAYER_.*")
-        .bitfield_enum("ibv_access_flags")
-        .bitfield_enum("ibv_create_cq_wc_flags")
-        .bitfield_enum("ibv_device_cap_flags")
-        .bitfield_enum("ibv_odp_transport_cap_bits")
-        .bitfield_enum("ibv_port_cap_flags")
-        .bitfield_enum("ibv_port_cap_flags2")
-        .bitfield_enum("ibv_qp_attr_mask")
-        .bitfield_enum("ibv_qp_create_send_ops_flags")
-        .bitfield_enum("ibv_qp_init_attr_mask")
-        .bitfield_enum("ibv_qp_open_attr_mask")
-        .bitfield_enum("ibv_raw_packet_caps")
-        .bitfield_enum("ibv_rx_hash_fields")
-        .bitfield_enum("ibv_send_flags")
-        .bitfield_enum("ibv_srq_init_attr_mask")
-        .bitfield_enum("ibv_wc_flags")
-        .bitfield_enum("ibv_wq_attr_mask")
-        .bitfield_enum("ibv_wq_flags")
-        .bitfield_enum("ibv_xrcd_init_attr_mask")
+        // The flag sets, by the names rdma-core gives them (`..._flags`, `..._mask`, `..._caps`,
+        // and so on): they get the bit operators, so `IBV_SRQ_MAX_WR | IBV_SRQ_LIMIT` works.
+        .bitfield_enum("(ibv|ib_uverbs|rdma_cm)_.*_(flags2?|flag|mask|caps|cap_bits|fields)")
+        .bitfield_enum("ibv_pci_atomic_op_size")
+        .bitfield_enum("ibv_qp_attach_comp_cntr_op")
         // C fills these in, and kernels and providers newer than the headers can hand back values
         // the headers do not name; a newtype holds any value, so neither that nor a zeroed
         // `Default` is ever an invalid enum
