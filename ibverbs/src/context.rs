@@ -706,7 +706,7 @@ pub enum AsyncEventType {
     /// An error occurred on a shared receive queue.
     SrqError,
     /// The number of receives posted to a shared receive queue dropped below its low watermark
-    /// (the `srq_limit` of [`ProtectionDomain::create_srq`]).
+    /// (armed with [`SharedReceiveQueue::set_limit`](crate::SharedReceiveQueue::set_limit)).
     SrqLimitReached,
     /// The last work request reached a queue pair, attached to a shared receive queue, that is in
     /// the error state: no more receives will be consumed from the SRQ by this queue pair.

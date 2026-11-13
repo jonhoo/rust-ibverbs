@@ -676,7 +676,7 @@ fn shared_receive_queue() {
 
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
 
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder.set_srq(&srq);
@@ -743,7 +743,7 @@ fn srq_limit_reached_async_event() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     // Arm the low watermark after creation: dropping below 2 posted receives raises the event.
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
     srq.set_limit(2).expect("failed to arm the SRQ limit");
     let attrs = srq.query().expect("failed to query the SRQ");
     assert!(attrs.max_wr >= 16, "{attrs:?}");
@@ -818,7 +818,7 @@ fn qp_async_event() {
         == SOFT_ROCE_VENDOR_ID;
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder.set_srq(&srq);
     });
@@ -892,7 +892,7 @@ fn objects_from_another_context_are_refused() {
     let foreign_srq = b
         .alloc_pd()
         .expect("failed to allocate PD")
-        .create_srq(16, 1, 0)
+        .create_srq(16, 1)
         .expect("failed to create SRQ");
     let refused = |result: ibverbs::Result<_>| {
         matches!(
@@ -923,7 +923,7 @@ fn objects_from_another_context_are_refused() {
     let other_pd_srq = a
         .alloc_pd()
         .expect("failed to allocate PD")
-        .create_srq(16, 1, 0)
+        .create_srq(16, 1)
         .expect("failed to create SRQ");
     builder.set_srq(&other_pd_srq);
     assert!(
@@ -1313,7 +1313,7 @@ fn split_queue_pair_across_threads() {
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn post_recv_reports_how_many_were_posted() {
     let mut lb = loopback();
-    let srq = lb.pd.create_srq(4, 1, 0).expect("failed to create SRQ");
+    let srq = lb.pd.create_srq(4, 1).expect("failed to create SRQ");
     let recv = mr(&lb.pd, 8);
     let sges = [recv.slice(..8)];
     let overflow = |room: u32| -> Vec<RecvRequest<'_>> {
@@ -1542,7 +1542,7 @@ fn raw_handles() {
     assert!(!mr.as_raw().is_null());
     assert_eq!(mr.lkey(), mr.slice(..).lkey());
 
-    let srq = pd.create_srq(16, 1, 0).expect("failed to create SRQ");
+    let srq = pd.create_srq(16, 1).expect("failed to create SRQ");
     assert!(!srq.as_raw().is_null());
 
     // Clones of a handle are equal and hash alike; another object of the same kind is neither.

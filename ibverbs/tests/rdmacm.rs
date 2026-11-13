@@ -331,7 +331,7 @@ fn request_tells_the_peer_about_srq_and_flow_control() {
     let port = resolved.cm_id().port_num().expect("client port");
     let pd = ctx.alloc_pd().expect("client pd");
     let cq = ctx.create_cq(16).build().expect("client cq");
-    let srq = pd.create_srq(16, 1, 0).expect("client srq");
+    let srq = pd.create_srq(16, 1).expect("client srq");
     let qp = pd
         .create_qp::<Rc>(&cq, &cq, port)
         .expect("client qp builder")

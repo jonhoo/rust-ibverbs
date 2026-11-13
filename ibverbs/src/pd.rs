@@ -389,14 +389,9 @@ impl ProtectionDomain {
     /// `max_wr` is the maximum number of outstanding work requests that can be posted to the SRQ.
     /// `max_sge` is the maximum number of scatter/gather elements per work request. Providers
     /// round both up; [`SharedReceiveQueue::capacity`] and
-    /// [`max_sge`](SharedReceiveQueue::max_sge) report what was granted.
-    /// `srq_limit` is recorded at creation and, on providers that honor it there (Soft-RoCE's rxe
-    /// does; this crate's test suite relies on that), arms the low-watermark event: once fewer
-    /// receives than the limit remain posted, the device raises
-    /// [`AsyncEventType::SrqLimitReached`](crate::AsyncEventType::SrqLimitReached) once. The
-    /// `ibv_create_srq` man page considers the field irrelevant at creation, so arm it portably
-    /// (and re-arm it after it fires) with [`SharedReceiveQueue::set_limit`]. Pass 0 for no
-    /// limit.
+    /// [`max_sge`](SharedReceiveQueue::max_sge) report what was granted. The queue is created
+    /// without a low-watermark limit; arm one (and re-arm it after it fires) with
+    /// [`SharedReceiveQueue::set_limit`].
     ///
     /// # Errors
     ///
@@ -409,18 +404,15 @@ impl ProtectionDomain {
     ///
     /// [1]: https://www.rdmamojo.com/2012/11/24/ibv_create_srq/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_create_srq.3.html
-    pub fn create_srq(
-        &self,
-        max_wr: u32,
-        max_sge: u32,
-        srq_limit: u32,
-    ) -> Result<SharedReceiveQueue> {
+    pub fn create_srq(&self, max_wr: u32, max_sge: u32) -> Result<SharedReceiveQueue> {
+        // No `srq_limit`: `ibv_create_srq(3)` calls it irrelevant at creation, and only rxe arms
+        // it there (mlx5 arms it only when modified, and hns zeroes it).
         let mut srq_init_attr = ffi::ibv_srq_init_attr {
             srq_context: ptr::null_mut(),
             attr: ffi::ibv_srq_attr {
                 max_wr,
                 max_sge,
-                srq_limit,
+                srq_limit: 0,
             },
         };
         let srq = nonnull(
