@@ -1502,7 +1502,7 @@ impl<T: Connected> PreparedQueuePair<T> {
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct RecvRequest<'a> {
-    pub(crate) wr: ffi::ibv_recv_wr,
+    wr: ffi::ibv_recv_wr,
     _local: std::marker::PhantomData<&'a [LocalMemorySlice]>,
 }
 
@@ -1534,11 +1534,31 @@ impl<'a> RecvRequest<'a> {
         }
     }
 
+    /// Posts `recvs` as one linked list with `post` (`ibv_post_recv` or `ibv_post_srq_recv`, handed
+    /// the list's head and `bad_wr`); an empty batch posts nothing. `srq_attached` is for the
+    /// error ([`post_recv_error`]).
+    #[inline(always)]
+    pub(crate) fn post(
+        recvs: &mut [RecvRequest<'_>],
+        srq_attached: bool,
+        post: impl FnOnce(*mut ffi::ibv_recv_wr, *mut *mut ffi::ibv_recv_wr) -> i32,
+    ) -> Result<()> {
+        if recvs.is_empty() {
+            return Ok(());
+        }
+        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
+        let errno = post(Self::link(recvs), &mut bad_wr);
+        if errno != 0 {
+            return Err(post_recv_error(errno, recvs, bad_wr, srq_attached));
+        }
+        Ok(())
+    }
+
     /// Links the non-empty `recvs` into the list `ibv_post_recv` and `ibv_post_srq_recv` walk, and
     /// returns its head. Every link comes from one pointer to the slice: indexing the slice again
     /// for each request would invalidate the links stored before it, which the provider then
     /// follows.
-    pub(crate) fn link(recvs: &mut [RecvRequest<'_>]) -> *mut ffi::ibv_recv_wr {
+    fn link(recvs: &mut [RecvRequest<'_>]) -> *mut ffi::ibv_recv_wr {
         let base = recvs.as_mut_ptr();
         unsafe {
             for i in 1..recvs.len() {
@@ -2087,21 +2107,17 @@ impl SendOp<'_, '_, Ud> {
 /// others return them as they are.
 #[cold]
 #[inline(never)]
-pub(crate) fn post_recv_error(
+fn post_recv_error(
     errno: i32,
     recvs: &[RecvRequest<'_>],
     bad_wr: *const ffi::ibv_recv_wr,
     srq_attached: bool,
 ) -> Error {
-    // A null `bad_wr` lands past the end. Plain address arithmetic, since a provider's pointer is
-    // only compared, never followed.
-    let index = (bad_wr as usize).wrapping_sub(recvs.as_ptr() as usize)
-        / std::mem::size_of::<RecvRequest<'_>>();
-    let posted = if index < recvs.len() {
-        u32::try_from(index).unwrap_or(u32::MAX)
-    } else {
-        0
-    };
+    // The provider's pointer is only compared, never followed; a null one matches no request.
+    let posted = recvs
+        .iter()
+        .position(|recv| ptr::eq(&recv.wr, bad_wr))
+        .map_or(0, |index| u32::try_from(index).unwrap_or(u32::MAX));
     let source = if srq_attached {
         io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -2881,19 +2897,9 @@ impl<T: Transport> QueuePair<T> {
     ///    the requests at the front of `recvs` that were posted before the one that failed, so
     ///    the rest can be posted again once there is room.
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
-        let recvs = recvs.as_mut();
-        if recvs.is_empty() {
-            return Ok(());
-        }
-        let head = RecvRequest::link(recvs);
-
-        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let errno = unsafe { ffi::ibv_post_recv(self.qp, head, &mut bad_wr) };
-        if errno != 0 {
-            Err(post_recv_error(errno, recvs, bad_wr, self._srq.is_some()))
-        } else {
-            Ok(())
-        }
+        RecvRequest::post(recvs.as_mut(), self._srq.is_some(), |head, bad_wr| unsafe {
+            ffi::ibv_post_recv(self.qp, head, bad_wr)
+        })
     }
 
     /// Begin a batch of send work requests on this queue pair's send queue.

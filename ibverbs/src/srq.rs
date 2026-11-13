@@ -1,9 +1,8 @@
-use std::ptr;
 use std::sync::Arc;
 
 use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
-use crate::qp::{RecvRequest, post_recv_error};
+use crate::qp::RecvRequest;
 
 struct SharedReceiveQueueInner {
     _pd: ProtectionDomain,
@@ -205,18 +204,8 @@ impl SharedReceiveQueue {
     /// [1]: https://www.rdmamojo.com/2013/02/08/ibv_post_srq_recv/
     /// [2]: https://man7.org/linux/man-pages/man3/ibv_post_srq_recv.3.html
     pub unsafe fn post_recv<'a>(&self, mut recvs: impl AsMut<[RecvRequest<'a>]>) -> Result<()> {
-        let recvs = recvs.as_mut();
-        if recvs.is_empty() {
-            return Ok(());
-        }
-        let head = RecvRequest::link(recvs);
-
-        let mut bad_wr: *mut ffi::ibv_recv_wr = ptr::null_mut();
-        let errno = unsafe { ffi::ibv_post_srq_recv(self.srq, head, &mut bad_wr) };
-        if errno != 0 {
-            Err(post_recv_error(errno, recvs, bad_wr, false))
-        } else {
-            Ok(())
-        }
+        RecvRequest::post(recvs.as_mut(), false, |head, bad_wr| unsafe {
+            ffi::ibv_post_srq_recv(self.srq, head, bad_wr)
+        })
     }
 }
