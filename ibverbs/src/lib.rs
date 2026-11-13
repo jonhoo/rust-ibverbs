@@ -312,7 +312,7 @@ mod srq;
 mod efa;
 
 #[cfg(feature = "efa")]
-pub use efa::Srd;
+pub use efa::{EfaDeviceAttr, Srd};
 
 #[cfg(feature = "mlx5")]
 mod mlx5;

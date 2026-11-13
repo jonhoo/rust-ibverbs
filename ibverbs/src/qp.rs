@@ -18,6 +18,14 @@ pub(crate) mod sealed {
     pub trait Sealed {
         /// The queue-pair type (`IBV_QPT_*`) the marker stands for.
         const TYPE: ffi::ibv_qp_type;
+
+        /// The send operations a queue pair of this transport on `ctx` is created with unless
+        /// the builder says otherwise: SEND on every transport, RDMA WRITE on the connected
+        /// ones, and RDMA READ and the atomics on RC, the atomics only if the device executes
+        /// them (`atomics`). SRD asks the device (see `efa.rs`).
+        fn default_send_ops(_ctx: &crate::Context, atomics: bool) -> super::SendOps {
+            super::default_send_ops(Self::TYPE, atomics)
+        }
     }
 }
 
@@ -449,20 +457,21 @@ flags_newtype! {
 }
 
 /// The send operations a queue pair of `qp_type` is created with unless the builder says
-/// otherwise: SEND on every transport, RDMA WRITE on the connected transports and SRD, RDMA READ
-/// on RC and SRD, and the atomics on RC only, and there only when the device executes them
-/// (`atomics`): mlx5 refuses to create a queue pair that requests atomics on a device without.
+/// otherwise, on the transports this crate knows the set of: SEND on every transport, RDMA WRITE
+/// on the connected transports, and RDMA READ and the atomics on RC only, the atomics only when
+/// the device executes them (`atomics`): mlx5 refuses to create a queue pair that requests
+/// atomics on a device without. SRD asks its device instead (see `efa.rs`).
 fn default_send_ops(qp_type: ffi::ibv_qp_type, atomics: bool) -> SendOps {
     use ffi::ibv_qp_type as T;
     let mut ops = SendOps::SEND | SendOps::SEND_WITH_IMM;
-    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_UC | T::IBV_QPT_DRIVER) {
+    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_UC) {
         ops |= SendOps::RDMA_WRITE | SendOps::RDMA_WRITE_WITH_IMM;
     }
-    if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_DRIVER) {
+    if qp_type == T::IBV_QPT_RC {
         ops |= SendOps::RDMA_READ;
-    }
-    if qp_type == T::IBV_QPT_RC && atomics {
-        ops |= SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
+        if atomics {
+            ops |= SendOps::ATOMIC_CMP_AND_SWP | SendOps::ATOMIC_FETCH_AND_ADD;
+        }
     }
     ops
 }
@@ -555,6 +564,8 @@ impl<T: Transport> QueuePairBuilder<T> {
             rtr.set_max_dest_rd_atomic(responder);
             rts.set_max_rd_atomic(initiator);
         }
+        let default_send_ops =
+            T::default_send_ops(pd.context(), rc_limits.is_some_and(|limits| limits.atomics));
         QueuePairBuilder {
             ctx: 0,
             pd,
@@ -573,7 +584,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             max_recv_sge: 1,
             max_inline_data: 0,
             send_ops: None,
-            default_send_ops: default_send_ops(T::TYPE, rc_limits.is_some_and(|l| l.atomics)),
+            default_send_ops,
 
             service_level: 0,
             bring_up: BringUp { init, rtr, rts },
@@ -747,9 +758,10 @@ impl<T: Transport> QueuePairBuilder<T> {
 
     /// The send operations the queue pair will be created with: the set given to
     /// [`set_send_ops`](Self::set_send_ops), or else the transport's default — SEND (with and
-    /// without an immediate) everywhere, plus RDMA WRITE on RC, UC, and SRD, RDMA READ on RC and
-    /// SRD, and the atomics on RC where the device executes them (its `atomic_cap` is not
-    /// `IBV_ATOMIC_NONE`). Start from it to add an operation:
+    /// without an immediate) everywhere, plus RDMA WRITE on RC and UC, RDMA READ on RC, and the
+    /// atomics on RC where the device executes them (its `atomic_cap` is not `IBV_ATOMIC_NONE`).
+    /// On SRD, RDMA WRITE and RDMA READ are part of the default exactly when the EFA device has
+    /// them. Start from it to add an operation:
     /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
     pub fn send_ops(&self) -> SendOps {
         self.send_ops.unwrap_or(self.default_send_ops)
@@ -3089,7 +3101,7 @@ mod test_default_send_ops {
         assert_eq!(without & atomics, SendOps::empty());
         assert_eq!(without | atomics, with);
         assert!(without.contains(SendOps::RDMA_READ | SendOps::RDMA_WRITE | SendOps::SEND));
-        for qp_type in [T::IBV_QPT_UC, T::IBV_QPT_UD, T::IBV_QPT_DRIVER] {
+        for qp_type in [T::IBV_QPT_UC, T::IBV_QPT_UD] {
             assert_eq!(
                 default_send_ops(qp_type, true),
                 default_send_ops(qp_type, false)
