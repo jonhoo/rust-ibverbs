@@ -1116,7 +1116,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
 
 /// An allocated but uninitialized `QueuePair`. Created by [`QueuePairBuilder::build`].
 ///
-/// Specifically, this `QueuePair` has been allocated (with `ibv_create_qp_ex`, or
+/// Specifically, this `QueuePair` has been allocated (with `ibv_create_qp_ex`, `ibv_create_qp`, or
 /// `efadv_create_qp_ex` for SRD), but has not yet been initialized with calls to `ibv_modify_qp`.
 ///
 /// To complete the construction of the `QueuePair`, you will need to obtain the
