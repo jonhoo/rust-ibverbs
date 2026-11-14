@@ -1681,9 +1681,9 @@ impl<'a> InlineSlice<'a> {
 /// `send_to` on UD; which exist depends on the transport `T`), chain the modifiers
 /// ([`signaled`](Self::signaled), [`imm`](Self::imm), `solicited`, and on RC `fenced`), and post a
 /// slice of them with [`QueuePair::post_send`]. Like [`RecvRequest`], requests are posted from a
-/// caller-owned slice and linked in place, so posting allocates nothing. SRD (behind the `efa`
-/// feature) has no constructor: an SRD queue pair sends through a batch
-/// ([`QueuePair::start_send`]).
+/// caller-owned slice and linked in place, so posting allocates nothing, and a request is plain
+/// data until it is posted, so it can be copied. SRD (behind the `efa` feature) has no
+/// constructor: an SRD queue pair sends through a batch ([`QueuePair::start_send`]).
 ///
 /// # Borrow-checked guarantees
 ///
@@ -1743,6 +1743,19 @@ pub struct SendRequest<'a, T: Transport> {
     wr: ffi::ibv_send_wr,
     _borrows: std::marker::PhantomData<(&'a (), T)>,
 }
+
+impl<T: Transport> Clone for SendRequest<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T: Transport> Copy for SendRequest<'_, T> {}
+
+// The pointers are the borrowed scatter list or inline bytes (shared, immutable data), the
+// borrowed address handle (`Sync`), and the link to the next request, which every post rewrites
+// before the provider reads it.
+unsafe impl<T: Transport> Send for SendRequest<'_, T> {}
+unsafe impl<T: Transport> Sync for SendRequest<'_, T> {}
 
 impl<'a, T: Transport> SendRequest<'a, T> {
     /// A request for `opcode` over the `len` scatter/gather entries at `sges` (null for none, see
@@ -3681,6 +3694,13 @@ mod test_send_request {
         len: 8,
         rkey: 9,
     };
+
+    #[test]
+    fn requests_are_plain_data() {
+        fn plain<T: Copy + Send + Sync>() {}
+        plain::<SendRequest<'_, Rc>>();
+        plain::<SendRequest<'_, Ud>>();
+    }
 
     #[test]
     fn link_chains_the_requests_in_order() {
