@@ -3827,8 +3827,7 @@ mod test_send_request {
         assert_ne!(sge.addr, 0);
         assert_eq!(sge.addr, (&raw const EMPTY_INLINE) as u64);
         assert_eq!((sge.length, sge.lkey), (0, 0));
-        // SAFETY: `sge.addr` is `&raw const EMPTY_INLINE`, a static initialized `u8`.
-        assert_eq!(unsafe { *(sge.addr as *const u8) }, 0);
+        assert_eq!(EMPTY_INLINE, 0);
     }
 
     #[test]
