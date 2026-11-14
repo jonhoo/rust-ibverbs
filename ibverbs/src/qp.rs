@@ -39,6 +39,10 @@ pub(crate) mod sealed {
             builder.create_qp_ex()
         }
     }
+
+    /// Implemented by the transports `ibv_create_qp` creates (every one but SRD), which have
+    /// [`build_legacy`](QueuePairBuilder::build_legacy).
+    pub trait Legacy: Sealed {}
 }
 
 /// A queue-pair transport marker: types the queue-pair family ([`QueuePairBuilder`],
@@ -131,18 +135,21 @@ impl sealed::Sealed for Rc {
 impl Transport for Rc {}
 impl Connected for Rc {}
 impl Reliable for Rc {}
+impl sealed::Legacy for Rc {}
 
 impl sealed::Sealed for Uc {
     const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UC;
 }
 impl Transport for Uc {}
 impl Connected for Uc {}
+impl sealed::Legacy for Uc {}
 
 impl sealed::Sealed for Ud {
     const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UD;
 }
 impl Transport for Ud {}
 impl Datagram for Ud {}
+impl sealed::Legacy for Ud {}
 
 /// The state of a queue pair's state machine.
 ///
@@ -882,27 +889,6 @@ impl<T: Transport> QueuePairBuilder<T> {
         self.prepared(qp, &attr)
     }
 
-    /// The `ibv_create_qp` creation shared by the `build_legacy` of every transport it serves.
-    /// Asking for nothing beyond the protection domain makes the `ibv_create_qp_ex` shim create
-    /// the queue pair with `ibv_create_qp`, as the C inline does.
-    fn build_legacy_impl(&self) -> Result<PreparedQueuePair<T>> {
-        self.check_same_context()?;
-        let mut attr = ffi::ibv_qp_init_attr_ex {
-            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
-            comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0,
-            send_ops_flags: 0,
-            ..self.init_attr_ex()
-        };
-        let qp = nonnull(
-            unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
-            Error::CreateQueuePair,
-        )
-        .map_err(|e| e.for_operation(&"ibv_create_qp"))?;
-        // No `ibv_qp_to_qp_ex` here: it reads the `verbs_qp` fields that follow the `ibv_qp`, and
-        // a provider without the extended verbs (irdma) allocates its own fields there instead.
-        Ok(self.wrap(qp, &attr, ptr::null_mut()))
-    }
-
     /// Wraps `qp`, just created from `attr`, as the prepared queue pair this builder describes:
     /// the end of every transport's `build`. Creation wrote the granted capacities back into
     /// `attr`, and the queue pair holds the shared receive queue `attr` attached it to, if any.
@@ -978,14 +964,17 @@ impl<T: Connected> QueuePairBuilder<T> {
         self.bring_up.rtr.set_path_mtu(path_mtu);
         self
     }
+}
 
+impl<T: Transport + sealed::Legacy> QueuePairBuilder<T> {
     /// Create a new [`PreparedQueuePair`] from this builder template with the legacy
     /// `ibv_create_qp`, for providers without the extended queue-pair verbs (`irdma`).
     ///
     /// Send on it with [`post_send`](QueuePair::post_send). It has no extended work-request
     /// interface: [`as_raw_ex`](QueuePair::as_raw_ex) returns null and
     /// [`start_send`](QueuePair::start_send) panics. The send operations of
-    /// [`set_send_ops`](Self::set_send_ops) are ignored.
+    /// [`set_send_ops`](Self::set_send_ops) are ignored. It exists on RC, UC, and UD; an SRD queue
+    /// pair comes only from EFA's own verb.
     ///
     /// # Errors
     ///
@@ -1012,45 +1001,23 @@ impl<T: Connected> QueuePairBuilder<T> {
     /// # }
     /// ```
     pub fn build_legacy(&self) -> Result<PreparedQueuePair<T>> {
-        self.build_legacy_impl()
-    }
-}
-
-impl QueuePairBuilder<Ud> {
-    /// Create a new [`PreparedQueuePair`] from this builder template with the legacy
-    /// `ibv_create_qp`, for providers without the extended queue-pair verbs (`irdma`).
-    ///
-    /// Send on it with [`post_send`](QueuePair::post_send). It has no extended work-request
-    /// interface: [`as_raw_ex`](QueuePair::as_raw_ex) returns null and
-    /// [`start_send`](QueuePair::start_send) panics. The send operations of
-    /// [`set_send_ops`](Self::set_send_ops) are ignored.
-    ///
-    /// # Errors
-    ///
-    ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
-    ///    device context than the protection domain, or the shared receive queue to another
-    ///    protection domain, or `ibv_create_qp` failed (`EINVAL` for an invalid value in the queue
-    ///    pair attributes, `ENOMEM` when out of resources).
-    ///  - [`Unsupported`](Error::Unsupported): the provider does not create UD queue pairs
-    ///    (`EOPNOTSUPP`).
-    ///
-    /// # Examples
-    ///
-    /// `build` never falls back to this on its own. To run on providers with and without the
-    /// extended verbs, fall back explicitly; [`post_send`](QueuePair::post_send) sends on either
-    /// result:
-    ///
-    /// ```no_run
-    /// # use ibverbs::{Error, PreparedQueuePair, QueuePairBuilder, Result, Ud};
-    /// # fn f(builder: &QueuePairBuilder<Ud>) -> Result<PreparedQueuePair<Ud>> {
-    /// match builder.build() {
-    ///     Err(Error::Unsupported { .. }) => builder.build_legacy(),
-    ///     built => built,
-    /// }
-    /// # }
-    /// ```
-    pub fn build_legacy(&self) -> Result<PreparedQueuePair<Ud>> {
-        self.build_legacy_impl()
+        // Asking for nothing beyond the protection domain makes the `ibv_create_qp_ex` shim
+        // create the queue pair with `ibv_create_qp`, as the C inline does.
+        self.check_same_context()?;
+        let mut attr = ffi::ibv_qp_init_attr_ex {
+            srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
+            comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0,
+            send_ops_flags: 0,
+            ..self.init_attr_ex()
+        };
+        let qp = nonnull(
+            unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
+            Error::CreateQueuePair,
+        )
+        .map_err(|e| e.for_operation(&"ibv_create_qp"))?;
+        // No `ibv_qp_to_qp_ex` here: it reads the `verbs_qp` fields that follow the `ibv_qp`, and
+        // a provider without the extended verbs (irdma) allocates its own fields there instead.
+        Ok(self.wrap(qp, &attr, ptr::null_mut()))
     }
 }
 
