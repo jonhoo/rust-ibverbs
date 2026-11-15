@@ -45,7 +45,7 @@
 //!
 //! # Passive side
 //!
-//! Symmetric: [`Acceptor::bind`] then [`Acceptor::accept`] yields an [`Incoming`] whose
+//! Symmetric: [`Acceptor::bind`] then [`Acceptor::next_request`] yields an [`Incoming`] whose
 //! [`accept`](Incoming::accept) returns a [`Connection`]. A full client/server example lives in
 //! `examples/rdmacm_connect.rs`.
 //!
@@ -1911,9 +1911,10 @@ pub struct Acceptor {
 impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
     /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
-    /// listening, queueing up to `backlog` requests not yet taken by [`accept`](Self::accept) (0
-    /// means the kernel's limit, see [`CmId::listen`]). A loopback address listens on every
-    /// device too, for peers anywhere (see [`CmId::bind_addr`]).
+    /// listening, queueing up to `backlog` requests not yet taken by
+    /// [`next_request`](Self::next_request) (0 means the kernel's limit, see [`CmId::listen`]). A
+    /// loopback address listens on every device too, for peers anywhere (see
+    /// [`CmId::bind_addr`]).
     ///
     /// # Errors
     ///
@@ -1973,7 +1974,7 @@ impl Acceptor {
     ///  - [`ConnectionManager`](Error::ConnectionManager): the listener reported a failure: its
     ///    device was removed, which leaves the acceptor dead (see
     ///    [`DeviceRemoval`](CmEventType::DeviceRemoval)). Only one waiter gets the failure, and
-    ///    every other or later `accept` waits out its timeout, forever with `None`; so drop the
+    ///    every other or later `next_request` waits out its timeout, forever with `None`; so drop the
     ///    acceptor, and with several waiters give each a timeout and stop them all once one sees
     ///    the failure.
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
@@ -1981,7 +1982,7 @@ impl Acceptor {
     ///    a request arrived but could not get an event channel of its own (`EMFILE` once the
     ///    process is out of file descriptors, one per accepted connection): the request is then
     ///    declined, and the acceptor stays usable.
-    pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
+    pub fn next_request(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = crate::completion::deadline_after(timeout);
         let request = self
             .listener
@@ -1995,7 +1996,7 @@ impl Acceptor {
 }
 
 /// An incoming connection request, ready for its queue pair to be built and accepted (or
-/// rejected). Returned by [`Acceptor::accept`]. It carries its own event channel, so it is
+/// rejected). Returned by [`Acceptor::next_request`]. It carries its own event channel, so it is
 /// self-contained and can be handed to another thread. Dropping it declines the request, even
 /// while resources built on its [`context`](Self::context) live on.
 #[must_use = "dropping an incoming request declines it; `accept` or `reject` it"]

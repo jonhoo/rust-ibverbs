@@ -54,7 +54,7 @@ fn server(addr: SocketAddr) {
     println!("listening on {addr}");
 
     // Wait for a client indefinitely, but bound the establishment of an arrived request.
-    let incoming = acceptor.accept(None).unwrap();
+    let incoming = acceptor.next_request(None).unwrap();
     let ctx = incoming.context().unwrap();
     let port = incoming.cm_id().port_num().unwrap();
     let pd = ctx.alloc_pd().unwrap();
