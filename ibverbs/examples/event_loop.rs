@@ -1,7 +1,7 @@
 //! Event-driven completion handling: instead of burning a core on `poll`, queues are armed and a
 //! completion channel is blocked on. Two queue pairs (each self-connected, as in the loopback
 //! example) share one channel, so a single file descriptor reports notifications for both, and
-//! the context cookie set at build time says which queue fired — the shape a server driving many
+//! the user-data value set at build time says which queue fired — the shape a server driving many
 //! connections from one `epoll`/reactor uses. Device-level async events are checked at the end.
 //!
 //! This runs against the RDMA device `IBVERBS_TEST_DEVICE` names, or else the first one; on a
@@ -42,7 +42,7 @@ fn main() {
         .expect("no GID available")
         .gid_index;
 
-    // One channel, two queues built on it. The context cookies let the notifications be told
+    // One channel, two queues built on it. The user-data values let the notifications be told
     // apart; an event loop would instead register `channel.as_fd()` with its reactor.
     const PING: u64 = 1;
     const PONG: u64 = 2;
@@ -50,13 +50,13 @@ fn main() {
     let cq_ping = ctx
         .create_cq(16)
         .set_comp_channel(&channel)
-        .set_context(PING)
+        .set_user_data(PING)
         .build()
         .unwrap();
     let cq_pong = ctx
         .create_cq(16)
         .set_comp_channel(&channel)
-        .set_context(PONG)
+        .set_user_data(PONG)
         .build()
         .unwrap();
 

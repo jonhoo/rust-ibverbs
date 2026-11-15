@@ -589,7 +589,7 @@ fn wait_for_completion() {
     let cq = ctx
         .create_cq(64)
         .set_comp_channel(&channel)
-        .set_context(CQ_CONTEXT)
+        .set_user_data(CQ_CONTEXT)
         .build()
         .expect("failed to create completion queue");
     let pd = ctx
@@ -2736,7 +2736,7 @@ fn debug_formatting() {
 }
 
 /// Two completion queues share one completion channel, so a single file descriptor carries
-/// notifications for both. Drive them through the channel and demultiplex by the context value each
+/// notifications for both. Drive them through the channel and demultiplex by the user-data value each
 /// queue was built with.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
@@ -2749,20 +2749,20 @@ fn shared_completion_channel() {
         .create_comp_channel()
         .expect("failed to create completion channel");
 
-    // Distinct context values let `CompletionChannel::poll_event` say which queue a notification is
+    // Distinct user-data values let `CompletionChannel::poll_event` say which queue a notification is
     // for.
     const CTX_A: u64 = 1;
     const CTX_B: u64 = 2;
     let cq_a = ctx
         .create_cq(16)
         .set_comp_channel(&channel)
-        .set_context(CTX_A)
+        .set_user_data(CTX_A)
         .build()
         .expect("failed to build first completion queue");
     let cq_b = ctx
         .create_cq(16)
         .set_comp_channel(&channel)
-        .set_context(CTX_B)
+        .set_user_data(CTX_B)
         .build()
         .expect("failed to build second completion queue");
 

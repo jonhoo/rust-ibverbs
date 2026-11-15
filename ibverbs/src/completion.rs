@@ -94,8 +94,8 @@ fn provider_poll_failure(verb: &str, code: i32) -> Error {
 ///
 /// Any number of queues can be built on one channel, collapsing their notifications onto a single
 /// file descriptor (what you want for a server driving many queue pairs from one `epoll`/reactor).
-/// A notification carries the context value of the queue it belongs to (set with
-/// [`CompletionQueueBuilder::set_context`]), which is how [`poll_event`](Self::poll_event) tells the
+/// A notification carries the user-data value of the queue it belongs to (set with
+/// [`CompletionQueueBuilder::set_user_data`]), which is how [`poll_event`](Self::poll_event) tells the
 /// sharers apart — give each queue a distinct one. The channel is a single stream of events:
 /// however many threads consume it, each notification is delivered to exactly one of them, so
 /// routing it to the right queue is the consumer's job.
@@ -147,15 +147,15 @@ impl CompletionChannel {
         Ok(channel)
     }
 
-    /// Consume one pending notification from the channel, returning the context value of the
-    /// completion queue it belongs to (the value set with [`CompletionQueueBuilder::set_context`]),
+    /// Consume one pending notification from the channel, returning the user-data value of the
+    /// completion queue it belongs to (the value set with [`CompletionQueueBuilder::set_user_data`]),
     /// or `None` if none is pending.
     ///
     /// Demultiplexing several queues that share one channel works by draining notifications here
     /// after the channel's file descriptor becomes readable, and mapping each returned context
     /// back to the queue, which you then re-arm with [`req_notify`](CompletionQueue::req_notify)
     /// and only then drain with [`poll`](CompletionQueue::poll). Give each queue a distinct
-    /// [`set_context`](CompletionQueueBuilder::set_context) value so they can be told apart.
+    /// [`set_user_data`](CompletionQueueBuilder::set_user_data) value so they can be told apart.
     /// Acknowledgement is handled for you. Consume a given queue's notifications and re-arm it from
     /// one thread at a time (see [Thread safety](crate#thread-safety)).
     ///
@@ -179,8 +179,8 @@ impl CompletionChannel {
     }
 
     /// Block until a notification is available on the channel (up to `timeout`), then consume it,
-    /// returning the context value of the completion queue it belongs to (the value set with
-    /// [`CompletionQueueBuilder::set_context`]). Returns `None` only if `timeout` elapses first;
+    /// returning the user-data value of the completion queue it belongs to (the value set with
+    /// [`CompletionQueueBuilder::set_user_data`]). Returns `None` only if `timeout` elapses first;
     /// with no timeout it waits indefinitely, even if other threads race it for notifications.
     ///
     /// The blocking form of [`poll_event`](Self::poll_event): it waits on the channel's file
@@ -266,10 +266,10 @@ impl CompletionQueueBuilder {
         }
     }
 
-    /// Set an opaque context value associated with the completion queue.
+    /// Set an opaque user-data value associated with the completion queue.
     ///
     /// Defaults to 0.
-    pub fn set_context(&mut self, id: u64) -> &mut Self {
+    pub fn set_user_data(&mut self, id: u64) -> &mut Self {
         self.cq_context = id;
         self
     }
@@ -307,7 +307,7 @@ impl CompletionQueueBuilder {
     /// [`CompletionQueue::req_notify`] makes the next completion raise a notification on the
     /// channel, to block on ([`CompletionChannel::wait_event`]) or watch from an event loop. Several
     /// queues can be built on one channel; give each a distinct
-    /// [`set_context`](Self::set_context) so [`CompletionChannel::poll_event`] can tell them apart.
+    /// [`set_user_data`](Self::set_user_data) so [`CompletionChannel::poll_event`] can tell them apart.
     ///
     /// Defaults to no channel.
     pub fn set_comp_channel(&mut self, channel: &CompletionChannel) -> &mut Self {

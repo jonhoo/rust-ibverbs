@@ -663,12 +663,12 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the opaque context value for the new `QueuePair` (its `qp_context`), an integer like
-    /// the one [`CompletionQueueBuilder::set_context`](crate::CompletionQueueBuilder::set_context)
+    /// Set the opaque user-data value for the new `QueuePair` (its `qp_context`), an integer like
+    /// the one [`CompletionQueueBuilder::set_user_data`](crate::CompletionQueueBuilder::set_user_data)
     /// takes.
     ///
     /// Defaults to 0.
-    pub fn set_context(&mut self, ctx: u64) -> &mut Self {
+    pub fn set_user_data(&mut self, ctx: u64) -> &mut Self {
         self.ctx = ctx;
         self
     }
@@ -822,7 +822,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// The creation attributes both `ibv_create_qp_ex` and `efadv_create_qp_ex` take: the
-    /// builder's context value, completion queues, capacities, and send operations, in its
+    /// builder's user-data value, completion queues, capacities, and send operations, in its
     /// protection domain. The shared receive queue is left to the caller.
     pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
         ffi::ibv_qp_init_attr_ex {

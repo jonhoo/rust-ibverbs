@@ -108,7 +108,7 @@ impl Context {
     ///
     /// `min_cq_entries` is the minimum size of the CQ (the actual size can be larger) and is the only
     /// required parameter. The optional ones are configured on the returned
-    /// [`CompletionQueueBuilder`]: an opaque context cookie, the completion vector, a completion
+    /// [`CompletionQueueBuilder`]: an opaque user-data value, the completion vector, a completion
     /// channel ([`set_comp_channel`](CompletionQueueBuilder::set_comp_channel)), and extra
     /// work-completion fields such as a hardware timestamp. Call
     /// [`build`](CompletionQueueBuilder::build) to create the queue.
