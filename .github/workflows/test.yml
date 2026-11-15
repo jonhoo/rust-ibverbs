@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     name: ubuntu / stable / vendored-headers
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Build matching libraries, then remove header overrides and host headers
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     name: ubuntu / stable / soft-roce
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Configure CI host
@@ -187,7 +187,7 @@ jobs:
     runs-on: ubuntu-latest
     name: ubuntu / nightly / miri
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Configure CI host
