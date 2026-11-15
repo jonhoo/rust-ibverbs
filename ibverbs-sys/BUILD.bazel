@@ -46,7 +46,6 @@ rust_bindgen(
         "--bitfield-enum=ibv_qp_attach_comp_cntr_op",
         "--default-enum-style=newtype",
         "--no-prepend-enum-name",
-        "--blocklist-type=ibv_wc",
     ],
     cc_lib = ":ibverbs_c",
     header = "@rdma_core//:libibverbs/verbs.h",

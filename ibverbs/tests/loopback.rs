@@ -3211,10 +3211,11 @@ fn reply_through_address_handle_from_wc() {
 fn address_handle_from_completion_without_grh() {
     let ctx = open_test_device();
     // A default completion reports no flags, so no GRH.
-    let mut wc = ibverbs::ffi::ibv_wc::default();
-    wc.slid = 7;
-    wc.sl = 3;
-    let wc = ibverbs::Completion::from(wc);
+    let wc = ibverbs::Completion::from(ibverbs::ffi::ibv_wc {
+        slid: 7,
+        sl: 3,
+        ..Default::default()
+    });
     assert_eq!((wc.slid(), wc.sl(), wc.has_grh()), (7, 3, false));
     AddressHandleAttribute::from_wc(&ctx, 1, &wc, None)
         .expect("a completion without a GRH derives a local route");

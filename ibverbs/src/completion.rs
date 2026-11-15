@@ -966,12 +966,14 @@ impl WorkCompletion<'_> {
     /// to a datagram's sender: the flags, the source and local queue pair numbers, the source LID,
     /// the service level, and — when the queue requested them — the path bits (zero otherwise).
     pub(crate) fn addressing(&self) -> Completion {
-        let mut wc = ffi::ibv_wc::default();
-        wc.wc_flags = self.wc_flags().into();
-        wc.src_qp = self.src_qp();
-        wc.qp_num = self.qp_num();
-        wc.slid = self.slid() as u16;
-        wc.sl = self.sl();
+        let mut wc = ffi::ibv_wc {
+            wc_flags: self.wc_flags().0,
+            src_qp: self.src_qp(),
+            qp_num: self.qp_num(),
+            slid: self.slid() as u16,
+            sl: self.sl(),
+            ..Default::default()
+        };
         if let Some(read_dlid_path_bits) = unsafe { (*self.cq).read_dlid_path_bits } {
             wc.dlid_path_bits = unsafe { read_dlid_path_bits(self.cq) };
         }
@@ -986,27 +988,39 @@ impl WorkCompletion<'_> {
 /// poll, copied, and sent to another thread, and every field is there on every queue, whichever
 /// [`WcFields`] the queue was built with. [`Default`] gives an entry for `poll_into` to fill,
 /// which reads as a failed work request until it has been.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct Completion(ffi::ibv_wc);
+
+impl Default for Completion {
+    /// An entry for [`CompletionQueue::poll_into`] to fill. Until it has been, it reads as a work
+    /// request that failed with [`WcStatus::GeneralError`], rather than as the successful SEND
+    /// that an all-zero `ibv_wc` would be.
+    fn default() -> Self {
+        Completion(ffi::ibv_wc {
+            status: ffi::ibv_wc_status::IBV_WC_GENERAL_ERR,
+            ..Default::default()
+        })
+    }
+}
 
 #[allow(clippy::len_without_is_empty)]
 impl Completion {
     /// The 64-bit id that was associated with the corresponding work request when it was posted.
     #[inline]
     pub fn wr_id(&self) -> u64 {
-        self.0.wr_id()
+        self.0.wr_id
     }
 
     /// `Ok(())` if the work request completed successfully (`IBV_WC_SUCCESS`), otherwise the
     /// [`WcError`] carrying the status and vendor error syndrome.
     #[inline]
     pub fn ok(&self) -> std::result::Result<(), WcError> {
-        match self.0.error() {
-            None => Ok(()),
-            Some((status, vendor_err)) => Err(WcError {
+        match self.0.status {
+            ffi::ibv_wc_status::IBV_WC_SUCCESS => Ok(()),
+            status => Err(WcError {
                 status: status.into(),
-                vendor_err,
+                vendor_err: self.0.vendor_err,
             }),
         }
     }
@@ -1019,20 +1033,25 @@ impl Completion {
     /// [`qp_num`](Self::qp_num) are defined.
     #[inline]
     pub fn opcode(&self) -> WcOpcode {
-        self.0.opcode().into()
+        self.0.opcode.into()
     }
 
     /// The number of bytes transferred, for a successful completion (see
     /// [`WorkCompletion::len`]).
     #[inline]
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.0.byte_len as usize
     }
 
     /// The 32-bit immediate value (host byte order) if one was carried ([`WcFlags::WITH_IMM`]).
     #[inline]
     pub fn imm_data(&self) -> Option<u32> {
-        self.0.imm_data()
+        if self.ok().is_ok() && self.wc_flags().contains(WcFlags::WITH_IMM) {
+            // SAFETY: both members of the union are 32-bit integers, of which any value is valid.
+            Some(u32::from_be(unsafe { self.0.__bindgen_anon_1.imm_data }))
+        } else {
+            None
+        }
     }
 
     /// The remote key a SEND-with-invalidate invalidated, if this completion reports one
@@ -1040,8 +1059,9 @@ impl Completion {
     /// carries one or the other.
     #[inline]
     pub fn invalidated_rkey(&self) -> Option<u32> {
-        if self.0.is_valid() && self.wc_flags().contains(WcFlags::WITH_INV) {
-            Some(self.0.imm_data)
+        if self.ok().is_ok() && self.wc_flags().contains(WcFlags::WITH_INV) {
+            // SAFETY: as in `imm_data`.
+            Some(unsafe { self.0.__bindgen_anon_1.invalidated_rkey })
         } else {
             None
         }
@@ -1063,7 +1083,7 @@ impl Completion {
     /// The flags describing this completion.
     #[inline]
     pub fn wc_flags(&self) -> WcFlags {
-        self.0.wc_flags.into()
+        WcFlags(self.0.wc_flags)
     }
 
     /// Whether the receive completion carries a 40-byte Global Routing Header (GRH) at the front of
@@ -1569,8 +1589,8 @@ mod test_conversions {
         raw.slid = 3;
         raw.sl = 2;
         raw.dlid_path_bits = 1;
-        raw.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_IMM | ffi::ibv_wc_flags::IBV_WC_GRH;
-        raw.imm_data = 0x0102_0304_u32.to_be();
+        raw.wc_flags = (ffi::ibv_wc_flags::IBV_WC_WITH_IMM | ffi::ibv_wc_flags::IBV_WC_GRH).0;
+        raw.__bindgen_anon_1.imm_data = 0x0102_0304_u32.to_be();
         let wc = Completion::from(raw);
         assert!(wc.ok().is_ok());
         assert_eq!(wc.opcode(), WcOpcode::Send);
@@ -1581,8 +1601,8 @@ mod test_conversions {
         assert!(wc.has_grh());
 
         // With the invalidate flag the same field is a remote key, in host order.
-        raw.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_INV;
-        raw.imm_data = 0x1234;
+        raw.wc_flags = ffi::ibv_wc_flags::IBV_WC_WITH_INV.0;
+        raw.__bindgen_anon_1.invalidated_rkey = 0x1234;
         let wc = Completion::from(raw);
         assert_eq!((wc.imm_data(), wc.invalidated_rkey()), (None, Some(0x1234)));
         assert!(!wc.has_grh());

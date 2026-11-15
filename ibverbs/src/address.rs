@@ -631,7 +631,7 @@ impl AddressHandleAttribute {
         grh: Option<&Grh>,
     ) -> Result<Self> {
         let mut wc = *wc.as_raw();
-        let has_grh = (wc.wc_flags & ffi::ibv_wc_flags::IBV_WC_GRH).0 != 0;
+        let has_grh = wc.wc_flags & ffi::ibv_wc_flags::IBV_WC_GRH.0 != 0;
         // `ibv_init_ah_from_wc` reads the header's first word (the flow label) before it checks
         // `IBV_WC_GRH`, so it must always be handed a header: the caller's when the completion
         // reports one, and an all-zero one (no flow label) when it does not.
