@@ -305,7 +305,7 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
     // the one its peer asks for); the receives posted from the setup hooks are in place first.
     let ip = device_ip(&open_test_device());
     let mut no_rnr_retries = ConnectionParameter::default();
-    no_rnr_retries.set_rnr_retry_count(0);
+    no_rnr_retries.set_rnr_retry(0);
     // Send `MESSAGE` as work request 2 and wait for it and receive 1 to complete.
     fn exchange(conn: &mut Connection, cq: &CompletionQueue, pd: &ProtectionDomain) {
         let mut send = mr(pd, 64);
@@ -1527,7 +1527,7 @@ fn check_options(conn: &mut Connection, side: &str) {
         .query(QueuePairAttributeMask::TIMEOUT | QueuePairAttributeMask::AV)
         .expect("query the queue pair");
     assert_eq!(
-        attr.timeout(),
+        attr.ack_timeout(),
         AckTimeout::from_exponent(14),
         "{side} ACK timeout"
     );

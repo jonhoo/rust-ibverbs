@@ -56,9 +56,9 @@ pub(crate) mod sealed {
 /// no-op or a runtime provider error:
 ///
 /// ```compile_fail,E0599
-/// // An unreliable datagram has no ACK timeout: `set_timeout` requires `T: Reliable`.
+/// // An unreliable datagram has no ACK timeout: `set_ack_timeout` requires `T: Reliable`.
 /// fn f(builder: &mut ibverbs::QueuePairBuilder<ibverbs::Ud>) {
-///     builder.set_timeout(ibverbs::AckTimeout::INFINITE);
+///     builder.set_ack_timeout(ibverbs::AckTimeout::INFINITE);
 /// }
 /// ```
 ///
@@ -255,7 +255,7 @@ flags_newtype! {
         AV = IBV_QP_AV;
         /// The path MTU ([`QueuePairAttribute::set_path_mtu`]).
         PATH_MTU = IBV_QP_PATH_MTU;
-        /// The ACK timeout ([`QueuePairAttribute::set_timeout`]).
+        /// The ACK timeout ([`QueuePairAttribute::set_ack_timeout`]).
         TIMEOUT = IBV_QP_TIMEOUT;
         /// The retry count ([`QueuePairAttribute::set_retry_count`]).
         RETRY_CNT = IBV_QP_RETRY_CNT;
@@ -287,7 +287,7 @@ flags_newtype! {
 }
 
 /// The ACK timeout of a reliable-connection queue pair: how long the sender waits for an ACK/NACK
-/// from the remote queue pair before retransmitting. Set with [`QueuePairBuilder::set_timeout`].
+/// from the remote queue pair before retransmitting. Set with [`QueuePairBuilder::set_ack_timeout`].
 ///
 /// The wire encoding is a 5-bit exponent: the device supports exactly the timeouts
 /// `4.096 µs × 2^n` for `n` in `1..=31` — from 8.192 µs up to about 2.4 hours — plus
@@ -571,7 +571,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             rtr.set_min_rnr_timer(RnrTimer::from_encoding(16));
             // The values of rdma-core's examples (`rc_pingpong`), and the retry counts of a
             // connection made through the connection manager.
-            rts.set_timeout(AckTimeout::from_exponent(14))
+            rts.set_ack_timeout(AckTimeout::from_exponent(14))
                 .set_retry_count(7)
                 .set_rnr_retry(7);
         }
@@ -952,7 +952,7 @@ impl<T: Connected> QueuePairBuilder<T> {
     /// Set the access flags for the new `QueuePair`.
     ///
     /// Defaults to [`AccessFlags::LOCAL_WRITE`].
-    pub fn set_access(&mut self, access: AccessFlags) -> &mut Self {
+    pub fn set_access_flags(&mut self, access: AccessFlags) -> &mut Self {
         self.bring_up.init.set_access_flags(access);
         self
     }
@@ -1052,8 +1052,8 @@ impl<T: Reliable> QueuePairBuilder<T> {
     ///
     /// Defaults to 67.1 ms (`n` = 14), which with the default retry count gives a peer between
     /// half a second and two seconds.
-    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
-        self.bring_up.rts.set_timeout(timeout);
+    pub fn set_ack_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
+        self.bring_up.rts.set_ack_timeout(timeout);
         self
     }
 
@@ -1143,7 +1143,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
 /// The answering side finishes its `handshake` before it replies, so it is ready for whatever the
 /// connecting side sends once that side's own `handshake` returns. A queue pair drops what
 /// arrives before its `handshake` is done, and the sender retransmits only after its
-/// [ACK timeout](QueuePairBuilder::set_timeout): a message in the other direction, sent while the
+/// [ACK timeout](QueuePairBuilder::set_ack_timeout): a message in the other direction, sent while the
 /// connecting side is still in its `handshake`, arrives late by at least that long.
 ///
 /// For a runnable version of this exchange (self-connected, so it fits one process), see
@@ -2900,8 +2900,8 @@ impl QueuePairAttribute {
     }
 
     /// Set the ACK timeout: how long to wait for an ACK/NACK before retransmitting (RC only). The
-    /// same knob as [`QueuePairBuilder::set_timeout`].
-    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
+    /// same knob as [`QueuePairBuilder::set_ack_timeout`].
+    pub fn set_ack_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
         self.attr.timeout = timeout.exponent();
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT;
         self
@@ -3011,7 +3011,7 @@ impl QueuePairAttribute {
     }
 
     /// The ACK timeout.
-    pub fn timeout(&self) -> AckTimeout {
+    pub fn ack_timeout(&self) -> AckTimeout {
         AckTimeout::from_exponent(self.attr.timeout & 0x1f)
     }
 

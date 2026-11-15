@@ -43,7 +43,9 @@ fn main() {
         .unwrap()
         .set_gid_index(gid_index)
         .set_max_send_wr(MAX_SEND_WR)
-        .set_access(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ)
+        .set_access_flags(
+            AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE | AccessFlags::REMOTE_READ,
+        )
         .build()
         .unwrap();
 

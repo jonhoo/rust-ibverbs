@@ -68,7 +68,7 @@ fn generous<T: Connected>(access: AccessFlags) -> impl FnOnce(&mut QueuePairBuil
             .set_max_recv_wr(16)
             .set_max_send_sge(4)
             .set_max_recv_sge(4)
-            .set_access(access);
+            .set_access_flags(access);
     }
 }
 
@@ -1839,7 +1839,7 @@ fn legacy_partial_post_reports_posted_count() {
         .expect("failed to create queue pair")
         .set_gid_index(gid_index(&ctx))
         .set_max_send_wr(2)
-        .set_access(AccessFlags::PERMISSIVE)
+        .set_access_flags(AccessFlags::PERMISSIVE)
         .build_legacy()
         .expect("failed to build legacy queue pair");
     let endpoint = prepared.endpoint().expect("failed to read local endpoint");
@@ -2119,7 +2119,7 @@ fn inline_send() {
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder
             .set_max_inline_data(64)
-            .set_access(AccessFlags::PERMISSIVE);
+            .set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     // Inline SEND: the payload lives only in this stack array, never in a registered MR.
@@ -2165,7 +2165,7 @@ fn inline_capacity_is_enforced() {
         builder
             .set_max_inline_data(16)
             .set_max_send_sge(4)
-            .set_access(AccessFlags::PERMISSIVE);
+            .set_access_flags(AccessFlags::PERMISSIVE);
     });
     let (_, init) = qp
         .query(QueuePairAttributeMask::STATE)
@@ -2261,7 +2261,7 @@ fn queue_pair_on_explicit_port() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(AccessFlags::PERMISSIVE);
+        builder.set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     let recv = mr(&pd, 64);
@@ -2303,7 +2303,7 @@ fn completion_timestamps() {
     };
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(AccessFlags::PERMISSIVE);
+        builder.set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     let recv = mr(&pd, 64);
@@ -2343,7 +2343,7 @@ fn extended_wc_fields() {
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(AccessFlags::PERMISSIVE);
+        builder.set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     let recv = mr(&pd, 64);
@@ -2638,7 +2638,7 @@ fn inline_send_list() {
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder
             .set_max_inline_data(64)
-            .set_access(AccessFlags::PERMISSIVE);
+            .set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     // Gathered inline SEND: the payload is assembled from three separate stack buffers.
@@ -3032,7 +3032,7 @@ fn manual_bringup_from_handshake_attributes() {
         .expect("failed to create QP");
     builder
         .set_gid_index(gid_index(&ctx))
-        .set_access(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE);
+        .set_access_flags(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE);
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
 

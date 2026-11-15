@@ -1661,7 +1661,7 @@ impl ConnectionParameter {
     ///
     /// Panics if `rnr_retry_count > 7` (the field is 3 bits, and the kernel would send 7 instead,
     /// which retries indefinitely).
-    pub fn set_rnr_retry_count(&mut self, rnr_retry_count: u8) -> &mut Self {
+    pub fn set_rnr_retry(&mut self, rnr_retry_count: u8) -> &mut Self {
         assert!(
             rnr_retry_count <= 7,
             "the RNR retry count is 3 bits, got {rnr_retry_count}"
@@ -2319,13 +2319,13 @@ mod test_conversions {
     fn retry_counts_are_three_bits() {
         let raw = ConnectionParameter::default()
             .set_retry_count(0)
-            .set_rnr_retry_count(7)
+            .set_rnr_retry(7)
             .as_raw();
         assert_eq!((raw.retry_count, raw.rnr_retry_count), (0, 7));
         type Setter = fn(&mut ConnectionParameter, u8) -> &mut ConnectionParameter;
         let setters: [Setter; 2] = [
             ConnectionParameter::set_retry_count,
-            ConnectionParameter::set_rnr_retry_count,
+            ConnectionParameter::set_rnr_retry,
         ];
         for set in setters {
             let wide = std::panic::catch_unwind(|| {
