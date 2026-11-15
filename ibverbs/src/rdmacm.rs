@@ -34,7 +34,7 @@
 //! let pd = ctx.alloc_pd()?;
 //! let cq = ctx.create_cq(16).build()?;
 //! let qp = pd
-//!     .create_qp::<ibverbs::Rc>(&cq, &cq, port)?
+//!     .create_qp::<ibverbs::transport::Rc>(&cq, &cq, port)?
 //!     .build()?;
 //! let mut conn = resolved.connect(qp, &ConnectionParameter::default(), None)?;
 //! // `conn.queue_pair_mut()` is ready to post on; poll completions on `cq`.
@@ -45,7 +45,7 @@
 //!
 //! # Passive side
 //!
-//! Symmetric: [`Acceptor::bind`] then [`Acceptor::accept`] yields an [`Incoming`] whose
+//! Symmetric: [`Acceptor::bind`] then [`Acceptor::next_request`] yields an [`Incoming`] whose
 //! [`accept`](Incoming::accept) returns a [`Connection`]. A full client/server example lives in
 //! `examples/rdmacm_connect.rs`.
 //!
@@ -92,9 +92,8 @@ use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage};
 
 use crate::error::{check, nonnull};
 use crate::qp::QueuePairState;
-use crate::{
-    AckTimeout, Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Rc, Result,
-};
+use crate::transport::Rc;
+use crate::{AckTimeout, Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Result};
 
 /// The port space a connection-manager identifier lives in: which namespace its port numbers are
 /// allocated from, and which transport its connections use. Passed to [`Connector::new`],
@@ -458,15 +457,19 @@ impl EventChannel {
     }
 
     /// Blocks until the next event on the channel is available and returns it, even if other
-    /// threads race it for events. The event is acknowledged when the returned [`CmEvent`] drops;
+    /// threads race it for events, or returns `None` once `timeout` has passed without one
+    /// (`None` waits indefinitely). The event is acknowledged when the returned [`CmEvent`] drops;
     /// [`CmEvent::id`] says which id it is about.
     ///
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the file descriptor (`poll`)
     ///    or reading the event (`rdma_get_cm_event`) failed.
-    pub fn get_cm_event(&self) -> Result<CmEvent> {
-        self.get_cm_event_deadline(None)
+    pub fn wait_cm_event(&self, timeout: Option<Duration>) -> Result<Option<CmEvent>> {
+        let deadline = crate::completion::deadline_after(timeout);
+        crate::completion::wait_and_take(self.as_fd(), deadline, Error::ConnectionSetup, || {
+            self.poll_cm_event()
+        })
     }
 
     /// Returns the next event on the channel, or `None` if none is currently pending. This never
@@ -480,7 +483,7 @@ impl EventChannel {
     ///    failed.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
         loop {
-            // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so
+            // The read itself, which `wait_cm_event` waits around; the channel is non-blocking, so
             // an empty one reports `EAGAIN`.
             let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
             nix::errno::Errno::clear();
@@ -628,7 +631,7 @@ impl Drop for CmIdInner {
 /// [module-level docs](self#low-level-control) for the overall flow. A typical active-side sequence
 /// is [`resolve_addr`](Self::resolve_addr), [`resolve_route`](Self::resolve_route),
 /// [`connect`](Self::connect), [`establish`](Self::establish), pumping for the matching
-/// [`CmEvent`] after each with [`get_cm_event`](Self::get_cm_event) (blocking) or
+/// [`CmEvent`] after each with [`wait_cm_event`](Self::wait_cm_event) (blocking) or
 /// [`poll_cm_event`](Self::poll_cm_event) (non-blocking); the queue pair is built on
 /// [`context`](Self::context) and [`port_num`](Self::port_num), and transitioned with
 /// [`init_qp_attr`](Self::init_qp_attr).
@@ -701,7 +704,8 @@ impl CmId {
     }
 
     /// Blocks until the next event on this id's channel is available and returns it, even if other
-    /// threads race it for events. On an [`EventChannel`] shared with other ids, that can be
+    /// threads race it for events, or returns `None` once `timeout` has passed without one
+    /// (`None` waits indefinitely). On an [`EventChannel`] shared with other ids, that can be
     /// another id's event (see [`CmEvent::id`]).
     ///
     /// The event is acknowledged automatically when the returned [`CmEvent`] drops. To wait from
@@ -711,8 +715,8 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the channel's file descriptor
     ///    (`poll`) or reading the event (`rdma_get_cm_event`) failed.
-    pub fn get_cm_event(&self) -> Result<CmEvent> {
-        self.inner.channel.get_cm_event()
+    pub fn wait_cm_event(&self, timeout: Option<Duration>) -> Result<Option<CmEvent>> {
+        self.inner.channel.wait_cm_event(timeout)
     }
 
     /// Returns the next event on this id's channel, or `None` if none is currently pending. This
@@ -1349,7 +1353,7 @@ impl AsFd for CmId {
     }
 }
 
-/// A connection-manager event, retrieved with [`CmId::get_cm_event`]/[`CmId::poll_cm_event`] (or
+/// A connection-manager event, retrieved with [`CmId::wait_cm_event`]/[`CmId::poll_cm_event`] (or
 /// from an [`EventChannel`]) and acknowledged automatically when dropped.
 ///
 /// The event keeps the id it is about ([`id`](Self::id)) alive: `rdma_destroy_id` blocks until
@@ -1656,7 +1660,7 @@ impl ConnectionParameter {
     ///
     /// Panics if `rnr_retry_count > 7` (the field is 3 bits, and the kernel would send 7 instead,
     /// which retries indefinitely).
-    pub fn set_rnr_retry_count(&mut self, rnr_retry_count: u8) -> &mut Self {
+    pub fn set_rnr_retry(&mut self, rnr_retry_count: u8) -> &mut Self {
         assert!(
             rnr_retry_count <= 7,
             "the RNR retry count is 3 bits, got {rnr_retry_count}"
@@ -1906,9 +1910,10 @@ pub struct Acceptor {
 impl Acceptor {
     /// Binds to `addr` (use an unspecified address such as `0.0.0.0:port` for any device, and
     /// port 0 for an ephemeral port, read back with [`local_addr`](Self::local_addr)) and starts
-    /// listening, queueing up to `backlog` requests not yet taken by [`accept`](Self::accept) (0
-    /// means the kernel's limit, see [`CmId::listen`]). A loopback address listens on every
-    /// device too, for peers anywhere (see [`CmId::bind_addr`]).
+    /// listening, queueing up to `backlog` requests not yet taken by
+    /// [`next_request`](Self::next_request) (0 means the kernel's limit, see [`CmId::listen`]). A
+    /// loopback address listens on every device too, for peers anywhere (see
+    /// [`CmId::bind_addr`]).
     ///
     /// # Errors
     ///
@@ -1968,7 +1973,7 @@ impl Acceptor {
     ///  - [`ConnectionManager`](Error::ConnectionManager): the listener reported a failure: its
     ///    device was removed, which leaves the acceptor dead (see
     ///    [`DeviceRemoval`](CmEventType::DeviceRemoval)). Only one waiter gets the failure, and
-    ///    every other or later `accept` waits out its timeout, forever with `None`; so drop the
+    ///    every other or later `next_request` waits out its timeout, forever with `None`; so drop the
     ///    acceptor, and with several waiters give each a timeout and stop them all once one sees
     ///    the failure.
     ///  - [`TimedOut`](Error::TimedOut): no request arrived in time.
@@ -1976,7 +1981,7 @@ impl Acceptor {
     ///    a request arrived but could not get an event channel of its own (`EMFILE` once the
     ///    process is out of file descriptors, one per accepted connection): the request is then
     ///    declined, and the acceptor stays usable.
-    pub fn accept(&self, timeout: Option<Duration>) -> Result<Incoming> {
+    pub fn next_request(&self, timeout: Option<Duration>) -> Result<Incoming> {
         let deadline = crate::completion::deadline_after(timeout);
         let request = self
             .listener
@@ -1990,7 +1995,7 @@ impl Acceptor {
 }
 
 /// An incoming connection request, ready for its queue pair to be built and accepted (or
-/// rejected). Returned by [`Acceptor::accept`]. It carries its own event channel, so it is
+/// rejected). Returned by [`Acceptor::next_request`]. It carries its own event channel, so it is
 /// self-contained and can be handed to another thread. Dropping it declines the request, even
 /// while resources built on its [`context`](Self::context) live on.
 #[must_use = "dropping an incoming request declines it; `accept` or `reject` it"]
@@ -2149,7 +2154,7 @@ impl Connection {
 
     /// The connection's id, to watch what happens to it after establishment — the peer
     /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
-    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. A connection can
+    /// with [`CmId::wait_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. A connection can
     /// also end with [`Unreachable`](CmEventType::Unreachable) (on RoCE, when the peer's link
     /// address changes under an id that connected) or [`Rejected`](CmEventType::Rejected) (the
     /// peer answering a connection it no longer knows), so treat those as the end too, not
@@ -2314,13 +2319,13 @@ mod test_conversions {
     fn retry_counts_are_three_bits() {
         let raw = ConnectionParameter::default()
             .set_retry_count(0)
-            .set_rnr_retry_count(7)
+            .set_rnr_retry(7)
             .as_raw();
         assert_eq!((raw.retry_count, raw.rnr_retry_count), (0, 7));
         type Setter = fn(&mut ConnectionParameter, u8) -> &mut ConnectionParameter;
         let setters: [Setter; 2] = [
             ConnectionParameter::set_retry_count,
-            ConnectionParameter::set_rnr_retry_count,
+            ConnectionParameter::set_rnr_retry,
         ];
         for set in setters {
             let wide = std::panic::catch_unwind(|| {

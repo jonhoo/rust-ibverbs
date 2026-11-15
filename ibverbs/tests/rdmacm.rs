@@ -23,9 +23,10 @@ use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, EventChannel,
     PortSpace, Resolved,
 };
+use ibverbs::transport::Rc;
 use ibverbs::{
     AccessFlags, AckTimeout, CompletionQueue, Context, Error, PreparedQueuePair, ProtectionDomain,
-    QueuePairAttribute, QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest,
+    QueuePairAttribute, QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, RecvRequest,
     RemoteMemorySlice, SendRequest, WcStatus,
 };
 
@@ -160,7 +161,7 @@ where
         let acceptor = bind_acceptor(ip, 1);
         let addr = acceptor.local_addr().expect("listen address");
         ready_tx.send(addr).expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
         let port = incoming.cm_id().port_num().expect("server port");
         let (pd, cq, qp) = resources(&ctx, port);
@@ -260,7 +261,7 @@ fn legacy_connect_and_send() {
         ready_tx
             .send(acceptor.local_addr().expect("listen address"))
             .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
         let port = incoming.cm_id().port_num().expect("server port");
         let (pd, cq, qp) = legacy_resources(&ctx, port);
@@ -305,7 +306,7 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
     // the one its peer asks for); the receives posted from the setup hooks are in place first.
     let ip = device_ip(&open_test_device());
     let mut no_rnr_retries = ConnectionParameter::default();
-    no_rnr_retries.set_rnr_retry_count(0);
+    no_rnr_retries.set_rnr_retry(0);
     // Send `MESSAGE` as work request 2 and wait for it and receive 1 to complete.
     fn exchange(conn: &mut Connection, cq: &CompletionQueue, pd: &ProtectionDomain) {
         let mut send = mr(pd, 64);
@@ -333,7 +334,7 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
         ready_tx
             .send(acceptor.local_addr().expect("listen address"))
             .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
         let port = incoming.cm_id().port_num().expect("server port");
         let (pd, cq, qp) = resources(&ctx, port);
@@ -423,7 +424,7 @@ fn accept_times_out() {
     // An acceptor with a timeout and no client reports TimedOut instead of blocking forever.
     let acceptor = bind_acceptor(device_ip(&open_test_device()), 1);
     let before = Instant::now();
-    match acceptor.accept(Some(Duration::from_millis(50))) {
+    match acceptor.next_request(Some(Duration::from_millis(50))) {
         Err(ibverbs::Error::TimedOut) => {}
         Err(e) => panic!("expected TimedOut, got error {e:?}"),
         Ok(_) => panic!("expected TimedOut, got a connection"),
@@ -447,7 +448,9 @@ fn waits_survive_restartable_signals() {
     let acceptor = bind_acceptor(device_ip(&open_test_device()), 1);
     let waiter = std::thread::spawn(move || {
         let before = Instant::now();
-        let result = acceptor.accept(Some(Duration::from_millis(500))).map(drop);
+        let result = acceptor
+            .next_request(Some(Duration::from_millis(500)))
+            .map(drop);
         (result, before.elapsed())
     });
     // Let the waiter block, then interrupt it.
@@ -482,7 +485,7 @@ fn racing_accepts_time_out_on_time() {
         std::thread::spawn(move || {
             let before = Instant::now();
             let result = acceptor
-                .accept(Some(TIMEOUT))
+                .next_request(Some(TIMEOUT))
                 .and_then(|incoming| incoming.reject(&[]));
             result_tx.send((result, before.elapsed())).ok();
         });
@@ -539,7 +542,7 @@ fn two_connections() {
         let mut received = Vec::new();
         let mut conns = Vec::new();
         for _ in 0..2 {
-            let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+            let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
             let ctx = incoming.context().expect("server device context");
             let port = incoming.cm_id().port_num().expect("server port");
             let (pd, cq, qp) = resources(&ctx, port);
@@ -635,7 +638,7 @@ const SERVER_PDATA: &[u8] =
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn low_level_connect_and_send() {
     // Drive the connection-manager state machine directly with `CmId`, instead of the blocking
-    // `Connector`/`Acceptor` helpers: the passive side blocks on `get_cm_event`, while the active
+    // `Connector`/`Acceptor` helpers: the passive side blocks on `wait_cm_event`, while the active
     // side pumps events off its non-blocking file descriptor the way an event loop would. Proves
     // the low-level escape hatch can set up a working connection, and that private data crosses it
     // in both directions.
@@ -938,7 +941,7 @@ fn server_writes_into_client() {
         ready_tx
             .send(acceptor.local_addr().expect("listen address"))
             .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
         let pdata = incoming.peer_private_data();
         assert!(
             pdata.len() >= RemoteMemorySlice::WIRE_LEN,
@@ -1098,7 +1101,7 @@ fn rejected_request_reports_reason_and_private_data() {
         ready_tx
             .send(acceptor.local_addr().expect("listen address"))
             .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
         incoming.reject(b"nope").expect("reject");
         done_rx
             .recv_timeout(Duration::from_secs(10))
@@ -1202,7 +1205,7 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
         ready_tx
             .send(acceptor.local_addr().expect("listen address"))
             .expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
         let ctx = incoming.context().expect("server device context");
         let port = incoming.cm_id().port_num().expect("server port");
         let pd = ctx.alloc_pd().expect("server pd");
@@ -1466,7 +1469,7 @@ fn cm_id_options_and_accessors() {
         let addr = acceptor.cm_id().local_addr().expect("listen address");
         assert_eq!(acceptor.local_addr(), Some(addr));
         ready_tx.send(addr).expect("signal ready");
-        let incoming = acceptor.accept(SETUP_TIMEOUT).expect("accept");
+        let incoming = acceptor.next_request(SETUP_TIMEOUT).expect("accept");
         assert_eq!(incoming.cm_id().local_addr(), Some(addr));
         let peer = incoming.cm_id().peer_addr();
         assert!(peer.is_some());
@@ -1527,7 +1530,7 @@ fn check_options(conn: &mut Connection, side: &str) {
         .query(QueuePairAttributeMask::TIMEOUT | QueuePairAttributeMask::AV)
         .expect("query the queue pair");
     assert_eq!(
-        attr.timeout(),
+        attr.ack_timeout(),
         AckTimeout::from_exponent(14),
         "{side} ACK timeout"
     );

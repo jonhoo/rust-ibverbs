@@ -11,145 +11,7 @@ use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
 use crate::srq::SharedReceiveQueue;
-
-/// Seals the transport traits: only the markers defined by this crate implement them.
-pub(crate) mod sealed {
-    use super::{PreparedQueuePair, QueuePairBuilder, Transport};
-    use crate::error::Result;
-
-    /// Implemented by every transport marker.
-    pub trait Sealed {
-        /// The queue-pair type (`IBV_QPT_*`) the marker stands for.
-        const TYPE: ffi::ibv_qp_type;
-
-        /// The send operations a queue pair of this transport on `ctx` is created with unless
-        /// the builder says otherwise: SEND on every transport, RDMA WRITE on the connected
-        /// ones, and RDMA READ and the atomics on RC, the atomics only if the device executes
-        /// them (`atomics`). SRD asks the device (see `efa.rs`).
-        fn default_send_ops(_ctx: &crate::Context, atomics: bool) -> super::SendOps {
-            super::default_send_ops(Self::TYPE, atomics)
-        }
-
-        /// Creates the queue pair `builder` describes, with `ibv_create_qp_ex` unless the
-        /// transport's queue pairs come from a provider's own verb (SRD's, in `efa.rs`).
-        fn create(builder: &QueuePairBuilder<Self>) -> Result<PreparedQueuePair<Self>>
-        where
-            Self: Transport + Sized,
-        {
-            builder.create_qp_ex()
-        }
-    }
-
-    /// Implemented by the transports `ibv_create_qp` creates (every one but SRD), which have
-    /// [`build_legacy`](QueuePairBuilder::build_legacy).
-    pub trait Legacy: Sealed {}
-}
-
-/// A queue-pair transport marker: types the queue-pair family ([`QueuePairBuilder`],
-/// [`PreparedQueuePair`], [`QueuePair`], [`SendOp`]) so that transport-specific operations only
-/// exist on the transports that support them. Sealed; implemented by [`Rc`], [`Uc`], [`Ud`], and
-/// `Srd` (behind the `efa` feature).
-///
-/// # Compile-time enforcement
-///
-/// Using a transport-specific operation on the wrong transport is a compile error, not a silent
-/// no-op or a runtime provider error:
-///
-/// ```compile_fail,E0599
-/// // An unreliable datagram has no ACK timeout: `set_timeout` requires `T: Reliable`.
-/// fn f(builder: &mut ibverbs::QueuePairBuilder<ibverbs::Ud>) {
-///     builder.set_timeout(ibverbs::AckTimeout::INFINITE);
-/// }
-/// ```
-///
-/// ```compile_fail,E0599
-/// // A connected transport addresses no individual sends: `to` requires `T: Datagram`.
-/// fn f(qp: &mut ibverbs::QueuePair, ah: &ibverbs::AddressHandle) {
-///     let mut batch = qp.start_send();
-///     batch.to(ah, 1, 2);
-/// }
-/// ```
-///
-/// ```compile_fail,E0599
-/// // A datagram work request is always addressed: its batch starts at `to`, and `op` requires
-/// // `T: Connected`.
-/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Ud>) {
-///     let mut batch = qp.start_send();
-///     batch.op();
-/// }
-/// ```
-///
-/// ```compile_fail,E0599
-/// // Only RC has reads and atomics for a fence to wait for: `fenced` requires `T: Reliable`.
-/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Uc>) {
-///     let mut batch = qp.start_send();
-///     let _ = batch.op().fenced();
-/// }
-/// ```
-///
-/// ```compile_fail,E0599
-/// // A datagram queue pair has no remote endpoint to handshake with: use `activate`.
-/// fn f(pqp: ibverbs::PreparedQueuePair<ibverbs::Ud>, remote: ibverbs::QueuePairEndpoint) {
-///     let _ = pqp.handshake(remote);
-/// }
-/// ```
-pub trait Transport: sealed::Sealed {}
-
-/// Implemented by the connected transports RC and UC, which are brought up against a single
-/// remote endpoint with [`PreparedQueuePair::handshake`].
-pub trait Connected: Transport {}
-
-/// Implemented by the reliable connected transport RC, the only connected transport with
-/// acknowledgements and retries and RDMA reads, and the only transport with atomics (EFA's SRD,
-/// behind the `efa` feature, is reliable and has RDMA reads too, but is a datagram transport).
-pub trait Reliable: Connected {}
-
-/// Implemented by the datagram transports UD and SRD, which address each send individually with
-/// an [`AddressHandle`] ([`SendBatch::to`]).
-pub trait Datagram: Transport {}
-
-/// The reliable-connection (RC) transport: connected to exactly one peer, in-order and reliable;
-/// supports sends, RDMA read/write, and atomics.
-///
-/// Note that this marker shadows [`std::rc::Rc`] when glob-imported (`use ibverbs::*`).
-#[derive(Debug, Clone, Copy)]
-pub struct Rc;
-
-/// The unreliable-connection (UC) transport: connected to exactly one peer, in order but without
-/// delivery guarantees; supports sends and RDMA writes.
-#[derive(Debug, Clone, Copy)]
-pub struct Uc;
-
-/// The unreliable-datagram (UD) transport: connectionless, each message fits in one MTU, and each
-/// send is addressed individually with an [`AddressHandle`].
-///
-/// On EFA, mark every UD send [`signaled`](SendOp::signaled) and none
-/// [`solicited`](SendOp::solicited): EFA refuses unsignaled and solicited work requests,
-/// and the batch then fails at [`submit`](SendBatch::submit).
-#[derive(Debug, Clone, Copy)]
-pub struct Ud;
-
-impl sealed::Sealed for Rc {
-    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_RC;
-}
-impl Transport for Rc {}
-impl Connected for Rc {}
-impl Reliable for Rc {}
-impl sealed::Legacy for Rc {}
-
-impl sealed::Sealed for Uc {
-    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UC;
-}
-impl Transport for Uc {}
-impl Connected for Uc {}
-impl sealed::Legacy for Uc {}
-
-impl sealed::Sealed for Ud {
-    const TYPE: ffi::ibv_qp_type = ffi::ibv_qp_type::IBV_QPT_UD;
-}
-impl Transport for Ud {}
-impl Datagram for Ud {}
-impl sealed::Legacy for Ud {}
+use crate::transport::{Connected, Datagram, Rc, Reliable, Transport, Ud, sealed};
 
 /// The state of a queue pair's state machine.
 ///
@@ -255,7 +117,7 @@ flags_newtype! {
         AV = IBV_QP_AV;
         /// The path MTU ([`QueuePairAttribute::set_path_mtu`]).
         PATH_MTU = IBV_QP_PATH_MTU;
-        /// The ACK timeout ([`QueuePairAttribute::set_timeout`]).
+        /// The ACK timeout ([`QueuePairAttribute::set_ack_timeout`]).
         TIMEOUT = IBV_QP_TIMEOUT;
         /// The retry count ([`QueuePairAttribute::set_retry_count`]).
         RETRY_CNT = IBV_QP_RETRY_CNT;
@@ -287,7 +149,7 @@ flags_newtype! {
 }
 
 /// The ACK timeout of a reliable-connection queue pair: how long the sender waits for an ACK/NACK
-/// from the remote queue pair before retransmitting. Set with [`QueuePairBuilder::set_timeout`].
+/// from the remote queue pair before retransmitting. Set with [`QueuePairBuilder::set_ack_timeout`].
 ///
 /// The wire encoding is a 5-bit exponent: the device supports exactly the timeouts
 /// `4.096 µs × 2^n` for `n` in `1..=31` — from 8.192 µs up to about 2.4 hours — plus
@@ -480,7 +342,7 @@ flags_newtype! {
 /// on the connected transports, and RDMA READ and the atomics on RC only, the atomics only when
 /// the device executes them (`atomics`): mlx5 refuses to create a queue pair that requests
 /// atomics on a device without. SRD asks its device instead (see `efa.rs`).
-fn default_send_ops(qp_type: ffi::ibv_qp_type, atomics: bool) -> SendOps {
+pub(crate) fn default_send_ops(qp_type: ffi::ibv_qp_type, atomics: bool) -> SendOps {
     use ffi::ibv_qp_type as T;
     let mut ops = SendOps::SEND | SendOps::SEND_WITH_IMM;
     if matches!(qp_type, T::IBV_QPT_RC | T::IBV_QPT_UC) {
@@ -571,7 +433,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             rtr.set_min_rnr_timer(RnrTimer::from_encoding(16));
             // The values of rdma-core's examples (`rc_pingpong`), and the retry counts of a
             // connection made through the connection manager.
-            rts.set_timeout(AckTimeout::from_exponent(14))
+            rts.set_ack_timeout(AckTimeout::from_exponent(14))
                 .set_retry_count(7)
                 .set_rnr_retry(7);
         }
@@ -663,12 +525,12 @@ impl<T: Transport> QueuePairBuilder<T> {
         self
     }
 
-    /// Set the opaque context value for the new `QueuePair` (its `qp_context`), an integer like
-    /// the one [`CompletionQueueBuilder::set_context`](crate::CompletionQueueBuilder::set_context)
+    /// Set the opaque user-data value for the new `QueuePair` (its `qp_context`), an integer like
+    /// the one [`CompletionQueueBuilder::set_user_data`](crate::CompletionQueueBuilder::set_user_data)
     /// takes.
     ///
     /// Defaults to 0.
-    pub fn set_context(&mut self, ctx: u64) -> &mut Self {
+    pub fn set_user_data(&mut self, ctx: u64) -> &mut Self {
         self.ctx = ctx;
         self
     }
@@ -822,7 +684,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// The creation attributes both `ibv_create_qp_ex` and `efadv_create_qp_ex` take: the
-    /// builder's context value, completion queues, capacities, and send operations, in its
+    /// builder's user-data value, completion queues, capacities, and send operations, in its
     /// protection domain. The shared receive queue is left to the caller.
     pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
         ffi::ibv_qp_init_attr_ex {
@@ -876,7 +738,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     }
 
     /// The `ibv_create_qp_ex` creation of every transport but SRD.
-    fn create_qp_ex(&self) -> Result<PreparedQueuePair<T>> {
+    pub(crate) fn create_qp_ex(&self) -> Result<PreparedQueuePair<T>> {
         self.check_same_context()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
@@ -952,7 +814,7 @@ impl<T: Connected> QueuePairBuilder<T> {
     /// Set the access flags for the new `QueuePair`.
     ///
     /// Defaults to [`AccessFlags::LOCAL_WRITE`].
-    pub fn set_access(&mut self, access: AccessFlags) -> &mut Self {
+    pub fn set_access_flags(&mut self, access: AccessFlags) -> &mut Self {
         self.bring_up.init.set_access_flags(access);
         self
     }
@@ -992,7 +854,8 @@ impl<T: Transport + sealed::Legacy> QueuePairBuilder<T> {
     /// result:
     ///
     /// ```no_run
-    /// # use ibverbs::{Error, PreparedQueuePair, QueuePairBuilder, Rc, Result};
+    /// # use ibverbs::{Error, PreparedQueuePair, QueuePairBuilder, Result};
+    /// # use ibverbs::transport::{Rc};
     /// # fn f(builder: &QueuePairBuilder<Rc>) -> Result<PreparedQueuePair<Rc>> {
     /// match builder.build() {
     ///     Err(Error::Unsupported { .. }) => builder.build_legacy(),
@@ -1052,8 +915,8 @@ impl<T: Reliable> QueuePairBuilder<T> {
     ///
     /// Defaults to 67.1 ms (`n` = 14), which with the default retry count gives a peer between
     /// half a second and two seconds.
-    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
-        self.bring_up.rts.set_timeout(timeout);
+    pub fn set_ack_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
+        self.bring_up.rts.set_ack_timeout(timeout);
         self
     }
 
@@ -1143,7 +1006,7 @@ impl<T: Reliable> QueuePairBuilder<T> {
 /// The answering side finishes its `handshake` before it replies, so it is ready for whatever the
 /// connecting side sends once that side's own `handshake` returns. A queue pair drops what
 /// arrives before its `handshake` is done, and the sender retransmits only after its
-/// [ACK timeout](QueuePairBuilder::set_timeout): a message in the other direction, sent while the
+/// [ACK timeout](QueuePairBuilder::set_ack_timeout): a message in the other direction, sent while the
 /// connecting side is still in its `handshake`, arrives late by at least that long.
 ///
 /// For a runnable version of this exchange (self-connected, so it fits one process), see
@@ -1713,7 +1576,7 @@ impl<'a> InlineSlice<'a> {
 ///
 /// ```compile_fail,E0505
 /// # fn f(
-/// #     qp: &mut ibverbs::QueuePair<ibverbs::Ud>,
+/// #     qp: &mut ibverbs::QueuePair<ibverbs::transport::Ud>,
 /// #     ah: ibverbs::AddressHandle,
 /// #     sges: &[ibverbs::LocalMemorySlice],
 /// # ) {
@@ -1728,14 +1591,14 @@ impl<'a> InlineSlice<'a> {
 /// ```compile_fail,E0599
 /// // A connected transport addresses no individual sends: `send_to` exists only on UD.
 /// fn f(ah: &ibverbs::AddressHandle, sges: &[ibverbs::LocalMemorySlice]) {
-///     let _ = ibverbs::SendRequest::<ibverbs::Rc>::send_to(ah, 1, 2, 3, sges);
+///     let _ = ibverbs::SendRequest::<ibverbs::transport::Rc>::send_to(ah, 1, 2, 3, sges);
 /// }
 /// ```
 ///
 /// ```compile_fail,E0599
 /// // Only RC has RDMA reads: `read` requires `T: Reliable`.
 /// fn f(local: &[ibverbs::LocalMemorySlice], remote: ibverbs::RemoteMemorySlice) {
-///     let _ = ibverbs::SendRequest::<ibverbs::Uc>::read(1, local, remote);
+///     let _ = ibverbs::SendRequest::<ibverbs::transport::Uc>::read(1, local, remote);
 /// }
 /// ```
 #[repr(transparent)]
@@ -2101,7 +1964,7 @@ impl<'a> SendRequest<'a, Ud> {
 ///
 /// ```compile_fail,E0505
 /// # fn dropped_handle(
-/// #     qp: &mut ibverbs::QueuePair<ibverbs::Ud>,
+/// #     qp: &mut ibverbs::QueuePair<ibverbs::transport::Ud>,
 /// #     ah: ibverbs::AddressHandle,
 /// #     sges: &[ibverbs::LocalMemorySlice],
 /// # ) {
@@ -2900,8 +2763,8 @@ impl QueuePairAttribute {
     }
 
     /// Set the ACK timeout: how long to wait for an ACK/NACK before retransmitting (RC only). The
-    /// same knob as [`QueuePairBuilder::set_timeout`].
-    pub fn set_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
+    /// same knob as [`QueuePairBuilder::set_ack_timeout`].
+    pub fn set_ack_timeout(&mut self, timeout: AckTimeout) -> &mut Self {
         self.attr.timeout = timeout.exponent();
         self.mask |= ffi::ibv_qp_attr_mask::IBV_QP_TIMEOUT;
         self
@@ -3011,7 +2874,7 @@ impl QueuePairAttribute {
     }
 
     /// The ACK timeout.
-    pub fn timeout(&self) -> AckTimeout {
+    pub fn ack_timeout(&self) -> AckTimeout {
         AckTimeout::from_exponent(self.attr.timeout & 0x1f)
     }
 

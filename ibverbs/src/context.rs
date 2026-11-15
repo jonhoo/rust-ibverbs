@@ -108,7 +108,7 @@ impl Context {
     ///
     /// `min_cq_entries` is the minimum size of the CQ (the actual size can be larger) and is the only
     /// required parameter. The optional ones are configured on the returned
-    /// [`CompletionQueueBuilder`]: an opaque context cookie, the completion vector, a completion
+    /// [`CompletionQueueBuilder`]: an opaque user-data value, the completion vector, a completion
     /// channel ([`set_comp_channel`](CompletionQueueBuilder::set_comp_channel)), and extra
     /// work-completion fields such as a hardware timestamp. Call
     /// [`build`](CompletionQueueBuilder::build) to create the queue.
@@ -129,7 +129,7 @@ impl Context {
     /// the queues built on it with [`CompletionQueueBuilder::set_comp_channel`].
     ///
     /// By default a completion queue has no channel and is driven by polling alone; a channel is
-    /// what lets you block for completions ([`CompletionChannel::wait`]) or hand the descriptor to
+    /// what lets you block for completions ([`CompletionChannel::wait_event`]) or hand the descriptor to
     /// an event loop instead. Several queues can share one channel — a single descriptor then
     /// reports notifications for all of them, which is what you want for a server driving many
     /// queue pairs from one `epoll`/reactor. See [`CompletionChannel`] for the notification loop.
@@ -164,7 +164,7 @@ impl Context {
     ///
     /// # Errors
     ///
-    ///  - [`AsyncEvent`](Error::AsyncEvent): reading the event failed (`ibv_get_async_event`).
+    ///  - [`ReadAsyncEvent`](Error::ReadAsyncEvent): reading the event failed (`ibv_get_async_event`).
     pub fn poll_async_event(&self) -> Result<Option<AsyncEvent>> {
         let mut event = ffi::ibv_async_event::default();
         let rc = unsafe { ffi::ibv_get_async_event(self.inner.ctx, &mut event) };
@@ -173,7 +173,7 @@ impl Context {
             if e.kind() == io::ErrorKind::WouldBlock {
                 return Ok(None);
             }
-            return Err(Error::os(e, Error::AsyncEvent));
+            return Err(Error::os(e, Error::ReadAsyncEvent));
         }
         // SAFETY: the event is not acknowledged yet, so the queue pair it names is still alive.
         let qp_num = unsafe { event_qp_num(&event) };
@@ -194,12 +194,12 @@ impl Context {
     ///
     /// # Errors
     ///
-    ///  - [`AsyncEvent`](Error::AsyncEvent): waiting for or reading the event failed.
+    ///  - [`ReadAsyncEvent`](Error::ReadAsyncEvent): waiting for or reading the event failed.
     pub fn wait_async_event(&self, timeout: Option<Duration>) -> Result<Option<AsyncEvent>> {
         crate::completion::wait_and_take(
             self.async_fd(),
             crate::completion::deadline_after(timeout),
-            Error::AsyncEvent,
+            Error::ReadAsyncEvent,
             || self.poll_async_event(),
         )
     }

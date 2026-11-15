@@ -12,12 +12,12 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{mr, open_test_device, poll_until, test_device};
+use ibverbs::transport::{Connected, Rc, Uc, Ud};
 use ibverbs::{
-    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
-    InlineSlice, LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain,
-    QueuePair, QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
-    QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, SendRequest, TransportType, Uc, Ud,
-    WcFields,
+    AccessFlags, AddressHandleAttribute, CompletionQueue, Context, Error, Grh, InlineSlice,
+    LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
+    QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
+    QueuePairState, RecvRequest, RnrTimer, SendOps, SendRequest, TransportType, WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.
@@ -68,7 +68,7 @@ fn generous<T: Connected>(access: AccessFlags) -> impl FnOnce(&mut QueuePairBuil
             .set_max_recv_wr(16)
             .set_max_send_sge(4)
             .set_max_recv_sge(4)
-            .set_access(access);
+            .set_access_flags(access);
     }
 }
 
@@ -575,7 +575,7 @@ fn multiple_outstanding() {
     }
 }
 
-/// Blocking on a completion channel (`CompletionChannel::wait`) delivers completions without
+/// Blocking on a completion channel (`CompletionChannel::wait_event`) delivers completions without
 /// busy-polling: arm the queue, drain it, and only then block on the channel.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
@@ -589,7 +589,7 @@ fn wait_for_completion() {
     let cq = ctx
         .create_cq(64)
         .set_comp_channel(&channel)
-        .set_context(CQ_CONTEXT)
+        .set_user_data(CQ_CONTEXT)
         .build()
         .expect("failed to create completion queue");
     let pd = ctx
@@ -623,7 +623,7 @@ fn wait_for_completion() {
             continue;
         }
         match channel
-            .wait(Some(Duration::from_secs(5)))
+            .wait_event(Some(Duration::from_secs(5)))
             .expect("wait failed")
         {
             Some(context) => assert_eq!(context, CQ_CONTEXT),
@@ -1839,7 +1839,7 @@ fn legacy_partial_post_reports_posted_count() {
         .expect("failed to create queue pair")
         .set_gid_index(gid_index(&ctx))
         .set_max_send_wr(2)
-        .set_access(AccessFlags::PERMISSIVE)
+        .set_access_flags(AccessFlags::PERMISSIVE)
         .build_legacy()
         .expect("failed to build legacy queue pair");
     let endpoint = prepared.endpoint().expect("failed to read local endpoint");
@@ -2119,7 +2119,7 @@ fn inline_send() {
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder
             .set_max_inline_data(64)
-            .set_access(AccessFlags::PERMISSIVE);
+            .set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     // Inline SEND: the payload lives only in this stack array, never in a registered MR.
@@ -2165,7 +2165,7 @@ fn inline_capacity_is_enforced() {
         builder
             .set_max_inline_data(16)
             .set_max_send_sge(4)
-            .set_access(AccessFlags::PERMISSIVE);
+            .set_access_flags(AccessFlags::PERMISSIVE);
     });
     let (_, init) = qp
         .query(QueuePairAttributeMask::STATE)
@@ -2261,7 +2261,7 @@ fn queue_pair_on_explicit_port() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
 
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(AccessFlags::PERMISSIVE);
+        builder.set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     let recv = mr(&pd, 64);
@@ -2296,14 +2296,14 @@ fn completion_timestamps() {
         &ctx,
         "completion timestamps",
         ctx.create_cq(16)
-            .set_wc_flags(WcFields::COMPLETION_TIMESTAMP)
+            .set_wc_fields(WcFields::COMPLETION_TIMESTAMP)
             .build(),
     ) else {
         return;
     };
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(AccessFlags::PERMISSIVE);
+        builder.set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     let recv = mr(&pd, 64);
@@ -2337,13 +2337,13 @@ fn extended_wc_fields() {
 
     let cq = ctx
         .create_cq(16)
-        .set_wc_flags(WcFields::DLID_PATH_BITS)
+        .set_wc_fields(WcFields::DLID_PATH_BITS)
         .build()
         .expect("failed to create a CQ with the path bits");
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        builder.set_access(AccessFlags::PERMISSIVE);
+        builder.set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     let recv = mr(&pd, 64);
@@ -2386,7 +2386,7 @@ fn extended_wc_fields() {
         &ctx,
         "packet-classification completion fields",
         ctx.create_cq(16)
-            .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
+            .set_wc_fields(WcFields::CVLAN | WcFields::FLOW_TAG)
             .build(),
     ) {
         let mut qp =
@@ -2450,11 +2450,11 @@ fn event_driven_completion() {
     unsafe { batch.submit() }.expect("send failed");
 
     // A real event loop would await readability of the descriptor; here we consume the notification
-    // as soon as it arrives. `get_event` reads the (non-blocking) channel and acknowledges for us.
+    // as soon as it arrives. `poll_event` reads the (non-blocking) channel and acknowledges for us.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut notified = false;
     while Instant::now() < deadline {
-        if channel.get_event().expect("get_event failed").is_some() {
+        if channel.poll_event().expect("poll_event failed").is_some() {
             notified = true;
             break;
         }
@@ -2638,7 +2638,7 @@ fn inline_send_list() {
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
         builder
             .set_max_inline_data(64)
-            .set_access(AccessFlags::PERMISSIVE);
+            .set_access_flags(AccessFlags::PERMISSIVE);
     });
 
     // Gathered inline SEND: the payload is assembled from three separate stack buffers.
@@ -2736,7 +2736,7 @@ fn debug_formatting() {
 }
 
 /// Two completion queues share one completion channel, so a single file descriptor carries
-/// notifications for both. Drive them through the channel and demultiplex by the context value each
+/// notifications for both. Drive them through the channel and demultiplex by the user-data value each
 /// queue was built with.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
@@ -2749,20 +2749,20 @@ fn shared_completion_channel() {
         .create_comp_channel()
         .expect("failed to create completion channel");
 
-    // Distinct context values let `CompletionChannel::get_event` say which queue a notification is
+    // Distinct user-data values let `CompletionChannel::poll_event` say which queue a notification is
     // for.
     const CTX_A: u64 = 1;
     const CTX_B: u64 = 2;
     let cq_a = ctx
         .create_cq(16)
         .set_comp_channel(&channel)
-        .set_context(CTX_A)
+        .set_user_data(CTX_A)
         .build()
         .expect("failed to build first completion queue");
     let cq_b = ctx
         .create_cq(16)
         .set_comp_channel(&channel)
-        .set_context(CTX_B)
+        .set_user_data(CTX_B)
         .build()
         .expect("failed to build second completion queue");
 
@@ -2819,7 +2819,7 @@ fn shared_completion_channel() {
     while a.len() < 2 || b.len() < 2 {
         assert!(Instant::now() < deadline, "timed out: a={a:?} b={b:?}");
         match channel
-            .wait(Some(Duration::from_millis(100)))
+            .wait_event(Some(Duration::from_millis(100)))
             .expect("channel wait")
         {
             None => continue,
@@ -3032,7 +3032,7 @@ fn manual_bringup_from_handshake_attributes() {
         .expect("failed to create QP");
     builder
         .set_gid_index(gid_index(&ctx))
-        .set_access(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE);
+        .set_access_flags(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE);
     let prepared = builder.build().expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
 

@@ -9,8 +9,9 @@ use crate::completion::CompletionQueue;
 use crate::context::{Context, PortAttr, PortState};
 use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion};
-use crate::qp::{QueuePairBuilder, Transport};
+use crate::qp::QueuePairBuilder;
 use crate::srq::SharedReceiveQueue;
+use crate::transport::Transport;
 
 /// Advice for [`ProtectionDomain::advise_mr`] (the `IBV_ADVISE_MR_ADVICE_*` values).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

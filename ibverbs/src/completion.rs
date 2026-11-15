@@ -23,7 +23,7 @@ pub(crate) fn deadline_after(timeout: Option<Duration>) -> Option<Instant> {
 /// `poll(2)` waits at most `i32::MAX` milliseconds (about 24.8 days) per call, so a later deadline
 /// is waited out in slices; each is rounded up to whole milliseconds so the wait never ends
 /// fractionally early. A signal interrupting `poll(2)` (`EINTR`) resumes the wait. Out of line:
-/// it blocks anyway, and inlined it would weigh on [`CompletionChannel::wait`]'s path for a
+/// it blocks anyway, and inlined it would weigh on [`CompletionChannel::wait_event`]'s path for a
 /// notification that is already pending.
 #[inline(never)]
 pub(crate) fn wait_and_take<T>(
@@ -87,15 +87,15 @@ fn provider_poll_failure(verb: &str, code: i32) -> Error {
 /// completions instead of burning a core, create a channel with [`Context::create_comp_channel`]
 /// and build the queue on it with [`CompletionQueueBuilder::set_comp_channel`]; then arm the queue
 /// with [`CompletionQueue::req_notify`], drain it with [`poll`](CompletionQueue::poll), and block
-/// on the channel ([`wait`](Self::wait)), or watch its descriptor
+/// on the channel ([`wait_event`](Self::wait_event)), or watch its descriptor
 /// ([`AsFd`]/[`AsRawFd`]) from your own reactor and consume notifications
-/// with [`get_event`](Self::get_event). After each notification, re-arm the queue and then drain
+/// with [`poll_event`](Self::poll_event). After each notification, re-arm the queue and then drain
 /// it again, in that order (see [`req_notify`](CompletionQueue::req_notify)).
 ///
 /// Any number of queues can be built on one channel, collapsing their notifications onto a single
 /// file descriptor (what you want for a server driving many queue pairs from one `epoll`/reactor).
-/// A notification carries the context value of the queue it belongs to (set with
-/// [`CompletionQueueBuilder::set_context`]), which is how [`get_event`](Self::get_event) tells the
+/// A notification carries the user-data value of the queue it belongs to (set with
+/// [`CompletionQueueBuilder::set_user_data`]), which is how [`poll_event`](Self::poll_event) tells the
 /// sharers apart — give each queue a distinct one. The channel is a single stream of events:
 /// however many threads consume it, each notification is delivered to exactly one of them, so
 /// routing it to the right queue is the consumer's job.
@@ -129,7 +129,7 @@ impl Drop for CompletionChannelInner {
 
 impl CompletionChannel {
     /// Create a completion channel on `ctx` (for [`Context::create_comp_channel`]), with its file
-    /// descriptor set non-blocking so [`get_event`](Self::get_event) reports an empty channel
+    /// descriptor set non-blocking so [`poll_event`](Self::poll_event) reports an empty channel
     /// instead of blocking.
     pub(crate) fn new(ctx: &Context) -> Result<CompletionChannel> {
         let cc = nonnull(
@@ -147,22 +147,22 @@ impl CompletionChannel {
         Ok(channel)
     }
 
-    /// Consume one pending notification from the channel, returning the context value of the
-    /// completion queue it belongs to (the value set with [`CompletionQueueBuilder::set_context`]),
+    /// Consume one pending notification from the channel, returning the user-data value of the
+    /// completion queue it belongs to (the value set with [`CompletionQueueBuilder::set_user_data`]),
     /// or `None` if none is pending.
     ///
     /// Demultiplexing several queues that share one channel works by draining notifications here
     /// after the channel's file descriptor becomes readable, and mapping each returned context
     /// back to the queue, which you then re-arm with [`req_notify`](CompletionQueue::req_notify)
     /// and only then drain with [`poll`](CompletionQueue::poll). Give each queue a distinct
-    /// [`set_context`](CompletionQueueBuilder::set_context) value so they can be told apart.
+    /// [`set_user_data`](CompletionQueueBuilder::set_user_data) value so they can be told apart.
     /// Acknowledgement is handled for you. Consume a given queue's notifications and re-arm it from
     /// one thread at a time (see [Thread safety](crate#thread-safety)).
     ///
     /// # Errors
     ///
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): `ibv_get_cq_event` failed.
-    pub fn get_event(&self) -> Result<Option<u64>> {
+    pub fn poll_event(&self) -> Result<Option<u64>> {
         let mut out_cq = ptr::null_mut();
         let mut out_cq_context = ptr::null_mut();
         let rc = unsafe { ffi::ibv_get_cq_event(self.inner.cc, &mut out_cq, &mut out_cq_context) };
@@ -179,11 +179,11 @@ impl CompletionChannel {
     }
 
     /// Block until a notification is available on the channel (up to `timeout`), then consume it,
-    /// returning the context value of the completion queue it belongs to (the value set with
-    /// [`CompletionQueueBuilder::set_context`]). Returns `None` only if `timeout` elapses first;
+    /// returning the user-data value of the completion queue it belongs to (the value set with
+    /// [`CompletionQueueBuilder::set_user_data`]). Returns `None` only if `timeout` elapses first;
     /// with no timeout it waits indefinitely, even if other threads race it for notifications.
     ///
-    /// The blocking form of [`get_event`](Self::get_event): it waits on the channel's file
+    /// The blocking form of [`poll_event`](Self::poll_event): it waits on the channel's file
     /// descriptor for you rather than requiring an external reactor. Arm each queue with
     /// [`CompletionQueue::req_notify`] and drain it with [`poll`](CompletionQueue::poll) *before*
     /// blocking here; polling after arming closes the race where a completion lands between an
@@ -194,17 +194,17 @@ impl CompletionChannel {
     ///
     ///  - [`PollCompletionQueue`](Error::PollCompletionQueue): waiting on the descriptor (`poll`)
     ///    or consuming the notification failed.
-    pub fn wait(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
+    pub fn wait_event(&self, timeout: Option<Duration>) -> Result<Option<u64>> {
         // A notification that is already pending needs no wait: take it without a `poll(2)` or
         // reading the clock.
-        if let Some(context) = self.get_event()? {
+        if let Some(context) = self.poll_event()? {
             return Ok(Some(context));
         }
         wait_and_take(
             self.as_fd(),
             deadline_after(timeout),
             Error::PollCompletionQueue,
-            || self.get_event(),
+            || self.poll_event(),
         )
     }
 
@@ -266,10 +266,10 @@ impl CompletionQueueBuilder {
         }
     }
 
-    /// Set an opaque context value associated with the completion queue.
+    /// Set an opaque user-data value associated with the completion queue.
     ///
     /// Defaults to 0.
-    pub fn set_context(&mut self, id: u64) -> &mut Self {
+    pub fn set_user_data(&mut self, id: u64) -> &mut Self {
         self.cq_context = id;
         self
     }
@@ -295,7 +295,7 @@ impl CompletionQueueBuilder {
     /// with `EOPNOTSUPP`).
     ///
     /// Defaults to none.
-    pub fn set_wc_flags(&mut self, wc_flags: WcFields) -> &mut Self {
+    pub fn set_wc_fields(&mut self, wc_flags: WcFields) -> &mut Self {
         self.wc_flags = wc_flags.0;
         self
     }
@@ -305,9 +305,9 @@ impl CompletionQueueBuilder {
     ///
     /// Without a channel the queue can only be polled; with one, arming the queue with
     /// [`CompletionQueue::req_notify`] makes the next completion raise a notification on the
-    /// channel, to block on ([`CompletionChannel::wait`]) or watch from an event loop. Several
+    /// channel, to block on ([`CompletionChannel::wait_event`]) or watch from an event loop. Several
     /// queues can be built on one channel; give each a distinct
-    /// [`set_context`](Self::set_context) so [`CompletionChannel::get_event`] can tell them apart.
+    /// [`set_user_data`](Self::set_user_data) so [`CompletionChannel::poll_event`] can tell them apart.
     ///
     /// Defaults to no channel.
     pub fn set_comp_channel(&mut self, channel: &CompletionChannel) -> &mut Self {
@@ -419,7 +419,7 @@ unsafe impl Sync for CompletionQueueInner {}
 
 flags_newtype! {
     /// Optional work-completion fields to request when building a completion queue (the
-    /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
+    /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_fields`].
     ///
     /// The byte length ([`WorkCompletion::len`]), immediate data ([`WorkCompletion::imm_data`]),
     /// QP number ([`WorkCompletion::qp_num`]), source QP ([`WorkCompletion::src_qp`]), source LID
@@ -830,7 +830,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::COMPLETION_TIMESTAMP`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]): the provider installs the timestamp reader only
+    /// [`CompletionQueueBuilder::set_wc_fields`]): the provider installs the timestamp reader only
     /// on a queue that did.
     #[inline]
     pub fn completion_timestamp(&self) -> HcaClock {
@@ -847,7 +847,7 @@ impl WorkCompletion<'_> {
     ///
     /// Panics if the completion queue did not request
     /// [`WcFields::COMPLETION_TIMESTAMP_WALLCLOCK`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]): the provider installs the reader only on a
+    /// [`CompletionQueueBuilder::set_wc_fields`]): the provider installs the reader only on a
     /// queue that did.
     #[inline]
     pub fn completion_wallclock_ns(&self) -> u64 {
@@ -893,7 +893,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::DLID_PATH_BITS`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn dlid_path_bits(&self) -> u8 {
         wc_reader!(self.cq, read_dlid_path_bits, "the DLID path bits")
@@ -916,7 +916,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::CVLAN`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn cvlan(&self) -> u16 {
         wc_reader!(self.cq, read_cvlan, "the customer VLAN")
@@ -927,7 +927,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::FLOW_TAG`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn flow_tag(&self) -> u32 {
         wc_reader!(self.cq, read_flow_tag, "the flow tag")
@@ -939,7 +939,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::TM_INFO`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn tag_matching(&self) -> TagMatchingInfo {
         let mut info = ffi::ibv_wc_tm_info::default();
@@ -1409,7 +1409,7 @@ impl CompletionQueue {
         let n = unsafe { ffi::ibv_poll_cq(self.as_raw(), num_entries, entries) };
         if n < 0 {
             // `ibv_poll_cq` signals failure with a negative return and leaves `errno` alone, so
-            // whatever is there is stale (in an event loop, typically the `EAGAIN` of the `get_event`
+            // whatever is there is stale (in an event loop, typically the `EAGAIN` of the `poll_event`
             // just before, which would read as "try again"): report the provider's return instead.
             return Err(provider_poll_failure("ibv_poll_cq", n));
         }
@@ -1422,9 +1422,9 @@ impl CompletionQueue {
     /// Event-driven and asynchronous completion handling builds on this: arm the
     /// queue, drain everything already pending with [`poll`](Self::poll), then wait for a
     /// notification on the [completion channel](Self::comp_channel) — either by blocking with
-    /// [`CompletionChannel::wait`], or by watching its [`AsFd`] descriptor with
+    /// [`CompletionChannel::wait_event`], or by watching its [`AsFd`] descriptor with
     /// your own reactor (for example `epoll` or a `tokio` `AsyncFd`) and consuming the notification
-    /// with [`CompletionChannel::get_event`]. Then re-arm, and only then drain again: arming
+    /// with [`CompletionChannel::poll_event`]. Then re-arm, and only then drain again: arming
     /// notifies of the completions that arrive after it, so a drain before it would leave one
     /// arriving in between unnotified, and the loop waiting for a notification that never comes.
     /// In this order a completion arriving between the arming and the drain is taken by the drain

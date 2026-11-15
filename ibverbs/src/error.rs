@@ -71,7 +71,7 @@ pub enum Error {
 
     /// Reading the device GUID failed (`ibv_get_device_guid`).
     #[error("failed to read the device GUID")]
-    DeviceGuid(#[source] io::Error),
+    QueryDeviceGuid(#[source] io::Error),
 
     /// Querying device attributes failed (`ibv_query_device`).
     #[error("failed to query device attributes")]
@@ -237,7 +237,7 @@ pub enum Error {
     /// Waiting for or reading a device asynchronous event failed (`poll` /
     /// `ibv_get_async_event`).
     #[error("failed to read a device asynchronous event")]
-    AsyncEvent(#[source] io::Error),
+    ReadAsyncEvent(#[source] io::Error),
 
     /// A blocking connection-manager helper reached its timeout before the awaited event arrived.
     #[cfg(feature = "rdmacm")]
@@ -315,7 +315,7 @@ impl Error {
             Error::DeviceIndexUnavailable => &"the device index",
             Error::GetDeviceList(_) => &"ibv_get_device_list",
             Error::OpenDevice(_) => &"ibv_open_device",
-            Error::DeviceGuid(_) => &"ibv_get_device_guid",
+            Error::QueryDeviceGuid(_) => &"ibv_get_device_guid",
             Error::QueryDevice(_) => &"ibv_query_device",
             Error::QueryPort { .. } => &"ibv_query_port",
             Error::QueryGid { .. } => &"ibv_query_gid",
@@ -341,7 +341,7 @@ impl Error {
             Error::PostSendBatch { .. } => &"ibv_post_send",
             Error::PostReceive { .. } => &"ibv_post_recv",
             Error::PollCompletionQueue(_) => &"completion-queue polling",
-            Error::AsyncEvent(_) => &"ibv_get_async_event",
+            Error::ReadAsyncEvent(_) => &"ibv_get_async_event",
             Error::MalformedWireFormat => &"wire-format decoding",
             #[cfg(feature = "rdmacm")]
             Error::TimedOut => &"the connection-manager wait",

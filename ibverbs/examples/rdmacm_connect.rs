@@ -12,7 +12,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use ibverbs::rdmacm::{Acceptor, ConnectionParameter, Connector, PortSpace};
-use ibverbs::{AccessFlags, CompletionQueue, Rc, RecvRequest};
+use ibverbs::transport::Rc;
+use ibverbs::{AccessFlags, CompletionQueue, RecvRequest};
 
 const MESSAGE: &[u8] = b"hello over rdmacm";
 
@@ -54,7 +55,7 @@ fn server(addr: SocketAddr) {
     println!("listening on {addr}");
 
     // Wait for a client indefinitely, but bound the establishment of an arrived request.
-    let incoming = acceptor.accept(None).unwrap();
+    let incoming = acceptor.next_request(None).unwrap();
     let ctx = incoming.context().unwrap();
     let port = incoming.cm_id().port_num().unwrap();
     let pd = ctx.alloc_pd().unwrap();

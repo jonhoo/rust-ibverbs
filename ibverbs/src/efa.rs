@@ -12,9 +12,8 @@ use crate::address::AddressHandle;
 use crate::context::Context;
 use crate::error::{Error, Result, nonnull};
 use crate::mr::{LocalMemorySlice, RemoteMemorySlice};
-use crate::qp::{
-    Datagram, Payload, PreparedQueuePair, QueuePairBuilder, SendOp, SendOps, Transport, sealed,
-};
+use crate::qp::{Payload, PreparedQueuePair, QueuePairBuilder, SendOp, SendOps};
+use crate::transport::{Datagram, Transport, sealed};
 
 #[cfg(doc)]
 use crate::{ProtectionDomain, QueuePair, WorkCompletion};
@@ -70,7 +69,7 @@ use crate::{ProtectionDomain, QueuePair, WorkCompletion};
 ///
 /// ```compile_fail,E0599
 /// // EFA refuses the solicited flag: `solicited` exists on every transport but SRD.
-/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::Srd>, ah: &ibverbs::AddressHandle) {
+/// fn f(qp: &mut ibverbs::QueuePair<ibverbs::transport::Srd>, ah: &ibverbs::AddressHandle) {
 ///     let mut batch = qp.start_send();
 ///     batch.to(ah, 1, 2).solicited();
 /// }
