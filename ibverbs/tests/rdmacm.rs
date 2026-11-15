@@ -23,9 +23,10 @@ use ibverbs::rdmacm::{
     Acceptor, CmEvent, CmEventType, CmId, Connection, ConnectionParameter, Connector, EventChannel,
     PortSpace, Resolved,
 };
+use ibverbs::transport::Rc;
 use ibverbs::{
     AccessFlags, AckTimeout, CompletionQueue, Context, Error, PreparedQueuePair, ProtectionDomain,
-    QueuePairAttribute, QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, Rc, RecvRequest,
+    QueuePairAttribute, QueuePairAttributeMask, QueuePairEndpoint, QueuePairState, RecvRequest,
     RemoteMemorySlice, SendRequest, WcStatus,
 };
 

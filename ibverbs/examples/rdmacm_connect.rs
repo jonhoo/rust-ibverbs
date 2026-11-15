@@ -12,7 +12,8 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use ibverbs::rdmacm::{Acceptor, ConnectionParameter, Connector, PortSpace};
-use ibverbs::{AccessFlags, CompletionQueue, Rc, RecvRequest};
+use ibverbs::transport::Rc;
+use ibverbs::{AccessFlags, CompletionQueue, RecvRequest};
 
 const MESSAGE: &[u8] = b"hello over rdmacm";
 

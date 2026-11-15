@@ -23,13 +23,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Two SRD queue pairs. SRD is connectionless, so each is just brought to ready with a Q_Key.
     let mut sender = pd
-        .create_qp::<ibverbs::Srd>(&cq, &cq, 1)?
+        .create_qp::<ibverbs::transport::Srd>(&cq, &cq, 1)?
         .set_gid_index(gid_index)
         .build()?
         .activate(QKEY)?;
 
     let receiver_prepared = pd
-        .create_qp::<ibverbs::Srd>(&cq, &cq, 1)?
+        .create_qp::<ibverbs::transport::Srd>(&cq, &cq, 1)?
         .set_gid_index(gid_index)
         .build()?;
     let receiver_endpoint = receiver_prepared.endpoint()?;

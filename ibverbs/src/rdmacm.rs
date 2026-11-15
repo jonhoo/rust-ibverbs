@@ -34,7 +34,7 @@
 //! let pd = ctx.alloc_pd()?;
 //! let cq = ctx.create_cq(16).build()?;
 //! let qp = pd
-//!     .create_qp::<ibverbs::Rc>(&cq, &cq, port)?
+//!     .create_qp::<ibverbs::transport::Rc>(&cq, &cq, port)?
 //!     .build()?;
 //! let mut conn = resolved.connect(qp, &ConnectionParameter::default(), None)?;
 //! // `conn.queue_pair_mut()` is ready to post on; poll completions on `cq`.
@@ -92,9 +92,8 @@ use nix::sys::socket::{SockaddrIn, SockaddrIn6, SockaddrLike, SockaddrStorage};
 
 use crate::error::{check, nonnull};
 use crate::qp::QueuePairState;
-use crate::{
-    AckTimeout, Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Rc, Result,
-};
+use crate::transport::Rc;
+use crate::{AckTimeout, Context, Error, PreparedQueuePair, QueuePair, QueuePairAttribute, Result};
 
 /// The port space a connection-manager identifier lives in: which namespace its port numbers are
 /// allocated from, and which transport its connections use. Passed to [`Connector::new`],

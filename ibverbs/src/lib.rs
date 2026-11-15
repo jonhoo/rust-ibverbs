@@ -31,7 +31,7 @@
 //! // there is one).
 //! let gid = ctx.routable_gid(1)?.expect("no GID on port 1");
 //! let prepared = pd
-//!     .create_qp::<ibverbs::Rc>(&cq, &cq, 1)?
+//!     .create_qp::<ibverbs::transport::Rc>(&cq, &cq, 1)?
 //!     .set_gid_index(gid.gid_index)
 //!     .build()?;
 //!
@@ -84,8 +84,8 @@
 //! - `rdmacm`: the `rdmacm` module, wrapping the `librdmacm` connection manager: connection setup
 //!   over IP addresses, blocking or event-loop driven, instead of an out-of-band endpoint
 //!   exchange. Links `librdmacm`, and needs the kernel's `rdma_ucm` module loaded.
-//! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via the `Srd` transport
-//!   (`ProtectionDomain::create_qp::<Srd>`). Links `libefa`.
+//! - `efa`: SRD queue pairs on AWS Elastic Fabric Adapter, via the `transport::Srd` marker
+//!   (`ProtectionDomain::create_qp::<transport::Srd>`). Links `libefa`.
 //! - `mlx5`: mlx5 Data Direct DMA-BUF registration
 //!   (`ProtectionDomain::register_dmabuf_data_direct`) and its device query
 //!   (`Context::mlx5_data_direct_sysfs_path`). Links `libmlx5` from rdma-core 54 or newer, and
@@ -123,9 +123,10 @@
 //!
 //! # Typed transports
 //!
-//! The queue-pair family is typed by its transport (see [`Transport`]): [`Rc`] supports sends,
-//! RDMA read/write, and atomics; [`Uc`] sends and RDMA writes; [`Ud`] (and, behind the `efa`
-//! feature, `Srd`) datagram sends addressed through an [`AddressHandle`]. Transport-specific
+//! The queue-pair family is typed by its transport, one of the markers in [`transport`] (see
+//! [`transport::Transport`]): [`transport::Rc`] supports sends, RDMA read/write, and atomics;
+//! [`transport::Uc`] sends and RDMA writes; [`transport::Ud`] (and, behind the `efa` feature,
+//! `transport::Srd`) datagram sends addressed through an [`AddressHandle`]. Transport-specific
 //! operations only exist on the matching types, so using one on the wrong transport is a compile
 //! error. The queue-pair types without a marker (raw packet, XRC, and driver-specific types other
 //! than EFA's SRD) are not usable through the portable wrapper anyway; if that changes, they will
@@ -352,7 +353,7 @@ mod srq;
 mod efa;
 
 #[cfg(feature = "efa")]
-pub use efa::{EfaDeviceAttr, Srd};
+pub use efa::EfaDeviceAttr;
 
 #[cfg(feature = "mlx5")]
 mod mlx5;
@@ -369,6 +370,8 @@ pub use srq::*;
 
 #[cfg(feature = "rdmacm")]
 pub mod rdmacm;
+
+pub mod transport;
 
 /// The raw `libibverbs` bindings (the `ibverbs-sys` crate), re-exported.
 ///

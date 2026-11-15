@@ -12,12 +12,12 @@ mod common;
 use std::time::{Duration, Instant};
 
 use common::{mr, open_test_device, poll_until, test_device};
+use ibverbs::transport::{Connected, Rc, Uc, Ud};
 use ibverbs::{
-    AccessFlags, AddressHandleAttribute, CompletionQueue, Connected, Context, Error, Grh,
-    InlineSlice, LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain,
-    QueuePair, QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
-    QueuePairState, Rc, RecvRequest, RnrTimer, SendOps, SendRequest, TransportType, Uc, Ud,
-    WcFields,
+    AccessFlags, AddressHandleAttribute, CompletionQueue, Context, Error, Grh, InlineSlice,
+    LinkLayer, MrAdvice, MrAdviseFlags, Payload, PortState, ProtectionDomain, QueuePair,
+    QueuePairAttribute, QueuePairAttributeMask, QueuePairBuilder, QueuePairEndpoint,
+    QueuePairState, RecvRequest, RnrTimer, SendOps, SendRequest, TransportType, WcFields,
 };
 
 /// A queue pair connected to itself, with the resources it uses.

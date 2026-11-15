@@ -10,7 +10,8 @@
 
 use std::time::Duration;
 
-use ibverbs::{AccessFlags, CompletionQueue, ProtectionDomain, QueuePair, Rc, RecvRequest};
+use ibverbs::transport::Rc;
+use ibverbs::{AccessFlags, CompletionQueue, ProtectionDomain, QueuePair, RecvRequest};
 
 /// Build a reliable-connected queue pair on `cq` and connect it to itself (see the loopback
 /// example for the GID selection).
