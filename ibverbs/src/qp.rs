@@ -1646,7 +1646,7 @@ impl<'a> InlineSlice<'a> {
 ///
 /// ```compile_fail,E0499
 /// # fn f(qp: &mut ibverbs::QueuePair, note: &[ibverbs::LocalMemorySlice]) {
-/// let batch = qp.start_send();
+/// let batch = unsafe { qp.start_send() };
 /// // error: `*qp` is already mutably borrowed by `batch`
 /// let _ = unsafe { qp.post_send([ibverbs::SendRequest::send(1, note)]) };
 /// drop(batch);
@@ -2032,8 +2032,8 @@ impl<'a> SendRequest<'a, Ud> {
 ///
 /// ```compile_fail,E0499
 /// # fn two_batches(qp: &mut ibverbs::QueuePair) {
-/// let first = qp.start_send();
-/// let second = qp.start_send(); // error: `*qp` is already mutably borrowed by `first`
+/// let first = unsafe { qp.start_send() };
+/// let second = unsafe { qp.start_send() }; // error: `*qp` is already mutably borrowed by `first`
 /// let _ = (first, second);
 /// # }
 /// ```
@@ -2044,7 +2044,7 @@ impl<'a> SendRequest<'a, Ud> {
 ///
 /// ```compile_fail,E0499
 /// # fn two_requests(qp: &mut ibverbs::QueuePair) {
-/// let mut batch = qp.start_send();
+/// let mut batch = unsafe { qp.start_send() };
 /// let first = batch.op();
 /// let second = batch.op(); // error: `batch` is already mutably borrowed by `first`
 /// let _ = (first, second);
@@ -2060,7 +2060,7 @@ impl<'a> SendRequest<'a, Ud> {
 /// #     ah: ibverbs::AddressHandle,
 /// #     sges: &[ibverbs::LocalMemorySlice],
 /// # ) {
-/// let mut batch = qp.start_send();
+/// let mut batch = unsafe { qp.start_send() };
 /// let op = batch.to(&ah, 1, 2);
 /// drop(ah); // error: cannot move out of `ah` because it is borrowed by `op`
 /// op.send(1, sges);
@@ -2155,37 +2155,16 @@ impl<'qp, T: Datagram> SendBatch<'qp, T> {
 impl<'qp, T: Transport> SendBatch<'qp, T> {
     /// Post the whole batch to the device, ringing the doorbell once.
     ///
-    /// # Safety
-    ///
-    /// Every memory region the batch references must stay valid until the device is done with it:
-    /// until a work completion has been polled for its request, or for a later signaled request on
-    /// the same send queue (an unsignaled request produces no completion of its own), or until the
-    /// queue pair has been reset or destroyed. EFA is the exception to the middle rule: its send
-    /// queues complete requests out of order (SRD delivers over several paths), so there a
-    /// request's memory is free only once its own completion has been polled (every request is
-    /// signaled there anyway: SRD queue pairs signal them all, and EFA refuses unsignaled UD
-    /// sends; see [`SendOp::signaled`]).
-    ///
-    /// That holds even when this returns `Err`, and for requests of a batch that was dropped:
-    ///
-    /// - rxe hands the requests to the device before it reports a failure (below `RTS`, for one);
-    /// - on mlx5, a request added while the send queue is full rewrites the last request posted
-    ///   before it, so never have more requests outstanding than the queue's capacity;
-    /// - hns devices in owner-doorbell mode may execute each request as soon as its opcode method
-    ///   returns, before `submit` and even if the batch is dropped.
-    ///
-    /// On hns, a reset releases the requests posted before it only if no batch is started while
-    /// the queue pair is below `RTS` afterwards: such a batch fails, and rolls hns' send queue back
-    /// to where the last batch before the reset began, so the next doorbell in `RTS` makes the
-    /// device execute those earlier requests again. Bring a reset queue pair back to `RTS` before
-    /// starting a batch on it.
+    /// What the batch asks of its memory is [`start_send`](QueuePair::start_send)'s contract,
+    /// which holds whether this succeeds or not.
     ///
     /// # Errors
     ///
     ///  - [`PostSend`](Error::PostSend): completing the batch failed (`EINVAL` for an invalid
     ///    value in one of the work requests, `ENOMEM` when out of resources or when the send queue
-    ///    was full, which on mlx5 also corrupted a posted request; see Safety).
-    pub unsafe fn submit(self) -> Result<()> {
+    ///    was full, which on mlx5 also corrupted a posted request; see the safety section of
+    ///    [`start_send`](QueuePair::start_send)).
+    pub fn submit(self) -> Result<()> {
         let qpx = self.qpx;
         // Disarm the abort-on-drop before completing: `Drop` would otherwise `wr_abort` the block we
         // are about to `wr_complete`.
@@ -2643,8 +2622,8 @@ const _: () = {
 /// posted, or bytes copied into the work request as it is posted.
 ///
 /// [`Sges`](Self::Sges) references memory regions through scatter/gather entries, so the buffers
-/// must stay valid until the work completion is reaped (the [`submit`](SendBatch::submit)
-/// contract), and the opcode method panics on a list with more entries than the queue pair was
+/// must stay valid until the work completion is reaped (the
+/// [`start_send`](QueuePair::start_send) contract), and the opcode method panics on a list with more entries than the queue pair was
 /// built for ([`QueuePairBuilder::set_max_send_sge`]). The inline variants copy the bytes into the
 /// work request during the opcode call, which lowers latency for small messages and lets the bytes
 /// be reused or dropped right away; they need a queue pair built with enough inline capacity
@@ -3401,9 +3380,10 @@ impl<T: Transport> QueuePair<T> {
     /// # Safety
     ///
     /// Every memory region a request references must stay valid until the device is done with it,
-    /// as for [`SendBatch::submit`]: until a work completion has been polled for its request, or
-    /// for a later signaled request on the same send queue (not on EFA, whose send queues complete
-    /// requests out of order), or until the queue pair has been reset or destroyed.
+    /// as for [`start_send`](Self::start_send): until a work completion has been polled for its
+    /// request, or for a later signaled request on the same send queue (not on EFA, whose send
+    /// queues complete requests out of order), or until the queue pair has been reset or
+    /// destroyed.
     ///
     /// After an `Err`, the requests ahead of the one that failed were posted (the error's `posted`
     /// counts them), so the same holds for theirs. On rxe it holds for every request in `sends`:
@@ -3456,15 +3436,42 @@ impl<T: Transport> QueuePair<T> {
     /// chain [`signaled`](SendOp::signaled) to request a completion, then post with the opcode
     /// method (`send`, `write`, `read`, the atomics, ...; which of them exist depends on the
     /// transport — see [`Transport`]). [`submit`](SendBatch::submit) then rings the doorbell once
-    /// for the whole batch; before that, the requests normally do not reach the device (its
+    /// for the whole batch; before that, the requests normally do not reach the device (the
     /// safety section lists the exceptions).
-    ///
-    /// As with any send, the memory backing each scatter/gather slice must stay valid until the
-    /// device is done with the request (see [`submit`](SendBatch::submit)).
     ///
     /// Start batches only once the queue pair is in `RTS`: providers handle a batch below it
     /// differently (most fail it at `submit`), and after a reset hns also loses track of its send
-    /// queue (see the safety section of [`submit`](SendBatch::submit)).
+    /// queue (see the safety section).
+    ///
+    /// # Safety
+    ///
+    /// Every memory region the batch references must stay valid until the device is done with it:
+    /// until a work completion has been polled for its request, or for a later signaled request on
+    /// the same send queue (an unsignaled request produces no completion of its own), or until the
+    /// queue pair has been reset or destroyed. EFA is the exception to the middle rule: its send
+    /// queues complete requests out of order (SRD delivers over several paths), so there a
+    /// request's memory is free only once its own completion has been polled (every request is
+    /// signaled there anyway: SRD queue pairs signal them all, and EFA refuses unsignaled UD
+    /// sends; see [`SendOp::signaled`]).
+    ///
+    /// That holds from the moment a request is added to the batch, whatever becomes of the batch:
+    /// also when [`submit`](SendBatch::submit) returns `Err`, and when the batch is dropped
+    /// instead.
+    ///
+    /// - rxe hands the requests to the device before it reports a failure (below `RTS`, for one);
+    /// - on mlx5, a request added while the send queue is full rewrites the last request posted
+    ///   before it, so never have more requests outstanding than the queue's capacity;
+    /// - hns devices in owner-doorbell mode may execute each request as soon as its opcode method
+    ///   returns, before `submit` and even if the batch is dropped.
+    ///
+    /// A batch that only carries inline payloads, or none, references no memory: there is nothing
+    /// to uphold for it beyond the capacity rule above.
+    ///
+    /// On hns, a reset releases the requests posted before it only if no batch is started while
+    /// the queue pair is below `RTS` afterwards: such a batch fails, and rolls hns' send queue back
+    /// to where the last batch before the reset began, so the next doorbell in `RTS` makes the
+    /// device execute those earlier requests again. Bring a reset queue pair back to `RTS` before
+    /// starting a batch on it.
     ///
     /// # Panics
     ///
@@ -3476,14 +3483,14 @@ impl<T: Transport> QueuePair<T> {
     /// ```no_run
     /// # use ibverbs::{QueuePair, LocalMemorySlice, RemoteMemorySlice};
     /// # unsafe fn f(qp: &mut QueuePair, payload: &[LocalMemorySlice], dest: RemoteMemorySlice, note: &[LocalMemorySlice]) -> ibverbs::Result<()> {
-    /// let mut batch = qp.start_send();
+    /// let mut batch = unsafe { qp.start_send() };
     /// batch.op().write(1, payload, dest);
     /// batch.op().signaled().send(2, note);
-    /// unsafe { batch.submit() }
+    /// batch.submit()
     /// # }
     /// ```
     #[inline]
-    pub fn start_send(&mut self) -> SendBatch<'_, T> {
+    pub unsafe fn start_send(&mut self) -> SendBatch<'_, T> {
         self.open_batch()
     }
 
@@ -3508,9 +3515,9 @@ impl<T: Transport> QueuePair<T> {
     /// std::thread::scope(|s| {
     ///     s.spawn(move || unsafe { recvs.post_recv([RecvRequest::new(1, inbox)]) });
     ///     s.spawn(move || {
-    ///         let mut batch = sends.start_send();
+    ///         let mut batch = unsafe { sends.start_send() };
     ///         batch.op().signaled().send(2, outbox);
-    ///         unsafe { batch.submit() }
+    ///         batch.submit()
     ///     });
     /// });
     /// # }
@@ -3546,8 +3553,8 @@ impl<T: Transport> QueuePair<T> {
 /// ```compile_fail,E0499
 /// # fn two_batches(qp: &mut ibverbs::QueuePair) {
 /// let (mut sends, _recvs) = qp.split();
-/// let first = sends.start_send();
-/// let second = sends.start_send(); // error: `sends` is already mutably borrowed by `first`
+/// let first = unsafe { sends.start_send() };
+/// let second = unsafe { sends.start_send() }; // error: `sends` is already mutably borrowed by `first`
 /// let _ = (first, second);
 /// # }
 /// ```
@@ -3558,12 +3565,16 @@ pub struct SendQueue<'qp, T: Transport> {
 impl<T: Transport> SendQueue<'_, T> {
     /// Begin a batch of send work requests, as [`QueuePair::start_send`] does.
     ///
+    /// # Safety
+    ///
+    /// As for [`QueuePair::start_send`].
+    ///
     /// # Panics
     ///
     /// Panics on a queue pair from [`build_legacy`](QueuePairBuilder::build_legacy), as
     /// [`QueuePair::start_send`] does.
     #[inline]
-    pub fn start_send(&mut self) -> SendBatch<'_, T> {
+    pub unsafe fn start_send(&mut self) -> SendBatch<'_, T> {
         self.qp.open_batch()
     }
 

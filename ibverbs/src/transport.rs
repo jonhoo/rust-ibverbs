@@ -67,7 +67,7 @@ pub(crate) mod sealed {
 /// ```compile_fail,E0599
 /// // A connected transport addresses no individual sends: `to` requires `T: Datagram`.
 /// fn f(qp: &mut ibverbs::QueuePair, ah: &ibverbs::AddressHandle) {
-///     let mut batch = qp.start_send();
+///     let mut batch = unsafe { qp.start_send() };
 ///     batch.to(ah, 1, 2);
 /// }
 /// ```
@@ -76,7 +76,7 @@ pub(crate) mod sealed {
 /// // A datagram work request is always addressed: its batch starts at `to`, and `op` requires
 /// // `T: Connected`.
 /// fn f(qp: &mut ibverbs::QueuePair<ibverbs::transport::Ud>) {
-///     let mut batch = qp.start_send();
+///     let mut batch = unsafe { qp.start_send() };
 ///     batch.op();
 /// }
 /// ```
@@ -84,7 +84,7 @@ pub(crate) mod sealed {
 /// ```compile_fail,E0599
 /// // Only RC has reads and atomics for a fence to wait for: `fenced` requires `T: Reliable`.
 /// fn f(qp: &mut ibverbs::QueuePair<ibverbs::transport::Uc>) {
-///     let mut batch = qp.start_send();
+///     let mut batch = unsafe { qp.start_send() };
 ///     let _ = batch.op().fenced();
 /// }
 /// ```

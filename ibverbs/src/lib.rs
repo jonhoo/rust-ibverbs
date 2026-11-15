@@ -47,9 +47,9 @@
 //! let mut send = pd.allocate(4096, ibverbs::AccessFlags::PERMISSIVE)?;
 //! send.bytes_mut()[..5].copy_from_slice(b"hello");
 //! unsafe { qp.post_recv([ibverbs::RecvRequest::new(/* wr_id */ 1, &[recv.slice(..)])]) }?;
-//! let mut batch = qp.start_send();
+//! let mut batch = unsafe { qp.start_send() };
 //! batch.op().signaled().send(/* wr_id */ 2, &[send.slice(..5)]);
-//! unsafe { batch.submit() }?;
+//! batch.submit()?;
 //!
 //! // Poll the completion queue until both work requests have completed.
 //! let mut pending = 2;
