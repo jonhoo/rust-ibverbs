@@ -241,11 +241,14 @@ impl<'devlist> Device<'devlist> {
     ///
     /// # Errors
     ///
-    ///  - [`DeviceGuid`](Error::DeviceGuid): `ibv_get_device_guid` failed.
+    ///  - [`QueryDeviceGuid`](Error::QueryDeviceGuid): `ibv_get_device_guid` failed.
     pub fn guid(&self) -> Result<Guid> {
         let guid = Guid::from_be64(unsafe { ffi::ibv_get_device_guid(*self.0) });
         if guid.is_reserved() {
-            Err(Error::os(io::Error::last_os_error(), Error::DeviceGuid))
+            Err(Error::os(
+                io::Error::last_os_error(),
+                Error::QueryDeviceGuid,
+            ))
         } else {
             Ok(guid)
         }
