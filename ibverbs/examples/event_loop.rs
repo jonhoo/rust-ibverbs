@@ -79,12 +79,12 @@ fn main() {
     cq_ping.req_notify(false).unwrap();
     cq_pong.req_notify(false).unwrap();
 
-    let mut batch = qp_ping.start_send();
+    let mut batch = unsafe { qp_ping.start_send() };
     batch.op().signaled().send(11, &[send_ping.slice(..4)]);
-    unsafe { batch.submit() }.unwrap();
-    let mut batch = qp_pong.start_send();
+    batch.submit().unwrap();
+    let mut batch = unsafe { qp_pong.start_send() };
     batch.op().signaled().send(21, &[send_pong.slice(..4)]);
-    unsafe { batch.submit() }.unwrap();
+    batch.submit().unwrap();
 
     // The event loop: block on the channel, learn which queue fired, re-arm it, then drain it.
     // Re-arming before draining closes the race where a completion lands in between.

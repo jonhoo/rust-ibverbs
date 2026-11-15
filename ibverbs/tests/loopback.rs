@@ -235,9 +235,9 @@ fn send_recv() {
 
     unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }
         .expect("post_recv failed");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..5)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain(&lb.cq, 2);
     assert!(
@@ -275,7 +275,7 @@ fn zero_length_ops_with_empty_slices() {
     }
     .expect("post_recv with empty slice failed");
 
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().write(10, empty_sges, remote);
     batch.op().signaled().send(11, empty_sges);
     batch.op().signaled().send(12, Payload::Inline(&[]));
@@ -283,7 +283,7 @@ fn zero_length_ops_with_empty_slices() {
         .op()
         .signaled()
         .send(13, Payload::InlineList(empty_iov));
-    unsafe { batch.submit() }.expect("submit with empty payloads failed");
+    batch.submit().expect("submit with empty payloads failed");
 
     let comps = drain(&lb.cq, 7);
     for id in [1, 2, 3] {
@@ -314,9 +314,9 @@ fn send_recv_poll_into() {
 
     unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }
         .expect("post_recv failed");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..5)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain_into(&lb.cq, 2);
     assert!(
@@ -359,9 +359,9 @@ fn send_recv_large() {
     }
 
     unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..)])]) }.expect("post_recv failed");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain(&lb.cq, 2);
     let recv_wc = comps
@@ -391,12 +391,12 @@ fn scatter_gather() {
             .post_recv([RecvRequest::new(1, &[recv.slice(0..5), recv.slice(32..35)])])
     }
     .expect("post_recv failed");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch
         .op()
         .signaled()
         .send(2, &[send.slice(0..3), send.slice(16..21)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain(&lb.cq, 2);
     let recv_wc = comps
@@ -420,9 +420,9 @@ fn rdma_write() {
     src.bytes_mut()[..6].copy_from_slice(b"verbs!");
 
     let remote = dst.remote().slice(..6);
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().write(1, &[src.slice(..6)], remote);
-    unsafe { batch.submit() }.expect("write failed");
+    batch.submit().expect("write failed");
 
     let comps = drain(&lb.cq, 1);
     assert_eq!(comps[0].wr_id(), 1);
@@ -447,13 +447,13 @@ fn rdma_write_with_imm() {
 
     let imm = 0xdead_beef_u32;
     let remote = dst.remote().slice(..4);
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch
         .op()
         .signaled()
         .imm(imm)
         .write(11, &[src.slice(..4)], remote);
-    unsafe { batch.submit() }.expect("write failed");
+    batch.submit().expect("write failed");
 
     let comps = drain(&lb.cq, 2);
     assert_eq!(&dst.bytes_mut()[..4], &[1, 2, 3, 4]);
@@ -475,9 +475,9 @@ fn rdma_read() {
     remote_mr.bytes_mut()[..8].copy_from_slice(&[9, 8, 7, 6, 5, 4, 3, 2]);
 
     let remote = remote_mr.remote().slice(..8);
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().read(1, &[local.slice(..8)], remote);
-    unsafe { batch.submit() }.expect("read failed");
+    batch.submit().expect("read failed");
 
     let comps = drain(&lb.cq, 1);
     assert_eq!(comps[0].wr_id(), 1);
@@ -504,8 +504,8 @@ fn batched_post() {
     let payload_sge = [payload.slice(..3)];
     let note_sge = [note.slice(..2)];
     let remote = dst.remote().slice(..3);
-    unsafe {
-        let mut batch = lb.qp.start_send();
+    {
+        let mut batch = unsafe { lb.qp.start_send() };
         batch.op().write(101, &payload_sge, remote);
         batch.op().signaled().send(102, &note_sge);
         batch.submit()
@@ -556,9 +556,9 @@ fn multiple_outstanding() {
     for i in 0..N {
         let mut mr = mr(&lb.pd, 8);
         mr.bytes_mut()[0] = i as u8;
-        let mut batch = lb.qp.start_send();
+        let mut batch = unsafe { lb.qp.start_send() };
         batch.op().signaled().send(i, &[mr.slice(..8)]);
-        unsafe { batch.submit() }.expect("send failed");
+        batch.submit().expect("send failed");
         send_mrs.push(mr);
     }
 
@@ -602,9 +602,9 @@ fn wait_for_completion() {
     send.bytes_mut()[..4].copy_from_slice(b"wait");
 
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let mut ids = Vec::new();
     while ids.len() < 2 {
@@ -649,9 +649,9 @@ fn unreliable_connection() {
 
     unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..3)])]) }
         .expect("post_recv failed");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..3)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain(&lb.cq, 2);
     assert!(
@@ -687,9 +687,9 @@ fn shared_receive_queue() {
     // Receives go to the SRQ, not the queue pair's own receive queue.
     unsafe { srq.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
         .expect("SRQ post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain(&cq, 2);
     assert!(
@@ -775,11 +775,11 @@ fn srq_limit_reached_async_event() {
         ])
     }
     .expect("SRQ post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(4, &[send.slice(..4)]);
     batch.op().signaled().send(5, &[send.slice(..4)]);
     batch.op().signaled().send(6, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
     drain(&cq, 6);
 
     // The event may share the queue with unrelated ones (port changes and the like); wait until
@@ -962,7 +962,7 @@ fn address_handle_from_another_context_is_refused() {
         .create_address_handle(&ah_attr)
         .expect("failed to create address handle");
 
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     let _ = batch.to(&foreign_ah, endpoint.qp_num, 0x1234_5678);
 }
 
@@ -991,7 +991,7 @@ fn address_handle_from_another_protection_domain_is_refused() {
         .create_address_handle(&ah_attr)
         .expect("failed to create address handle");
 
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     let _ = batch.to(&other_pd_ah, endpoint.qp_num, 0x1234_5678);
 }
 
@@ -1024,12 +1024,12 @@ fn unreliable_datagram() {
 
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..40 + payload.len())])]) }
         .expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .to(&ah, endpoint.qp_num, QKEY)
         .signaled()
         .send(2, &[send.slice(..payload.len())]);
-    unsafe { batch.submit() }.expect("UD send failed");
+    batch.submit().expect("UD send failed");
 
     let comps = drain(&cq, 2);
     let recv_wc = comps
@@ -1069,8 +1069,8 @@ fn atomic_operations() {
     let swapped = 0x0102_0304_0506_0708_u64;
     {
         let remote = target.remote().slice(..);
-        unsafe {
-            let mut batch = lb.qp.start_send();
+        {
+            let mut batch = unsafe { lb.qp.start_send() };
             batch
                 .op()
                 .signaled()
@@ -1090,8 +1090,8 @@ fn atomic_operations() {
     // A non-matching compare leaves the target untouched and returns the current value.
     {
         let remote = target.remote().slice(..);
-        unsafe {
-            let mut batch = lb.qp.start_send();
+        {
+            let mut batch = unsafe { lb.qp.start_send() };
             batch
                 .op()
                 .signaled()
@@ -1119,8 +1119,8 @@ fn atomic_operations() {
         .expect("failed to register counter MR");
     {
         let remote = counter.remote().slice(..);
-        unsafe {
-            let mut batch = lb.qp.start_send();
+        {
+            let mut batch = unsafe { lb.qp.start_send() };
             batch
                 .op()
                 .signaled()
@@ -1157,7 +1157,7 @@ fn atomic_local_buffer_must_be_8_bytes() {
         .pd
         .allocate(8, AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)
         .expect("failed to register counter MR");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch
         .op()
         .signaled()
@@ -1248,9 +1248,9 @@ fn register_from_raw() {
             .post_recv([RecvRequest::new(1, &[recv_mr.slice(..6)])])
     }
     .expect("post_recv failed");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(2, &[send_mr.slice(..6)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain(&lb.cq, 2);
     assert!(comps.iter().any(|wc| wc.wr_id() == 1), "missing recv");
@@ -1286,9 +1286,9 @@ fn split_queue_pair_across_threads() {
             posted.wait();
             for i in 0..N {
                 let range = i as usize * 8..(i as usize + 1) * 8;
-                let mut batch = sends.start_send();
+                let mut batch = unsafe { sends.start_send() };
                 batch.op().signaled().send(100 + i, &[send.slice(range)]);
-                unsafe { batch.submit() }.expect("send failed");
+                batch.submit().expect("send failed");
             }
         });
     });
@@ -1366,12 +1366,12 @@ fn batched_recv() {
     .expect("post_recv failed");
 
     // RC is in order, so the first send fills the first receive and so on.
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(11, &[send_a.slice(..3)]);
-    unsafe { batch.submit() }.expect("send a failed");
-    let mut batch = lb.qp.start_send();
+    batch.submit().expect("send a failed");
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(12, &[send_b.slice(..3)]);
-    unsafe { batch.submit() }.expect("send b failed");
+    batch.submit().expect("send b failed");
 
     let comps = drain(&lb.cq, 4);
     for id in [1, 2, 11, 12] {
@@ -1401,7 +1401,7 @@ fn send_flags() {
     }
     .expect("post_recv failed");
 
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     // Fenced: ordered after any prior reads/atomics on this queue pair.
     batch.op().signaled().fenced().send(10, &[send.slice(..4)]);
     // Solicited: raises a solicited event on the receiver.
@@ -1410,7 +1410,7 @@ fn send_flags() {
         .signaled()
         .solicited()
         .send(11, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("submit failed");
+    batch.submit().expect("submit failed");
 
     let comps = drain(&lb.cq, 4);
     for id in [1, 2, 10, 11] {
@@ -1606,7 +1606,7 @@ fn start_send_on_legacy_queue_pair_panics() {
     let mut qp = prepared
         .handshake(endpoint)
         .expect("failed to transition legacy queue pair to RTS");
-    let _batch = qp.start_send();
+    let _batch = unsafe { qp.start_send() };
 }
 
 /// A reliable-connected self-loopback queue pair from `build_legacy`, with [`generous`] limits,
@@ -1889,15 +1889,15 @@ fn post_send_on_extended_qp() {
     }
     .expect("post_recv failed");
 
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(10, &[send.slice(..1)]);
-    unsafe { batch.submit() }.expect("batch failed");
+    batch.submit().expect("batch failed");
     let middle = [send.slice(1..2)];
     unsafe { lb.qp.post_send([SendRequest::send(11, &middle).signaled()]) }
         .expect("post_send failed");
-    let mut batch = lb.qp.start_send();
+    let mut batch = unsafe { lb.qp.start_send() };
     batch.op().signaled().send(12, &[send.slice(2..3)]);
-    unsafe { batch.submit() }.expect("batch failed");
+    batch.submit().expect("batch failed");
 
     let comps = drain(&lb.cq, 6);
     for id in [1, 2, 3, 10, 11, 12] {
@@ -2125,9 +2125,9 @@ fn inline_send() {
     // Inline SEND: the payload lives only in this stack array, never in a registered MR.
     let recv = mr(&pd, 64);
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }.expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, Payload::Inline(b"inrun"));
-    unsafe { batch.submit() }.expect("inline send submit failed");
+    batch.submit().expect("inline send submit failed");
     let comps = drain(&cq, 2);
     assert!(comps.iter().any(|c| c.wr_id() == 1), "missing recv");
     assert!(comps.iter().any(|c| c.wr_id() == 2), "missing send");
@@ -2136,12 +2136,12 @@ fn inline_send() {
     // Inline RDMA WRITE into a remote region.
     let dst = mr(&pd, 64);
     let remote = dst.remote().slice(..4);
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .op()
         .signaled()
         .write(3, Payload::Inline(b"wxyz"), remote);
-    unsafe { batch.submit() }.expect("inline write submit failed");
+    batch.submit().expect("inline write submit failed");
     let comps = drain(&cq, 1);
     assert_eq!(comps[0].wr_id(), 3);
     assert_eq!(&dst.bytes()[..4], b"wxyz");
@@ -2183,7 +2183,7 @@ fn inline_capacity_is_enforced() {
     let halves = [IoSlice::new(&half), IoSlice::new(&half)];
     for payload in [Payload::Inline(&too_long), Payload::InlineList(&halves)] {
         let posted = catch_unwind(AssertUnwindSafe(|| {
-            let mut batch = qp.start_send();
+            let mut batch = unsafe { qp.start_send() };
             batch.op().signaled().send(1, payload);
         }));
         let message = posted.expect_err("an inline payload over the capacity was posted");
@@ -2197,9 +2197,9 @@ fn inline_capacity_is_enforced() {
     let recv = mr(&pd, cap);
     unsafe { qp.post_recv([RecvRequest::new(2, &[recv.slice(..)])]) }.expect("post_recv failed");
     let fits = vec![7u8; cap];
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(3, Payload::Inline(&fits));
-    unsafe { batch.submit() }.expect("inline send submit failed");
+    batch.submit().expect("inline send submit failed");
     let mut ids: Vec<u64> = drain(&cq, 2).iter().map(Completed::wr_id).collect();
     ids.sort_unstable();
     assert_eq!(ids, [2, 3], "only the send that fits completed");
@@ -2233,7 +2233,7 @@ fn send_sge_capacity_is_enforced() {
                 .set_max_inline_data(max_inline_data);
         });
         let posted = catch_unwind(AssertUnwindSafe(|| {
-            let mut batch = qp.start_send();
+            let mut batch = unsafe { qp.start_send() };
             batch.op().signaled().send(1, sges);
         }));
         let Err(message) = posted else {
@@ -2269,9 +2269,9 @@ fn queue_pair_on_explicit_port() {
     send.bytes_mut()[..4].copy_from_slice(b"port");
 
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     let comps = drain(&cq, 2);
     assert!(comps.iter().any(|c| c.wr_id() == 1), "missing recv");
@@ -2310,9 +2310,9 @@ fn completion_timestamps() {
     let mut send = mr(&pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"time");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     // Each completion carries a hardware timestamp; reading it must succeed (not panic).
     let mut stamps = Vec::new();
@@ -2350,9 +2350,9 @@ fn extended_wc_fields() {
     let mut send = mr(&pd, 64);
     send.bytes_mut()[..4].copy_from_slice(b"wcfl");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     // Exercise the accessors on each completion. The addressing values are device-defined (and zero
     // on RoCE), so just ensure the reads succeed; an RC completion never carries a GRH.
@@ -2393,9 +2393,9 @@ fn extended_wc_fields() {
             connect_self::<Rc>(&pd, &cq, gid_index(&ctx), generous(AccessFlags::PERMISSIVE));
         unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
             .expect("post_recv failed");
-        let mut batch = qp.start_send();
+        let mut batch = unsafe { qp.start_send() };
         batch.op().signaled().send(2, &[send.slice(..4)]);
-        unsafe { batch.submit() }.expect("send failed");
+        batch.submit().expect("send failed");
         let mut seen = 0;
         let arrived = poll_until(&cq, |wc| {
             let _ = wc.cvlan();
@@ -2445,9 +2445,9 @@ fn event_driven_completion() {
     cq.req_notify(false)
         .expect("failed to arm the completion queue");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..5)])]) }.expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..5)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
 
     // A real event loop would await readability of the descriptor; here we consume the notification
     // as soon as it arrives. `poll_event` reads the (non-blocking) channel and acknowledges for us.
@@ -2649,9 +2649,9 @@ fn inline_send_list() {
         IoSlice::new(b"cde"),
         IoSlice::new(b"fghi"),
     ];
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, Payload::InlineList(&bufs));
-    unsafe { batch.submit() }.expect("inline send-list submit failed");
+    batch.submit().expect("inline send-list submit failed");
     let comps = drain(&cq, 2);
     let recv_len = comps
         .iter()
@@ -2671,12 +2671,12 @@ fn inline_send_list() {
     let dst = mr(&pd, 64);
     let remote = dst.remote().slice(..6);
     let parts = [IoSlice::new(b"uvw"), IoSlice::new(b"xyz")];
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .op()
         .signaled()
         .write(3, Payload::InlineList(&parts), remote);
-    unsafe { batch.submit() }.expect("inline write-list submit failed");
+    batch.submit().expect("inline write-list submit failed");
     let comps = drain(&cq, 1);
     assert_eq!(comps[0].wr_id(), 3);
     assert_eq!(&dst.bytes()[..6], b"uvwxyz");
@@ -2804,12 +2804,12 @@ fn shared_completion_channel() {
     cq_a.req_notify(false).expect("arm a");
     cq_b.req_notify(false).expect("arm b");
 
-    let mut batch = qp_a.start_send();
+    let mut batch = unsafe { qp_a.start_send() };
     batch.op().signaled().send(11, &[send_a.slice(..4)]);
-    unsafe { batch.submit() }.expect("send a");
-    let mut batch = qp_b.start_send();
+    batch.submit().expect("send a");
+    let mut batch = unsafe { qp_b.start_send() };
     batch.op().signaled().send(21, &[send_b.slice(..4)]);
-    unsafe { batch.submit() }.expect("send b");
+    batch.submit().expect("send b");
 
     // Drive completions off the one channel, demultiplexing by context.
     let mut a = HashSet::new();
@@ -3068,9 +3068,9 @@ fn manual_bringup_from_handshake_attributes() {
     let mut send = mr(&pd, 16);
     send.bytes_mut()[..4].copy_from_slice(b"attr");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send");
+    batch.submit().expect("send");
     drain(&cq, 2);
     assert_eq!(&recv.bytes()[..4], b"attr");
 }
@@ -3097,9 +3097,9 @@ fn send_ops_subset() {
     let mut send = mr(&pd, 16);
     send.bytes_mut()[..4].copy_from_slice(b"only");
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }.expect("post_recv failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
     drain(&cq, 2);
     assert_eq!(&recv.bytes()[..4], b"only");
 }
@@ -3134,12 +3134,12 @@ fn reply_through_address_handle_from_wc() {
     // Round 1: request in, its completion read the classic way, reply out through the derived
     // route.
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..first)])]) }.expect("post_recv");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .to(&request_ah, endpoint.qp_num, QKEY)
         .signaled()
         .send(2, &[send.slice(..4)]);
-    unsafe { batch.submit() }.expect("UD send failed");
+    batch.submit().expect("UD send failed");
     let mut wcs = [ibverbs::Completion::default(); 4];
     let mut request_wc = None;
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -3170,12 +3170,12 @@ fn reply_through_address_handle_from_wc() {
     // completion this time.
     unsafe { qp.post_recv([RecvRequest::new(3, &[recv.slice(first..second)])]) }
         .expect("post_recv");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .to(&reply_ah, request_wc.src_qp(), QKEY)
         .signaled()
         .send(4, &[send.slice(16..20)]);
-    unsafe { batch.submit() }.expect("UD reply failed");
+    batch.submit().expect("UD reply failed");
     let mut next_attr = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while next_attr.is_none() {
@@ -3260,12 +3260,12 @@ fn bring_up_hooks_post_the_first_receives() {
             qp.post_recv([RecvRequest::new(1, &[recv.slice(..payload.len())])])
         })
         .expect("handshake_with failed");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .op()
         .signaled()
         .send(2, &[send.slice(..payload.len())]);
-    unsafe { batch.submit() }.expect("send failed");
+    batch.submit().expect("send failed");
     assert_eq!(completed(2), [1, 2]);
     assert_eq!(&recv.bytes_mut()[..payload.len()], payload);
 
@@ -3302,12 +3302,12 @@ fn bring_up_hooks_post_the_first_receives() {
     let ah = pd
         .create_address_handle(&ah_attr)
         .expect("failed to create address handle");
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .to(&ah, endpoint.qp_num, QKEY)
         .signaled()
         .send(4, &[send.slice(..payload.len())]);
-    unsafe { batch.submit() }.expect("UD send failed");
+    batch.submit().expect("UD send failed");
     assert_eq!(completed(2), [3, 4]);
     assert_eq!(&recv.bytes_mut()[40..40 + payload.len()], payload);
 }

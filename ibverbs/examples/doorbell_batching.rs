@@ -95,7 +95,7 @@ fn main() {
     let notify_slice = [notify_mr.slice(..)];
 
     // Build and post the chain of work requests as a single doorbell batch.
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     // Chain the RDMA Write operations for each word segment.
     for i in 0..num_writes {
         batch.op().write((i + 1) as u64, &locals[i], remotes[i]);
@@ -106,7 +106,7 @@ fn main() {
         .signaled()
         .send(send_chain_completion_wr_id, &notify_slice);
     // Post (ring the doorbell once) for the whole chain.
-    unsafe { batch.submit() }.unwrap();
+    batch.submit().unwrap();
 
     // Poll completion queue until both the send chain and the receive completion are done.
     // Note that only the final send is posted `.signaled()`, so it alone reports a completion;

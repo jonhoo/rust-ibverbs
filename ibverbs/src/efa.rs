@@ -70,7 +70,7 @@ use crate::{ProtectionDomain, QueuePair, WorkCompletion};
 /// ```compile_fail,E0599
 /// // EFA refuses the solicited flag: `solicited` exists on every transport but SRD.
 /// fn f(qp: &mut ibverbs::QueuePair<ibverbs::transport::Srd>, ah: &ibverbs::AddressHandle) {
-///     let mut batch = qp.start_send();
+///     let mut batch = unsafe { qp.start_send() };
 ///     batch.to(ah, 1, 2).solicited();
 /// }
 /// ```

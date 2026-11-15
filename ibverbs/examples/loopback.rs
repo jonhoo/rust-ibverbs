@@ -44,9 +44,9 @@ fn main() {
     // Receive into the first half of the buffer what we send from the second half. Note that byte
     // 9 of the region is byte 1 of the posted send slice, and lands in byte 1 of the receive half.
     unsafe { qp.post_recv([ibverbs::RecvRequest::new(2, &[mr.slice(..8)])]) }.unwrap();
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(1, &[mr.slice(8..)]);
-    unsafe { batch.submit() }.unwrap();
+    batch.submit().unwrap();
 
     let mut sent = false;
     let mut received = false;

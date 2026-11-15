@@ -104,12 +104,12 @@ fn client(addr: SocketAddr) {
             Some(Duration::from_secs(10)),
         )
         .unwrap();
-    let mut batch = conn.queue_pair_mut().start_send();
+    let mut batch = unsafe { conn.queue_pair_mut().start_send() };
     batch
         .op()
         .signaled()
         .send(2, &[send.slice(..MESSAGE.len())]);
-    unsafe { batch.submit() }.unwrap();
+    batch.submit().unwrap();
     wait_for(&cq, 2);
     println!("sent: {:?}", String::from_utf8_lossy(MESSAGE));
     conn.disconnect().ok();

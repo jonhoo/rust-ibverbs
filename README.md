@@ -42,9 +42,9 @@ fn main() -> ibverbs::Result<()> {
     send.bytes_mut()[..5].copy_from_slice(b"hello");
 
     unsafe { qp.post_recv([RecvRequest::new(1, &[recv.slice(..)])]) }?;
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch.op().signaled().send(2, &[send.slice(..5)]);
-    unsafe { batch.submit() }?;
+    batch.submit()?;
 
     let mut pending = 2;
     while pending > 0 {

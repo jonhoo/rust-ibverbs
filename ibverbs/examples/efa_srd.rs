@@ -50,11 +50,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Post the receive, then the send. Both go through the normal, non-EFA-specific API. Every SRD
     // send generates a completion, so it needs no `.signaled()`.
     unsafe { receiver.post_recv([ibverbs::RecvRequest::new(1, &[recv_buf.slice(..)])]) }?;
-    let mut batch = sender.start_send();
+    let mut batch = unsafe { sender.start_send() };
     batch
         .to(&ah, receiver_endpoint.qp_num, QKEY)
         .send(2, &[send_buf.slice(..5)]);
-    unsafe { batch.submit() }?;
+    batch.submit()?;
 
     // Wait for the receive and send completions.
     let mut recv_len = None;

@@ -219,12 +219,12 @@ fn connect_and_send() {
             assert_eq!(conn.cm_id().peer_addr(), Some(addr));
             let local = conn.cm_id().local_addr().expect("client local address");
             assert_eq!(local.ip(), addr.ip());
-            let mut batch = conn.queue_pair_mut().start_send();
+            let mut batch = unsafe { conn.queue_pair_mut().start_send() };
             batch
                 .op()
                 .signaled()
                 .send(2, &[send.slice(..MESSAGE.len())]);
-            unsafe { batch.submit() }.expect("send");
+            batch.submit().expect("send");
             wait_for(cq, 2);
         },
     );
@@ -311,12 +311,12 @@ fn receives_posted_while_connecting_catch_the_first_messages() {
     fn exchange(conn: &mut Connection, cq: &CompletionQueue, pd: &ProtectionDomain) {
         let mut send = mr(pd, 64);
         send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
-        let mut batch = conn.queue_pair_mut().start_send();
+        let mut batch = unsafe { conn.queue_pair_mut().start_send() };
         batch
             .op()
             .signaled()
             .send(2, &[send.slice(..MESSAGE.len())]);
-        unsafe { batch.submit() }.expect("send");
+        batch.submit().expect("send");
         let mut pending = vec![1, 2];
         assert!(
             poll_until(cq, |wc| {
@@ -578,12 +578,12 @@ fn two_connections() {
                 let mut conn = resolved
                     .connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
                     .expect("connect");
-                let mut batch = conn.queue_pair_mut().start_send();
+                let mut batch = unsafe { conn.queue_pair_mut().start_send() };
                 batch
                     .op()
                     .signaled()
                     .send(2, &[send.slice(..MESSAGE.len())]);
-                unsafe { batch.submit() }.expect("send");
+                batch.submit().expect("send");
                 wait_for(&cq, 2);
                 barrier.wait();
             })
@@ -779,12 +779,12 @@ fn low_level_connect_and_send() {
 
     let mut send = mr(&pd, 64);
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
-    let mut batch = qp.start_send();
+    let mut batch = unsafe { qp.start_send() };
     batch
         .op()
         .signaled()
         .send(2, &[send.slice(..MESSAGE.len())]);
-    unsafe { batch.submit() }.expect("send");
+    batch.submit().expect("send");
     wait_for(&cq, 2);
 
     done_rx
@@ -889,12 +889,12 @@ fn shared_event_channel_routes_events_by_id() {
 
     let mut send = mr(&client_pd, 64);
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
-    let mut batch = client_qp.start_send();
+    let mut batch = unsafe { client_qp.start_send() };
     batch
         .op()
         .signaled()
         .send(2, &[send.slice(..MESSAGE.len())]);
-    unsafe { batch.submit() }.expect("send");
+    batch.submit().expect("send");
     wait_for(&client_cq, 2);
     wait_for(&server_cq, 1);
     assert_eq!(&recv.bytes_mut()[..MESSAGE.len()], MESSAGE);
@@ -968,13 +968,13 @@ fn server_writes_into_client() {
             .accept(qp, &ConnectionParameter::default(), SETUP_TIMEOUT)
             .expect("accept");
 
-        let mut batch = conn.queue_pair_mut().start_send();
+        let mut batch = unsafe { conn.queue_pair_mut().start_send() };
         batch
             .op()
             .signaled()
             .write(1, &[src.slice(..MESSAGE.len())], target);
         batch.op().signaled().send(2, &[notify.slice(..)]);
-        unsafe { batch.submit() }.expect("submit");
+        batch.submit().expect("submit");
         wait_for(&cq, 1);
         wait_for(&cq, 2);
         done_rx
