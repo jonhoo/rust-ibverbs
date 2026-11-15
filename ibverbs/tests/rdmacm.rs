@@ -73,7 +73,6 @@ fn resources(
         .expect("failed to create a completion queue");
     let qp = pd
         .create_qp::<Rc>(&cq, &cq, port)
-        .expect("failed to create a queue pair builder")
         .build()
         .expect("failed to build a queue pair");
     (pd, cq, qp)
@@ -248,7 +247,6 @@ fn legacy_connect_and_send() {
             .expect("failed to create a completion queue");
         let qp = pd
             .create_qp::<Rc>(&cq, &cq, port)
-            .expect("failed to create a queue pair builder")
             .build_legacy()
             .expect("failed to build a legacy queue pair");
         (pd, cq, qp)
@@ -400,7 +398,6 @@ fn request_tells_the_peer_about_srq_and_flow_control() {
     let srq = pd.create_srq(16, 1).expect("client srq");
     let qp = pd
         .create_qp::<Rc>(&cq, &cq, port)
-        .expect("client qp builder")
         .set_srq(&srq)
         .build()
         .expect("client qp");
@@ -957,7 +954,6 @@ fn server_writes_into_client() {
         let cq = ctx.create_cq(16).build().expect("server cq");
         let qp = pd
             .create_qp::<Rc>(&cq, &cq, port)
-            .expect("server qp builder")
             .set_max_send_wr(4)
             .build()
             .expect("server qp");
@@ -1140,7 +1136,6 @@ fn request_without_listener_is_rejected_as_invalid_service() {
     let cq = ctx.create_cq(16).build().expect("client cq");
     let qp = pd
         .create_qp::<Rc>(&cq, &cq, port)
-        .expect("client qp builder")
         .build()
         .expect("client qp");
     match resolved.connect(qp, &ConnectionParameter::default(), SETUP_TIMEOUT) {
@@ -1218,7 +1213,6 @@ fn dropped_incoming_is_rejected_while_its_resources_live() {
         let _mr = mr(&pd, 64);
         let _qp = pd
             .create_qp::<Rc>(&cq, &cq, port)
-            .expect("server qp builder after the request is gone")
             .build()
             .expect("server qp after the request is gone");
     });

@@ -18,7 +18,6 @@ use ibverbs::{AccessFlags, CompletionQueue, ProtectionDomain, QueuePair, RecvReq
 fn self_connected(pd: &ProtectionDomain, cq: &CompletionQueue, gid_index: u32) -> QueuePair {
     let prepared = pd
         .create_qp::<Rc>(cq, cq, 1)
-        .unwrap()
         .set_gid_index(gid_index)
         .build()
         .unwrap();

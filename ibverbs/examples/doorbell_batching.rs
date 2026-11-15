@@ -40,7 +40,6 @@ fn main() {
         .gid_index;
     let prepared_qp = pd
         .create_qp::<ibverbs::transport::Rc>(&cq, &cq, 1)
-        .unwrap()
         .set_gid_index(gid_index)
         .set_max_send_wr(MAX_SEND_WR)
         .set_access_flags(

@@ -56,7 +56,6 @@ fn rxe_rejects_mlx5_operations() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let Err(err) = pd
         .create_qp::<ibverbs::transport::Rc>(&cq, &cq, 1)
-        .expect("failed to start a queue pair")
         .disable_mlx5_scatter_to_cqe()
         .build()
     else {

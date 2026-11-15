@@ -60,7 +60,7 @@ fn server(addr: SocketAddr) {
     let port = incoming.cm_id().port_num().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd.create_qp::<Rc>(&cq, &cq, port).unwrap().build().unwrap();
+    let qp = pd.create_qp::<Rc>(&cq, &cq, port).build().unwrap();
     let mut recv = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
 
     // Post the receive while accepting, before the reply lets the client send: posted after
@@ -93,7 +93,7 @@ fn client(addr: SocketAddr) {
     let port = resolved.cm_id().port_num().unwrap();
     let pd = ctx.alloc_pd().unwrap();
     let cq = ctx.create_cq(16).build().unwrap();
-    let qp = pd.create_qp::<Rc>(&cq, &cq, port).unwrap().build().unwrap();
+    let qp = pd.create_qp::<Rc>(&cq, &cq, port).build().unwrap();
     let mut send = pd.allocate(64, AccessFlags::PERMISSIVE).unwrap();
     send.bytes_mut()[..MESSAGE.len()].copy_from_slice(MESSAGE);
 

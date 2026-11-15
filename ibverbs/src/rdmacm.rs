@@ -34,7 +34,7 @@
 //! let pd = ctx.alloc_pd()?;
 //! let cq = ctx.create_cq(16).build()?;
 //! let qp = pd
-//!     .create_qp::<ibverbs::transport::Rc>(&cq, &cq, port)?
+//!     .create_qp::<ibverbs::transport::Rc>(&cq, &cq, port)
 //!     .build()?;
 //! let mut conn = resolved.connect(qp, &ConnectionParameter::default(), None)?;
 //! // `conn.queue_pair_mut()` is ready to post on; poll completions on `cq`.
@@ -1129,9 +1129,9 @@ impl CmId {
 
     /// The port of [`context`](Self::context)'s device that the connection manager bound this id
     /// to (ports are numbered from 1), or `None` while it has no device. Build the queue pair on
-    /// this port: [`ProtectionDomain::create_qp`](crate::ProtectionDomain::create_qp) refuses a
-    /// port that is not active, and on a multi-port device the connection manager may have picked
-    /// any of them.
+    /// this port: [`QueuePairBuilder::build`](crate::QueuePairBuilder::build) refuses a port
+    /// that is not active, and on a multi-port device the connection manager may have picked any
+    /// of them.
     pub fn port_num(&self) -> Option<u8> {
         // librdmacm sets the port together with the device: when the address resolves, the id
         // binds to a device's address, or a request arrives.

@@ -27,7 +27,7 @@ fn main() -> ibverbs::Result<()> {
     // port's routable entry (its IPv4 RoCE v2 one, when there is one).
     let gid = ctx.routable_gid(1)?.expect("no GID on port 1");
     let prepared = pd
-        .create_qp::<ibverbs::transport::Rc>(&cq, &cq, 1)?
+        .create_qp::<ibverbs::transport::Rc>(&cq, &cq, 1)
         .set_gid_index(gid.gid_index)
         .build()?;
 

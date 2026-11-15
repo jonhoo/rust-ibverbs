@@ -80,9 +80,7 @@ fn connect_self<T: Connected>(
     gid_index: u32,
     configure: impl FnOnce(&mut QueuePairBuilder<T>),
 ) -> QueuePair<T> {
-    let mut builder = pd
-        .create_qp::<T>(cq, cq, 1)
-        .expect("failed to create queue pair");
+    let mut builder = pd.create_qp::<T>(cq, cq, 1);
     configure(builder.set_gid_index(gid_index));
     let prepared = builder.build().expect("failed to build queue pair");
     let endpoint = prepared.endpoint().expect("failed to read local endpoint");
@@ -101,7 +99,6 @@ fn activate_self(
 ) -> (QueuePair<Ud>, QueuePairEndpoint) {
     let prepared = pd
         .create_qp::<Ud>(cq, cq, 1)
-        .expect("failed to create UD QP")
         .set_gid_index(gid_index)
         .build()
         .expect("failed to build UD QP");
@@ -900,17 +897,13 @@ fn objects_from_another_context_are_refused() {
     };
 
     for (send, recv) in [(&foreign_cq, &cq), (&cq, &foreign_cq)] {
-        let builder = pd
-            .create_qp::<Rc>(send, recv, 1)
-            .expect("failed to create QP builder");
+        let builder = pd.create_qp::<Rc>(send, recv, 1);
         assert!(
             refused(builder.build()),
             "a foreign completion queue is refused"
         );
     }
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP builder");
+    let mut builder = pd.create_qp::<Rc>(&cq, &cq, 1);
     builder.set_srq(&foreign_srq);
     assert!(
         refused(builder.build()),
@@ -932,7 +925,6 @@ fn objects_from_another_context_are_refused() {
     // The same objects from the protection domain's own context build.
     let _prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP builder")
         .build()
         .expect("same-context objects build");
 }
@@ -1522,7 +1514,6 @@ fn legacy_queue_pair_bring_up() {
 
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create queue pair")
         .set_gid_index(gid_index)
         .build_legacy()
         .expect("failed to build legacy RC queue pair");
@@ -1539,7 +1530,6 @@ fn legacy_queue_pair_bring_up() {
 
     let prepared = pd
         .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
         .set_gid_index(gid_index)
         .build_legacy()
         .expect("failed to build legacy UD queue pair");
@@ -1561,7 +1551,6 @@ fn legacy_shared_receive_queue() {
 
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create queue pair")
         .set_gid_index(gid_index(&ctx))
         .set_srq(&srq)
         .build_legacy()
@@ -1598,7 +1587,6 @@ fn start_send_on_legacy_queue_pair_panics() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create queue pair")
         .set_gid_index(gid_index(&ctx))
         .build_legacy()
         .expect("failed to build legacy RC queue pair");
@@ -1621,9 +1609,7 @@ fn legacy_loopback(inline: u32) -> Loopback<Rc> {
     let pd = ctx
         .alloc_pd()
         .expect("failed to allocate protection domain");
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create queue pair");
+    let mut builder = pd.create_qp::<Rc>(&cq, &cq, 1);
     generous::<Rc>(AccessFlags::PERMISSIVE | AccessFlags::REMOTE_ATOMIC)(&mut builder);
     let prepared = builder
         .set_gid_index(gid_index(&ctx))
@@ -1836,7 +1822,6 @@ fn legacy_partial_post_reports_posted_count() {
     // Room for two requests; post four.
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create queue pair")
         .set_gid_index(gid_index(&ctx))
         .set_max_send_wr(2)
         .set_access_flags(AccessFlags::PERMISSIVE)
@@ -1968,7 +1953,6 @@ fn legacy_ud_send_to() {
     let gid_index = gid_index(&ctx);
     let prepared = pd
         .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
         .set_gid_index(gid_index)
         .build_legacy()
         .expect("failed to build legacy UD queue pair");
@@ -2021,7 +2005,6 @@ fn legacy_post_send_refuses_address_handle_from_another_protection_domain() {
     let gid_index = gid_index(&ctx);
     let prepared = pd
         .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
         .set_gid_index(gid_index)
         .build_legacy()
         .expect("failed to build legacy UD queue pair");
@@ -2591,7 +2574,6 @@ fn manual_bringup_via_modify() {
     // Build a UD queue pair but do not activate it; take the still-RESET queue pair to drive by hand.
     let prepared = pd
         .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create QP")
         .build()
         .expect("failed to build QP");
     let mut qp = prepared.into_queue_pair();
@@ -2872,7 +2854,6 @@ fn roce_route_failure_diagnostic() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP")
         .set_gid_index(gid_index(&ctx))
         .build()
         .expect("failed to build QP");
@@ -2947,10 +2928,7 @@ fn rd_atomic_defaults_follow_the_device() {
 
     // The endpoint advertises the responder resources, and the peer's handshake caps its initiator
     // side to them.
-    let mut builder = lb
-        .pd
-        .create_qp::<Rc>(&lb.cq, &lb.cq, 1)
-        .expect("failed to create QP");
+    let mut builder = lb.pd.create_qp::<Rc>(&lb.cq, &lb.cq, 1);
     builder.set_gid_index(gid_index(&ctx));
     let prepared = builder.build().expect("failed to build QP");
     let mut remote = prepared.endpoint().expect("failed to read endpoint");
@@ -2975,7 +2953,6 @@ fn roce_handshake_needs_a_gid() {
     // No GID index, so the endpoint carries no GID.
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP")
         .build()
         .expect("failed to build QP");
     let endpoint = prepared.endpoint().expect("failed to read endpoint");
@@ -2996,7 +2973,6 @@ fn gid_index_above_255_is_refused() {
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let remote = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP")
         .set_gid_index(gid_index(&ctx))
         .build()
         .expect("failed to build QP")
@@ -3004,7 +2980,6 @@ fn gid_index_above_255_is_refused() {
         .expect("failed to read endpoint");
     let prepared = pd
         .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP")
         .set_gid_index(256 + gid_index(&ctx))
         .build()
         .expect("failed to build QP");
@@ -3027,9 +3002,7 @@ fn manual_bringup_from_handshake_attributes() {
     let ctx = open_test_device();
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
-    let mut builder = pd
-        .create_qp::<Rc>(&cq, &cq, 1)
-        .expect("failed to create QP");
+    let mut builder = pd.create_qp::<Rc>(&cq, &cq, 1);
     builder
         .set_gid_index(gid_index(&ctx))
         .set_access_flags(AccessFlags::LOCAL_WRITE | AccessFlags::REMOTE_WRITE);
@@ -3084,13 +3057,13 @@ fn send_ops_subset() {
     let cq = ctx.create_cq(16).build().expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
-        let default = builder.send_ops();
+        let default = builder.send_ops().expect("failed to read the default");
         assert!(
             default.contains(SendOps::SEND | SendOps::RDMA_READ | SendOps::ATOMIC_FETCH_AND_ADD),
             "an RC queue pair requests the full set by default: {default:?}"
         );
         builder.set_send_ops(SendOps::SEND);
-        assert_eq!(builder.send_ops(), SendOps::SEND);
+        assert_eq!(builder.send_ops().ok(), Some(SendOps::SEND));
     });
 
     let recv = mr(&pd, 16);
@@ -3246,7 +3219,6 @@ fn bring_up_hooks_post_the_first_receives() {
     let reliable = || {
         let prepared = pd
             .create_qp::<Rc>(&cq, &cq, 1)
-            .expect("failed to create queue pair")
             .set_gid_index(gid_index)
             .build()
             .expect("failed to build queue pair");
@@ -3280,7 +3252,6 @@ fn bring_up_hooks_post_the_first_receives() {
     const QKEY: u32 = 0x1234_5678;
     let prepared = pd
         .create_qp::<Ud>(&cq, &cq, 1)
-        .expect("failed to create UD QP")
         .set_gid_index(gid_index)
         .build()
         .expect("failed to build UD QP");

@@ -28,7 +28,6 @@ fn main() {
 
     let prepared = pd
         .create_qp::<ibverbs::transport::Rc>(&cq, &cq, 1)
-        .unwrap()
         .set_gid_index(gid_index)
         .build()
         .unwrap();
