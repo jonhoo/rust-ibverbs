@@ -89,7 +89,7 @@ jobs:
     name: stable / semver-checks
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
           fetch-depth: 0
@@ -116,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     name: ubuntu / stable / package
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
       - name: Install libibverbs and the build tools
