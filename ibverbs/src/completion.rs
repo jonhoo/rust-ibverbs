@@ -379,6 +379,12 @@ impl CompletionQueueBuilder {
             unsafe { ffi::ibv_create_cq_ex(self.ctx.as_raw(), &mut cq_attr) },
             Error::CreateCompletionQueue,
         )?;
+        // ionic's extended poll holds no lock from its start to its end, so this crate holds one
+        // around it there (see `PollLock`). Its devices report Pensando's PCI vendor id.
+        let lock_polls = self
+            .ctx
+            .query_device()
+            .is_ok_and(|attr| attr.vendor_id == IONIC_VENDOR_ID);
         Ok(CompletionQueue {
             inner: Arc::new(CompletionQueueInner {
                 _ctx: self.ctx.clone(),
@@ -386,7 +392,57 @@ impl CompletionQueueBuilder {
                 cq_ex,
             }),
             cq_ex,
+            lock_polls,
         })
+    }
+}
+
+/// The PCI vendor id of Pensando, which ionic devices report as their vendor.
+const IONIC_VENDOR_ID: u32 = 0x1dd8;
+
+/// The lock this crate holds around an extended poll of an ionic queue, from the poll's start
+/// until it ends, as the other providers do themselves. ionic takes its queue lock only while it
+/// copies a completion into a buffer it keeps per queue, so without this a second thread's poll
+/// would overwrite the completion a live [`Completions`] is reading.
+///
+/// One table for all queues, of the queues with a poll in progress, rather than a lock in each
+/// queue: a `Completions` then needs one flag to know that it holds its queue's entry, and stays
+/// the two words it is on every other provider.
+struct PollLocks {
+    polling: std::sync::Mutex<Vec<usize>>,
+    released: std::sync::Condvar,
+}
+
+static POLL_LOCKS: PollLocks = PollLocks {
+    polling: std::sync::Mutex::new(Vec::new()),
+    released: std::sync::Condvar::new(),
+};
+
+impl PollLocks {
+    /// Waits until no poll of `cq` is in progress, and enters one.
+    #[cold]
+    #[inline(never)]
+    fn lock(&self, cq: *mut ffi::ibv_cq_ex) {
+        // Nothing panics while holding the mutex, so a poisoned table is still right.
+        let mut polling = self.polling.lock().unwrap_or_else(|e| e.into_inner());
+        while polling.contains(&cq.addr()) {
+            polling = self
+                .released
+                .wait(polling)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        polling.push(cq.addr());
+    }
+
+    /// Ends the poll of `cq` that [`lock`](Self::lock) entered.
+    #[cold]
+    #[inline(never)]
+    fn unlock(&self, cq: *mut ffi::ibv_cq_ex) {
+        self.polling
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|&polling| polling != cq.addr());
+        self.released.notify_all();
     }
 }
 
@@ -1173,11 +1229,10 @@ pub struct TagMatchingInfo {
 ///
 /// The provider holds the queue's poll lock from the poll's start until [`next`](Self::next) has
 /// returned `None` or the `Completions` is dropped, whichever comes first (`ibv_end_poll`); a poll
-/// of an empty queue holds nothing. (ionic is the exception: it holds the lock only inside each
-/// step, so on ionic only one thread may poll a queue at a time; see
-/// [Thread safety](crate#thread-safety).) The lock is not reentrant, and other calls take it too
-/// (on mlx5, for one), so while a `Completions` of a queue is alive and not yet drained, the same
-/// thread must not:
+/// of an empty queue holds nothing. (ionic holds its own lock only inside each step, so on ionic
+/// this crate holds one of its own for the same span, which only other polls of the queue wait
+/// for.) The lock is not reentrant, and other calls take it too (on mlx5, for one), so while a
+/// `Completions` of a queue is alive and not yet drained, the same thread must not:
 ///
 /// - poll that queue again ([`poll`](CompletionQueue::poll) or
 ///   [`poll_into`](CompletionQueue::poll_into));
@@ -1219,6 +1274,8 @@ pub struct Completions<'cq> {
     /// Whether the entries are exhausted (or the provider reported an error), so `next_poll`
     /// must not be called again.
     done: bool,
+    /// Whether this poll holds its queue's entry in [`PollLocks`] (ionic only).
+    locked: bool,
     _cq: std::marker::PhantomData<&'cq CompletionQueueInner>,
 }
 
@@ -1251,6 +1308,7 @@ impl Completions<'_> {
                 self.done = true;
                 self.open = false;
                 unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+                self.unlock();
                 return None;
             }
         }
@@ -1258,6 +1316,26 @@ impl Completions<'_> {
             cq: self.cq,
             _iter: std::marker::PhantomData,
         })
+    }
+}
+
+/// `start_poll` on an ionic queue, under [`PollLocks`]: enters the queue there, and stays in
+/// only if a poll was started (a return of 0), for `Completions` to leave where the poll ends.
+/// Out of line, so that every other provider's poll pays one test for it.
+#[cold]
+#[inline(never)]
+fn start_poll_locked(cq: *mut ffi::ibv_cq_ex) -> i32 {
+    let mut attr = ffi::ibv_poll_cq_attr::default();
+    POLL_LOCKS.lock(cq);
+    loop {
+        match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
+            0 => return 0,
+            e if e == nix::libc::EBUSY => std::hint::spin_loop(),
+            e => {
+                POLL_LOCKS.unlock(cq);
+                return e;
+            }
+        }
     }
 }
 
@@ -1283,6 +1361,19 @@ impl Drop for Completions<'_> {
     fn drop(&mut self) {
         if self.open {
             unsafe { (*self.cq).end_poll.unwrap()(self.cq) };
+            self.unlock();
+        }
+    }
+}
+
+impl Completions<'_> {
+    /// Ends the queue's entry in [`PollLocks`] if this poll holds it. Only an open poll does, so
+    /// this follows each `end_poll`.
+    #[inline]
+    fn unlock(&mut self) {
+        if self.locked {
+            POLL_LOCKS.unlock(self.cq);
+            self.locked = false;
         }
     }
 }
@@ -1296,6 +1387,9 @@ pub struct CompletionQueue {
     /// `inner.cq_ex`, kept next to the `Arc` for the data path: read through it, the pointer is a
     /// dependent load that every opaque provider call makes the compiler repeat.
     cq_ex: *mut ffi::ibv_cq_ex,
+    /// Whether the queue is ionic's, whose extended polls this crate serializes
+    /// ([`PollLocks`]).
+    lock_polls: bool,
 }
 
 // The pointer is a copy of `inner`'s, valid for as long as `inner` keeps the queue alive.
@@ -1339,9 +1433,12 @@ impl CompletionQueue {
     /// # Ok(())
     /// # }
     /// ```
-    #[inline]
+    // Always inlined: left to its own judgment the compiler builds the `Completions` in memory
+    // once the ionic branch is here, which costs an empty poll 16 instructions more.
+    #[inline(always)]
     pub fn poll(&self) -> Result<Completions<'_>> {
         let cq = self.cq_ex;
+        let locked = self.lock_polls;
         let mut attr = ffi::ibv_poll_cq_attr::default();
         // `start_poll` positions the CQ on the first completion; it returns ENOENT (and must not be
         // paired with `end_poll`) when the queue is empty. On a queue with wallclock timestamps it
@@ -1350,13 +1447,21 @@ impl CompletionQueue {
         // only since rdma-core 65.0: before that it had consumed a completion, which the retry
         // cannot recover).
         loop {
-            match unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) } {
+            // ionic's own retries of EBUSY happen under the lock, in `start_poll_locked`.
+            let started = if locked {
+                start_poll_locked(cq)
+            } else {
+                unsafe { (*cq).start_poll.unwrap()(cq, &mut attr as *mut _) }
+            };
+            match started {
                 0 => {
                     return Ok(Completions {
                         cq,
                         open: true,
                         first: true,
                         done: false,
+                        // Held from here on, on ionic, until the poll ends.
+                        locked,
                         _cq: std::marker::PhantomData,
                     });
                 }
@@ -1366,6 +1471,7 @@ impl CompletionQueue {
                         open: false,
                         first: false,
                         done: true,
+                        locked: false,
                         _cq: std::marker::PhantomData,
                     });
                 }
@@ -1664,6 +1770,7 @@ mod test_conversions {
             open: true,
             first: true,
             done: false,
+            locked: false,
             _cq: std::marker::PhantomData,
         }
     }
@@ -1702,6 +1809,52 @@ mod test_conversions {
         unsafe { (*spy).busy = 1 };
         assert!(completions.next().is_none());
         assert_eq!(unsafe { (*spy).ends }, 1);
+    }
+
+    /// On ionic the crate's own poll lock is held for as long as the provider's would be: until
+    /// the entries run out or the `Completions` drops, and then it is free for the next poll.
+    #[test]
+    fn the_crate_side_poll_lock_is_released_with_the_poll() {
+        let held = |cq: *mut SpyCqEx| {
+            let polling = POLL_LOCKS.polling.lock().unwrap();
+            polling.contains(&cq.addr())
+        };
+        // Drained.
+        let mut spy = SpyCqEx::started(0);
+        let spy = &raw mut spy;
+        POLL_LOCKS.lock(spy.cast());
+        let mut completions = open_poll(spy);
+        completions.locked = true;
+        assert!(completions.next().is_some());
+        assert!(held(spy));
+        assert!(completions.next().is_none());
+        assert!(!held(spy), "a drained poll still holds the lock");
+        drop(completions);
+        // Dropped early.
+        let mut spy = SpyCqEx::started(1);
+        let spy = &raw mut spy;
+        POLL_LOCKS.lock(spy.cast());
+        let mut completions = open_poll(spy);
+        completions.locked = true;
+        assert!(completions.next().is_some());
+        drop(completions);
+        assert!(!held(spy), "a dropped poll still holds the lock");
+        // A second poll of the queue waits for the first, and not for another queue's.
+        let (queue, other) = (spy.addr(), spy.addr() + 8);
+        let at = |addr: usize| std::ptr::without_provenance_mut::<ffi::ibv_cq_ex>(addr);
+        POLL_LOCKS.lock(at(queue));
+        POLL_LOCKS.lock(at(other));
+        POLL_LOCKS.unlock(at(other));
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(move || {
+                POLL_LOCKS.lock(at(queue));
+                POLL_LOCKS.unlock(at(queue));
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(!waiter.is_finished(), "two polls of one queue at once");
+            POLL_LOCKS.unlock(at(queue));
+        });
+        assert!(!held(spy));
     }
 
     #[test]
