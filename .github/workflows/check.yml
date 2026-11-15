@@ -31,7 +31,7 @@ jobs:
         with:
           submodules: true
       - name: Install stable
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: stable
           components: rustfmt
@@ -52,7 +52,7 @@ jobs:
       - name: Configure CI host
         run: ./configure-ci.sh --vendored-libs
       - name: Install ${{ matrix.toolchain }}
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: ${{ matrix.toolchain }}
           components: clippy
@@ -73,7 +73,7 @@ jobs:
       - name: Configure CI host
         run: ./configure-ci.sh --vendored-libs
       - name: Install nightly
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: nightly
       - name: cargo doc
@@ -89,16 +89,20 @@ jobs:
     name: stable / semver-checks
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
         with:
           submodules: true
           fetch-depth: 0
       - name: Configure CI host
         run: ./configure-ci.sh --vendored-libs
       - name: Install stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
+        with:
+          toolchain: stable
       - name: cargo install cargo-semver-checks
-        uses: taiki-e/install-action@cargo-semver-checks
+        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # tag=v2.87.21
+        with:
+          tool: cargo-semver-checks
       - name: cargo semver-checks
         env:
           # The baseline is built from a scratch checkout without the vendored submodule, so point
@@ -116,13 +120,15 @@ jobs:
     runs-on: ubuntu-latest
     name: ubuntu / stable / package
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # tag=v7.0.1
         with:
           submodules: true
       - name: Install libibverbs and the build tools
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libibverbs-dev clang
       - name: Install stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
+        with:
+          toolchain: stable
       - name: cargo package --workspace
         run: cargo package --workspace --locked
   hack:
@@ -137,7 +143,7 @@ jobs:
       - name: Configure CI host
         run: ./configure-ci.sh --vendored-libs
       - name: Install stable
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: stable
       - name: cargo install cargo-hack
@@ -171,11 +177,11 @@ jobs:
       # not be, so we resolve with stable and only build with the MSRV toolchain. Stable is
       # installed first so that the MSRV toolchain ends up as the default.
       - name: Install stable
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: stable
       - name: Install ${{ matrix.msrv }}
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: ${{ matrix.msrv }}
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # tag=v6.1.0
