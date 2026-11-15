@@ -661,129 +661,68 @@ unsafe fn event_qp_num(event: &ffi::ibv_async_event) -> Option<u32> {
     }
 }
 
-/// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
-///
-/// The events fall into three scopes: affiliated errors and state changes on a completion queue,
-/// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which
-/// object, and queue-pair events also expose [`AsyncEvent::qp_num`]), port-level changes (with
-/// [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum AsyncEventType {
-    /// An error occurred on a completion queue (overrun or protection fault); the queue and the
-    /// queue pairs attached to it are unusable.
-    CqError,
-    /// An error occurred on a queue pair that its completion queues could not report; the queue
-    /// pair moved to the error state.
-    QpFatal,
-    /// The transport detected an invalid request on the queue pair while it was the responder.
-    QpRequestError,
-    /// The transport detected an access violation on the queue pair while it was the responder.
-    QpAccessError,
-    /// The first message arrived on a queue pair still in `RTR` (communication is established).
-    CommEstablished,
-    /// The send queue finished draining after a transition to `SQD`.
-    SqDrained,
-    /// The connection migrated to its alternate path.
-    PathMigrated,
-    /// The connection failed to migrate to its alternate path.
-    PathMigrationError,
-    /// The device is in a fatal state; all of its resources are unusable. This is the device's
-    /// last event: no other events follow it (a [`Context::wait_async_event`] without a timeout
-    /// then waits forever), and posting may keep succeeding without effect. Drop everything built
-    /// on the device and open it again.
-    DeviceFatal,
-    /// The port's logical state became active.
-    PortActive,
-    /// The port's logical state left active.
-    PortError,
-    /// The subnet manager changed the port's LID.
-    LidChange,
-    /// The port's partition-key (P_Key) table changed.
-    PkeyChange,
-    /// A new subnet manager took over the port.
-    SmChange,
-    /// An error occurred on a shared receive queue.
-    SrqError,
-    /// The number of receives posted to a shared receive queue dropped below its low watermark
-    /// (armed with [`SharedReceiveQueue::set_limit`](crate::SharedReceiveQueue::set_limit)).
-    SrqLimitReached,
-    /// The last work request reached a queue pair, attached to a shared receive queue, that is in
-    /// the error state: no more receives will be consumed from the SRQ by this queue pair.
-    QpLastWqeReached,
-    /// The subnet manager asked the port's clients to reregister their subscriptions.
-    ClientReregister,
-    /// The port's GID table changed.
-    GidChange,
-    /// An error occurred on a work queue.
-    WqFatal,
-    /// The device's link speed changed.
-    DeviceSpeedChange,
-    /// A value this version of the crate does not know.
-    Unknown(u32),
-}
-
-impl From<ffi::ibv_event_type> for AsyncEventType {
-    fn from(event: ffi::ibv_event_type) -> Self {
-        use ffi::ibv_event_type as E;
-        match event {
-            E::IBV_EVENT_CQ_ERR => AsyncEventType::CqError,
-            E::IBV_EVENT_QP_FATAL => AsyncEventType::QpFatal,
-            E::IBV_EVENT_QP_REQ_ERR => AsyncEventType::QpRequestError,
-            E::IBV_EVENT_QP_ACCESS_ERR => AsyncEventType::QpAccessError,
-            E::IBV_EVENT_COMM_EST => AsyncEventType::CommEstablished,
-            E::IBV_EVENT_SQ_DRAINED => AsyncEventType::SqDrained,
-            E::IBV_EVENT_PATH_MIG => AsyncEventType::PathMigrated,
-            E::IBV_EVENT_PATH_MIG_ERR => AsyncEventType::PathMigrationError,
-            E::IBV_EVENT_DEVICE_FATAL => AsyncEventType::DeviceFatal,
-            E::IBV_EVENT_PORT_ACTIVE => AsyncEventType::PortActive,
-            E::IBV_EVENT_PORT_ERR => AsyncEventType::PortError,
-            E::IBV_EVENT_LID_CHANGE => AsyncEventType::LidChange,
-            E::IBV_EVENT_PKEY_CHANGE => AsyncEventType::PkeyChange,
-            E::IBV_EVENT_SM_CHANGE => AsyncEventType::SmChange,
-            E::IBV_EVENT_SRQ_ERR => AsyncEventType::SrqError,
-            E::IBV_EVENT_SRQ_LIMIT_REACHED => AsyncEventType::SrqLimitReached,
-            E::IBV_EVENT_QP_LAST_WQE_REACHED => AsyncEventType::QpLastWqeReached,
-            E::IBV_EVENT_CLIENT_REREGISTER => AsyncEventType::ClientReregister,
-            E::IBV_EVENT_GID_CHANGE => AsyncEventType::GidChange,
-            E::IBV_EVENT_WQ_FATAL => AsyncEventType::WqFatal,
-            // `IBV_EVENT_DEVICE_SPEED_CHANGE`, spelled by value: rdma-core 62 added it, and
-            // installed headers from an older rdma-core lack the name.
-            E(20) => AsyncEventType::DeviceSpeedChange,
-            other => AsyncEventType::Unknown(other.0),
-        }
-    }
-}
-
-impl std::fmt::Display for AsyncEventType {
+ffi_enum! {
+    /// The kind of a device asynchronous event. Returned by [`AsyncEvent::event_type`].
+    ///
+    /// The events fall into three scopes: affiliated errors and state changes on a completion queue,
+    /// queue pair, or shared receive queue (the [`AsyncEvent::as_raw`] element identifies which
+    /// object, and queue-pair events also expose [`AsyncEvent::qp_num`]), port-level changes (with
+    /// [`AsyncEvent::port_num`]), and device-wide ("unaffiliated") failures.
+    ///
     /// Formats the event as it is named in the C headers, for example `SRQ_LIMIT_REACHED` for
-    /// [`SrqLimitReached`](Self::SrqLimitReached).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            AsyncEventType::CqError => "CQ_ERR",
-            AsyncEventType::QpFatal => "QP_FATAL",
-            AsyncEventType::QpRequestError => "QP_REQ_ERR",
-            AsyncEventType::QpAccessError => "QP_ACCESS_ERR",
-            AsyncEventType::CommEstablished => "COMM_EST",
-            AsyncEventType::SqDrained => "SQ_DRAINED",
-            AsyncEventType::PathMigrated => "PATH_MIG",
-            AsyncEventType::PathMigrationError => "PATH_MIG_ERR",
-            AsyncEventType::DeviceFatal => "DEVICE_FATAL",
-            AsyncEventType::PortActive => "PORT_ACTIVE",
-            AsyncEventType::PortError => "PORT_ERR",
-            AsyncEventType::LidChange => "LID_CHANGE",
-            AsyncEventType::PkeyChange => "PKEY_CHANGE",
-            AsyncEventType::SmChange => "SM_CHANGE",
-            AsyncEventType::SrqError => "SRQ_ERR",
-            AsyncEventType::SrqLimitReached => "SRQ_LIMIT_REACHED",
-            AsyncEventType::QpLastWqeReached => "QP_LAST_WQE_REACHED",
-            AsyncEventType::ClientReregister => "CLIENT_REREGISTER",
-            AsyncEventType::GidChange => "GID_CHANGE",
-            AsyncEventType::WqFatal => "WQ_FATAL",
-            AsyncEventType::DeviceSpeedChange => "DEVICE_SPEED_CHANGE",
-            AsyncEventType::Unknown(raw) => return write!(f, "unknown ({raw})"),
-        };
-        f.write_str(name)
+    /// [`SrqLimitReached`](AsyncEventType::SrqLimitReached).
+    pub enum AsyncEventType: ffi::ibv_event_type {
+        /// An error occurred on a completion queue (overrun or protection fault); the queue and the
+        /// queue pairs attached to it are unusable.
+        CqError = E::IBV_EVENT_CQ_ERR => "CQ_ERR",
+        /// An error occurred on a queue pair that its completion queues could not report; the queue
+        /// pair moved to the error state.
+        QpFatal = E::IBV_EVENT_QP_FATAL => "QP_FATAL",
+        /// The transport detected an invalid request on the queue pair while it was the responder.
+        QpRequestError = E::IBV_EVENT_QP_REQ_ERR => "QP_REQ_ERR",
+        /// The transport detected an access violation on the queue pair while it was the responder.
+        QpAccessError = E::IBV_EVENT_QP_ACCESS_ERR => "QP_ACCESS_ERR",
+        /// The first message arrived on a queue pair still in `RTR` (communication is established).
+        CommEstablished = E::IBV_EVENT_COMM_EST => "COMM_EST",
+        /// The send queue finished draining after a transition to `SQD`.
+        SqDrained = E::IBV_EVENT_SQ_DRAINED => "SQ_DRAINED",
+        /// The connection migrated to its alternate path.
+        PathMigrated = E::IBV_EVENT_PATH_MIG => "PATH_MIG",
+        /// The connection failed to migrate to its alternate path.
+        PathMigrationError = E::IBV_EVENT_PATH_MIG_ERR => "PATH_MIG_ERR",
+        /// The device is in a fatal state; all of its resources are unusable. This is the device's
+        /// last event: no other events follow it (a [`Context::wait_async_event`] without a timeout
+        /// then waits forever), and posting may keep succeeding without effect. Drop everything built
+        /// on the device and open it again.
+        DeviceFatal = E::IBV_EVENT_DEVICE_FATAL => "DEVICE_FATAL",
+        /// The port's logical state became active.
+        PortActive = E::IBV_EVENT_PORT_ACTIVE => "PORT_ACTIVE",
+        /// The port's logical state left active.
+        PortError = E::IBV_EVENT_PORT_ERR => "PORT_ERR",
+        /// The subnet manager changed the port's LID.
+        LidChange = E::IBV_EVENT_LID_CHANGE => "LID_CHANGE",
+        /// The port's partition-key (P_Key) table changed.
+        PkeyChange = E::IBV_EVENT_PKEY_CHANGE => "PKEY_CHANGE",
+        /// A new subnet manager took over the port.
+        SmChange = E::IBV_EVENT_SM_CHANGE => "SM_CHANGE",
+        /// An error occurred on a shared receive queue.
+        SrqError = E::IBV_EVENT_SRQ_ERR => "SRQ_ERR",
+        /// The number of receives posted to a shared receive queue dropped below its low watermark
+        /// (armed with [`SharedReceiveQueue::set_limit`](crate::SharedReceiveQueue::set_limit)).
+        SrqLimitReached = E::IBV_EVENT_SRQ_LIMIT_REACHED => "SRQ_LIMIT_REACHED",
+        /// The last work request reached a queue pair, attached to a shared receive queue, that is in
+        /// the error state: no more receives will be consumed from the SRQ by this queue pair.
+        QpLastWqeReached = E::IBV_EVENT_QP_LAST_WQE_REACHED => "QP_LAST_WQE_REACHED",
+        /// The subnet manager asked the port's clients to reregister their subscriptions.
+        ClientReregister = E::IBV_EVENT_CLIENT_REREGISTER => "CLIENT_REREGISTER",
+        /// The port's GID table changed.
+        GidChange = E::IBV_EVENT_GID_CHANGE => "GID_CHANGE",
+        /// An error occurred on a work queue.
+        WqFatal = E::IBV_EVENT_WQ_FATAL => "WQ_FATAL",
+        /// The device's link speed changed.
+        // `IBV_EVENT_DEVICE_SPEED_CHANGE`, spelled by value: rdma-core 62 added it, and
+        // installed headers from an older rdma-core lack the name.
+        DeviceSpeedChange = E(20) => "DEVICE_SPEED_CHANGE",
     }
 }
 
@@ -890,52 +829,21 @@ impl fmt::Display for Mtu {
     }
 }
 
-/// The logical state of a port. Returned by [`PortAttr::state`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum PortState {
-    /// Reserved value (no state change).
-    Nop,
-    /// The port is down.
-    Down,
-    /// The port is initializing: the link is up, but the subnet manager has not configured it yet.
-    Init,
-    /// The port is armed: it may receive, but not yet transmit, data packets.
-    Armed,
-    /// The port is active and may send and receive packets.
-    Active,
-    /// The port is active, but temporarily deferring packet transmission.
-    ActiveDefer,
-    /// A value this version of the crate does not know.
-    Unknown(u32),
-}
-
-impl From<ffi::ibv_port_state> for PortState {
-    fn from(state: ffi::ibv_port_state) -> Self {
-        match state {
-            ffi::ibv_port_state::IBV_PORT_NOP => PortState::Nop,
-            ffi::ibv_port_state::IBV_PORT_DOWN => PortState::Down,
-            ffi::ibv_port_state::IBV_PORT_INIT => PortState::Init,
-            ffi::ibv_port_state::IBV_PORT_ARMED => PortState::Armed,
-            ffi::ibv_port_state::IBV_PORT_ACTIVE => PortState::Active,
-            ffi::ibv_port_state::IBV_PORT_ACTIVE_DEFER => PortState::ActiveDefer,
-            other => PortState::Unknown(other.0),
-        }
-    }
-}
-
-impl fmt::Display for PortState {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
-            PortState::Nop => "Nop",
-            PortState::Down => "Down",
-            PortState::Init => "Init",
-            PortState::Armed => "Armed",
-            PortState::Active => "Active",
-            PortState::ActiveDefer => "ActiveDefer",
-            PortState::Unknown(raw) => return write!(f, "unknown ({raw})"),
-        };
-        f.write_str(name)
+ffi_enum! {
+    /// The logical state of a port. Returned by [`PortAttr::state`].
+    pub enum PortState: ffi::ibv_port_state {
+        /// Reserved value (no state change).
+        Nop = E::IBV_PORT_NOP => "Nop",
+        /// The port is down.
+        Down = E::IBV_PORT_DOWN => "Down",
+        /// The port is initializing: the link is up, but the subnet manager has not configured it yet.
+        Init = E::IBV_PORT_INIT => "Init",
+        /// The port is armed: it may receive, but not yet transmit, data packets.
+        Armed = E::IBV_PORT_ARMED => "Armed",
+        /// The port is active and may send and receive packets.
+        Active = E::IBV_PORT_ACTIVE => "Active",
+        /// The port is active, but temporarily deferring packet transmission.
+        ActiveDefer = E::IBV_PORT_ACTIVE_DEFER => "ActiveDefer",
     }
 }
 
