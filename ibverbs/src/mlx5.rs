@@ -4,7 +4,8 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use crate::qp::{QueuePairBuilder, Transport};
+use crate::qp::QueuePairBuilder;
+use crate::transport::Transport;
 use crate::{AccessFlags, Context, Error, MemoryRegion, ProtectionDomain, Result};
 
 impl<T: Transport> QueuePairBuilder<T> {
