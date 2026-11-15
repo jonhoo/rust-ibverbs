@@ -128,88 +128,60 @@ impl From<PortSpace> for ffi::rdma_port_space {
     }
 }
 
-/// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
-/// the sequence in which the events arrive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum CmEventType {
-    /// The destination address resolved to an RDMA device.
-    AddressResolved,
-    /// Resolving the destination address failed.
-    AddressError,
-    /// The route to the destination resolved.
-    RouteResolved,
-    /// Resolving the route failed.
-    RouteError,
-    /// An incoming connection request arrived on a listener (take its id with
-    /// [`CmEvent::connection_request`]).
-    ConnectRequest,
-    /// The remote accepted a connection whose queue pair the connection manager does not manage;
-    /// finish with [`CmId::establish`].
-    ConnectResponse,
-    /// Establishing the connection failed.
-    ConnectError,
-    /// The remote is unreachable.
-    Unreachable,
-    /// The remote rejected the connection request.
-    Rejected,
-    /// The connection is established.
-    Established,
-    /// The connection was disconnected.
-    Disconnected,
-    /// The device backing the id was removed. The id is dead from then on: the kernel destroys its
-    /// side of it and never reports on it again, so drop it and the resources built on its
-    /// device. Until it is dropped, a wait on it only ends at its timeout, and the calls that
-    /// reach the kernel fail with `ENXIO`.
-    DeviceRemoval,
-    /// A multicast join completed.
-    MulticastJoin,
-    /// A multicast join failed or the group errored.
-    MulticastError,
-    /// The id's network address changed.
-    AddressChange,
-    /// The connection left the timewait state; its queue pair may be reused.
-    TimewaitExit,
-    /// Address information resolved (`rdma_getaddrinfo`-style resolution).
-    AddressInfoResolved,
-    /// Resolving address information failed.
-    AddressInfoError,
-    /// A user-generated event.
-    User,
-    /// An internal event.
-    Internal,
-    /// A value this version of the crate does not know.
-    Unknown(u32),
-}
-
-impl From<ffi::rdma_cm_event_type> for CmEventType {
-    fn from(event: ffi::rdma_cm_event_type) -> Self {
-        use ffi::rdma_cm_event_type as E;
-        match event {
-            E::RDMA_CM_EVENT_ADDR_RESOLVED => CmEventType::AddressResolved,
-            E::RDMA_CM_EVENT_ADDR_ERROR => CmEventType::AddressError,
-            E::RDMA_CM_EVENT_ROUTE_RESOLVED => CmEventType::RouteResolved,
-            E::RDMA_CM_EVENT_ROUTE_ERROR => CmEventType::RouteError,
-            E::RDMA_CM_EVENT_CONNECT_REQUEST => CmEventType::ConnectRequest,
-            E::RDMA_CM_EVENT_CONNECT_RESPONSE => CmEventType::ConnectResponse,
-            E::RDMA_CM_EVENT_CONNECT_ERROR => CmEventType::ConnectError,
-            E::RDMA_CM_EVENT_UNREACHABLE => CmEventType::Unreachable,
-            E::RDMA_CM_EVENT_REJECTED => CmEventType::Rejected,
-            E::RDMA_CM_EVENT_ESTABLISHED => CmEventType::Established,
-            E::RDMA_CM_EVENT_DISCONNECTED => CmEventType::Disconnected,
-            E::RDMA_CM_EVENT_DEVICE_REMOVAL => CmEventType::DeviceRemoval,
-            E::RDMA_CM_EVENT_MULTICAST_JOIN => CmEventType::MulticastJoin,
-            E::RDMA_CM_EVENT_MULTICAST_ERROR => CmEventType::MulticastError,
-            E::RDMA_CM_EVENT_ADDR_CHANGE => CmEventType::AddressChange,
-            E::RDMA_CM_EVENT_TIMEWAIT_EXIT => CmEventType::TimewaitExit,
-            // `RDMA_CM_EVENT_ADDRINFO_RESOLVED`, `_ADDRINFO_ERROR`, `_USER`, and `_INTERNAL`,
-            // spelled by value: installed headers from rdma-core before 60 lack the names.
-            E(16) => CmEventType::AddressInfoResolved,
-            E(17) => CmEventType::AddressInfoError,
-            E(18) => CmEventType::User,
-            E(19) => CmEventType::Internal,
-            other => CmEventType::Unknown(other.0),
-        }
+ffi_enum! {
+    /// The kind of a connection-manager event. Returned by [`CmEvent::event_type`]; see [`CmId`] for
+    /// the sequence in which the events arrive.
+    ///
+    /// Formats the event as it is named in the C headers, for example `CONNECT_REQUEST` for
+    /// [`ConnectRequest`](CmEventType::ConnectRequest).
+    pub enum CmEventType: ffi::rdma_cm_event_type {
+        /// The destination address resolved to an RDMA device.
+        AddressResolved = E::RDMA_CM_EVENT_ADDR_RESOLVED => "ADDR_RESOLVED",
+        /// Resolving the destination address failed.
+        AddressError = E::RDMA_CM_EVENT_ADDR_ERROR => "ADDR_ERROR",
+        /// The route to the destination resolved.
+        RouteResolved = E::RDMA_CM_EVENT_ROUTE_RESOLVED => "ROUTE_RESOLVED",
+        /// Resolving the route failed.
+        RouteError = E::RDMA_CM_EVENT_ROUTE_ERROR => "ROUTE_ERROR",
+        /// An incoming connection request arrived on a listener (take its id with
+        /// [`CmEvent::connection_request`]).
+        ConnectRequest = E::RDMA_CM_EVENT_CONNECT_REQUEST => "CONNECT_REQUEST",
+        /// The remote accepted a connection whose queue pair the connection manager does not manage;
+        /// finish with [`CmId::establish`].
+        ConnectResponse = E::RDMA_CM_EVENT_CONNECT_RESPONSE => "CONNECT_RESPONSE",
+        /// Establishing the connection failed.
+        ConnectError = E::RDMA_CM_EVENT_CONNECT_ERROR => "CONNECT_ERROR",
+        /// The remote is unreachable.
+        Unreachable = E::RDMA_CM_EVENT_UNREACHABLE => "UNREACHABLE",
+        /// The remote rejected the connection request.
+        Rejected = E::RDMA_CM_EVENT_REJECTED => "REJECTED",
+        /// The connection is established.
+        Established = E::RDMA_CM_EVENT_ESTABLISHED => "ESTABLISHED",
+        /// The connection was disconnected.
+        Disconnected = E::RDMA_CM_EVENT_DISCONNECTED => "DISCONNECTED",
+        /// The device backing the id was removed. The id is dead from then on: the kernel destroys its
+        /// side of it and never reports on it again, so drop it and the resources built on its
+        /// device. Until it is dropped, a wait on it only ends at its timeout, and the calls that
+        /// reach the kernel fail with `ENXIO`.
+        DeviceRemoval = E::RDMA_CM_EVENT_DEVICE_REMOVAL => "DEVICE_REMOVAL",
+        /// A multicast join completed.
+        MulticastJoin = E::RDMA_CM_EVENT_MULTICAST_JOIN => "MULTICAST_JOIN",
+        /// A multicast join failed or the group errored.
+        MulticastError = E::RDMA_CM_EVENT_MULTICAST_ERROR => "MULTICAST_ERROR",
+        /// The id's network address changed.
+        AddressChange = E::RDMA_CM_EVENT_ADDR_CHANGE => "ADDR_CHANGE",
+        /// The connection left the timewait state; its queue pair may be reused.
+        TimewaitExit = E::RDMA_CM_EVENT_TIMEWAIT_EXIT => "TIMEWAIT_EXIT",
+        /// Address information resolved (`rdma_getaddrinfo`-style resolution).
+        // `RDMA_CM_EVENT_ADDRINFO_RESOLVED`, `_ADDRINFO_ERROR`, `_USER`, and `_INTERNAL`,
+        // spelled by value: installed headers from rdma-core before 60 lack the names.
+        AddressInfoResolved = E(16) => "ADDR_INFO_RESOLVED",
+        /// Resolving address information failed.
+        AddressInfoError = E(17) => "ADDR_INFO_ERROR",
+        /// A user-generated event.
+        User = E(18) => "USER",
+        /// An internal event.
+        Internal = E(19) => "INTERNAL",
     }
 }
 
@@ -222,37 +194,6 @@ impl std::fmt::Display for PortSpace {
             PortSpace::Tcp => "TCP",
             PortSpace::Udp => "UDP",
             PortSpace::Ib => "IB",
-        };
-        f.write_str(name)
-    }
-}
-
-impl std::fmt::Display for CmEventType {
-    /// Formats the event as it is named in the C headers, for example `CONNECT_REQUEST` for
-    /// [`ConnectRequest`](Self::ConnectRequest).
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            CmEventType::AddressResolved => "ADDR_RESOLVED",
-            CmEventType::AddressError => "ADDR_ERROR",
-            CmEventType::RouteResolved => "ROUTE_RESOLVED",
-            CmEventType::RouteError => "ROUTE_ERROR",
-            CmEventType::ConnectRequest => "CONNECT_REQUEST",
-            CmEventType::ConnectResponse => "CONNECT_RESPONSE",
-            CmEventType::ConnectError => "CONNECT_ERROR",
-            CmEventType::Unreachable => "UNREACHABLE",
-            CmEventType::Rejected => "REJECTED",
-            CmEventType::Established => "ESTABLISHED",
-            CmEventType::Disconnected => "DISCONNECTED",
-            CmEventType::DeviceRemoval => "DEVICE_REMOVAL",
-            CmEventType::MulticastJoin => "MULTICAST_JOIN",
-            CmEventType::MulticastError => "MULTICAST_ERROR",
-            CmEventType::AddressChange => "ADDR_CHANGE",
-            CmEventType::TimewaitExit => "TIMEWAIT_EXIT",
-            CmEventType::AddressInfoResolved => "ADDR_INFO_RESOLVED",
-            CmEventType::AddressInfoError => "ADDR_INFO_ERROR",
-            CmEventType::User => "USER",
-            CmEventType::Internal => "INTERNAL",
-            CmEventType::Unknown(raw) => return write!(f, "unknown ({raw})"),
         };
         f.write_str(name)
     }

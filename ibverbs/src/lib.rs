@@ -318,6 +318,48 @@ macro_rules! flags_newtype {
     };
 }
 
+/// Defines a crate enum for a C enum from one row per variant: `Variant = pattern => "name"`,
+/// where the pattern matches the C value (`E` is the C enum's type in it) and the name is what
+/// `Display` prints. Generates the enum with an `Unknown(u32)` variant for the values no row
+/// matches, its `From` the C enum, and its `Display` (an unknown value prints as
+/// `unknown (value)`).
+macro_rules! ffi_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident: $ffi:ty {
+            $( $(#[$vmeta:meta])* $variant:ident = $raw:pat => $display:literal, )+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        #[non_exhaustive]
+        $vis enum $name {
+            $( $(#[$vmeta])* $variant, )+
+            /// A value this version of the crate does not know.
+            Unknown(u32),
+        }
+
+        impl From<$ffi> for $name {
+            fn from(raw: $ffi) -> Self {
+                use $ffi as E;
+                match raw {
+                    $( $raw => $name::$variant, )+
+                    other => $name::Unknown(other.0),
+                }
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                match self {
+                    $( $name::$variant => f.write_str($display), )+
+                    $name::Unknown(raw) => write!(f, "unknown ({raw})"),
+                }
+            }
+        }
+    };
+}
+
 /// Implements identity comparison and hashing for a cloneable handle: two handles are equal when
 /// they name the same underlying object (they are clones of one another), so a handle can key a
 /// map or be told apart from another.
