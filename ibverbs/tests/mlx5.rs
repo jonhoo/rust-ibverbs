@@ -51,4 +51,25 @@ fn rxe_rejects_mlx5_operations() {
         ),
         "mlx5dv_reg_dmabuf_mr on {name} returned {err:?}"
     );
+
+    // A queue pair without scatter to CQE comes from mlx5's own creation verb.
+    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let Err(err) = pd
+        .create_qp::<ibverbs::Rc>(&cq, &cq, 1)
+        .expect("failed to start a queue pair")
+        .disable_mlx5_scatter_to_cqe()
+        .build()
+    else {
+        panic!("rxe must reject mlx5dv_create_qp");
+    };
+    assert!(
+        matches!(
+            err,
+            Error::Unsupported {
+                operation: &"mlx5dv_create_qp",
+                ..
+            }
+        ),
+        "mlx5dv_create_qp on {name} returned {err:?}"
+    );
 }

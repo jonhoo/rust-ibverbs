@@ -398,6 +398,9 @@ pub struct QueuePairBuilder<T: Transport> {
     bring_up: BringUp,
     /// shared receive queue
     srq: Option<SharedReceiveQueue>,
+    /// whether to create the queue pair through `mlx5dv_create_qp`, without scatter to CQE
+    #[cfg(feature = "mlx5")]
+    pub(crate) mlx5_no_scatter_to_cqe: bool,
     _transport: std::marker::PhantomData<T>,
 }
 
@@ -470,6 +473,8 @@ impl<T: Transport> QueuePairBuilder<T> {
             service_level: 0,
             bring_up: BringUp { init, rtr, rts },
             srq: None,
+            #[cfg(feature = "mlx5")]
+            mlx5_no_scatter_to_cqe: false,
             _transport: std::marker::PhantomData,
         }
     }
@@ -744,6 +749,22 @@ impl<T: Transport> QueuePairBuilder<T> {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
             ..self.init_attr_ex()
         };
+        #[cfg(feature = "mlx5")]
+        if self.mlx5_no_scatter_to_cqe {
+            let mut mlx5_attr = ffi::mlx5dv_qp_init_attr {
+                comp_mask: ffi::mlx5dv_qp_init_attr_mask::MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS.0
+                    as u64,
+                create_flags: ffi::mlx5dv_qp_create_flags::MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE
+                    .0,
+                ..Default::default()
+            };
+            let qp = unsafe {
+                ffi::mlx5dv_create_qp(self.pd.context().as_raw(), &mut attr, &mut mlx5_attr)
+            };
+            let qp = nonnull(qp, Error::CreateQueuePair)
+                .map_err(|e| e.for_operation(&"mlx5dv_create_qp"))?;
+            return self.prepared(qp, &attr);
+        }
         let qp = nonnull(
             unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
             Error::CreateQueuePair,
