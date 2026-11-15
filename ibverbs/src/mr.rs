@@ -172,7 +172,8 @@ impl<O> MemoryRegion<O> {
     ///
     /// Panics if `bounds` is empty or falls outside the region. A message of no bytes is an empty
     /// list of slices (`&[]`), not an empty slice: where a length comes from a peer, such as the
-    /// [`len`](crate::WorkCompletion::len) of a receive to echo, check it for zero before slicing.
+    /// [`len`](crate::WorkCompletion::len) of a receive to echo, check it for zero before slicing,
+    /// or use [`try_slice`](Self::try_slice).
     pub fn slice(&self, bounds: impl RangeBounds<usize>) -> LocalMemorySlice {
         let (addr, length) =
             calc_addr_len(bounds, self.inner.addr, unsafe { (*self.inner.mr).length });
@@ -182,6 +183,23 @@ impl<O> MemoryRegion<O> {
             lkey: self.lkey(),
         };
         LocalMemorySlice { _sge: sge }
+    }
+
+    /// As [`slice`](Self::slice), but `None` where it panics: for bounds that are empty, fall
+    /// outside the region, or span 4 GiB or more.
+    ///
+    /// An `Option` is a list of at most one entry, which is what a length that may be zero asks
+    /// for: `send(id, mr.try_slice(..len).as_slice())` sends `len` bytes, or the empty message.
+    /// Bounds that are out of range give the empty message too, so check them where they can be.
+    pub fn try_slice(&self, bounds: impl RangeBounds<usize>) -> Option<LocalMemorySlice> {
+        let (addr, length) =
+            checked_addr_len(bounds, self.inner.addr, unsafe { (*self.inner.mr).length })?;
+        let sge = ffi::ibv_sge {
+            addr,
+            length: length.try_into().ok()?,
+            lkey: self.lkey(),
+        };
+        Some(LocalMemorySlice { _sge: sge })
     }
 }
 
@@ -267,6 +285,20 @@ impl LocalMemorySlice {
             },
         }
     }
+
+    /// As [`slice`](Self::slice), but `None` where it panics: for bounds that are empty or fall
+    /// outside this slice.
+    pub fn try_slice(&self, bounds: impl RangeBounds<usize>) -> Option<Self> {
+        let (addr, len) = checked_addr_len(bounds, self.addr(), self.len())?;
+        Some(Self {
+            _sge: ffi::ibv_sge {
+                addr,
+                // No longer than this slice, whose length is a `u32`.
+                length: len as u32,
+                lkey: self.lkey(),
+            },
+        })
+    }
 }
 
 /// Remote memory region, targetable by one-sided operations (RDMA read/write and atomics).
@@ -337,6 +369,17 @@ impl RemoteMemorySlice {
             rkey: self.rkey,
         }
     }
+
+    /// As [`slice`](Self::slice), but `None` where it panics: for bounds that are empty or fall
+    /// outside this slice.
+    pub fn try_slice(&self, bounds: impl RangeBounds<usize>) -> Option<Self> {
+        let (addr, len) = checked_addr_len(bounds, self.addr, self.len)?;
+        Some(Self {
+            addr,
+            len,
+            rkey: self.rkey,
+        })
+    }
 }
 
 /// The address and length of the `bounds` sub-range of the `bytes_len` bytes at `addr`.
@@ -364,6 +407,31 @@ fn calc_addr_len(bounds: impl RangeBounds<usize>, addr: u64, bytes_len: usize) -
             }
         }
         _ => slice_outside(),
+    }
+}
+
+/// [`calc_addr_len`] for the `try_slice` methods: `None` where that panics. Kept apart from it,
+/// so that the panicking form's code stays what it was.
+fn checked_addr_len(
+    bounds: impl RangeBounds<usize>,
+    addr: u64,
+    bytes_len: usize,
+) -> Option<(u64, usize)> {
+    use std::ops::Bound;
+    let start = match bounds.start_bound() {
+        Bound::Included(&i) => i,
+        Bound::Excluded(&i) => i.checked_add(1)?,
+        Bound::Unbounded => 0,
+    };
+    let end = match bounds.end_bound() {
+        Bound::Included(&i) => i.checked_add(1)?,
+        Bound::Excluded(&i) => i,
+        Bound::Unbounded => bytes_len,
+    };
+    if start < end && end <= bytes_len {
+        Some((addr.checked_add(start as u64)?, end - start))
+    } else {
+        None
     }
 }
 
@@ -434,6 +502,45 @@ mod test {
         ] {
             assert!(std::panic::catch_unwind(|| remote.slice(bounds)).is_err());
         }
+    }
+
+    /// `try_slice` gives what `slice` gives, and `None` exactly where `slice` panics.
+    #[test]
+    fn try_slice_is_slice_without_the_panic() {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+        let remote = RemoteMemorySlice {
+            addr: 0x1000,
+            len: 64,
+            rkey: 1,
+        };
+        let local = LocalMemorySlice::from(ffi::ibv_sge {
+            addr: 0x1000,
+            length: 64,
+            lkey: 2,
+        });
+        let ends = [0, 1, 8, 63, 64, 65, usize::MAX];
+        let mut some = 0;
+        for start in ends {
+            for end in ends {
+                for bounds in [
+                    (Included(start), Excluded(end)),
+                    (Included(start), Included(end)),
+                    (Excluded(start), Excluded(end)),
+                    (Unbounded, Excluded(end)),
+                    (Included(start), Unbounded),
+                ] {
+                    let sliced = std::panic::catch_unwind(|| remote.slice(bounds)).ok();
+                    assert_eq!(remote.try_slice(bounds), sliced, "{bounds:?}");
+                    let tried = local.try_slice(bounds).map(|s| (s.addr(), s.len()));
+                    assert_eq!(tried, sliced.map(|s| (s.addr, s.len)), "{bounds:?}");
+                    some += usize::from(sliced.is_some());
+                }
+            }
+        }
+        assert!(some > 20, "{some}");
+        // The echo of a message of `len` bytes, empty or not, is one expression.
+        assert_eq!(local.try_slice(..0).as_slice().len(), 0);
+        assert_eq!(local.try_slice(..5).as_slice().len(), 1);
     }
 
     #[test]
