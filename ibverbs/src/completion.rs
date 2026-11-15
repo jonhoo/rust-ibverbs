@@ -295,7 +295,7 @@ impl CompletionQueueBuilder {
     /// with `EOPNOTSUPP`).
     ///
     /// Defaults to none.
-    pub fn set_wc_flags(&mut self, wc_flags: WcFields) -> &mut Self {
+    pub fn set_wc_fields(&mut self, wc_flags: WcFields) -> &mut Self {
         self.wc_flags = wc_flags.0;
         self
     }
@@ -419,7 +419,7 @@ unsafe impl Sync for CompletionQueueInner {}
 
 flags_newtype! {
     /// Optional work-completion fields to request when building a completion queue (the
-    /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_flags`].
+    /// `IBV_WC_EX_WITH_*` bits), via [`CompletionQueueBuilder::set_wc_fields`].
     ///
     /// The byte length ([`WorkCompletion::len`]), immediate data ([`WorkCompletion::imm_data`]),
     /// QP number ([`WorkCompletion::qp_num`]), source QP ([`WorkCompletion::src_qp`]), source LID
@@ -830,7 +830,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::COMPLETION_TIMESTAMP`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]): the provider installs the timestamp reader only
+    /// [`CompletionQueueBuilder::set_wc_fields`]): the provider installs the timestamp reader only
     /// on a queue that did.
     #[inline]
     pub fn completion_timestamp(&self) -> HcaClock {
@@ -847,7 +847,7 @@ impl WorkCompletion<'_> {
     ///
     /// Panics if the completion queue did not request
     /// [`WcFields::COMPLETION_TIMESTAMP_WALLCLOCK`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]): the provider installs the reader only on a
+    /// [`CompletionQueueBuilder::set_wc_fields`]): the provider installs the reader only on a
     /// queue that did.
     #[inline]
     pub fn completion_wallclock_ns(&self) -> u64 {
@@ -893,7 +893,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::DLID_PATH_BITS`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn dlid_path_bits(&self) -> u8 {
         wc_reader!(self.cq, read_dlid_path_bits, "the DLID path bits")
@@ -916,7 +916,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::CVLAN`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn cvlan(&self) -> u16 {
         wc_reader!(self.cq, read_cvlan, "the customer VLAN")
@@ -927,7 +927,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::FLOW_TAG`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn flow_tag(&self) -> u32 {
         wc_reader!(self.cq, read_flow_tag, "the flow tag")
@@ -939,7 +939,7 @@ impl WorkCompletion<'_> {
     /// # Panics
     ///
     /// Panics if the completion queue did not request [`WcFields::TM_INFO`] (see
-    /// [`CompletionQueueBuilder::set_wc_flags`]).
+    /// [`CompletionQueueBuilder::set_wc_fields`]).
     #[inline]
     pub fn tag_matching(&self) -> TagMatchingInfo {
         let mut info = ffi::ibv_wc_tm_info::default();

@@ -2296,7 +2296,7 @@ fn completion_timestamps() {
         &ctx,
         "completion timestamps",
         ctx.create_cq(16)
-            .set_wc_flags(WcFields::COMPLETION_TIMESTAMP)
+            .set_wc_fields(WcFields::COMPLETION_TIMESTAMP)
             .build(),
     ) else {
         return;
@@ -2337,7 +2337,7 @@ fn extended_wc_fields() {
 
     let cq = ctx
         .create_cq(16)
-        .set_wc_flags(WcFields::DLID_PATH_BITS)
+        .set_wc_fields(WcFields::DLID_PATH_BITS)
         .build()
         .expect("failed to create a CQ with the path bits");
 
@@ -2386,7 +2386,7 @@ fn extended_wc_fields() {
         &ctx,
         "packet-classification completion fields",
         ctx.create_cq(16)
-            .set_wc_flags(WcFields::CVLAN | WcFields::FLOW_TAG)
+            .set_wc_fields(WcFields::CVLAN | WcFields::FLOW_TAG)
             .build(),
     ) {
         let mut qp =
