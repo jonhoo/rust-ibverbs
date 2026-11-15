@@ -458,15 +458,19 @@ impl EventChannel {
     }
 
     /// Blocks until the next event on the channel is available and returns it, even if other
-    /// threads race it for events. The event is acknowledged when the returned [`CmEvent`] drops;
+    /// threads race it for events, or returns `None` once `timeout` has passed without one
+    /// (`None` waits indefinitely). The event is acknowledged when the returned [`CmEvent`] drops;
     /// [`CmEvent::id`] says which id it is about.
     ///
     /// # Errors
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the file descriptor (`poll`)
     ///    or reading the event (`rdma_get_cm_event`) failed.
-    pub fn get_cm_event(&self) -> Result<CmEvent> {
-        self.get_cm_event_deadline(None)
+    pub fn wait_cm_event(&self, timeout: Option<Duration>) -> Result<Option<CmEvent>> {
+        let deadline = crate::completion::deadline_after(timeout);
+        crate::completion::wait_and_take(self.as_fd(), deadline, Error::ConnectionSetup, || {
+            self.poll_cm_event()
+        })
     }
 
     /// Returns the next event on the channel, or `None` if none is currently pending. This never
@@ -480,7 +484,7 @@ impl EventChannel {
     ///    failed.
     pub fn poll_cm_event(&self) -> Result<Option<CmEvent>> {
         loop {
-            // The read itself, which `get_cm_event` waits around; the channel is non-blocking, so
+            // The read itself, which `wait_cm_event` waits around; the channel is non-blocking, so
             // an empty one reports `EAGAIN`.
             let mut event: *mut ffi::rdma_cm_event = ptr::null_mut();
             nix::errno::Errno::clear();
@@ -628,7 +632,7 @@ impl Drop for CmIdInner {
 /// [module-level docs](self#low-level-control) for the overall flow. A typical active-side sequence
 /// is [`resolve_addr`](Self::resolve_addr), [`resolve_route`](Self::resolve_route),
 /// [`connect`](Self::connect), [`establish`](Self::establish), pumping for the matching
-/// [`CmEvent`] after each with [`get_cm_event`](Self::get_cm_event) (blocking) or
+/// [`CmEvent`] after each with [`wait_cm_event`](Self::wait_cm_event) (blocking) or
 /// [`poll_cm_event`](Self::poll_cm_event) (non-blocking); the queue pair is built on
 /// [`context`](Self::context) and [`port_num`](Self::port_num), and transitioned with
 /// [`init_qp_attr`](Self::init_qp_attr).
@@ -701,7 +705,8 @@ impl CmId {
     }
 
     /// Blocks until the next event on this id's channel is available and returns it, even if other
-    /// threads race it for events. On an [`EventChannel`] shared with other ids, that can be
+    /// threads race it for events, or returns `None` once `timeout` has passed without one
+    /// (`None` waits indefinitely). On an [`EventChannel`] shared with other ids, that can be
     /// another id's event (see [`CmEvent::id`]).
     ///
     /// The event is acknowledged automatically when the returned [`CmEvent`] drops. To wait from
@@ -711,8 +716,8 @@ impl CmId {
     ///
     ///  - [`ConnectionSetup`](Error::ConnectionSetup): waiting on the channel's file descriptor
     ///    (`poll`) or reading the event (`rdma_get_cm_event`) failed.
-    pub fn get_cm_event(&self) -> Result<CmEvent> {
-        self.inner.channel.get_cm_event()
+    pub fn wait_cm_event(&self, timeout: Option<Duration>) -> Result<Option<CmEvent>> {
+        self.inner.channel.wait_cm_event(timeout)
     }
 
     /// Returns the next event on this id's channel, or `None` if none is currently pending. This
@@ -1349,7 +1354,7 @@ impl AsFd for CmId {
     }
 }
 
-/// A connection-manager event, retrieved with [`CmId::get_cm_event`]/[`CmId::poll_cm_event`] (or
+/// A connection-manager event, retrieved with [`CmId::wait_cm_event`]/[`CmId::poll_cm_event`] (or
 /// from an [`EventChannel`]) and acknowledged automatically when dropped.
 ///
 /// The event keeps the id it is about ([`id`](Self::id)) alive: `rdma_destroy_id` blocks until
@@ -2149,7 +2154,7 @@ impl Connection {
 
     /// The connection's id, to watch what happens to it after establishment — the peer
     /// disconnecting ([`CmEventType::Disconnected`]), the device going away, the timewait exit —
-    /// with [`CmId::get_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. A connection can
+    /// with [`CmId::wait_cm_event`] or, non-blocking, [`CmId::poll_cm_event`]. A connection can
     /// also end with [`Unreachable`](CmEventType::Unreachable) (on RoCE, when the peer's link
     /// address changes under an id that connected) or [`Rejected`](CmEventType::Rejected) (the
     /// peer answering a connection it no longer knows), so treat those as the end too, not

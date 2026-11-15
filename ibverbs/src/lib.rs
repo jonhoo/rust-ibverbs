@@ -73,7 +73,7 @@
 //! with SoftRoCE's provider library from rdma-core 63.1 or newer (see the README).
 //!
 //! You do not have to poll: completion channels ([`Context::create_comp_channel`]) deliver
-//! completion notifications on a file descriptor to block on ([`CompletionChannel::wait`]) or hand
+//! completion notifications on a file descriptor to block on ([`CompletionChannel::wait_event`]) or hand
 //! to an `epoll`/`tokio` reactor, and the device's out-of-band reports — port state changes,
 //! queue-pair errors, SRQ low-watermark warnings — arrive the same two ways through the
 //! asynchronous-event API ([`Context::wait_async_event`], or [`Context::async_fd`] plus
@@ -150,7 +150,7 @@
 //!
 //! - Arming a completion queue ([`CompletionQueue::req_notify`]) reads its consumer index, which
 //!   polling advances, without a lock, and arming and consuming its notifications
-//!   ([`CompletionChannel::get_event`] or [`wait`](CompletionChannel::wait)) both update its arm
+//!   ([`CompletionChannel::poll_event`] or [`wait_event`](CompletionChannel::wait_event)) both update its arm
 //!   sequence number without one (on mlx5, EFA, and hns): arm, poll, and consume the
 //!   notifications of a given queue from one thread at a time, or an arm can be lost and its
 //!   notification never arrive.

@@ -90,7 +90,7 @@ fn main() {
     let mut outstanding = 4;
     while outstanding > 0 {
         let fired = channel
-            .wait(Some(Duration::from_secs(5)))
+            .wait_event(Some(Duration::from_secs(5)))
             .unwrap()
             .expect("timed out waiting for a completion notification");
         let cq = match fired {

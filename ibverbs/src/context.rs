@@ -129,7 +129,7 @@ impl Context {
     /// the queues built on it with [`CompletionQueueBuilder::set_comp_channel`].
     ///
     /// By default a completion queue has no channel and is driven by polling alone; a channel is
-    /// what lets you block for completions ([`CompletionChannel::wait`]) or hand the descriptor to
+    /// what lets you block for completions ([`CompletionChannel::wait_event`]) or hand the descriptor to
     /// an event loop instead. Several queues can share one channel — a single descriptor then
     /// reports notifications for all of them, which is what you want for a server driving many
     /// queue pairs from one `epoll`/reactor. See [`CompletionChannel`] for the notification loop.

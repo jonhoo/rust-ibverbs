@@ -575,7 +575,7 @@ fn multiple_outstanding() {
     }
 }
 
-/// Blocking on a completion channel (`CompletionChannel::wait`) delivers completions without
+/// Blocking on a completion channel (`CompletionChannel::wait_event`) delivers completions without
 /// busy-polling: arm the queue, drain it, and only then block on the channel.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
@@ -623,7 +623,7 @@ fn wait_for_completion() {
             continue;
         }
         match channel
-            .wait(Some(Duration::from_secs(5)))
+            .wait_event(Some(Duration::from_secs(5)))
             .expect("wait failed")
         {
             Some(context) => assert_eq!(context, CQ_CONTEXT),
@@ -2450,11 +2450,11 @@ fn event_driven_completion() {
     unsafe { batch.submit() }.expect("send failed");
 
     // A real event loop would await readability of the descriptor; here we consume the notification
-    // as soon as it arrives. `get_event` reads the (non-blocking) channel and acknowledges for us.
+    // as soon as it arrives. `poll_event` reads the (non-blocking) channel and acknowledges for us.
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut notified = false;
     while Instant::now() < deadline {
-        if channel.get_event().expect("get_event failed").is_some() {
+        if channel.poll_event().expect("poll_event failed").is_some() {
             notified = true;
             break;
         }
@@ -2749,7 +2749,7 @@ fn shared_completion_channel() {
         .create_comp_channel()
         .expect("failed to create completion channel");
 
-    // Distinct context values let `CompletionChannel::get_event` say which queue a notification is
+    // Distinct context values let `CompletionChannel::poll_event` say which queue a notification is
     // for.
     const CTX_A: u64 = 1;
     const CTX_B: u64 = 2;
@@ -2819,7 +2819,7 @@ fn shared_completion_channel() {
     while a.len() < 2 || b.len() < 2 {
         assert!(Instant::now() < deadline, "timed out: a={a:?} b={b:?}");
         match channel
-            .wait(Some(Duration::from_millis(100)))
+            .wait_event(Some(Duration::from_millis(100)))
             .expect("channel wait")
         {
             None => continue,

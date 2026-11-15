@@ -635,7 +635,7 @@ const SERVER_PDATA: &[u8] =
 #[ignore = "requires an RDMA device; run with `cargo test --features rdmacm -- --ignored`"]
 fn low_level_connect_and_send() {
     // Drive the connection-manager state machine directly with `CmId`, instead of the blocking
-    // `Connector`/`Acceptor` helpers: the passive side blocks on `get_cm_event`, while the active
+    // `Connector`/`Acceptor` helpers: the passive side blocks on `wait_cm_event`, while the active
     // side pumps events off its non-blocking file descriptor the way an event loop would. Proves
     // the low-level escape hatch can set up a working connection, and that private data crosses it
     // in both directions.
