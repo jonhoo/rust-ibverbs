@@ -25,7 +25,7 @@ jobs:
       - name: Configure CI host
         run: ./configure-ci.sh --vendored-libs
       - name: Install nightly
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: nightly
       - name: cargo generate-lockfile
@@ -53,7 +53,7 @@ jobs:
         run: ./configure-ci.sh --vendored-libs
       - name: Install beta
         if: hashFiles('Cargo.lock') != ''
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # branch=master
+        uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # branch=master
         with:
           toolchain: beta
       - name: cargo update
