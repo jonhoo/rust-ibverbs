@@ -104,12 +104,13 @@ impl sealed::Sealed for Srd {
             return Err(Error::errno(nix::libc::EOPNOTSUPP, Error::CreateQueuePair)
                 .for_operation(&"mlx5dv_create_qp"));
         }
+        let resolved = builder.resolve()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
             // EFA rejects a work request without `IBV_SEND_SIGNALED` unless the queue pair signals
             // every send, and requests a completion for every work request either way, so
             // signaling all costs nothing and spares each request the flag.
             sq_sig_all: 1,
-            ..builder.init_attr_ex()
+            ..builder.init_attr_ex(resolved.send_ops)
         };
         // rdma-core adds fields to this struct over time (64.0 added `wr_flags`); the provider
         // reads only as much as the passed-in length covers.
@@ -127,7 +128,7 @@ impl sealed::Sealed for Srd {
         };
         let qp = nonnull(qp, Error::CreateQueuePair)
             .map_err(|e| e.for_operation(&"efadv_create_qp_ex"))?;
-        builder.prepared(qp, &attr)
+        builder.prepared(qp, &attr, resolved)
     }
 }
 impl Transport for Srd {}

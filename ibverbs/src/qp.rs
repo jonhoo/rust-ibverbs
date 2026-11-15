@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::address::Gid;
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
-use crate::context::{Mtu, RcLimits};
+use crate::context::{Mtu, PortState, RcLimits};
 use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, RemoteMemorySlice};
 use crate::pd::ProtectionDomain;
@@ -368,10 +368,6 @@ pub(crate) fn default_send_ops(qp_type: ffi::ibv_qp_type, atomics: bool) -> Send
 pub struct QueuePairBuilder<T: Transport> {
     ctx: u64,
     pub(crate) pd: ProtectionDomain,
-    /// port local identifier
-    lid: u16,
-    /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
-    roce: bool,
     /// the device port this queue pair is associated with (numbered from 1)
     port_num: u8,
 
@@ -386,8 +382,6 @@ pub struct QueuePairBuilder<T: Transport> {
     max_inline_data: u32,
     /// the send operations to request at creation, or the transport's default set
     send_ops: Option<SendOps>,
-    /// the transport's default set of send operations on this device
-    default_send_ops: SendOps,
 
     // carried along to handshake phase
     /// traffic class set in Global Routing Headers, only used if `gid_index` is set.
@@ -405,18 +399,14 @@ pub struct QueuePairBuilder<T: Transport> {
 }
 
 impl<T: Transport> QueuePairBuilder<T> {
-    /// Prepare a new `QueuePair` builder on port `port_num`, whose attributes are `port_attr`, with
-    /// the defaults the setters document.
-    ///
-    /// `rc_limits` is what a reliable connection's defaults take from the device (its RDMA read
-    /// and atomic depths, and whether it executes atomics); it is `None` for the other transports.
+    /// Prepare a new `QueuePair` builder on port `port_num`, with the defaults the setters
+    /// document. The defaults that come from the port or the device are filled in when the queue
+    /// pair is built ([`resolve`](Self::resolve)).
     pub(crate) fn new(
         pd: ProtectionDomain,
-        port_attr: &ffi::ibv_port_attr,
         port_num: u8,
         send: CompletionQueue,
         recv: CompletionQueue,
-        rc_limits: Option<RcLimits>,
     ) -> QueuePairBuilder<T> {
         let reliable = T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC;
         let connected = reliable || T::TYPE == ffi::ibv_qp_type::IBV_QPT_UC;
@@ -430,7 +420,6 @@ impl<T: Transport> QueuePairBuilder<T> {
         rts.set_state(QueuePairState::ReadyToSend).set_sq_psn(0);
         if connected {
             init.set_access_flags(AccessFlags::LOCAL_WRITE);
-            rtr.set_path_mtu(port_attr.active_mtu.into());
         }
         if reliable {
             rtr.set_min_rnr_timer(RnrTimer::from_encoding(16));
@@ -440,21 +429,9 @@ impl<T: Transport> QueuePairBuilder<T> {
                 .set_retry_count(7)
                 .set_rnr_retry(7);
         }
-        if let Some(RcLimits {
-            rd_atomic: (initiator, responder),
-            ..
-        }) = rc_limits
-        {
-            rtr.set_max_dest_rd_atomic(responder);
-            rts.set_max_rd_atomic(initiator);
-        }
-        let default_send_ops =
-            T::default_send_ops(pd.context(), rc_limits.is_some_and(|limits| limits.atomics));
         QueuePairBuilder {
             ctx: 0,
             pd,
-            lid: port_attr.lid,
-            roce: port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET.0 as u8,
             port_num,
 
             gid_index: None,
@@ -468,7 +445,6 @@ impl<T: Transport> QueuePairBuilder<T> {
             max_recv_sge: 1,
             max_inline_data: 0,
             send_ops: None,
-            default_send_ops,
 
             service_level: 0,
             bring_up: BringUp { init, rtr, rts },
@@ -654,9 +630,81 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// atomics on RC where the device executes them (its `atomic_cap` is not `IBV_ATOMIC_NONE`).
     /// On SRD, RDMA WRITE and RDMA READ are part of the default exactly when the EFA device has
     /// them. Start from it to add an operation:
-    /// `let ops = builder.send_ops() | SendOps::SEND_WITH_INV;`.
-    pub fn send_ops(&self) -> SendOps {
-        self.send_ops.unwrap_or(self.default_send_ops)
+    /// `let ops = builder.send_ops()? | SendOps::SEND_WITH_INV;`.
+    ///
+    /// # Errors
+    ///
+    ///  - [`QueryDevice`](Error::QueryDevice): no set was given, and asking the device whether it
+    ///    executes atomics, for a reliable connection's default, failed (`ibv_query_device`).
+    pub fn send_ops(&self) -> Result<SendOps> {
+        match self.send_ops {
+            Some(ops) => Ok(ops),
+            None => Ok(T::default_send_ops(
+                self.pd.context(),
+                self.rc_limits()?.is_some_and(|limits| limits.atomics),
+            )),
+        }
+    }
+
+    /// What a reliable connection's defaults take from the device (its RDMA read and atomic
+    /// depths, and whether it executes atomics); `None` for the other transports.
+    fn rc_limits(&self) -> Result<Option<RcLimits>> {
+        if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
+            self.pd.context().rc_limits().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Reads what the queue pair takes from its port and device, as of now: the port's LID and
+    /// link layer, and the defaults for whatever the setters left open (the path MTU, a reliable
+    /// connection's RDMA read and atomic depths, the send operations). Port attributes change
+    /// (the subnet manager reassigns LIDs, for one), so they are read when each queue pair is
+    /// built; `PreparedQueuePair::endpoint` documents the stale-LID case.
+    pub(crate) fn resolve(&self) -> Result<Resolved> {
+        let port_attr = self.pd.context().query_port(self.port_num)?;
+        // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
+        //
+        //   The content of the GID table is valid only when the port_attr.state is either
+        //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
+        //   table is indeterminate.
+        //
+        if !matches!(port_attr.state(), PortState::Active | PortState::Armed) {
+            return Err(Error::PortNotActive(self.port_num));
+        }
+        let rc_limits = self.rc_limits()?;
+        let mut bring_up = self.bring_up.clone();
+        let set = |attr: &QueuePairAttribute, bit| attr.mask().contains(bit);
+        let connected = matches!(
+            T::TYPE,
+            ffi::ibv_qp_type::IBV_QPT_RC | ffi::ibv_qp_type::IBV_QPT_UC
+        );
+        if connected && !set(&bring_up.rtr, QueuePairAttributeMask::PATH_MTU) {
+            bring_up.rtr.set_path_mtu(port_attr.active_mtu.into());
+        }
+        if let Some(RcLimits {
+            rd_atomic: (initiator, responder),
+            ..
+        }) = rc_limits
+        {
+            if !set(&bring_up.rtr, QueuePairAttributeMask::MAX_DEST_RD_ATOMIC) {
+                bring_up.rtr.set_max_dest_rd_atomic(responder);
+            }
+            if !set(&bring_up.rts, QueuePairAttributeMask::MAX_QP_RD_ATOMIC) {
+                bring_up.rts.set_max_rd_atomic(initiator);
+            }
+        }
+        Ok(Resolved {
+            lid: port_attr.lid,
+            roce: port_attr.link_layer == ffi::IBV_LINK_LAYER_ETHERNET.0 as u8,
+            send_ops: self.send_ops.unwrap_or_else(|| {
+                T::default_send_ops(
+                    self.pd.context(),
+                    rc_limits.is_some_and(|limits| limits.atomics),
+                )
+            }),
+            bring_up,
+        })
     }
 
     /// Refuses completion queues from another device context than the protection domain's, and a
@@ -691,7 +739,7 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The creation attributes both `ibv_create_qp_ex` and `efadv_create_qp_ex` take: the
     /// builder's user-data value, completion queues, capacities, and send operations, in its
     /// protection domain. The shared receive queue is left to the caller.
-    pub(crate) fn init_attr_ex(&self) -> ffi::ibv_qp_init_attr_ex {
+    pub(crate) fn init_attr_ex(&self, send_ops: SendOps) -> ffi::ibv_qp_init_attr_ex {
         ffi::ibv_qp_init_attr_ex {
             // The cookie is a plain integer to the caller; the C ABI carries it as a pointer.
             qp_context: self.ctx as usize as *mut c_void,
@@ -712,7 +760,7 @@ impl<T: Transport> QueuePairBuilder<T> {
             pd: self.pd.as_raw(),
             // The extended send operations driven through the doorbell post API: the transport's
             // default set, or whatever the builder was told to request instead.
-            send_ops_flags: self.send_ops().0 as u64,
+            send_ops_flags: send_ops.0 as u64,
             ..Default::default()
         }
     }
@@ -727,6 +775,11 @@ impl<T: Transport> QueuePairBuilder<T> {
     ///
     /// # Errors
     ///
+    ///  - [`QueryPort`](Error::QueryPort): querying the builder's port failed (`ibv_query_port`).
+    ///  - [`PortNotActive`](Error::PortNotActive): the port is not in the `ACTIVE` or `ARMED`
+    ///    state, so its GID table and routing are unusable.
+    ///  - [`QueryDevice`](Error::QueryDevice): querying the device's RDMA read and atomic limits,
+    ///    which a reliable connection defaults to, failed (`ibv_query_device`).
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
     ///    device context than the protection domain, or the shared receive queue to another
     ///    protection domain, or the creation failed (`EINVAL` for an invalid `ProtectionDomain`
@@ -745,9 +798,10 @@ impl<T: Transport> QueuePairBuilder<T> {
     /// The `ibv_create_qp_ex` creation of every transport but SRD.
     pub(crate) fn create_qp_ex(&self) -> Result<PreparedQueuePair<T>> {
         self.check_same_context()?;
+        let resolved = self.resolve()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
-            ..self.init_attr_ex()
+            ..self.init_attr_ex(resolved.send_ops)
         };
         #[cfg(feature = "mlx5")]
         if self.mlx5_no_scatter_to_cqe {
@@ -763,13 +817,13 @@ impl<T: Transport> QueuePairBuilder<T> {
             };
             let qp = nonnull(qp, Error::CreateQueuePair)
                 .map_err(|e| e.for_operation(&"mlx5dv_create_qp"))?;
-            return self.prepared(qp, &attr);
+            return self.prepared(qp, &attr, resolved);
         }
         let qp = nonnull(
             unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
             Error::CreateQueuePair,
         )?;
-        self.prepared(qp, &attr)
+        self.prepared(qp, &attr, resolved)
     }
 
     /// Wraps `qp`, just created from `attr`, as the prepared queue pair this builder describes:
@@ -779,9 +833,10 @@ impl<T: Transport> QueuePairBuilder<T> {
         &self,
         qp: *mut ffi::ibv_qp,
         attr: &ffi::ibv_qp_init_attr_ex,
+        resolved: Resolved,
     ) -> Result<PreparedQueuePair<T>> {
         let qp_ex = unsafe { ffi::ibv_qp_to_qp_ex(qp) };
-        let prepared = self.wrap(qp, attr, qp_ex);
+        let prepared = self.wrap(qp, attr, qp_ex, resolved);
         // `ibv_qp_to_qp_ex` hands out the extended view only when the provider installed the
         // work-request table; one that accepted the send-operations mask without doing so has
         // made a queue pair this crate could never post to. Dropping `prepared` destroys it.
@@ -801,10 +856,11 @@ impl<T: Transport> QueuePairBuilder<T> {
         qp: *mut ffi::ibv_qp,
         attr: &ffi::ibv_qp_init_attr_ex,
         qp_ex: *mut ffi::ibv_qp_ex,
+        resolved: Resolved,
     ) -> PreparedQueuePair<T> {
         PreparedQueuePair {
-            lid: self.lid,
-            roce: self.roce,
+            lid: resolved.lid,
+            roce: resolved.roce,
             port_num: self.port_num,
             qp: QueuePair {
                 pd: self.pd.clone(),
@@ -826,9 +882,22 @@ impl<T: Transport> QueuePairBuilder<T> {
             gid_index: self.gid_index,
             traffic_class: self.traffic_class,
             service_level: self.service_level,
-            bring_up: self.bring_up.clone(),
+            bring_up: resolved.bring_up,
         }
     }
+}
+
+/// What a queue pair takes from its port and device at the time it is built
+/// ([`QueuePairBuilder::resolve`]).
+pub(crate) struct Resolved {
+    /// port local identifier
+    lid: u16,
+    /// whether the port's link layer is Ethernet (RoCE), which routes every packet by GID
+    roce: bool,
+    /// the send operations to create the queue pair with
+    pub(crate) send_ops: SendOps,
+    /// the builder's bring-up attributes, with the defaults the port and device decide
+    bring_up: BringUp,
 }
 
 impl<T: Connected> QueuePairBuilder<T> {
@@ -861,6 +930,8 @@ impl<T: Transport + sealed::Legacy> QueuePairBuilder<T> {
     ///
     /// # Errors
     ///
+    ///  - [`QueryPort`](Error::QueryPort), [`PortNotActive`](Error::PortNotActive),
+    ///    [`QueryDevice`](Error::QueryDevice): as for [`build`](Self::build).
     ///  - [`CreateQueuePair`](Error::CreateQueuePair): a completion queue belongs to another
     ///    device context than the protection domain, or the shared receive queue to another
     ///    protection domain, or `ibv_create_qp` failed (`EINVAL` for an invalid value in the queue
@@ -888,11 +959,11 @@ impl<T: Transport + sealed::Legacy> QueuePairBuilder<T> {
         // Asking for nothing beyond the protection domain makes the `ibv_create_qp_ex` shim
         // create the queue pair with `ibv_create_qp`, as the C inline does.
         self.check_same_context()?;
+        let resolved = self.resolve()?;
         let mut attr = ffi::ibv_qp_init_attr_ex {
             srq: self.srq.as_ref().map_or(ptr::null_mut(), |s| s.as_raw()),
             comp_mask: ffi::ibv_qp_init_attr_mask::IBV_QP_INIT_ATTR_PD.0,
-            send_ops_flags: 0,
-            ..self.init_attr_ex()
+            ..self.init_attr_ex(SendOps::empty())
         };
         let qp = nonnull(
             unsafe { ffi::ibv_create_qp_ex(self.pd.context().as_raw(), &mut attr) },
@@ -901,7 +972,7 @@ impl<T: Transport + sealed::Legacy> QueuePairBuilder<T> {
         .map_err(|e| e.for_operation(&"ibv_create_qp"))?;
         // No `ibv_qp_to_qp_ex` here: it reads the `verbs_qp` fields that follow the `ibv_qp`, and
         // a provider without the extended verbs (irdma) allocates its own fields there instead.
-        Ok(self.wrap(qp, &attr, ptr::null_mut()))
+        Ok(self.wrap(qp, &attr, ptr::null_mut(), resolved))
     }
 }
 

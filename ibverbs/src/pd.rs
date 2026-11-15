@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::address::{AddressHandle, AddressHandleAttribute};
 use crate::completion::CompletionQueue;
-use crate::context::{Context, PortAttr, PortState};
+use crate::context::Context;
 use crate::error::{Error, Result, destroyed, keep, nonnull};
 use crate::mr::{AccessFlags, LocalMemorySlice, MemoryRegion};
 use crate::qp::QueuePairBuilder;
@@ -178,37 +178,15 @@ impl ProtectionDomain {
     /// The queue pair keeps this protection domain and both completion queues alive for as long as
     /// it exists.
     ///
-    /// # Errors
-    ///
-    ///  - [`QueryPort`](Error::QueryPort): querying `port_num` failed (`ibv_query_port`).
-    ///  - [`PortNotActive`](Error::PortNotActive): `port_num` is not in the `ACTIVE` or `ARMED`
-    ///    state, so its GID table and routing are unusable.
-    ///  - [`QueryDevice`](Error::QueryDevice): querying the device's RDMA read and atomic limits,
-    ///    which a reliable connection defaults to, failed (`ibv_query_device`).
+    /// Nothing is asked of the device yet: the builder only collects settings, and
+    /// [`build`](QueuePairBuilder::build) reads the port and creates the queue pair.
     pub fn create_qp<T: Transport>(
         &self,
         send: &CompletionQueue,
         recv: &CompletionQueue,
         port_num: u8,
-    ) -> Result<QueuePairBuilder<T>> {
-        // Port attributes change (the subnet manager reassigns LIDs, for one), so they are read
-        // when each builder is created; `PreparedQueuePair::endpoint` documents the stale-LID case.
-        let port_attr = self.context().query_port(port_num)?;
-        require_active(port_num, &port_attr)?;
-        // Only reliable connections carry RDMA read and atomic limits, and default to the atomics.
-        let rc_limits = if T::TYPE == ffi::ibv_qp_type::IBV_QPT_RC {
-            Some(self.context().rc_limits()?)
-        } else {
-            None
-        };
-        Ok(QueuePairBuilder::new(
-            self.clone(),
-            &port_attr,
-            port_num,
-            send.clone(),
-            recv.clone(),
-            rc_limits,
-        ))
+    ) -> QueuePairBuilder<T> {
+        QueuePairBuilder::new(self.clone(), port_num, send.clone(), recv.clone())
     }
 
     /// Register `[ptr, ptr + len)` as a region owned by `owner`, deduplicating the `ibv_reg_mr`
@@ -444,20 +422,6 @@ fn zeroed_buffer(n: usize) -> Option<Box<[u8]>> {
     // SAFETY: `ptr` is a fresh, zeroed allocation with the layout of `[u8; n]`, the one `Box`
     // frees it with.
     Some(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, n)) })
-}
-
-/// Refuses a port that is neither `ACTIVE` nor `ARMED`, for [`ProtectionDomain::create_qp`].
-fn require_active(port_num: u8, port_attr: &PortAttr) -> Result<()> {
-    // From http://www.rdmamojo.com/2012/08/02/ibv_query_gid/:
-    //
-    //   The content of the GID table is valid only when the port_attr.state is either
-    //   IBV_PORT_ARMED or IBV_PORT_ACTIVE. For other states of the port, the value of the GID
-    //   table is indeterminate.
-    //
-    match port_attr.state() {
-        PortState::Active | PortState::Armed => Ok(()),
-        _ => Err(Error::PortNotActive(port_num)),
-    }
 }
 
 #[cfg(test)]
