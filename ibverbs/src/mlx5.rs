@@ -4,7 +4,32 @@ use std::os::fd::{AsRawFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
+use crate::qp::{QueuePairBuilder, Transport};
 use crate::{AccessFlags, Context, Error, MemoryRegion, ProtectionDomain, Result};
+
+impl<T: Transport> QueuePairBuilder<T> {
+    /// Create the queue pair without mlx5's scatter to CQE (`mlx5dv_create_qp` with
+    /// `MLX5DV_QP_CREATE_DISABLE_SCATTER_TO_CQE`), so that the device writes every message it
+    /// receives to the receive's buffer itself, however small.
+    ///
+    /// That is what receives into a DMA-BUF region need (see "Receiving small messages on mlx5"
+    /// in [`register_dmabuf`](ProtectionDomain::register_dmabuf)): with scatter to CQE, the
+    /// library copies a message of up to 32 bytes to the address in the receive request with the
+    /// CPU, and for such a region that address is not this process's mapping of the memory. The
+    /// setting belongs to the queue pair that receives, also when it receives through a shared
+    /// receive queue. Small messages then cost the device a write to the buffer, as larger ones
+    /// do.
+    ///
+    /// [`build`](Self::build) then fails with [`Unsupported`](Error::Unsupported) on a device
+    /// that is not mlx5, and for an SRD queue pair.
+    /// [`build_legacy`](Self::build_legacy) does not look at this setting.
+    ///
+    /// Requires the `mlx5` feature.
+    pub fn disable_mlx5_scatter_to_cqe(&mut self) -> &mut Self {
+        self.mlx5_no_scatter_to_cqe = true;
+        self
+    }
+}
 
 impl ProtectionDomain {
     /// Register an exported DMA-BUF through mlx5 Data Direct (`mlx5dv_reg_dmabuf_mr` with

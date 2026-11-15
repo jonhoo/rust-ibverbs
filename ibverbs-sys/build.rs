@@ -172,6 +172,11 @@ fn main() {
         builder = builder
             .allowlist_function("mlx5dv_reg_dmabuf_mr")
             .allowlist_function("mlx5dv_get_data_direct_sysfs_path")
+            .allowlist_function("mlx5dv_create_qp")
+            .allowlist_type("mlx5dv_qp_init_attr_mask")
+            .allowlist_type("mlx5dv_qp_create_flags")
+            .bitfield_enum("mlx5dv_qp_init_attr_mask")
+            .bitfield_enum("mlx5dv_qp_create_flags")
             .allowlist_type("mlx5_ib_uapi_reg_dmabuf_flags")
             .bitfield_enum("mlx5_ib_uapi_reg_dmabuf_flags");
     }

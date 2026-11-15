@@ -343,9 +343,11 @@ impl ProtectionDomain {
     /// request carries, which for a slice of this region is `iova`-based: the bytes land in
     /// whatever this process has mapped at that address, not in the DMA-BUF, and the poll crashes
     /// if nothing is mapped there. Before posting receives that point into such a region (on a
-    /// queue pair or a shared receive queue), set `MLX5_SCATTER_TO_CQE=0` in the environment
-    /// (libmlx5 reads it whenever a queue pair is created), or choose an `iova` at which this
-    /// process maps the same memory. Sends, and RDMA reads and writes, are not affected.
+    /// queue pair or a shared receive queue), create the receiving queue pairs without the feature
+    /// (`QueuePairBuilder::disable_mlx5_scatter_to_cqe`, with the `mlx5` feature, or
+    /// `MLX5_SCATTER_TO_CQE=0` in the environment, which libmlx5 reads whenever a queue pair is
+    /// created), or choose an `iova` at which this process maps the same memory. Sends, and RDMA
+    /// reads and writes, are not affected.
     ///
     /// # Errors
     ///

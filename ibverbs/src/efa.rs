@@ -99,6 +99,12 @@ impl sealed::Sealed for Srd {
     /// Creates the SRD queue pair `builder` describes (`efadv_create_qp_ex`).
     fn create(builder: &QueuePairBuilder<Srd>) -> Result<PreparedQueuePair<Srd>> {
         builder.check_same_context()?;
+        // An SRD queue pair comes from EFA's own verb, never from mlx5's.
+        #[cfg(feature = "mlx5")]
+        if builder.mlx5_no_scatter_to_cqe {
+            return Err(Error::errno(nix::libc::EOPNOTSUPP, Error::CreateQueuePair)
+                .for_operation(&"mlx5dv_create_qp"));
+        }
         let mut attr = ffi::ibv_qp_init_attr_ex {
             // EFA rejects a work request without `IBV_SEND_SIGNALED` unless the queue pair signals
             // every send, and requests a completion for every work request either way, so
