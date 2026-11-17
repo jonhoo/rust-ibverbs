@@ -2310,8 +2310,8 @@ fn completion_timestamps() {
     let _delta: u64 = latest - earliest;
 }
 
-/// The extended work-completion accessors: the always-available GRH flag, service level, and
-/// source LID, the DLID path bits requested through the completion-queue builder, and the optional
+/// The extended work-completion accessors: the always-available GRH flag, the source LID, service
+/// level, and DLID path bits requested through the completion-queue builder, and the optional
 /// packet-classification fields.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
@@ -2320,9 +2320,9 @@ fn extended_wc_fields() {
 
     let cq = ctx
         .create_cq(16)
-        .set_wc_fields(WcFields::DLID_PATH_BITS)
+        .set_wc_fields(WcFields::SLID | WcFields::SL | WcFields::DLID_PATH_BITS)
         .build()
-        .expect("failed to create a CQ with the path bits");
+        .expect("failed to create a CQ with the addressing fields");
 
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let mut qp = connect_self::<Rc>(&pd, &cq, gid_index(&ctx), |builder| {
@@ -2388,6 +2388,28 @@ fn extended_wc_fields() {
         });
         assert!(arrived, "timed out waiting for completions");
     }
+}
+
+/// The source LID is requested like the other optional fields: reading it from a queue that did not
+/// request it panics, naming the field, instead of reading zero.
+#[test]
+#[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
+#[should_panic(expected = "completion queue did not request the source LID")]
+fn unrequested_source_lid_panics() {
+    let mut lb = loopback();
+    let recv = mr(&lb.pd, 16);
+    let mut send = mr(&lb.pd, 16);
+    send.bytes_mut()[..4].copy_from_slice(b"slid");
+    unsafe { lb.qp.post_recv([RecvRequest::new(1, &[recv.slice(..4)])]) }
+        .expect("post_recv failed");
+    let mut batch = unsafe { lb.qp.start_send() };
+    batch.op().signaled().send(2, &[send.slice(..4)]);
+    batch.submit().expect("send failed");
+    let arrived = poll_until(&lb.cq, |wc| {
+        let _ = wc.slid();
+        true
+    });
+    assert!(arrived, "timed out waiting for a completion");
 }
 
 /// The completion channel exposes a descriptor and arm/consume hooks for event-driven polling.
@@ -3079,12 +3101,23 @@ fn send_ops_subset() {
 
 /// A UD queue pair answers a datagram through the route derived from the receive completion and
 /// its GRH, in both completion forms: the classic `ibv_wc` from `poll_into`, and the lazily read
-/// `WorkCompletion` from `poll`.
+/// `WorkCompletion` from `poll`. Only on InfiniBand does the queue request the source LID and
+/// service level, which RoCE does not route by.
 #[test]
 #[ignore = "requires an RDMA device; run with `cargo test -- --ignored`"]
 fn reply_through_address_handle_from_wc() {
     let ctx = open_test_device();
-    let cq = ctx.create_cq(16).build().expect("failed to create CQ");
+    let port = ctx.query_port(1).expect("failed to query port");
+    let addressing = if port.link_layer() == LinkLayer::Ethernet {
+        WcFields::empty()
+    } else {
+        WcFields::SLID | WcFields::SL
+    };
+    let cq = ctx
+        .create_cq(16)
+        .set_wc_fields(addressing)
+        .build()
+        .expect("failed to create CQ");
     let pd = ctx.alloc_pd().expect("failed to allocate PD");
     let gid_index = gid_index(&ctx);
     const QKEY: u32 = 0x1234_5678;

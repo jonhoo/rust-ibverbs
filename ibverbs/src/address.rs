@@ -4,7 +4,7 @@ use std::fmt;
 use std::io;
 
 use crate::completion::{Completion, WorkCompletion};
-use crate::context::Context;
+use crate::context::{Context, LinkLayer};
 use crate::error::{Error, Result, destroyed, keep};
 use crate::pd::ProtectionDomain;
 
@@ -673,11 +673,25 @@ impl AddressHandleAttribute {
     /// ([`CompletionQueue::poll`]).
     ///
     /// On RoCE the route comes from the header alone. On InfiniBand it also needs the source LID
-    /// and service level, which every completion carries, and the path bits, which it only
-    /// carries if its queue requested [`WcFields::DLID_PATH_BITS`]; they are taken as zero
-    /// otherwise, which is what they are unless the subnet assigns a port several LIDs (LMC).
+    /// and service level, which the completion only carries if its queue requested
+    /// [`WcFields::SLID`] and [`WcFields::SL`]: without them, this queries the port to tell
+    /// InfiniBand from RoCE, and refuses an InfiniBand port rather than route the reply to LID 0.
+    /// The path bits are carried if the queue requested [`WcFields::DLID_PATH_BITS`], and taken as
+    /// zero otherwise, which is what they are unless the subnet assigns a port several LIDs (LMC).
+    ///
+    /// # Errors
+    ///
+    /// Those of [`from_wc`](Self::from_wc), and:
+    ///
+    ///  - [`CreateAddressHandle`](Error::CreateAddressHandle): the port is an InfiniBand one, and
+    ///    the completion's queue did not request [`WcFields::SLID`] and [`WcFields::SL`]
+    ///    ([`io::ErrorKind::InvalidInput`]).
+    ///  - [`QueryPort`](Error::QueryPort): the queue did not request them, and querying the port
+    ///    failed.
     ///
     /// [`CompletionQueue::poll`]: crate::CompletionQueue::poll
+    /// [`WcFields::SLID`]: crate::WcFields::SLID
+    /// [`WcFields::SL`]: crate::WcFields::SL
     /// [`WcFields::DLID_PATH_BITS`]: crate::WcFields::DLID_PATH_BITS
     pub fn from_completion(
         context: &Context,
@@ -685,6 +699,22 @@ impl AddressHandleAttribute {
         wc: &WorkCompletion<'_>,
         grh: Option<&Grh>,
     ) -> Result<Self> {
+        // InfiniBand routes the reply by the sender's LID and service level, header or not, and a
+        // queue that did not request them reads both as zero. RoCE (an Ethernet link layer) routes
+        // by the header alone, and EFA, which has no InfiniBand transport, has no route back at
+        // all, which `from_wc` reports.
+        if !wc.has_slid_and_sl() {
+            let transport = unsafe { (*(*context.as_raw()).device).transport_type };
+            if transport == ffi::ibv_transport_type::IBV_TRANSPORT_IB
+                && context.query_port(port_num)?.link_layer() != LinkLayer::Ethernet
+            {
+                return Err(Error::CreateAddressHandle(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an InfiniBand route needs the source LID and service level, which the \
+                     completion queue did not request (WcFields::SLID and WcFields::SL)",
+                )));
+            }
+        }
         Self::from_wc(context, port_num, &wc.addressing(), grh)
     }
 }
