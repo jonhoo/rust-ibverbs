@@ -16,7 +16,7 @@ use crate::qp::{Payload, PreparedQueuePair, QueuePairBuilder, SendOp, SendOps};
 use crate::transport::{Datagram, Transport, sealed};
 
 #[cfg(doc)]
-use crate::{ProtectionDomain, QueuePair, WorkCompletion};
+use crate::{ProtectionDomain, QueuePair, WcFields, WorkCompletion};
 
 /// The EFA SRD (Scalable Reliable Datagram) transport: reliable like RC but connectionless and
 /// addressed like UD (a provider-specific `IBV_QPT_DRIVER` queue pair).
@@ -256,8 +256,9 @@ impl AddressHandle {
     /// device that is not EFA.
     ///
     /// EFA has no LIDs. A receive completion names the sender by the number of the address handle
-    /// the receiving side holds for the sender's GID ([`WorkCompletion::slid`]), and by `0xffff`
-    /// when it holds none: keep a map from this number to the peer to tell who sent a datagram.
+    /// the receiving side holds for the sender's GID ([`WorkCompletion::slid`], on a queue built
+    /// with [`WcFields::SLID`]), and by `0xffff` when it holds none: keep a map from this number
+    /// to the peer to tell who sent a datagram.
     pub fn efa_ah_number(&self) -> Option<u16> {
         let mut attr = ffi::efadv_ah_attr::default();
         let errno = unsafe {
